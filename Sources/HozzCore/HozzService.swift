@@ -9,4 +9,12 @@ import Foundation
 public enum HozzService {
     /// The Bonjour service type a Hozz receiver advertises.
     public static let bonjourType = "_hozz._tcp"
+
+    /// The port a receiver listens on.
+    ///
+    /// Fixed, and shared by both halves, so the phone can ask an address
+    /// directly when neither Bonjour nor iCloud can say where a computer is.
+    /// An ephemeral port would change on every launch and leave a saved
+    /// destination pointing at nothing.
+    public static let defaultPort: UInt16 = 54330
 }

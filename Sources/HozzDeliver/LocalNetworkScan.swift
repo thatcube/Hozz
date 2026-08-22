@@ -29,11 +29,14 @@ public struct LocalNetworkScan: Sendable {
         self.probe = ReceiverProbe(timeout: timeout)
     }
 
-    /// Every receiver found on this device's networks.
-    public func scan() async -> [String] {
-        var results: [String] = []
+    /// Every receiver found on this device's networks, with its name.
+    public func scan() async -> [(name: String, endpoint: String)] {
+        var results: [(name: String, endpoint: String)] = []
         for prefix in Self.localPrefixes() {
-            results.append(contentsOf: await sweep(prefix: prefix))
+            for endpoint in await sweep(prefix: prefix) {
+                let name = await probe.identify(endpoint) ?? endpoint
+                results.append((name: name, endpoint: endpoint))
+            }
         }
         return results
     }

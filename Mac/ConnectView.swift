@@ -139,14 +139,27 @@ struct ConnectView: View {
         )
 
         GroupBox {
-            Label(
-                """
-                This Mac is advertising itself as “Hozz on \
-                \(services.computerName)”, so the phone can usually find it \
-                without the address.
-                """,
-                systemImage: "bonjour"
-            )
+            VStack(alignment: .leading, spacing: 8) {
+                Label(
+                    """
+                    This Mac is advertising itself as “Hozz on \
+                    \(services.computerName)”, so the phone can usually find it \
+                    without the address.
+                    """,
+                    systemImage: "bonjour"
+                )
+                if services.sharedWithOtherDevices == false {
+                    Label(
+                        """
+                        This Mac could not tell your other devices about itself \
+                        through iCloud, so it may not appear on your iPhone by \
+                        name. The address above still works.
+                        """,
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             .padding(6)
         }
 

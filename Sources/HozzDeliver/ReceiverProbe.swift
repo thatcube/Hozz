@@ -43,6 +43,27 @@ public struct ReceiverProbe: Sendable {
         return nil
     }
 
+    /// The name a receiver reports, or `nil` if it is not one.
+    ///
+    /// Lets a computer found by sweeping the network be shown by name rather
+    /// than as a bare address.
+    public func identify(_ endpoint: String) async -> String? {
+        guard let url = URL(string: endpoint) else {
+            return nil
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        guard
+            let (data, response) = try? await session.data(for: request),
+            (response as? HTTPURLResponse)?.statusCode == 200,
+            let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+            body["service"] as? String == Self.expectedService
+        else {
+            return nil
+        }
+        return body["name"] as? String ?? endpoint
+    }
+
     /// Why a probe failed, in words a person can act on.
     ///
     /// Swallowing these made every failure identical — "did not answer" —

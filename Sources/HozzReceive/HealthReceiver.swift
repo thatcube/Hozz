@@ -52,14 +52,8 @@ public actor HealthReceiver {
 
     /// The port the receiver listens on by default.
     ///
-    /// Fixed rather than system-assigned. An ephemeral port changes every time
-    /// the app launches, so a destination the phone saved yesterday points at a
-    /// port nothing is listening on — the setup appears to work and then times
-    /// out forever, which is far worse than failing outright.
-    ///
-    /// Chosen from the dynamic range, where it is unlikely to collide with a
-    /// service anyone runs deliberately.
-    public static let defaultPort: UInt16 = 54330
+    /// Defined in HozzCore because both halves need to agree on it.
+    public static let defaultPort = HozzService.defaultPort
 
     /// The Bonjour service type both ends agree on.
     ///
@@ -304,9 +298,16 @@ public actor HealthReceiver {
             // A browser pointed at the port should get something human, so the
             // user can tell "wrong address" from "not running".
             if request.method == "GET" {
+                // The name is included so a phone that found this computer by
+                // sweeping the network — with no Bonjour and no shared record
+                // to consult — can still show which computer it is.
                 return HTTPResponse(
                     status: 200,
-                    json: ["service": "hozz-receiver", "ready": true]
+                    json: [
+                        "service": "hozz-receiver",
+                        "ready": true,
+                        "name": serviceName
+                    ]
                 )
             }
             return HTTPResponse(status: 405, json: ["error": "method not allowed"])

@@ -1,4 +1,6 @@
+import HozzCore
 import HozzDeliver
+
 import UIKit
 import HozzUI
 import SwiftUI
@@ -26,11 +28,17 @@ struct DestinationPickerView: View {
     /// as offline rather than offered as though tapping it would work.
     @State private var reachable: [String: String] = [:]
     @State private var checking = false
+    /// Computers found by asking every address on the local network.
+    @State private var scanned: [DiscoveredReceiver] = []
 
     /// Everything worth offering: what Bonjour found, plus the computer this
     /// person already set up, which may not be discoverable on this network.
     private var computers: [DiscoveredReceiver] {
         var all = discovered
+        // Anything the sweep found is live by definition — it just answered.
+        for computer in scanned where !all.contains(where: { $0.name == computer.name }) {
+            all.append(computer)
+        }
         // Every computer this person has opened Hozz on, not just the last one
         // to publish. A single record meant a second computer replaced the
         // first and only one could ever be offered.
@@ -130,6 +138,14 @@ struct DestinationPickerView: View {
                 accessGroup: SharedReceiverStore.resolvedAccessGroup()
             ).publishedAll()
             await checkReachability()
+            // Bonjour needs mDNS, and the shared record needs iCloud to have
+            // synced. Neither is dependable, and when both come up empty the
+            // user is left looking at a computer they can see is running. The
+            // receiver's port is known, so the network can simply be asked.
+            let found = await LocalNetworkScan(port: HozzService.defaultPort).scan()
+            scanned = found.map {
+                DiscoveredReceiver(id: $0.endpoint, name: $0.name, url: $0.endpoint)
+            }
         }
         .onDisappear { Task { await browser.stop() } }
         .alert(
@@ -268,15 +284,17 @@ struct DestinationPickerView: View {
     }
 
     private func isOnline(_ receiver: DiscoveredReceiver) -> Bool {
-        // Anything Bonjour just returned is live by definition.
-        if discovered.contains(where: { $0.id == receiver.id }) {
+        // Anything Bonjour or the sweep just returned is live by definition.
+        if discovered.contains(where: { $0.id == receiver.id })
+            || scanned.contains(where: { $0.id == receiver.id }) {
             return true
         }
         return reachable[receiver.name] != nil
     }
 
     private func status(for receiver: DiscoveredReceiver) -> String {
-        if discovered.contains(where: { $0.id == receiver.id }) {
+        if discovered.contains(where: { $0.id == receiver.id })
+            || scanned.contains(where: { $0.id == receiver.id }) {
             return "Found on this network"
         }
         if reachable[receiver.name] != nil {

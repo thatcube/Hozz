@@ -33,6 +33,10 @@ final class MacServices {
     private(set) var events: [ReceiverEvent] = []
     private(set) var devices: [PairedDevice] = []
     private(set) var lastReceivedAt: Date?
+    /// Whether this computer managed to tell the user's other devices about
+    /// itself. Surfaced because a silent failure here looks exactly like the
+    /// feature working, and leaves a computer that simply never appears.
+    private(set) var sharedWithOtherDevices: Bool?
 
     private(set) var token = ""
     private(set) var computerName = ""
@@ -240,15 +244,17 @@ final class MacServices {
             token: token,
             endpoints: hosts.map { "http://\($0):\(port)" }
         )
-        Task.detached(priority: .utility) {
+        Task { @MainActor in
             do {
                 let group = SharedReceiverStore.resolvedAccessGroup()
                 try SharedReceiverStore(accessGroup: group).publish(record)
+                sharedWithOtherDevices = true
                 // Addresses only — never the token.
                 Self.log.info(
                     "Published \(record.endpoints.joined(separator: ", "), privacy: .public) to group \(group ?? "none", privacy: .public)"
                 )
             } catch {
+                sharedWithOtherDevices = false
                 Self.log.error(
                     "Could not publish this Mac's address: \(error.localizedDescription, privacy: .public)"
                 )
