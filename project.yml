@@ -50,6 +50,17 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzAcquire
 
+  HozzCatalog:
+    templates:
+      - HozzFramework
+    sources:
+      - Sources/HozzCatalog
+    dependencies:
+      - target: HozzCore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzCatalog
+
   HozzHealth:
     templates:
       - HozzFramework
@@ -57,6 +68,7 @@ targets:
       - Sources/HozzHealth
     dependencies:
       - target: HozzCore
+      - target: HozzCatalog
       - sdk: HealthKit.framework
     settings:
       base:
@@ -81,6 +93,7 @@ targets:
       - App
     dependencies:
       - target: HozzCore
+      - target: HozzCatalog
       - target: HozzHealth
     settings:
       base:
@@ -126,6 +139,8 @@ targets:
     dependencies:
       - target: HozzCore
       - target: HozzAcquire
+      - target: HozzCatalog
+      - target: HozzHealth
       - target: HozzHealthFake
     settings:
       base:

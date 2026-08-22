@@ -3,7 +3,7 @@
 
 # Xcode / XcodeGen
 Hozz.xcodeproj/
-DerivedData/
+DerivedData*/
 *.xcworkspace/xcuserdata/
 *.xcodeproj/xcuserdata/
 xcuserdata/

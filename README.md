@@ -7,9 +7,11 @@ that Apple permits an app to read. It is being built without subscriptions,
 accounts, analytics, advertising, or a developer-operated relay.
 
 > [!IMPORTANT]
-> Hozz is pre-alpha and is not ready to export real Health data yet. The
-> repository currently contains the reviewed architecture and its first
-> executable acquisition test harness.
+> Hozz is an early alpha. The current iPhone build creates a real, manual,
+> historical NDJSON export for quantity, category, correlation, and basic
+> workout records. Workout statistics, routes, ECG, audiograms, other series,
+> and clinical records remain explicitly unsupported until their lossless
+> encoders and device-validation gates pass.
 
 ## Product promise
 

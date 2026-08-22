@@ -2,6 +2,7 @@ import HozzHealth
 import SwiftUI
 
 struct RootView: View {
+    @State private var model = ExportViewModel()
     private let healthDataAvailable: Bool
 
     init(healthDataAvailable: Bool = HealthKitAvailability.isAvailable) {
@@ -11,14 +12,26 @@ struct RootView: View {
     var body: some View {
         NavigationStack {
             ScrollView {
-                VStack(spacing: 28) {
-                    ExportLedgerHero()
-                    PrivacyPromiseSection()
-                    FoundationStatusSection(healthDataAvailable: healthDataAvailable)
-                    ProjectLinksSection()
+                VStack(spacing: 24) {
+                    ExportActionCard(
+                        state: model.state,
+                        healthDataAvailable: healthDataAvailable,
+                        isWorking: model.isWorking,
+                        exportAction: model.exportNow
+                    )
+
+                    if let result = model.result {
+                        CompletedExportCard(result: result)
+                    }
+
+                    if let partialFileURL = model.partialFileURL {
+                        PartialExportCard(fileURL: partialFileURL)
+                    }
+
+                    ExportScopeCard()
+                    CompactProjectLinks()
                 }
-                .padding(.horizontal, 20)
-                .padding(.vertical, 24)
+                .padding(20)
             }
             .background(HozzPalette.canvas.ignoresSafeArea())
             .navigationTitle("Hozz")
@@ -27,26 +40,58 @@ struct RootView: View {
     }
 }
 
-private struct ExportLedgerHero: View {
+private struct ExportActionCard: View {
+    let state: ExportViewModel.State
+    let healthDataAvailable: Bool
+    let isWorking: Bool
+    let exportAction: () -> Void
+
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
-            ExportPathMark()
+            Image(systemName: "heart.text.square.fill")
+                .font(.largeTitle)
+                .foregroundStyle(.white)
 
             VStack(alignment: .leading, spacing: 8) {
-                Text("Your health data.\nYour destination.")
+                Text("Export Apple Health")
                     .font(.largeTitle.weight(.bold))
                     .foregroundStyle(.white)
 
-                Text("No account, analytics, subscription, or relay between the two.")
+                Text(statusText)
                     .font(.body)
                     .foregroundStyle(.white.opacity(0.82))
             }
 
-            HStack(spacing: 8) {
-                PrivacyChip(title: "On device", symbol: "iphone")
-                PrivacyChip(title: "Open source", symbol: "chevron.left.forwardslash.chevron.right")
-                PrivacyChip(title: "Free", symbol: "heart")
+            if case .exporting(let progress) = state {
+                ProgressView(
+                    value: Double(progress.completedTypes),
+                    total: Double(max(progress.totalTypes, 1))
+                )
+                .tint(.white)
+
+                Text("\(progress.recordCount) records · \(progress.completedTypes) of \(progress.totalTypes) types")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.78))
             }
+
+            Button(action: exportAction) {
+                HStack {
+                    if isWorking {
+                        ProgressView()
+                            .tint(HozzPalette.ink)
+                    } else {
+                        Image(systemName: "square.and.arrow.up")
+                    }
+                    Text(buttonTitle)
+                        .fontWeight(.semibold)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 12)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(.white)
+            .foregroundStyle(HozzPalette.ink)
+            .disabled(!healthDataAvailable || isWorking)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(24)
@@ -58,203 +103,133 @@ private struct ExportLedgerHero: View {
             ),
             in: RoundedRectangle(cornerRadius: 30, style: .continuous)
         )
-        .shadow(color: HozzPalette.ink.opacity(0.16), radius: 28, y: 14)
     }
-}
 
-private struct ExportPathMark: View {
-    var body: some View {
-        HStack(spacing: 12) {
-            Image(systemName: "heart.text.square.fill")
-                .font(.title2)
-
-            Rectangle()
-                .fill(.white.opacity(0.7))
-                .frame(height: 1)
-                .overlay(alignment: .trailing) {
-                    Image(systemName: "arrow.right")
-                        .font(.caption.weight(.semibold))
-                }
-
-            Image(systemName: "externaldrive.fill.badge.checkmark")
-                .font(.title2)
+    private var statusText: LocalizedStringResource {
+        switch state {
+        case .idle:
+            healthDataAvailable
+                ? "Choose Health access, then Hozz creates an NDJSON file on this device."
+                : "Health data is unavailable on this device."
+        case .requestingAccess:
+            "Waiting for your Health access choices…"
+        case .exporting(let progress):
+            progress.currentType.isEmpty
+                ? "Preparing your export…"
+                : "Reading \(progress.currentType)…"
+        case .ready(let result):
+            "Created an export with \(result.recordCount) records."
+        case .failed(let message, _):
+            "Export failed: \(message)"
         }
-        .foregroundStyle(.white)
-        .accessibilityElement(children: .ignore)
-        .accessibilityLabel("Health data moves directly to your destination")
+    }
+
+    private var buttonTitle: LocalizedStringResource {
+        switch state {
+        case .idle, .failed:
+            "Export now"
+        case .requestingAccess:
+            "Waiting for Health access"
+        case .exporting:
+            "Exporting"
+        case .ready:
+            "Export again"
+        }
     }
 }
 
-private struct PrivacyChip: View {
-    let title: LocalizedStringResource
-    let symbol: String
+private struct CompletedExportCard: View {
+    let result: HealthExportResult
 
-    var body: some View {
-        Label(title, systemImage: symbol)
-            .font(.caption.weight(.semibold))
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(.white.opacity(0.12), in: Capsule())
-            .foregroundStyle(.white)
-    }
-}
-
-private struct PrivacyPromiseSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("Built around privacy")
+            Label("Export ready", systemImage: "checkmark.circle.fill")
                 .font(.title2.weight(.bold))
+                .foregroundStyle(HozzPalette.success)
 
-            VStack(spacing: 0) {
-                PromiseRow(
-                    symbol: "network.slash",
-                    title: "No developer cloud",
-                    detail: "Hozz never routes your data through infrastructure operated by its maintainer."
-                )
-                Divider().padding(.leading, 48)
-                PromiseRow(
-                    symbol: "person.crop.circle.badge.xmark",
-                    title: "No account",
-                    detail: "Your destinations and credentials stay under your control."
-                )
-                Divider().padding(.leading, 48)
-                PromiseRow(
-                    symbol: "checkmark.seal",
-                    title: "Honest receipts",
-                    detail: "Exports report what HealthKit returned and what could not be verified."
-                )
-            }
-            .background(HozzPalette.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
-        }
-    }
-}
+            Text("\(result.recordCount) records across \(result.nonEmptyTypeCount) types that returned data.")
+                .font(.body)
 
-private struct PromiseRow: View {
-    let symbol: String
-    let title: LocalizedStringResource
-    let detail: LocalizedStringResource
-
-    var body: some View {
-        HStack(alignment: .top, spacing: 14) {
-            Image(systemName: symbol)
-                .font(.body.weight(.semibold))
-                .foregroundStyle(HozzPalette.action)
-                .frame(width: 34, height: 34)
-                .background(HozzPalette.action.opacity(0.12), in: Circle())
-
-            VStack(alignment: .leading, spacing: 4) {
-                Text(title)
-                    .font(.headline)
-                Text(detail)
-                    .font(.subheadline)
+            if result.zeroResultTypeCount > 0 {
+                Text("\(result.zeroResultTypeCount) types returned no records. iOS does not reveal whether those types were empty or denied.")
+                    .font(.footnote)
                     .foregroundStyle(.secondary)
             }
-            .frame(maxWidth: .infinity, alignment: .leading)
+
+            if result.failedTypeCount > 0 || result.sampleEncodingErrorCount > 0 {
+                Text("\(result.failedTypeCount) types and \(result.sampleEncodingErrorCount) individual samples reported errors in the export file.")
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+            }
+
+            ShareLink(item: result.fileURL) {
+                Label("Save or share export", systemImage: "square.and.arrow.up")
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+            }
+            .buttonStyle(.borderedProminent)
+            .tint(HozzPalette.action)
         }
-        .padding(16)
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HozzPalette.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 }
 
-private struct FoundationStatusSection: View {
-    let healthDataAvailable: Bool
+private struct PartialExportCard: View {
+    let fileURL: URL
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Text("Foundation status")
-                .font(.title2.weight(.bold))
+            Label("Partial export preserved", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(.orange)
 
-            HStack(alignment: .top, spacing: 14) {
-                Image(systemName: healthDataAvailable ? "checkmark.circle.fill" : "xmark.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(healthDataAvailable ? HozzPalette.success : .red)
+            Text("The file includes everything written before the unexpected failure.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(healthDataAvailable ? "HealthKit is available" : "HealthKit is unavailable")
-                        .font(.headline)
-                    Text("The reviewed acquisition engine is under construction. Hozz will not request partial access or pretend a small demo is a complete exporter.")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
+            ShareLink(item: fileURL) {
+                Label("Save partial export", systemImage: "square.and.arrow.up")
             }
-            .padding(16)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(HozzPalette.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         }
+        .padding(20)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(HozzPalette.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 }
 
-private struct ProjectLinksSection: View {
+private struct ExportScopeCard: View {
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("Free and open source")
-                .font(.title2.weight(.bold))
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Current export coverage")
+                .font(.headline)
 
-            VStack(spacing: 0) {
-                ProjectLinkRow(
-                    title: "Source code",
-                    subtitle: "Follow development or contribute",
-                    symbol: "chevron.left.forwardslash.chevron.right",
-                    destination: HozzLinks.source
-                )
-                Divider().padding(.leading, 48)
-                ProjectLinkRow(
-                    title: "Support development",
-                    subtitle: "Optional donations via GitHub Sponsors",
-                    symbol: "heart.fill",
-                    destination: HozzLinks.sponsors
-                )
-                Divider().padding(.leading, 48)
-                ProjectLinkRow(
-                    title: "More free apps",
-                    subtitle: "Plozz, Mozz, and Twozz",
-                    symbol: "square.grid.2x2",
-                    destination: HozzLinks.developer
-                )
-            }
-            .background(HozzPalette.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+            Label("Quantity, category, and correlation samples", systemImage: "checkmark")
+            Label("Basic workout records and workout events", systemImage: "checkmark")
+            Label("Historical drain and deletion tombstones", systemImage: "checkmark")
+            Label("Workout statistics, routes, series, ECG, audiograms, and clinical records are not in this build yet", systemImage: "exclamationmark.triangle")
+                .foregroundStyle(.secondary)
         }
+        .font(.subheadline)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(20)
+        .background(HozzPalette.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
     }
 }
 
-private struct ProjectLinkRow: View {
-    let title: LocalizedStringResource
-    let subtitle: LocalizedStringResource
-    let symbol: String
-    let destination: URL
-
+private struct CompactProjectLinks: View {
     var body: some View {
-        Link(destination: destination) {
-            HStack(spacing: 14) {
-                Image(systemName: symbol)
-                    .foregroundStyle(HozzPalette.action)
-                    .frame(width: 34)
-
-                VStack(alignment: .leading, spacing: 2) {
-                    Text(title)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                    Text(subtitle)
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Image(systemName: "arrow.up.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-            }
-            .padding(16)
-            .contentShape(Rectangle())
+        HStack {
+            Link("Source", destination: URL(string: "https://github.com/thatcube/hozz")!)
+            Spacer()
+            Link("Donate", destination: URL(string: "https://github.com/sponsors/thatcube")!)
+            Spacer()
+            Link("More apps", destination: URL(string: "https://github.com/thatcube")!)
         }
-        .buttonStyle(.plain)
+        .font(.footnote.weight(.semibold))
+        .padding(.horizontal, 8)
     }
-}
-
-private enum HozzLinks {
-    static let source = URL(string: "https://github.com/thatcube/hozz")!
-    static let sponsors = URL(string: "https://github.com/sponsors/thatcube")!
-    static let developer = URL(string: "https://github.com/thatcube")!
 }
 
 enum HozzPalette {
