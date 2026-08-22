@@ -27,12 +27,32 @@ struct DataView: View {
         .task { await services.refresh() }
     }
 
+    /// Deliberately an `HStack` and not an `HSplitView`.
+    ///
+    /// This view is already the detail column of a `NavigationSplitView`, and on
+    /// macOS 26 nesting one split view inside another makes the two negotiate
+    /// widths that cannot all hold at once. The window then re-runs the layout
+    /// to satisfy them, each pass invalidating the last, until AppKit gives up
+    /// inside `_postWindowNeedsUpdateConstraints` and the app is killed:
+    ///
+    ///     NSGenericException
+    ///     -[NSWindow(NSDisplayCycle) _postWindowNeedsUpdateConstraints]
+    ///     -[NSView _informContainerThatSubviewsNeedUpdateConstraints]  (x14)
+    ///
+    /// It took selecting a type to trigger, because an empty detail pane asks
+    /// for nothing and a populated one asks for a minimum width. So the app
+    /// opened cleanly, listed everything received, and died on the first click.
+    ///
+    /// The cost is that this divider no longer drags. That is a real loss and it
+    /// is the right trade: the outer sidebar still resizes, and a pane the user
+    /// cannot widen is better than a window that closes itself.
     private var content: some View {
-        HSplitView {
+        HStack(spacing: 0) {
             typeList
-                .frame(minWidth: 260, idealWidth: 300)
+                .frame(width: 300)
+            Divider()
             detail
-                .frame(minWidth: 420)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
     }
 
