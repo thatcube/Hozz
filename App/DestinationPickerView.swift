@@ -58,7 +58,29 @@ struct DestinationPickerView: View {
                 )
             )
         }
-        return all
+        // A computer that is already a destination is not on offer. Adding it
+        // twice would deliver everything twice and give the user two entries
+        // to keep in step for no benefit.
+        return all.filter { !isAlreadyAdded($0) }
+    }
+
+    private func isAlreadyAdded(_ receiver: DiscoveredReceiver) -> Bool {
+        model.summaries.contains { summary in
+            let destination = summary.destination
+            if destination.name == receiver.name {
+                return true
+            }
+            guard let endpoint = destination.endpointURL?.absoluteString else {
+                return false
+            }
+            if endpoint == receiver.url {
+                return true
+            }
+            // The same computer may answer on several addresses, so a match on
+            // any of the ones it published counts.
+            return known.first { $0.name == receiver.name }?
+                .endpoints.contains(endpoint) ?? false
+        }
     }
 
     private let browser = ReceiverBrowser()
@@ -257,11 +279,17 @@ struct DestinationPickerView: View {
         case .failed(let reason):
             return reason
         case .idle, .searching:
-            return computers.isEmpty
-                ? "Open Hozz on your Mac and it will appear here. Nothing to "
-                    + "type, and nothing to copy across."
-                : "Tap to connect. Hozz sets up the address and the token for "
-                    + "you — nothing to copy across."
+            if !computers.isEmpty {
+                return "Tap to connect. Hozz sets up the address and the token "
+                    + "for you — nothing to copy across."
+            }
+            // Nothing left to offer because everything found is already set up
+            // is a success, and should not read like a failure to find it.
+            if !model.summaries.isEmpty {
+                return "Every computer Hozz can see is already set up."
+            }
+            return "Open Hozz on your Mac and it will appear here. Nothing to "
+                + "type, and nothing to copy across."
         }
     }
 

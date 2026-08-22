@@ -92,6 +92,16 @@ public actor HealthReceiver {
         pairedDevices
     }
 
+    /// Records that a device has been heard from.
+    private func noteDeviceSeen(named rawName: String?) {
+        let name = PairingPolicy.safeDeviceName(rawName ?? "An iPhone")
+        guard !pairedDevices.contains(where: { $0.name == name }) else {
+            return
+        }
+        pairedDevices.append(PairedDevice(name: name))
+        record(ReceiverEvent(outcome: .paired(device: name)))
+    }
+
     /// Replaces the token, which immediately invalidates every paired device.
     public func rotateToken(to newToken: String) {
         token = newToken
@@ -336,6 +346,13 @@ public actor HealthReceiver {
             record(ReceiverEvent(outcome: .rejected("Unreadable payload")))
             return HTTPResponse(status: 400, json: ["error": "unreadable payload"])
         }
+
+        // A phone that authenticated is connected, however it came by the
+        // token. Counting only devices that went through /pair meant one that
+        // already had the token — shared through the user's own iCloud
+        // Keychain, which is the ordinary path — was delivering data while the
+        // Mac still said it was waiting for a phone.
+        noteDeviceSeen(named: request.header("x-hozz-device"))
 
         do {
             let result = try await store.ingest(

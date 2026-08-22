@@ -1,4 +1,7 @@
 import Foundation
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Posts batches to an endpoint the user runs.
 ///
@@ -9,13 +12,26 @@ import Foundation
 public struct RESTDeliveryChannel: DeliveryChannel {
     private let session: URLSession
     private let credentials: DestinationCredentials
+    private let deviceName: String
 
     public init(
         session: URLSession = .shared,
-        credentials: DestinationCredentials = DestinationCredentials()
+        credentials: DestinationCredentials = DestinationCredentials(),
+        deviceName: String = RESTDeliveryChannel.defaultDeviceName()
     ) {
         self.session = session
         self.credentials = credentials
+        self.deviceName = deviceName
+    }
+
+    /// What this device calls itself, so a receiver can say which phone is
+    /// connected rather than that something unnamed is.
+    public static func defaultDeviceName() -> String {
+        #if canImport(UIKit)
+        return UIDevice.current.name
+        #else
+        return Host.current().localizedName ?? "A device"
+        #endif
     }
 
     public func deliver(
@@ -28,6 +44,8 @@ public struct RESTDeliveryChannel: DeliveryChannel {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // Names this phone so a receiver can show which device is connected.
+        request.setValue(deviceName, forHTTPHeaderField: "X-Hozz-Device")
         request.setValue(batch.format.contentType, forHTTPHeaderField: "Content-Type")
         request.setValue(
             batch.id.uuidString.lowercased(),
