@@ -2,272 +2,161 @@
 
 **Export Apple Health data to destinations you own.**
 
-Hozz is a free and open-source app for exporting the Health data that Apple
-permits an app to read, to destinations you own. It is built without
-subscriptions, accounts, analytics, advertising, or a developer-operated relay.
+Hozz is a free, open-source iPhone app with a companion Mac receiver. The iPhone app reads the Health data Apple lets an app read, exports it on demand, and can keep user-configured destinations up to date in the background. The Mac app receives those deliveries, stores them in a local SQLite database, charts them, and can expose them to an MCP-capable assistant running against that local database.
 
-There are two parts. The **iPhone app** reads Health and exports it, manually or
-automatically, to a folder, a web address, or an MQTT broker. The **Mac app**
-receives what the phone sends, keeps it in a queryable database, and can expose
-it to an AI assistant through the Model Context Protocol — locally, without the
-data passing through anyone's service.
+There is no subscription, account, analytics, advertising, hosted relay, or default network destination. Nothing leaves the iPhone until you add a destination and confirm it.
 
-> [!IMPORTANT]
-> Hozz is an early alpha. The current iPhone build creates a real, manual,
-> historical NDJSON export for quantity, category, and basic workout records. It
-> writes a standard `.zip` holding NDJSON, CSV, or JSON, so it opens with a
-> double-click on any machine. The
-> export is resumable: it survives the screen sleeping, the app being
-> backgrounded, and the device being killed or rebooted, and it continues from
-> its last durable checkpoint instead of starting over. Correlations, workout
-> statistics, routes, ECG, audiograms, other series, and clinical records remain
-> explicitly unsupported until their lossless encoders and device-validation
-> gates pass.
+Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, and historical deletions. Correlations, routes, ECG, audiograms, series, characteristics, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
 
-## Automatic export
+## What works today
 
-Add a destination once and new Health data flows to it on its own.
+The iPhone app has two paths: **Automatic** and **Export**.
 
-| Destination | What it is |
+Automatic export sends new Health records to destinations you configure. Destinations can be limited to selected Health types, turned off, set to run when data arrives, hourly, daily, or only manually, and tested before you trust them. The dashboard shows the last successful delivery, retry or attention states, and a one-tap **Sync now** action. Shortcuts expose **Sync Health Data** and **Check Health Sync Status**.
+
+Supported automatic destinations are:
+
+| Destination | What Hozz sends |
 | --- | --- |
-| Folder | Anywhere the Files app reaches — iCloud Drive, Dropbox, OneDrive, Google Drive, an SMB share |
-| Home Assistant | A webhook or the REST API, with a long-lived token |
-| Web address | Any endpoint you run, with idempotent batches |
-| MQTT | A broker on your network, one retained topic per metric |
+| This Mac | NDJSON batches to the Hozz Mac receiver over the local network, with token authentication. |
+| Folder | Batch files written through the Files picker to iCloud Drive, Dropbox, OneDrive, Google Drive, SMB, or on-device storage. |
+| Home Assistant | Metrics JSON to a webhook or REST endpoint. |
+| Web address | NDJSON, JSON, CSV, or Metrics JSON POSTs to an endpoint you run. |
+| MQTT | MQTT 3.1.1 publishes to `mqtt://` or `mqtts://`, using retained QoS 0 topics. |
 
-Each is offered as a named preset with its setup steps shown inline. Home
-Assistant and MQTT default to **Metrics JSON**, which groups records by metric
-name rather than streaming them flat — the shape sensors and dashboards expect.
+Background delivery is requested with `HKObserverQuery` and `enableBackgroundDelivery`, then coalesced into bounded sync passes. iOS still decides when background work runs, most Health types are capped at hourly delivery, Health cannot be read while the phone is locked, and force-quitting Hozz stops launches until the app is opened again. Hozz reports those states rather than calling them success.
 
-That shape also matches what other Apple Health exporters emit, so an existing
-Home Assistant integration, Grafana dashboard, or community ingest server keeps
-working when pointed at Hozz. That is a migration path, not a headline: the app
-describes the format by what it does, because naming another product in your own
-interface mostly advertises it.
+Manual export creates a full historical export you can save or share from the phone. It is resumable: pausing, backgrounding, expiration, a kill, or a reboot resumes from the last durable checkpoint instead of starting over.
 
-`enableBackgroundDelivery` asks iOS to activate Hozz when Health records
-something, which is what lets sync continue for months without the app being
-opened. Four limits are real and are stated in the app rather than hidden: the
-device must be unlocked for any app to read Health, iOS decides when background
-work runs, most types are capped at hourly, and force-quitting stops it until
-the app is opened again.
+## Formats
 
-What Hozz guarantees regardless: **nothing is lost**. Each destination has its
-own cursor and only advances it once that destination has accepted the data, so
-a missed window is simply sent next time. Tools that export "the last hour"
-cannot make that promise — a skipped window is gone and an overlapping one
-duplicates.
+Manual exports are built from a canonical NDJSON spool. That spool is the durable format because it streams, survives interruption, and can be assembled without recompressing. Presentation formats are produced from it at the end.
 
-A [receiver](receiver/) ships alongside: one dependency-free file that turns
-batches into a SQLite database, over HTTP or by watching a synced folder. The
-website repository also carries a browser viewer that turns an export into
-charts without installing anything; it is static files with no backend, so
-there is nowhere for the data to be sent even in principle.
-
-## Product promise
-
-- No subscription, paywall, account, analytics, or data collection.
-- No maintainer-operated server, database, relay, or cloud dependency.
-- Nothing leaves the device until you choose a destination and confirm it.
-- Credentials remain device-only in Keychain.
-- Export destinations belong to and are configured by the user.
-- Canonical exports are versioned, streamable, and independently verifiable.
-- Permissions, unsupported data, incomplete reads, background delays, and
-  delivery failures are reported honestly.
-
-Apple deliberately prevents apps from determining whether read access to a
-Health data type was denied or whether no matching data exists. Hozz therefore
-does not claim that an export is universally "complete." It reports
-**anchor-closed, authorization-scoped, catalog-versioned coverage**: every
-object and deletion that the public HealthKit APIs returned within the recorded
-query range, plus explicit limitations for everything Hozz cannot prove.
-
-## Architecture
-
-Three independent reviews shaped the initial design: an Apple/HealthKit review,
-a data-integrity review, and an adversarial privacy and App Review review.
-
-The binding decisions are:
-
-1. **No date-window backfill.** Each supported HealthKit type is drained from an
-   opaque anchor with no date predicate until an empty page proves the stream is
-   caught up. Observer queries only mark streams dirty.
-2. **No permanent Health mirror by default.** Hozz does not keep a second,
-   unbounded copy of the user's live Health history. It persists opaque cursors,
-   staged pages, tombstones, coverage state, and a bounded canonical spool.
-3. **Anchors advance conservatively.** A page is fully hydrated, encoded, and
-   durably staged before its anchor can be committed. Crashes replay work rather
-   than skip it.
-4. **Destinations are isolated consumers.** Destinations share immutable spool
-   segments only when their source cursor and format agree. A failed destination
-   cannot corrupt another destination or advance its receipt cursor.
-5. **Storage pressure is visible.** Hozz never silently drops queued data. If a
-   destination exhausts the spool budget, acquisition pauses or the user
-   explicitly chooses a verified replacement snapshot/rebaseline.
-6. **The canonical model is a graph.** Samples are nodes; correlations, workout
-   routes, series measurements, attachments, and other relationships are edges
-   or lifecycle-bound children. CSV and GPX are labeled lossy projections.
-7. **Background work is best effort.** Background delivery is requested, never
-   promised. The app distinguishes queued, waiting for iOS, delivered, blocked,
-   and failed states.
-8. **One writer per destination.** iPhone is the default exporter. iPad takeover
-   requires an explicit receiver-backed writer epoch; HealthKit anchors are
-   never copied between devices.
-
-The app is split along those boundaries:
-
-| Module | Responsibility |
-| --- | --- |
-| `HozzCore` | Stable identifiers, opaque anchors, change batches, coverage, and protocols |
-| `HozzCatalog` | Exhaustive, generated HealthKit type capabilities and canonical units |
-| `HozzHealth` | The only production module that imports HealthKit |
-| `HozzHealthFake` | Scriptable source for crashes, mutations, deletions, and scale tests |
-| `HozzAcquire` | Resumable anchor draining and conservative commit coordination |
-| `HozzStore` | Migrations, cursors, coverage, export runs, and sealed spool parts |
-| `HozzCanonical` | Deterministic, versioned canonical envelopes |
-| `HozzSpool` | Bounded, shared, immutable segments for multiple destinations |
-| `HozzDeliver` | Destinations, credentials, batches, retries, and receipts |
-| `HozzUI` | Shared iconography and view helpers |
-| `HozzFormats` | Explicitly lossy CSV and GPX projections (CSV shipped in `HozzHealth`) |
-| `HozzDiagnostics` | Local-only, redacted diagnostics |
-
-### How an export survives being interrupted
-
-A full export takes many minutes, so it is built to be resumed rather than
-restarted:
-
-1. Drained changes are appended to an **open part** — one gzip member in the
-   private spool — and the anchors they advance are staged in memory only.
-2. **Sealing** a part flushes it, closes it, and commits every staged anchor in
-   a single store transaction. This is the only operation that may advance a
-   durable cursor.
-3. An open part is not durable. On relaunch it is deleted and the types it
-   touched replay from their last sealed cursor.
-4. Finishing a run assembles its sealed parts into one Zip64 archive. Each part
-   is a raw deflate stream ended with a sync flush rather than a final block, so
-   the parts concatenate into a single valid deflate stream and the archive is
-   written with no recompression.
-
-The consequence is the property that matters: an interrupted export can repeat
-work, but it can never skip a record and never emit one twice. Pausing, the
-screen sleeping, backgrounding, a background-task expiry, a kill, and a reboot
-all take the same path. `ExportEngineTests` asserts this directly, including
-that an unsealed part never advances a cursor, that a type which failed is not
-mistaken for one that finished, and that re-finishing a run cannot concatenate
-its artifact onto itself.
-
-A run has exactly one writer. The foreground UI and the background task hold the
-same process-wide lease, so they cannot both drive the same run and fight over
-the same part file.
-
-Foreground exports hold an idle-timer disable and a background task assertion
-for their duration and release both on every exit path; a paused run can also be
-picked up by a `BGProcessingTask`, which resumes it in the format the run
-already started with.
-
-## Milestone gates
-
-| Milestone | Status | Acceptance gate |
+| Format | Output | Notes |
 | --- | --- | --- |
-| M0 — Contract | Done | Every known HealthKit family has a query, authorization, deletion, background, and limitation classification; privacy and threat models are documented |
-| M1 — Foundation | Done | Swift 6 targets build; fake Health source and fault tests prove retries cannot over-advance an anchor |
-| M2 — Catalog and authorization | Done | The SDK catalog diff is empty or acknowledged; special authorization flows are separated; zero-result types remain indeterminate |
-| M3 — Canonical model | Partial | Golden fixtures are byte-deterministic across locale and timezone; every public field and child family is represented or explicitly unsupported |
-| M4 — Acquisition | Partial | Millions of synthetic changes converge under cancellation and injected crashes with bounded memory and no date watermark |
-| M5 — Files | Partial | Interrupted exports never appear complete; manifests verify every part and disclose every coverage limitation |
-| M6 — Background | Partial | Physical-device observer and task testing converges after lock, reboot, expiration, and network loss without overstating latency |
-| M7 — Network delivery | Partial | TLS-first, idempotent batches and atomic replacement snapshots reconcile against the open-source reference receiver |
-| M8 — Multi-device | Planned | Stale writer epochs are rejected and explicit takeover converges without copying device-local anchors |
-| M9 — Release | Planned | Accessibility, localization, privacy disclosures, App Review checks, multi-year endurance, and physical-device reconciliation pass |
+| NDJSON | `.zip` containing one `.ndjson` member | Default. One record per line, streamable, and lossless for the fields Hozz currently encodes. |
+| CSV | `.zip` with one CSV per Health type, plus deletion and export-log files when needed | Opens in spreadsheets. Explicitly lossy: metadata and nested workout details do not fit a grid. |
+| JSON | `.zip` containing one JSON array | Convenient for smaller exports and tools that expect a single JSON value. |
+| Raw NDJSON | `.ndjson` | Supported by the export engine for direct piping; the main picker currently exposes NDJSON, CSV, and JSON. |
 
-M3 and M5 are partial because the shipped exporter covers quantity, category,
-and basic workout records with a run manifest, but not the special families or a
-full reconciliation receipt. M4 is partial because durable cursors, sealed
-parts, and crash replay are in place and tested against a scripted source, but
-have not yet been driven at multi-million-record scale on a physical device.
+Automatic destinations use `DeliveryFormat`: NDJSON, JSON, CSV, or Metrics JSON. Metrics JSON groups points by metric name for Home Assistant, MQTT, and dashboards; deletions are carried alongside instead of silently dropped.
 
-## Next: automatic export
+## Health acquisition and durability
 
-Automatic export is the point of the app, so the next milestone is one narrow
-vertical slice rather than finishing every family first:
+Hozz does not use date-window watermarks. Each HealthKit type has its own opaque, device-local anchor, drained with `HKAnchoredObjectQuery`. An anchor advances only after the records it covers have been durably staged.
 
-1. ~~Persist per-type anchors, tombstones, and coverage state across launches.~~
-2. ~~Mark types dirty with `HKObserverQuery` and background delivery.~~
-3. ~~Drain changes incrementally and deliver them in bounded batches.~~
-4. ~~Deliver to user-configured folder and HTTPS destinations with idempotent
-   batches.~~
-5. ~~Ship a small open-source receiver that stores batches and reports counts.~~
-6. ~~Report queued, waiting for iOS, delivered, blocked, and failed honestly.~~
+For a manual export, records are written to an open spool part and anchors are only committed when that part is sealed in the same store transaction. An unsealed part is deleted on relaunch and replayed from the previous anchor. The result is the property that matters: interruption can repeat work, but it cannot skip records or publish a half-finished export as complete.
 
-Remaining for M6 and M7: multi-day endurance on a physical device, and
-reconciliation counts surfaced in the app rather than only in the receiver.
+Automatic sync uses the same anchor rule per destination. Each destination has its own cursor, so a failed destination cannot advance past data it did not accept, and one broken destination does not block a healthy one. Batches use stable content-derived identifiers and `Idempotency-Key` headers so a retry can be accepted safely.
 
-## Build
+Apple does not let apps distinguish “the user denied this Health type” from “there is no matching data.” Hozz therefore reports authorization-scoped coverage and keeps denied-or-empty, unavailable, unsupported, and failed states visible.
+
+## Mac receiver
+
+The Mac app is a local receiver and browser for data the phone sends. It starts an `NWListener` HTTP receiver, advertises `_hozz._tcp`, normally listens on port **54330**, accepts `/pair` without a token, and requires the token for deliveries. It stores accepted batches in `hozz-received.sqlite` with schema version 2, idempotent batch records, deletions, and per-device “last heard from” state.
+
+Setup is designed to avoid typing an address. The phone first browses Bonjour, also reads receiver records published through the user's own iCloud Keychain, then falls back to a private `/24` local-network sweep on port 54330. Every remembered address is probed before it is offered or reused, so a computer that does not answer is shown as offline instead of saved as a dead destination.
+
+The Mac app also watches a folder for automatic batch files. Point the phone at a synced folder, pick the same folder on the Mac, and the Mac ingests new NDJSON, JSON, CSV, or Metrics JSON files as they arrive. This path works when the local network refuses inbound connections.
+
+The Mac UI has four tabs:
+
+- **Connect** shows the receiver, folder watcher, token, and honest per-device status based on when data last arrived.
+- **Data** lists received Health types, charts numeric values by hour/day/week/month, and exports a type as CSV.
+- **Assistant** shows the MCP configuration to copy into an assistant.
+- **Activity** lists recent accepted, duplicate, paired, test, and rejected deliveries without logging sample values.
+
+A small standalone Python receiver remains in `receiver/` for people who want a dependency-free script instead of the Mac app.
+
+## MCP assistant access
+
+The Mac app embeds a read-only MCP server at:
+
+```text
+Hozz.app/Contents/MacOS/hozz-mcp
+```
+
+It speaks JSON-RPC 2.0 over stdio, advertises protocol version `2024-11-05`, server name `hozz`, version `1.0.0`, and exposes four tools:
+
+- `list_health_types`
+- `summarise_health_data`
+- `aggregate_health_data`
+- `list_health_samples`
+
+The tool must be given the Mac app's received-data directory. The Mac app is sandboxed, while the assistant launches `hozz-mcp` outside that sandbox; if the path is guessed, the tool opens an empty directory. Open the Mac app's **Assistant** tab and copy the generated configuration. It has this shape:
+
+```json
+{
+  "mcpServers": {
+    "hozz": {
+      "command": "/Applications/Hozz.app/Contents/MacOS/hozz-mcp",
+      "args": [
+        "--data-dir",
+        "/Users/you/Library/Containers/com.thatcube.Hozz.mac/Data/Library/Application Support/Hozz/Received"
+      ]
+    }
+  }
+}
+```
+
+The same path can be passed as `HOZZ_DATA_DIR` instead of `--data-dir`. The server can only read the received database; it cannot change or delete data. If you connect it to a cloud-hosted assistant, that assistant may upload whatever it reads. That is the assistant's behaviour, not Hozz's.
+
+## Storage, privacy, and security
+
+On the phone, Hozz stores cursors, coverage state, destination configuration, delivery receipts, and bounded spool artifacts. It does not keep a permanent local mirror of Health history by default. Health-derived files are protected with complete-unless-open file protection and excluded from device backups, including SQLite side files and spool files.
+
+Destination credentials are kept in the device Keychain with `ThisDeviceOnly` accessibility and are not synchronised. The Mac receiver token is different: it is intentionally shared through the user's own iCloud Keychain access group so a phone and Mac signed into the same Apple ID can find each other without a manual token copy. If that entitlement or iCloud path is unavailable, the app falls back to pairing over the local network.
+
+Logs and diagnostics must not include Health sample values, credentials, or secret destination details. Network errors record statuses and human-readable failure states, not response bodies that might echo data back.
+
+## Build and test
 
 Requirements:
 
 - Xcode 27 or newer
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.46 or newer (`brew install xcodegen`)
 
-`Hozz.xcodeproj` is generated from `project.yml` and is not committed, so
-`xcodegen generate` comes first. Anything set in Xcode's UI — a team, a
-capability — is overwritten the next time the project is regenerated, so it
-belongs in `project.yml` or in the gitignored `Local.xcconfig` instead.
+`Hozz.xcodeproj` is generated from `project.yml` and is not committed. Signing lives in gitignored `Local.xcconfig`, usually just:
 
-### The Mac app
+```xcconfig
+DEVELOPMENT_TEAM = YOURTEAMID
+```
+
+Both helper scripts create `Local.xcconfig` if it is missing. The app and widget targets declare `group.com.thatcube.Hozz`; your Apple developer profile must carry that App Group or device builds with the widget will fail. The widget reads the shared store and shows the last sync state, record count, and attention status. If it cannot reach the shared store, it says **Open Hozz for status** rather than inventing a state.
+
+Build the Mac app:
 
 ```bash
 tools/mac-build.sh
 ```
 
-Builds, signs and launches it. On a first run it writes `Local.xcconfig` with a
-development team, registers the Mac as a development device, and refreshes the
-provisioning profile. Override the team with `HOZZ_TEAM=XXXXXXXXXX`, and pass
-`HOZZ_MAC_RUN=0` to build without launching.
+That regenerates the project, builds `HozzMac`, signs it, registers the Mac and refreshes profiles when needed, and launches the app unless an existing copy is already running. Use `HOZZ_MAC_RUN=1 tools/mac-build.sh` to replace a running copy, and `HOZZ_TEAM=XXXXXXXXXX` to override the signing team.
 
-The Mac app listens on port **54330** and needs Local Network permission the
-first time — macOS asks once, and if it is refused the app keeps running while
-being silently unreachable from the phone.
-
-### The iPhone app
+Build and install the iPhone app on a connected device:
 
 ```bash
-tools/device-build.sh          # build, sign, install on a connected iPhone
+tools/device-build.sh
 ```
 
-Override the device with `HOZZ_DEVICE=<udid>`. For the simulator:
+Use `HOZZ_DEVICE=<udid>` to choose a device and `HOZZ_TEAM=XXXXXXXXXX` to override the signing team.
+
+Simulator build and tests:
 
 ```bash
 xcodegen generate
-xcodebuild \
-  -project Hozz.xcodeproj \
-  -scheme Hozz \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
-  build
+xcodebuild -project Hozz.xcodeproj -scheme Hozz \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
+xcodebuild -project Hozz.xcodeproj -scheme Hozz \
+  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-Run the unit tests with the same generated project:
-
-```bash
-xcodebuild \
-  -project Hozz.xcodeproj \
-  -scheme Hozz \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' \
-  test
-```
+The current XCTest suite contains 178 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 
-Two macOS behaviours cost a lot of time to diagnose. Both look like a network
-fault and are not one.
+Two macOS behaviours cost a lot of time to diagnose. Both look like network faults and are not.
 
-**A sandboxed app needs `com.apple.security.network.client` to answer, not just
-`com.apple.security.network.server` to listen.** A reply travels to the phone's
-ephemeral port, which the sandbox classifies as an outbound connection. With
-only the server entitlement the listener accepts a connection and is then
-silently forbidden from writing the response, so the request hangs and times
-out exactly as though the computer were switched off. The kernel says so
-plainly, and this is the fastest way to confirm it:
+A sandboxed app needs `com.apple.security.network.client` to answer, not just `com.apple.security.network.server` to listen. A reply travels to the phone's ephemeral port, which the sandbox classifies as outbound. With only the server entitlement, the listener accepts a connection and is then silently forbidden from writing the response, so the request hangs and times out exactly as though the Mac were switched off. The kernel says so plainly:
 
 ```bash
 log show --last 5m --predicate 'eventMessage CONTAINS "deny("' --info \
@@ -275,16 +164,7 @@ log show --last 5m --predicate 'eventMessage CONTAINS "deny("' --info \
 # Sandbox: Hozz(2625) deny(1) network-outbound remote:*:60607
 ```
 
-Strongbox, a sandboxed Mac App Store app that syncs with an iPhone over
-`NWListener`, declares both entitlements for the same reason.
-
-**Local Network authorisation is keyed to the executable's UUID, and cannot be
-reset.** It is not TCC — it is a packet filter in the Network Extension
-framework — so `tccutil reset LocalNetwork` fails, and Apple documents that
-there is no way to return the state to undetermined (FB14944392). Every rebuild
-produces a new UUID, so a grant can go stale while System Settings still shows
-the app as allowed. Listening does not require this grant, but advertising over
-Bonjour does. When developing, exempt the subnet rather than fighting it:
+macOS 15+ Local Network authorisation is keyed to the executable's UUID, and cannot be reset. It is not TCC, so `tccutil reset LocalNetwork` fails, and Apple documents that there is no way to return the state to undetermined. Every rebuild produces a new UUID, so a grant can go stale while System Settings still shows the app as allowed. Listening does not require this grant, but advertising over Bonjour does. While developing, exempt the subnet rather than fighting it:
 
 ```bash
 sudo defaults write com.apple.network.local-network \
@@ -294,75 +174,20 @@ sudo reboot
 
 Remove that before testing what a real user would experience.
 
-## Privacy and security
-
-Hozz sends nothing until the user configures and confirms a destination. Network
-destinations will be TLS-first, credentials will be scoped per destination and
-function, cross-host redirects will not receive credentials, and local Health
-artifacts will be file-protected and excluded from device backups. Diagnostics
-remain local and redact sample values, credentials, and destination secrets.
-
-Security-sensitive behavior must be proven with tests, not policy text alone.
-This includes backup exclusion for SQLite side files and spool files, Keychain
-non-synchronization, redirect isolation, deterministic encoding, and log
-redaction.
-
-Compressed exports are Zip64 archives, so they open
-with a double-click on a stock Mac and with `unzip` everywhere else. ZIP rather
-than gzip for two reasons: a resumable export produces several compressed
-segments, and gzip's uncompressed-size field is 32 bits, which wraps on the
-multi-gigabyte exports Health routinely produces. Both make a `.gz` unreadable
-to Archive Utility even though the bytes are valid.
+One more trap: Bonjour resolution must ask for IPv4. Network.framework otherwise tends to hand back an IPv6 link-local `fe80::` address. That address only works with its interface scope, and the scope is lost when the address is saved as a string for a later `URLSession` request. The saved destination parses fine and connects to nothing forever.
 
 ## Support development
 
-Hozz has no paid features. Donations are entirely optional and support continued
-development of Hozz and Brandon's other free, open-source apps.
+Hozz has no paid features. Donations are optional and support continued development of Hozz and Brandon's other free, open-source apps.
 
 **[Donate via GitHub Sponsors](https://github.com/sponsors/thatcube)**
 
 Other projects:
 
-- [Plozz](https://github.com/thatcube/Plozz) — a native media player for
-  Jellyfin, Plex, Emby, and network shares
+- [Plozz](https://github.com/thatcube/Plozz) — a native media player for Jellyfin, Plex, Emby, and network shares
 - [Mozz](https://github.com/thatcube/Mozz) — music for Plex and Jellyfin
 - [Twozz](https://github.com/thatcube/Twozz) — Twitch on Apple TV
 
 ## License
 
 [GPL-3.0 with an App Store distribution exception](LICENSE) © 2026 Brandon Moore
-
-## Export formats
-
-| Format | Shape | Notes |
-| --- | --- | --- |
-| NDJSON | One record per line | Default. Lossless, streams at any size, and assembled by copying compressed parts, so it costs nothing extra. |
-| CSV | One spreadsheet per data type | Opens in Excel or Sheets. **Explicitly lossy**: metadata, device details, and nested workout events do not fit a grid. |
-| JSON | A single array | Convenient for small exports and for feeding to other tools. A multi-million-record array is awkward for most parsers; prefer NDJSON at that size. |
-| Raw | Uncompressed NDJSON | For piping straight into something else. |
-
-The spool is always NDJSON, whichever format is chosen. That is deliberate: it
-is the representation the durability machinery is built and tested around, and
-a presentation choice should not reach into the part that has to survive a
-reboot. CSV and JSON are produced by reading that stream once at the end, so
-NDJSON keeps its zero-cost path and the other formats cost one extra pass.
-
-## One manual step for the widget
-
-The widget shows "Open Hozz for status" until the **App Groups** capability is
-enabled for `com.thatcube.Hozz` in the Apple developer portal. An iOS extension
-has its own data container, so without a shared group the widget cannot read the
-app's database at all.
-
-Once the capability exists, add to both the app and widget targets in
-`project.yml`:
-
-```yaml
-        com.apple.security.application-groups:
-          - group.com.thatcube.Hozz
-```
-
-The code already prefers that container and falls back to the app's own when it
-is unavailable, so nothing else needs to change. It is left out of the committed
-project because the current development profile lacks the capability, and
-declaring an entitlement the profile does not carry fails every device build.
