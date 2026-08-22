@@ -155,13 +155,20 @@ public extension SharedReceiverStore {
 
     private static func teamPrefix() -> String? {
         let probeAccount = "com.thatcube.Hozz.group-probe"
-        let query: [String: Any] = [
+        var query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrAccount as String: probeAccount,
             kSecAttrService as String: probeAccount,
             kSecReturnAttributes as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
+        #if os(macOS)
+        // Essential. Without this the probe lands in the legacy macOS keychain,
+        // which has no concept of access groups at all — so it reports no group,
+        // the shared group is never resolved, and each app silently writes
+        // somewhere the other cannot read.
+        query[kSecUseDataProtectionKeychain as String] = true
+        #endif
 
         var item: CFTypeRef?
         var status = SecItemCopyMatching(query as CFDictionary, &item)

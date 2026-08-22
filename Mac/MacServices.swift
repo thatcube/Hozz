@@ -236,9 +236,12 @@ final class MacServices {
         )
         Task.detached(priority: .utility) {
             do {
-                try SharedReceiverStore(
-                    accessGroup: SharedReceiverStore.resolvedAccessGroup()
-                ).publish(record)
+                let group = SharedReceiverStore.resolvedAccessGroup()
+                try SharedReceiverStore(accessGroup: group).publish(record)
+                // Addresses only — never the token.
+                Self.log.info(
+                    "Published \(record.endpoints.joined(separator: ", "), privacy: .public) to group \(group ?? "none", privacy: .public)"
+                )
             } catch {
                 Self.log.error(
                     "Could not publish this Mac's address: \(error.localizedDescription, privacy: .public)"

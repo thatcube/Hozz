@@ -1,4 +1,5 @@
 import Foundation
+import os
 import HozzCore
 import HozzStore
 
@@ -8,6 +9,11 @@ import HozzStore
 /// and is responsible only for getting them to a destination exactly once,
 /// eventually, without losing them if the attempt fails.
 public actor DeliveryEngine {
+    private static let log = Logger(
+        subsystem: "com.thatcube.Hozz",
+        category: "delivery"
+    )
+
     /// Retry schedule after consecutive failures. Deliberately gentle: a
     /// destination that is down is usually a computer that is switched off, and
     /// hammering it costs battery for nothing.
@@ -188,6 +194,16 @@ public actor DeliveryEngine {
             )
         )
 
+        var destination = destination
+        // A computer's address is not permanent: routers reassign them, laptops
+        // move network, ports change when an app restarts. Without this, a
+        // destination that worked yesterday retries a dead address forever and
+        // the user is told only that it timed out.
+        if let repaired = await repairedEndpointIfNeeded(for: destination) {
+            destination = repaired
+            try? await save(repaired)
+        }
+
         do {
             let receipt = try await channel.deliver(batch, to: destination)
 
@@ -260,6 +276,52 @@ public actor DeliveryEngine {
     ///
     /// Used by the connection test, which must not look like a real delivery in
     /// the history or move any cursor.
+    /// Re-resolves a computer that is no longer answering where it used to be.
+    ///
+    /// Only applies to a destination this person's own computer published, and
+    /// only when the recorded address has actually stopped responding — so a
+    /// working setup is never disturbed, and a destination the user typed by
+    /// hand is never quietly repointed somewhere else.
+    private func repairedEndpointIfNeeded(
+        for destination: Destination
+    ) async -> Destination? {
+        guard destination.kind == .restAPI,
+              let current = destination.endpointURL?.absoluteString,
+              let known = SharedReceiverStore(
+                  accessGroup: SharedReceiverStore.resolvedAccessGroup()
+              ).published(),
+              known.endpoints.contains(current) || known.name == destination.name
+        else {
+            return nil
+        }
+
+        let probe = ReceiverProbe()
+        if await probe.isReceiver(current) {
+            return nil
+        }
+        guard let working = await probe.firstReachable(
+            among: known.endpoints.filter { $0 != current }
+        ) else {
+            return nil
+        }
+
+        Self.log.info("A destination moved address and was re-resolved.")
+        return Destination(
+            id: destination.id,
+            name: destination.name,
+            kind: destination.kind,
+            format: destination.format,
+            cadence: destination.cadence,
+            isEnabled: destination.isEnabled,
+            folderBookmark: destination.folderBookmark,
+            endpointURL: URL(string: working),
+            headers: destination.headers,
+            authorizationHeader: destination.authorizationHeader,
+            includedTypes: destination.includedTypes,
+            createdAt: destination.createdAt
+        )
+    }
+
     public func deliverWithoutRecording(
         _ batch: DeliveryBatch,
         to destination: Destination
