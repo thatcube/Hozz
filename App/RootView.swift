@@ -319,13 +319,8 @@ private struct ExportStepList: View {
                             }
                         } label: {
                             HStack {
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text("\(emptySteps.count) types had no data")
-                                        .font(.subheadline.weight(.medium))
-                                    Text("Normal — nobody records everything.")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
+                                Text("\(emptySteps.count) types with no data")
+                                    .font(.subheadline.weight(.medium))
                                 Spacer()
                                 Text(showsEmptyTypes ? "Hide" : "Show")
                                     .font(.subheadline)
