@@ -30,8 +30,14 @@ Add a destination once and new Health data flows to it on its own.
 | MQTT | A broker on your network, one retained topic per metric |
 
 Each is offered as a named preset with its setup steps shown inline. Home
-Assistant and MQTT default to a payload shape those ecosystems already parse, so
-an existing dashboard or automation keeps working when pointed at Hozz.
+Assistant and MQTT default to **Metrics JSON**, which groups records by metric
+name rather than streaming them flat — the shape sensors and dashboards expect.
+
+That shape also matches what other Apple Health exporters emit, so an existing
+Home Assistant integration, Grafana dashboard, or community ingest server keeps
+working when pointed at Hozz. That is a migration path, not a headline: the app
+describes the format by what it does, because naming another product in your own
+interface mostly advertises it.
 
 `enableBackgroundDelivery` asks iOS to activate Hozz when Health records
 something, which is what lets sync continue for months without the app being

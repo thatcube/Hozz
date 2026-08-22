@@ -84,10 +84,15 @@ public enum DeliveryFormat: String, Codable, CaseIterable, Sendable {
     case ndjson
     case json
     case csv
-    /// The payload shape used by the widely deployed Health Auto Export
-    /// schema, so existing Home Assistant integrations, Grafana dashboards,
-    /// and community ingest servers keep working when pointed at Hozz.
-    case compatible
+    /// Records grouped by metric with the latest value per point.
+    ///
+    /// This is the shape home-automation and dashboard tools expect, and it
+    /// happens to match the schema other Apple Health exporters emit, so an
+    /// existing Home Assistant integration or Grafana dashboard keeps working
+    /// when pointed at Hozz. The compatibility is documented rather than
+    /// advertised in the interface: it is a reason this shape was chosen, not
+    /// a feature to sell.
+    case metrics
 
     public var displayName: String {
         switch self {
@@ -97,8 +102,8 @@ public enum DeliveryFormat: String, Codable, CaseIterable, Sendable {
             "JSON"
         case .csv:
             "CSV"
-        case .compatible:
-            "Health Auto Export compatible"
+        case .metrics:
+            "Metrics JSON"
         }
     }
 
@@ -106,7 +111,7 @@ public enum DeliveryFormat: String, Codable, CaseIterable, Sendable {
         switch self {
         case .ndjson:
             "ndjson"
-        case .json, .compatible:
+        case .json, .metrics:
             "json"
         case .csv:
             "csv"
@@ -117,7 +122,7 @@ public enum DeliveryFormat: String, Codable, CaseIterable, Sendable {
         switch self {
         case .ndjson:
             "application/x-ndjson"
-        case .json, .compatible:
+        case .json, .metrics:
             "application/json"
         case .csv:
             "text/csv"

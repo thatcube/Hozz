@@ -79,9 +79,9 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
         case .folder, .restAPI:
             .ndjson
         case .homeAssistant, .mqtt:
-            // Both ecosystems already understand this shape, so an existing
-            // dashboard or automation keeps working unchanged.
-            .compatible
+            // Both want data grouped by metric, and both already understand
+            // this shape, so an existing dashboard or automation keeps working.
+            .metrics
         }
     }
 

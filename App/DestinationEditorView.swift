@@ -267,8 +267,8 @@ struct DestinationEditorView: View {
             "One array per batch. Easy to read and to feed to other tools."
         case .csv:
             "A spreadsheet. Drops metadata and workout detail."
-        case .compatible:
-            "Matches the Health Auto Export payload, so existing Home Assistant, Grafana, and community server setups keep working."
+        case .metrics:
+            "Grouped by metric, with the latest value for each. What Home Assistant, Grafana, and most dashboards expect."
         }
     }
 

@@ -1,17 +1,21 @@
 import Foundation
 
-/// Builds the payload shape used by the widely deployed Health Auto Export
-/// schema, so existing receivers keep working.
+/// Builds a payload grouped by metric rather than by sample.
 ///
-/// Anyone who has already wired up a Home Assistant integration, a Grafana
-/// dashboard, or the community ingest server should be able to point it at Hozz
-/// and have it keep working. Interoperability is the point; a free tool that
-/// forces everyone to rewrite their pipeline is not actually cheaper.
+/// Home Assistant sensors, MQTT topics, and most dashboards want "here is
+/// step_count, here are its points", not a flat stream of records. This shape
+/// gives them that.
+///
+/// It also matches the schema other Apple Health exporters emit, which is
+/// deliberate: someone who already wired up a Home Assistant integration or a
+/// Grafana dashboard should be able to point it at Hozz and have it keep
+/// working. Interoperability is the point — a free tool that forces everyone to
+/// rewrite their pipeline is not actually cheaper. That compatibility is
+/// documented rather than advertised in the interface.
 ///
 /// One deliberate difference: Hozz sends the individual samples HealthKit
-/// returned, not hourly or daily rollups. That schema's own "summarize off"
-/// mode does the same, so receivers already handle it, and it is the only
-/// option that can honestly claim no gaps and no duplicates.
+/// returned, not hourly or daily rollups, because that is the only option that
+/// can honestly claim no gaps and no duplicates.
 public enum CompatiblePayloadBuilder {
     /// One decoded record from Hozz's canonical NDJSON.
     public struct Record: Sendable {

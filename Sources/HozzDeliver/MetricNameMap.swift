@@ -1,12 +1,12 @@
 import Foundation
 
-/// Maps HealthKit identifiers to the short metric names used by the widely
-/// deployed Health Auto Export payload schema.
+/// Maps HealthKit identifiers to short, readable metric names.
 ///
-/// This exists for interoperability, not imitation. That schema already has an
-/// ecosystem around it — Home Assistant integrations, Grafana dashboards, and a
-/// community ingest server — and someone who has already built against it
-/// should be able to move to Hozz without rewriting any of it.
+/// `HKQuantityTypeIdentifierStepCount` is a poor sensor name and a worse MQTT
+/// topic; `step_count` is neither. These names also match what other Apple
+/// Health exporters emit, which is deliberate — someone who has already built a
+/// Home Assistant integration or a Grafana dashboard against those names should
+/// be able to move to Hozz without rewriting any of it.
 public enum MetricNameMap {
     public static func metricName(for identifier: String) -> String {
         if let known = names[identifier] {

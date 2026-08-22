@@ -372,7 +372,7 @@ enum DeliveryPayloadBuilder {
         case .csv:
             return try csv(from: lines)
 
-        case .compatible:
+        case .metrics:
             return try CompatiblePayloadBuilder.build(
                 records: lines.compactMap(CompatiblePayloadBuilder.record(from:))
             )

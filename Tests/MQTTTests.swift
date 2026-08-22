@@ -15,7 +15,7 @@ final class MQTTTests: XCTestCase {
         return Destination(
             name: "Broker",
             kind: .mqtt,
-            format: .compatible,
+            format: .metrics,
             endpointURL: URL(string: "mqtt://broker.local:1883"),
             headers: headers
         )
@@ -132,7 +132,7 @@ final class MQTTTests: XCTestCase {
             createdAt: .now,
             recordCount: 3,
             payload: payload,
-            format: .compatible
+            format: .metrics
         )
 
         let topics = MQTTDeliveryChannel.topics(for: batch, destination: destination())
@@ -158,7 +158,7 @@ final class MQTTTests: XCTestCase {
             createdAt: .now,
             recordCount: 0,
             payload: Data("{}".utf8),
-            format: .compatible
+            format: .metrics
         )
 
         let topics = MQTTDeliveryChannel.topics(
@@ -176,7 +176,7 @@ final class MQTTTests: XCTestCase {
             createdAt: .now,
             recordCount: 0,
             payload: Data("not json".utf8),
-            format: .compatible
+            format: .metrics
         )
 
         let topics = MQTTDeliveryChannel.topics(for: batch, destination: destination())
@@ -200,8 +200,8 @@ final class MQTTTests: XCTestCase {
     /// Home Assistant and MQTT default to the payload shape their ecosystems
     /// already parse, so an existing dashboard keeps working.
     func testHomeAssistantAndMQTTDefaultToTheCompatibleFormat() {
-        XCTAssertEqual(DestinationPreset.homeAssistant.format, .compatible)
-        XCTAssertEqual(DestinationPreset.mqtt.format, .compatible)
+        XCTAssertEqual(DestinationPreset.homeAssistant.format, .metrics)
+        XCTAssertEqual(DestinationPreset.mqtt.format, .metrics)
         XCTAssertEqual(DestinationPreset.homeAssistant.kind, .restAPI)
     }
 
