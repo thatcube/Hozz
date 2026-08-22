@@ -79,7 +79,13 @@ public actor HealthSyncEngine {
         self.lease = lease
     }
 
-    /// Runs one pass over the types that may have new data.
+    /// Runs one pass, delivering to every destination that is due.
+    ///
+    /// Each destination is drained from its **own** cursor and committed
+    /// independently. Sharing one cursor would be cheaper, but destinations are
+    /// scheduled independently — one hourly, another daily, another manual — so
+    /// a shared cursor advanced by whichever ran first would permanently skip
+    /// that data for all the others.
     ///
     /// - Parameter limitTo: Types the observer flagged. Empty means check all.
     public func sync(
@@ -94,8 +100,7 @@ public actor HealthSyncEngine {
         guard !destinations.isEmpty else {
             return .idle
         }
-        // The manual exporter and this share one spool and one cursor space, so
-        // only one of them may run at a time.
+        // The manual exporter shares this store, so only one may drain at once.
         guard await lease.acquire() else {
             for destination in destinations {
                 try? await delivery.markWaitingForSystem(destination.id)
@@ -106,31 +111,68 @@ public actor HealthSyncEngine {
             Task { await lease.release() }
         }
 
-        let candidates = dirtyTypes.isEmpty
-            ? allTypes
-            : allTypes.filter { dirtyTypes.contains($0) }
-
-        var pending: [HealthTypeKey: [HealthChange]] = [:]
-        var proposedAnchors: [HealthTypeKey: AnchorToken] = [:]
-        var baseAnchors: [HealthTypeKey: AnchorToken?] = [:]
-        var recordCount = 0
+        var deliveredRecords = 0
         var typesDrained = 0
         var interrupted = false
         var waitingForUnlock = false
 
+        for destination in destinations {
+            let result = try await sync(
+                destination: destination,
+                dirtyTypes: dirtyTypes,
+                now: now
+            )
+            deliveredRecords += result.deliveredRecords
+            typesDrained = max(typesDrained, result.typesDrained)
+            interrupted = interrupted || result.wasInterrupted
+            waitingForUnlock = waitingForUnlock || result.waitingForUnlock
+
+            if result.waitingForUnlock {
+                // Nothing can be read until the phone is unlocked, so there is
+                // no point trying the remaining destinations.
+                break
+            }
+        }
+
+        return SyncOutcome(
+            deliveredRecords: deliveredRecords,
+            destinationCount: destinations.count,
+            typesDrained: typesDrained,
+            wasInterrupted: interrupted,
+            waitingForUnlock: waitingForUnlock
+        )
+    }
+
+    /// Drains and delivers for one destination, using only its own cursor.
+    private func sync(
+        destination: Destination,
+        dirtyTypes: Set<HealthTypeKey>,
+        now: Date
+    ) async throws -> SyncOutcome {
+        let scope = AnchorScope.destination(destination.id)
+        let candidates = allTypes
+            .filter { destination.includes($0) }
+            .filter { dirtyTypes.isEmpty || dirtyTypes.contains($0) }
+
+        var records: [HealthChange] = []
+        var proposedAnchors: [HealthTypeKey: AnchorToken] = [:]
+        var baseAnchors: [HealthTypeKey: AnchorToken?] = [:]
+        var counts: [HealthTypeKey: Int] = [:]
+        var interrupted = false
+        var waitingForUnlock = false
+
         for type in candidates {
-            if Task.isCancelled || recordCount >= Self.batchRecordLimit {
+            if Task.isCancelled || records.count >= Self.batchRecordLimit {
                 interrupted = true
                 break
             }
 
-            let base = try await store.committedAnchor(scope: .global, type: type)
+            let base = try await store.committedAnchor(scope: scope, type: type)
             var anchor = base
             var collected: [HealthChange] = []
 
-            // Drain this type until it is caught up or the batch is full.
             drain: while true {
-                if Task.isCancelled || recordCount + collected.count >= Self.batchRecordLimit {
+                if Task.isCancelled || records.count + collected.count >= Self.batchRecordLimit {
                     interrupted = true
                     break drain
                 }
@@ -154,14 +196,13 @@ public actor HealthSyncEngine {
                         typeIdentifier: type.rawValue
                     )
                     if failure.kind == .deviceLocked {
-                        // Nothing can be read until the phone is unlocked. This
-                        // is the ordinary background case, not a failure.
+                        // The ordinary background case, not a failure.
                         waitingForUnlock = true
                         interrupted = true
                         break drain
                     }
                     try? await store.recordCoverage(
-                        scope: .global,
+                        scope: scope,
                         type: type,
                         coverage: failure.coverageState,
                         failureReason: failure.underlyingDescription
@@ -171,86 +212,78 @@ public actor HealthSyncEngine {
             }
 
             if !collected.isEmpty || anchor != base {
-                pending[type] = collected
+                records.append(contentsOf: collected)
                 proposedAnchors[type] = anchor
                 baseAnchors[type] = base
-                recordCount += collected.count
-                typesDrained += 1
+                counts[type] = collected.count
             }
             if waitingForUnlock {
                 break
             }
         }
 
-        guard recordCount > 0 else {
-            // Nothing new. Still commit any anchor that moved without data, so
-            // an empty stream is not re-read forever.
+        guard !records.isEmpty else {
+            // Nothing new for this destination. Still commit any cursor that
+            // moved without data, so an empty stream is not re-read forever.
             try await commitAnchors(
                 proposedAnchors,
                 base: baseAnchors,
-                counts: pending.mapValues(\.count)
+                counts: counts,
+                scope: scope
             )
             return SyncOutcome(
                 deliveredRecords: 0,
-                destinationCount: destinations.count,
-                typesDrained: typesDrained,
+                destinationCount: 1,
+                typesDrained: proposedAnchors.count,
                 wasInterrupted: interrupted,
                 waitingForUnlock: waitingForUnlock
             )
         }
 
-        // Deliver to every destination before any cursor moves. A destination
-        // that fails keeps the whole batch pending, so it is replayed rather
-        // than lost — at the cost of other destinations seeing it twice, which
-        // stable identifiers make harmless.
-        var allAccepted = true
-        for destination in destinations {
-            let filtered = pending.filter { destination.includes($0.key) }
-            let records = filtered.values.flatMap { $0 }
-            guard !records.isEmpty else {
-                continue
-            }
+        let payload = try DeliveryPayloadBuilder.build(
+            records: records,
+            format: destination.format
+        )
+        let batch = DeliveryBatch(
+            // The key is derived from the bytes being sent, so a retry of the
+            // same data reuses it and a receiver can discard the repeat, while
+            // a retry that picked up newer data gets a new key and is stored.
+            // Reusing a key for changed contents would silently lose records.
+            id: DeliveryBatch.identifier(for: payload),
+            sequence: try await delivery.nextSequence(for: destination.id),
+            createdAt: now,
+            recordCount: records.count,
+            payload: payload,
+            format: destination.format
+        )
 
-            let sequence = try await delivery.nextSequence(for: destination.id)
-            let existing = try await delivery.state(for: destination.id)
-            let payload = try DeliveryPayloadBuilder.build(
-                records: records,
-                format: destination.format
+        do {
+            _ = try await delivery.deliver(batch, to: destination, now: now)
+        } catch {
+            Self.log.error(
+                "A destination did not accept its batch; it will be retried."
             )
-            let batch = DeliveryBatch(
-                // Reusing the pending identifier makes a retry recognisable to
-                // the receiver as the same batch it may already have stored.
-                id: existing?.pendingBatchID ?? UUID(),
-                sequence: sequence,
-                createdAt: now,
-                recordCount: records.count,
-                payload: payload,
-                format: destination.format
-            )
-
-            do {
-                _ = try await delivery.deliver(batch, to: destination, now: now)
-            } catch {
-                allAccepted = false
-                Self.log.error(
-                    "Delivery failed: \(error.localizedDescription, privacy: .public)"
-                )
-            }
-        }
-
-        if allAccepted {
-            try await commitAnchors(
-                proposedAnchors,
-                base: baseAnchors,
-                counts: pending.mapValues(\.count)
+            return SyncOutcome(
+                deliveredRecords: 0,
+                destinationCount: 1,
+                typesDrained: proposedAnchors.count,
+                wasInterrupted: true,
+                waitingForUnlock: waitingForUnlock
             )
         }
+
+        try await commitAnchors(
+            proposedAnchors,
+            base: baseAnchors,
+            counts: counts,
+            scope: scope
+        )
 
         return SyncOutcome(
-            deliveredRecords: allAccepted ? recordCount : 0,
-            destinationCount: destinations.count,
-            typesDrained: typesDrained,
-            wasInterrupted: interrupted || !allAccepted,
+            deliveredRecords: records.count,
+            destinationCount: 1,
+            typesDrained: proposedAnchors.count,
+            wasInterrupted: interrupted,
             waitingForUnlock: waitingForUnlock
         )
     }
@@ -258,7 +291,8 @@ public actor HealthSyncEngine {
     private func commitAnchors(
         _ anchors: [HealthTypeKey: AnchorToken],
         base: [HealthTypeKey: AnchorToken?],
-        counts: [HealthTypeKey: Int]
+        counts: [HealthTypeKey: Int],
+        scope: AnchorScope
     ) async throws {
         guard !anchors.isEmpty else {
             return
@@ -276,7 +310,7 @@ public actor HealthSyncEngine {
                 )
             }
             .sorted { $0.type < $1.type }
-        try await store.commit(commits, scope: .global)
+        try await store.commit(commits, scope: scope)
     }
 }
 

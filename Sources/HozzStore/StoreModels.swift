@@ -10,6 +10,15 @@ import HozzCore
 public enum AnchorScope: Hashable, Sendable {
     case global
     case run(UUID)
+    /// One destination's own cursor space.
+    ///
+    /// Destinations must not share a cursor. They are scheduled independently —
+    /// one may be hourly, another daily, another manual — so a shared cursor
+    /// advanced by whichever happened to run would permanently skip that data
+    /// for all the others. Giving each its own cursor costs re-reading the same
+    /// pages once per destination and buys the guarantee that every destination
+    /// receives everything it asked for.
+    case destination(UUID)
 
     public var rawValue: String {
         switch self {
@@ -17,6 +26,8 @@ public enum AnchorScope: Hashable, Sendable {
             "global"
         case .run(let id):
             "run:\(id.uuidString.lowercased())"
+        case .destination(let id):
+            "destination:\(id.uuidString.lowercased())"
         }
     }
 
@@ -25,13 +36,17 @@ public enum AnchorScope: Hashable, Sendable {
             self = .global
             return
         }
-        guard
-            rawValue.hasPrefix("run:"),
-            let id = UUID(uuidString: String(rawValue.dropFirst(4)))
-        else {
-            return nil
+        if rawValue.hasPrefix("run:"),
+           let id = UUID(uuidString: String(rawValue.dropFirst(4))) {
+            self = .run(id)
+            return
         }
-        self = .run(id)
+        if rawValue.hasPrefix("destination:"),
+           let id = UUID(uuidString: String(rawValue.dropFirst(12))) {
+            self = .destination(id)
+            return
+        }
+        return nil
     }
 }
 

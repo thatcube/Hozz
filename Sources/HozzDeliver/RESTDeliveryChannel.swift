@@ -45,9 +45,22 @@ public struct RESTDeliveryChannel: DeliveryChannel {
         for (name, value) in destination.headers {
             request.setValue(value, forHTTPHeaderField: name)
         }
-        if let secret = try? credentials.secret(for: destination.credentialKey),
-           !secret.isEmpty {
-            request.setValue(secret, forHTTPHeaderField: destination.authorizationHeader)
+        // A Keychain read can fail transiently, most often because the device
+        // has not been unlocked since boot. Sending the batch unauthenticated
+        // in that case would turn a wait into a 401 the user has to diagnose,
+        // so it is reported as transient instead.
+        do {
+            if let secret = try credentials.secret(for: destination.credentialKey),
+               !secret.isEmpty {
+                request.setValue(
+                    secret,
+                    forHTTPHeaderField: destination.authorizationHeader
+                )
+            }
+        } catch {
+            throw DeliveryError.transport(
+                "Hozz could not read this destination's saved credential yet."
+            )
         }
         request.httpBody = batch.payload
 
@@ -65,10 +78,13 @@ public struct RESTDeliveryChannel: DeliveryChannel {
             throw DeliveryError.transport("The destination sent an unreadable response.")
         }
         guard (200...299).contains(http.statusCode) else {
-            // Only a short prefix is kept: a response body can quote the data
-            // that was sent, and diagnostics must never contain sample values.
-            let snippet = String(data: data.prefix(200), encoding: .utf8)
-            throw DeliveryError.rejected(statusCode: http.statusCode, body: snippet)
+            // The body is deliberately discarded. A server that rejects a batch
+            // frequently echoes the offending record back, and a response body
+            // stored in the database or written to a log would put Health
+            // sample values somewhere they must never appear. The status code
+            // is enough to act on.
+            _ = data
+            throw DeliveryError.rejected(statusCode: http.statusCode, body: nil)
         }
 
         return DeliveryReceipt(

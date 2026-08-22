@@ -124,8 +124,17 @@ public actor DeliveryEngine {
             }
             let state = try await store.deliveryState(for: destination.id)
 
-            // A destination that failed is held off until its backoff expires,
-            // so one unreachable endpoint cannot spin the whole pipeline.
+            // A destination that needs the user to fix something is not retried
+            // on a timer. Without this it would be attempted on every single
+            // pass, which is both a battery drain and, worse, a permanent
+            // failure that no amount of waiting clears.
+            if state?.state == DeliveryState.needsAttention.rawValue {
+                continue
+            }
+
+            // A destination that failed transiently is held off until its
+            // backoff expires, so one unreachable endpoint cannot spin the
+            // whole pipeline.
             if let nextAttempt = state?.nextAttemptAt, nextAttempt > now {
                 continue
             }
@@ -249,8 +258,18 @@ public actor DeliveryEngine {
     }
 
     /// Records that Hozz is waiting on iOS rather than on the destination.
+    ///
+    /// Only a state that is genuinely idle is overwritten. Reading, then
+    /// writing back every field, would otherwise let this roll back a delivery
+    /// that succeeded while it was suspended.
     public func markWaitingForSystem(_ destinationID: UUID) async throws {
         guard let previous = try await store.deliveryState(for: destinationID) else {
+            return
+        }
+        guard
+            previous.state == DeliveryState.idle.rawValue
+                || previous.state == DeliveryState.delivered.rawValue
+        else {
             return
         }
         try await store.saveDeliveryState(

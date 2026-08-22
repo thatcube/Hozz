@@ -1,3 +1,4 @@
+import HozzCore
 import HozzDeliver
 import HozzUI
 import SwiftUI
@@ -24,6 +25,8 @@ struct DestinationEditorView: View {
     @State private var isPickingFolder = false
     @State private var testResult: String?
     @State private var isTesting = false
+    @State private var includedTypes: Set<HealthTypeKey>
+    @State private var isPickingTypes = false
 
     private let existing: Destination?
 
@@ -39,6 +42,7 @@ struct DestinationEditorView: View {
         _secret = State(initialValue: "")
         _folderBookmark = State(initialValue: destination?.folderBookmark)
         _folderName = State(initialValue: destination?.folderBookmark.flatMap(Self.folderName))
+        _includedTypes = State(initialValue: destination?.includedTypes ?? [])
     }
 
     var body: some View {
@@ -77,6 +81,20 @@ struct DestinationEditorView: View {
                 Picker("How often", selection: $cadence) {
                     ForEach(SyncCadence.allCases, id: \.self) { cadence in
                         Text(cadence.displayName).tag(cadence)
+                    }
+                }
+
+                Button {
+                    isPickingTypes = true
+                } label: {
+                    HStack {
+                        Text("Data types")
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        Text(includedTypes.isEmpty ? "Everything" : "\(includedTypes.count)")
+                            .foregroundStyle(.secondary)
+                        HozzIconView(.chevronRight, size: 14)
+                            .foregroundStyle(.tertiary)
                     }
                 }
 
@@ -134,6 +152,13 @@ struct DestinationEditorView: View {
             allowedContentTypes: [.folder]
         ) { result in
             handleFolderSelection(result)
+        }
+        .sheet(isPresented: $isPickingTypes) {
+            NavigationStack {
+                TypePickerView(selection: includedTypes) { selection in
+                    includedTypes = selection
+                }
+            }
         }
     }
 
@@ -262,7 +287,7 @@ struct DestinationEditorView: View {
             folderBookmark: folderBookmark,
             endpointURL: kind == .restAPI ? URL(string: endpoint) : nil,
             headers: existing?.headers ?? [:],
-            includedTypes: existing?.includedTypes ?? [],
+            includedTypes: includedTypes,
             createdAt: existing?.createdAt ?? .now
         )
     }

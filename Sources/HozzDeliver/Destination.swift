@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import HozzCore
 
@@ -281,6 +282,26 @@ public struct DeliveryBatch: Sendable {
         self.recordCount = recordCount
         self.payload = payload
         self.format = format
+    }
+
+    /// A key derived from the bytes being sent.
+    ///
+    /// Idempotency only works if the same key always means the same content. A
+    /// retry that re-read Health and picked up newer records is a *different*
+    /// batch, and reusing the previous key for it would let a correctly written
+    /// receiver discard records it had never seen.
+    public static func identifier(for payload: Data) -> UUID {
+        var digest = SHA256()
+        digest.update(data: payload)
+        let bytes = Array(digest.finalize())
+        return UUID(
+            uuid: (
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[8], bytes[9], bytes[10], bytes[11],
+                bytes[12], bytes[13], bytes[14], bytes[15]
+            )
+        )
     }
 
     /// A name that sorts chronologically and never collides.

@@ -33,6 +33,7 @@ public actor HealthObserver {
     private var activeQueries: [HKObserverQuery] = []
     private var dirtyTypes: Set<HealthTypeKey> = []
     private var onDirty: (@Sendable (Set<HealthTypeKey>) async -> Void)?
+    private var isStarting = false
 
     public init(
         healthStore: HKHealthStore = HKHealthStore(),
@@ -66,6 +67,15 @@ public actor HealthObserver {
         guard HKHealthStore.isHealthDataAvailable() else {
             return
         }
+        // `start` suspends while enabling background delivery, so two callers
+        // could otherwise interleave and leave two live queries per type, each
+        // waking the app independently.
+        guard !isStarting else {
+            return
+        }
+        isStarting = true
+        defer { isStarting = false }
+
         await stop()
         self.onDirty = onDirty
 

@@ -163,6 +163,11 @@ final class DeliveryTests: XCTestCase {
 
     /// A folder that was deleted will not fix itself, so Hozz stops retrying
     /// and asks the user rather than burning battery forever.
+    ///
+    /// This asserts the *effect*, not just the recorded state. An earlier
+    /// version only checked that no retry time was scheduled, which read as
+    /// "due immediately" to the scheduler and produced the exact opposite
+    /// behaviour: a broken destination retried on every single pass.
     func testAPermanentFailureIsNotRetriedForever() async throws {
         let store = try makeStore()
         let channel = ScriptedChannel(behaviour: .fail(.accessDenied))
@@ -175,11 +180,40 @@ final class DeliveryTests: XCTestCase {
         let state = try await engine.state(for: destination.id)
         XCTAssertEqual(state?.state, DeliveryState.needsAttention.rawValue)
         XCTAssertNil(state?.nextAttemptAt)
+
+        let dueNow = try await engine.dueDestinations()
+        let dueMuchLater = try await engine.dueDestinations(
+            now: Date(timeIntervalSinceNow: 365 * 24 * 60 * 60)
+        )
+        XCTAssertTrue(dueNow.isEmpty, "A broken destination must not be retried on a timer.")
+        XCTAssertTrue(dueMuchLater.isEmpty, "Waiting does not fix a deleted folder.")
+
+        let forced = try await engine.dueDestinations(ignoringCadence: true)
+        XCTAssertEqual(forced.count, 1, "The user can still retry it deliberately.")
     }
 
-    /// The whole point of an idempotency key: a retry has to look like the same
-    /// batch, so a receiver that already stored it can discard the repeat.
-    func testARetryReusesTheSameBatchIdentifier() async throws {
+    /// The idempotency key has to change when the contents change. Reusing it
+    /// for a re-drained, larger batch would let a correct receiver discard
+    /// records it had never seen.
+    func testTheBatchKeyIsDerivedFromItsContents() {
+        let first = Data(#"{"id":"a"}"#.utf8)
+        let second = Data(#"{"id":"a"}{"id":"b"}"#.utf8)
+
+        XCTAssertEqual(
+            DeliveryBatch.identifier(for: first),
+            DeliveryBatch.identifier(for: first),
+            "The same bytes must always produce the same key."
+        )
+        XCTAssertNotEqual(
+            DeliveryBatch.identifier(for: first),
+            DeliveryBatch.identifier(for: second),
+            "Different bytes must never share a key."
+        )
+    }
+
+    /// A retry of the *same* data has to look like the same batch, so a
+    /// receiver that already stored it can discard the repeat.
+    func testARetryOfIdenticalDataReusesTheSameKey() async throws {
         let store = try makeStore()
         let channel = ScriptedChannel(behaviour: .fail(.transport("offline")))
         let engine = DeliveryEngine(store: store, channels: [.folder: channel])
