@@ -71,19 +71,39 @@ public enum HTTPRequestReader {
     public static let requestTimeout: Duration = .seconds(30)
 
     public static func read(from connection: NWConnection) async throws -> HTTPRequest {
-        try await withThrowingTaskGroup(of: HTTPRequest.self) { group in
+        try await withThrowingTaskGroup(of: HTTPRequest?.self) { group in
             group.addTask {
                 try await readRequest(from: connection)
             }
             group.addTask {
-                try await Task.sleep(for: requestTimeout)
-                throw HTTPError.timedOut
+                do {
+                    try await Task.sleep(for: requestTimeout)
+                } catch {
+                    // Cancelled because the request already arrived. Returning
+                    // here is essential: swallowing this and falling through
+                    // would cancel the connection out from under a response
+                    // that is about to be written.
+                    return nil
+                }
+                // Cancelling the *connection*, not just the task, is what makes
+                // this a real deadline. A pending `receive` only calls back on
+                // bytes, an error, or cancellation, and a checked continuation
+                // has no cancellation handling — so cancelling the task alone
+                // would leave the reader suspended forever while the task group
+                // waited for it, which is precisely a slowloris.
+                connection.cancel()
+                return nil
             }
-            guard let request = try await group.next() else {
-                throw HTTPError.closed
+
+            while let result = try await group.next() {
+                if let request = result {
+                    group.cancelAll()
+                    return request
+                }
+                // The deadline passed. The reader is now unblocked by the
+                // cancellation above and will finish on the next iteration.
             }
-            group.cancelAll()
-            return request
+            throw HTTPError.timedOut
         }
     }
 

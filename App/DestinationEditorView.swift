@@ -27,6 +27,10 @@ struct DestinationEditorView: View {
     @State private var isTesting = false
     @State private var includedTypes: Set<HealthTypeKey>
     @State private var isPickingTypes = false
+    @State private var discovered: [DiscoveredReceiver] = []
+    @State private var isBrowsing = false
+
+    private let browser = ReceiverBrowser()
 
     private let existing: Destination?
     private let preset: DestinationPreset?
@@ -172,6 +176,23 @@ struct DestinationEditorView: View {
         }
         .navigationTitle(existing == nil ? "New destination" : "Destination")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            // Browsing prompts for local network access, so it starts only on
+            // the screen where an address is actually being chosen.
+            isBrowsing = true
+            await browser.onChange { receivers in
+                Task { @MainActor in
+                    discovered = receivers
+                    if !receivers.isEmpty {
+                        isBrowsing = false
+                    }
+                }
+            }
+            await browser.start()
+        }
+        .onDisappear {
+            Task { await browser.stop() }
+        }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Cancel") { dismiss() }
@@ -228,6 +249,10 @@ struct DestinationEditorView: View {
 
     private var endpointSection: some View {
         Section {
+            if kind == .restAPI {
+                discoveredReceivers
+            }
+
             TextField(preset?.addressPlaceholder ?? "https://example.com/health", text: $endpoint)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
@@ -245,6 +270,38 @@ struct DestinationEditorView: View {
                 + "token is kept in this iPhone's Keychain and never written to "
                 + "a file, a backup, or a log."
             )
+        }
+    }
+
+    /// Hozz receivers advertising on the same network.
+    ///
+    /// Offered before the address field rather than after it, because typing an
+    /// address is the step people abandon — and a home IP address changes
+    /// without warning, so one typed today silently stops working later.
+    @ViewBuilder
+    private var discoveredReceivers: some View {
+        if !discovered.isEmpty {
+            ForEach(discovered) { receiver in
+                Button {
+                    endpoint = receiver.url
+                } label: {
+                    HStack {
+                        Label(receiver.name, systemImage: "desktopcomputer")
+                            .foregroundStyle(.primary)
+                        Spacer()
+                        if endpoint == receiver.url {
+                            Image(systemName: "checkmark")
+                                .foregroundStyle(.tint)
+                        }
+                    }
+                }
+            }
+        } else if isBrowsing {
+            HStack(spacing: 10) {
+                ProgressView()
+                Text("Looking for Hozz on this network…")
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 

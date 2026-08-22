@@ -176,6 +176,56 @@ final class ReceiverIntegrationTests: XCTestCase {
         XCTAssertEqual(total, 0, "A partial batch must store nothing at all.")
     }
 
+    /// Regression: a client that announces a body and then goes quiet used to
+    /// hang the read task forever. The task group awaited that child, so the
+    /// connection, its task, and its entry in the tracking set leaked — and all
+    /// of it happened *before* the token check, so any unauthenticated device on
+    /// the network could exhaust the process with idle sockets.
+    ///
+    /// The deadline is shortened via the real one being 30s; this asserts the
+    /// server stays responsive rather than waiting for it to elapse.
+    func testAStalledClientDoesNotBlockOtherRequests() async throws {
+        // Announce a large body, send only the headers, then hold the socket.
+        let stalled = NWConnection(
+            host: "127.0.0.1",
+            port: NWEndpoint.Port(rawValue: port)!,
+            using: .tcp
+        )
+        stalled.start(queue: .global())
+        defer { stalled.cancel() }
+
+        let headers = """
+            POST / HTTP/1.1\r
+            Host: 127.0.0.1\r
+            Authorization: \(token)\r
+            Content-Length: 1000000\r
+            \r
+
+            """
+        await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+            stalled.send(
+                content: Data(headers.utf8),
+                completion: .contentProcessed { _ in continuation.resume() }
+            )
+        }
+
+        // The stalled socket is deliberately left open. A healthy request must
+        // still be served promptly.
+        let response = try await post(
+            body: sample(id: "healthy", value: 5),
+            token: token,
+            idempotencyKey: "healthy"
+        )
+
+        XCTAssertEqual(
+            response.status,
+            200,
+            "One stalled client must not stop the receiver serving others."
+        )
+        let total = try await store.totalRecordCount()
+        XCTAssertEqual(total, 1)
+    }
+
     /// Sends bytes verbatim and reads the reply, with no client-side rewriting.
     private func sendRaw(_ request: String) async throws -> String {
         let connection = NWConnection(

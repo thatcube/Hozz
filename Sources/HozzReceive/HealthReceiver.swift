@@ -49,7 +49,11 @@ public actor HealthReceiver {
     )
 
     /// The Bonjour service type both ends agree on.
-    public static let serviceType = "_hozz._tcp"
+    ///
+    /// Defined in HozzCore because the phone browses for exactly what this
+    /// advertises, and a duplicated literal would drift silently: the Mac would
+    /// advertise and the phone would simply never find it.
+    public static let serviceType = HozzService.bonjourType
 
     private let store: IngestStore
     private let token: String

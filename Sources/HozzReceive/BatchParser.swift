@@ -178,8 +178,14 @@ public enum BatchParser {
         var unreadable = 0
 
         for object in objects {
-            if let deleted = object["deleted"] as? Bool, deleted,
-               let id = object["id"] as? String {
+            // Hozz's own encoder marks a removed sample with `kind: "deletion"`
+            // and no dates; other producers use a `deleted` flag. Missing the
+            // first meant a deletion was counted as unreadable, answered 200,
+            // and never resent — so a sample the user deleted from Health stayed
+            // on the receiver permanently and kept being served as live data.
+            let isDeletion = (object["deleted"] as? Bool == true)
+                || (object["kind"] as? String == "deletion")
+            if isDeletion, let id = object["id"] as? String {
                 deletions.append(
                     HealthDeletion(id: id, type: object["type"] as? String)
                 )
@@ -302,6 +308,46 @@ public enum BatchParser {
                     )
                 )
             }
+        }
+
+        // Workouts travel in their own key, not in `metrics`. Missing them meant
+        // every workout sent in this format was discarded, counted as nothing,
+        // and answered 200 — so it was never sent again.
+        for workout in payload["workouts"] as? [[String: Any]] ?? [] {
+            guard
+                let identifier = workout["id"] as? String,
+                let startText = workout["start"] as? String,
+                let start = Timestamps.date(from: startText)
+            else {
+                unreadable += 1
+                continue
+            }
+            let end = (workout["end"] as? String)
+                .flatMap(Timestamps.date(from:)) ?? start
+            let name = workout["name"] as? String ?? "Workout"
+            let object: [String: Any] = [
+                "id": identifier,
+                "type": name,
+                "kind": "workout",
+                "startDate": startText,
+                "endDate": workout["end"] as? String ?? startText
+            ]
+            records.append(
+                HealthRecord(
+                    id: identifier,
+                    type: name,
+                    kind: "workout",
+                    startDate: start,
+                    endDate: end,
+                    value: nil,
+                    unit: nil,
+                    sourceName: workout["source"] as? String,
+                    raw: (try? JSONSerialization.data(
+                        withJSONObject: object,
+                        options: [.sortedKeys]
+                    )) ?? Data()
+                )
+            )
         }
 
         var deletions: [HealthDeletion] = []

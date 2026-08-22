@@ -57,16 +57,24 @@ public enum StoreLocation {
         }
 
         let directory = shared.appending(path: "Hozz", directoryHint: .isDirectory)
+        #if os(macOS)
         do {
             try prepareDirectory(directory)
         } catch {
-            // macOS hands back a group container path whether or not the app
-            // is entitled to it, and the sandbox then denies the write. Refusing
-            // to launch over that would be far worse than using the app's own
-            // container, which is private but perfectly serviceable — only a
-            // widget would notice the difference.
+            // macOS hands back a group container path whether or not the app is
+            // entitled to it, and the sandbox then denies the write. Refusing to
+            // launch over that would be far worse than using the app's own
+            // container — only a widget would notice the difference.
+            //
+            // Deliberately macOS-only. On iOS the group container is the real
+            // store, and quietly redirecting after a transient failure would
+            // hand the user an empty database: no destinations, no cursors, and
+            // a full re-export of their history to every destination they own.
             return try legacyDirectory()
         }
+        #else
+        try prepareDirectory(directory)
+        #endif
 
         // Enabling the App Groups capability changes where the store resolves
         // to, so an existing install must be carried across.

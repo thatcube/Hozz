@@ -122,6 +122,63 @@ final class ReceiveTests: XCTestCase {
         XCTAssertEqual(batch.unreadableCount, 1, "A dropped line must be visible.")
     }
 
+    /// Regression: Hozz's own encoder marks a removed sample with
+    /// `kind: "deletion"` and no dates. The parser only understood a `deleted`
+    /// flag, so its own NDJSON deletions were counted as unreadable, answered
+    /// 200, and never resent — the sample stayed on the receiver forever and
+    /// kept being served to an assistant as live data.
+    func testHozzsOwnDeletionShapeIsUnderstood() throws {
+        let payload = Data(
+            #"{"id":"gone","kind":"deletion","schemaVersion":1,"type":"HKQuantityTypeIdentifierStepCount"}"#.utf8
+        )
+
+        let batch = try BatchParser.parse(payload)
+
+        XCTAssertEqual(batch.deletions.count, 1, "A kind=deletion line is a deletion.")
+        XCTAssertEqual(batch.deletions.first?.id, "gone")
+        XCTAssertEqual(batch.unreadableCount, 0, "It must not be counted as junk.")
+    }
+
+    func testAnNDJSONDeletionActuallyRemovesTheSample() async throws {
+        let store = try makeStore()
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(#"{"id":"a","type":"S","startDate":"2026-01-01T10:00:00.000Z","value":1}"#.utf8)
+            ),
+            idempotencyKey: "k1"
+        )
+
+        let result = try await store.ingest(
+            try BatchParser.parse(
+                Data(#"{"id":"a","kind":"deletion","schemaVersion":1,"type":"S"}"#.utf8)
+            ),
+            idempotencyKey: "k2"
+        )
+
+        XCTAssertEqual(result.deleted, 1)
+        let total = try await store.totalRecordCount()
+        XCTAssertEqual(total, 0)
+    }
+
+    /// Regression: workouts travel in their own key of the metrics envelope.
+    /// They were dropped without even counting as unreadable, so the receiver
+    /// answered 200 and the phone never sent them again.
+    func testWorkoutsInTheMetricsEnvelopeAreKept() throws {
+        let payload = Data(
+            """
+            {"data":{"metrics":[],"workouts":[
+              {"id":"w1","name":"Workout","start":"2026-01-01T10:00:00.000Z","end":"2026-01-01T11:00:00.000Z"}
+            ]}}
+            """.utf8
+        )
+
+        let batch = try BatchParser.parse(payload)
+
+        XCTAssertEqual(batch.records.count, 1, "A workout must not vanish.")
+        XCTAssertEqual(batch.records.first?.id, "w1")
+        XCTAssertEqual(batch.records.first?.kind, "workout")
+    }
+
     func testDeletionsAreParsed() throws {
         let payload = Data(
             #"{"id":"gone","type":"HKQuantityTypeIdentifierStepCount","deleted":true}"#.utf8
