@@ -12,6 +12,16 @@ DERIVED="${HOZZ_MAC_DERIVED:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+# Recreate the local signing settings if this is a fresh clone or worktree.
+# Gitignored on purpose: no team identifier belongs in a public repository.
+if [ ! -f Local.xcconfig ]; then
+  cat > Local.xcconfig <<CFG
+// Local signing settings, recreated by tools/mac-build.sh when missing.
+DEVELOPMENT_TEAM = $TEAM
+CFG
+  echo "Created Local.xcconfig for team $TEAM."
+fi
+
 xcodegen generate >/dev/null
 
 ARGS=(

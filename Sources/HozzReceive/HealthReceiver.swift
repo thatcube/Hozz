@@ -241,7 +241,7 @@ public actor HealthReceiver {
         connections.insert(ObjectIdentifier(connection))
         connection.start(queue: .global(qos: .userInitiated))
         Task {
-            await self.handle(connection)
+            await self.serve(connection)
             connection.cancel()
             await self.forget(connection)
         }
@@ -251,7 +251,17 @@ public actor HealthReceiver {
         connections.remove(ObjectIdentifier(connection))
     }
 
-    private func handle(_ connection: NWConnection) async {
+    /// Serves one connection, deliberately *not* on the actor.
+    ///
+    /// Reading a request means waiting on the network, and waiting on the actor
+    /// serialises every connection behind whichever arrived first. Browsers and
+    /// URLSession both open speculative connections and then send nothing on
+    /// them, so the first such connection held the actor for the full request
+    /// timeout and every real request queued behind it — the socket accepted,
+    /// then nothing, which looks exactly like the computer being unreachable.
+    ///
+    /// Only `respond` touches actor state, and only briefly.
+    nonisolated private func serve(_ connection: NWConnection) async {
         do {
             let request = try await HTTPRequestReader.read(from: connection)
             let response = await respond(to: request)

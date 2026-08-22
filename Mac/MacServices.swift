@@ -47,11 +47,17 @@ final class MacServices {
     private(set) var dataDirectory = URL(fileURLWithPath: "/")
 
     /// The address to give the phone, once the receiver is listening.
+    ///
+    /// The numeric address, not the `.local` name. Showing a name that the
+    /// phone may be unable to resolve produces a setup that looks correct and
+    /// silently never connects — and it is the address that gets published, so
+    /// showing something different is confusing on top of being fragile.
     var endpointURL: String? {
         guard case .ready(let port) = status else {
             return nil
         }
-        return "http://\(Self.localHostName()):\(port)"
+        let host = LocalAddress.candidates().first ?? Self.localHostName()
+        return "http://\(host):\(port)"
     }
 
     /// Deliberately does nothing.

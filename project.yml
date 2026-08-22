@@ -213,6 +213,17 @@ targets:
         NSHealthShareUsageDescription: Hozz reads the Health data you select so you can export it to destinations you own.
         # Required before Hozz may look for a receiver on the local network.
         NSLocalNetworkUsageDescription: Hozz looks for the Hozz app on your computer so you can send Health data to it without typing an address.
+        # A computer on your own network has no public certificate, so it is
+        # reached over plain HTTP. iOS blocks that by default, and the block is
+        # silent — every request fails exactly as though the computer were
+        # switched off, which sends you hunting for a network fault that is not
+        # there.
+        #
+        # NSAllowsLocalNetworking is the narrow form: it permits cleartext to
+        # private addresses and .local names only. Arbitrary loads stay
+        # forbidden, so nothing may be sent in the clear to the internet.
+        NSAppTransportSecurity:
+          NSAllowsLocalNetworking: true
         NSBonjourServices:
           - _hozz._tcp
         BGTaskSchedulerPermittedIdentifiers:

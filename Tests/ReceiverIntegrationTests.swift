@@ -300,6 +300,60 @@ final class ReceiverIntegrationTests: XCTestCase {
         XCTAssertEqual(result.status, 200)
     }
 
+    /// Regression: a connection that sends *nothing* is what browsers and
+    /// URLSession actually open — speculative connections they may never use.
+    /// Serving them on the actor serialised every request behind the first such
+    /// connection for the whole request timeout, so the socket accepted and then
+    /// went silent, which is indistinguishable from the computer being off.
+    ///
+    /// The earlier stalled-client test sent headers first and so missed this.
+    func testASilentConnectionDoesNotBlockOtherRequests() async throws {
+        // Raw sockets, because NWConnection establishes lazily — it does not
+        // actually complete a handshake until there is traffic, so it cannot
+        // reproduce a connection that is open and silent.
+        var idle: [Int32] = []
+        for _ in 0..<3 {
+            let handle = socket(AF_INET, SOCK_STREAM, 0)
+            guard handle >= 0 else { continue }
+            var address = sockaddr_in()
+            address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+            address.sin_family = sa_family_t(AF_INET)
+            address.sin_port = port.bigEndian
+            address.sin_addr.s_addr = inet_addr("127.0.0.1")
+            let connected = withUnsafePointer(to: &address) {
+                $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                    connect(handle, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+                }
+            }
+            if connected == 0 {
+                idle.append(handle)
+            } else {
+                close(handle)
+            }
+        }
+        defer { idle.forEach { close($0) } }
+        XCTAssertFalse(idle.isEmpty, "The test needs real established connections.")
+        try await Task.sleep(for: .milliseconds(300))
+
+        // A real request must still be served promptly.
+        let started = Date()
+        let response = try await post(
+            body: sample(id: "a", value: 1),
+            token: token,
+            idempotencyKey: "not-blocked"
+        )
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(response.status, 200)
+        XCTAssertLessThan(
+            elapsed,
+            5,
+            "A silent connection must not hold up a real request."
+        )
+        let total = try await store.totalRecordCount()
+        XCTAssertEqual(total, 1)
+    }
+
     /// Sends bytes verbatim and reads the reply, with no client-side rewriting.
     private func sendRaw(_ request: String) async throws -> String {
         let connection = NWConnection(

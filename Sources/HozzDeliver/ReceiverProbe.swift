@@ -43,6 +43,33 @@ public struct ReceiverProbe: Sendable {
         return nil
     }
 
+    /// Why a probe failed, in words a person can act on.
+    ///
+    /// Swallowing these made every failure identical — "did not answer" —
+    /// whether the computer was off, the address stale, or the request refused
+    /// by the operating system before it ever left the phone.
+    public func failureReason(for endpoint: String) async -> String? {
+        guard let url = URL(string: endpoint) else {
+            return "\(endpoint): not a valid address"
+        }
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        do {
+            let (data, response) = try await session.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+            guard status == 200 else {
+                return "\(endpoint): answered \(status)"
+            }
+            let body = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            guard body?["service"] as? String == Self.expectedService else {
+                return "\(endpoint): something else is listening there"
+            }
+            return nil
+        } catch {
+            return "\(endpoint): \((error as NSError).localizedDescription)"
+        }
+    }
+
     /// Whether a Hozz receiver — and not merely *something* — is at this
     /// address.
     ///

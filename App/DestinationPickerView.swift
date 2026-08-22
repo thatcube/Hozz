@@ -260,15 +260,19 @@ struct DestinationPickerView: View {
             // it is invisible: every probe simply times out exactly as it
             // would if the computer were switched off. Naming it first saves
             // the user hunting for a network fault that is not there.
+            // Report what was actually tried and what each address said.
+            // Without this every failure reads the same regardless of cause.
+            let probe = ReceiverProbe()
+            var reasons: [String] = []
+            for endpoint in ordered {
+                if let reason = await probe.failureReason(for: endpoint) {
+                    reasons.append(reason)
+                }
+            }
             pairingError = """
                 \(known.name) did not answer.
 
-                Check Settings > Privacy & Security > Local Network and make \
-                sure Hozz is allowed. iOS only asks once, so it may have been \
-                declined earlier.
-
-                Otherwise make sure Hozz is open on the computer and both \
-                devices are on the same network.
+                \(reasons.joined(separator: "\n\n"))
                 """
             return
         }
