@@ -31,7 +31,9 @@ struct RootView: View {
                         PartialExportCard(fileURL: partialFileURL)
                     }
 
-                    ExportScopeCard()
+                    if !model.isWorking {
+                        ExportScopeCard()
+                    }
                     CompactProjectLinks()
                 }
                 .padding(20)
@@ -57,15 +59,9 @@ private struct ExportActionCard: View {
                 .font(.largeTitle)
                 .foregroundStyle(.white)
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text("Export Apple Health")
-                    .font(.largeTitle.weight(.bold))
-                    .foregroundStyle(.white)
-
-                Text(statusText)
-                    .font(.body)
-                    .foregroundStyle(.white.opacity(0.82))
-            }
+            Text(isWorking ? "Exporting Health Data" : "Export Apple Health")
+                .font(.largeTitle.weight(.bold))
+                .foregroundStyle(.white)
 
             if case .exporting(let presentation) = state {
                 TimelineView(.periodic(from: .now, by: 1)) { context in
@@ -76,65 +72,65 @@ private struct ExportActionCard: View {
                 }
             }
 
-            Menu {
-                Button {
-                    selectExportFormat(.gzip)
-                } label: {
-                    Label(
-                        "Compressed NDJSON (.gz)",
-                        systemImage: exportFormat == .gzip ? "checkmark" : "archivebox"
-                    )
-                }
+            if !isWorking {
+                Text(statusText)
+                    .font(.body)
+                    .foregroundStyle(.white.opacity(0.82))
 
-                Button {
-                    selectExportFormat(.raw)
-                } label: {
-                    Label(
-                        "Raw NDJSON",
-                        systemImage: exportFormat == .raw ? "checkmark" : "doc.plaintext"
-                    )
-                }
-            } label: {
-                HStack(spacing: 12) {
-                    Image(systemName: exportFormat == .gzip ? "archivebox" : "doc.plaintext")
-
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(formatTitle)
-                            .font(.subheadline.weight(.semibold))
-                        Text(formatDetail)
-                            .font(.caption)
-                            .foregroundStyle(.white.opacity(0.68))
+                Menu {
+                    Button {
+                        selectExportFormat(.gzip)
+                    } label: {
+                        Label(
+                            "Compressed NDJSON (.gz)",
+                            systemImage: exportFormat == .gzip ? "checkmark" : "archivebox"
+                        )
                     }
 
-                    Spacer()
-                    Image(systemName: "chevron.up.chevron.down")
-                        .font(.caption.weight(.semibold))
-                }
-                .foregroundStyle(.white)
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
-            }
-            .disabled(isWorking)
+                    Button {
+                        selectExportFormat(.raw)
+                    } label: {
+                        Label(
+                            "Raw NDJSON",
+                            systemImage: exportFormat == .raw ? "checkmark" : "doc.plaintext"
+                        )
+                    }
+                } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: exportFormat == .gzip ? "archivebox" : "doc.plaintext")
 
-            Button(action: exportAction) {
-                HStack {
-                    if isWorking {
-                        ProgressView()
-                            .tint(HozzPalette.ink)
-                    } else {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(formatTitle)
+                                .font(.subheadline.weight(.semibold))
+                            Text(formatDetail)
+                                .font(.caption)
+                                .foregroundStyle(.white.opacity(0.68))
+                        }
+
+                        Spacer()
+                        Image(systemName: "chevron.up.chevron.down")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .foregroundStyle(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
+                }
+
+                Button(action: exportAction) {
+                    HStack {
                         Image(systemName: "square.and.arrow.up")
+                        Text(buttonTitle)
+                            .fontWeight(.semibold)
                     }
-                    Text(buttonTitle)
-                        .fontWeight(.semibold)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 12)
                 }
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 12)
+                .buttonStyle(.borderedProminent)
+                .tint(.white)
+                .foregroundStyle(HozzPalette.ink)
+                .disabled(!healthDataAvailable)
             }
-            .buttonStyle(.borderedProminent)
-            .tint(.white)
-            .foregroundStyle(HozzPalette.ink)
-            .disabled(!healthDataAvailable || isWorking)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(24)
@@ -156,10 +152,8 @@ private struct ExportActionCard: View {
                 : "Health data is unavailable on this device."
         case .requestingAccess:
             "Waiting for your Health access choices…"
-        case .exporting(let presentation):
-            presentation.export.currentTypeName.isEmpty
-                ? "Preparing your export…"
-                : "Reading \(presentation.export.currentTypeName)…"
+        case .exporting:
+            ""
         case .ready(let result):
             "Created an export with \(result.recordCount) records."
         case .failed(let message, _):
@@ -208,13 +202,13 @@ private struct ExportProgressDetails: View {
         let progress = presentation.export
 
         VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
+            VStack(alignment: .leading, spacing: 2) {
                 Text(progress.currentTypeName.isEmpty ? "Preparing export" : progress.currentTypeName)
-                    .font(.headline)
+                    .font(.title3.weight(.semibold))
                     .foregroundStyle(.white)
 
-                if let family = progress.currentTypeFamily {
-                    Text("\(familyLabel(family)) · \(progress.currentTypeRecordCount.formatted()) records · \(durationLabel(currentTypeElapsed)) on this type")
+                if progress.currentTypeFamily != nil {
+                    Text("\(progress.currentTypeRecordCount.formatted()) records · \(durationLabel(currentTypeElapsed)) on this type")
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.white.opacity(0.76))
                 }
@@ -226,28 +220,20 @@ private struct ExportProgressDetails: View {
             )
             .tint(.white)
 
-            Text("\(progress.recordCount.formatted()) records · \(progress.completedTypes) of \(progress.totalTypes) types")
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.white.opacity(0.78))
-
-            HStack(spacing: 16) {
-                Label(
-                    "\(durationLabel(exportElapsed)) elapsed",
-                    systemImage: "clock"
-                )
+            HStack(spacing: 8) {
+                Text("\(progress.recordCount.formatted()) total")
+                Text("·")
+                Text("\(progress.completedTypes)/\(progress.totalTypes) types")
+                Text("·")
+                Text("\(durationLabel(exportElapsed))")
 
                 if let estimate = remainingEstimate {
+                    Spacer()
                     Label(etaLabel(estimate), systemImage: "hourglass")
-                } else {
-                    Label("No reliable ETA yet", systemImage: "hourglass")
                 }
             }
             .font(.caption.monospacedDigit())
             .foregroundStyle(.white.opacity(0.78))
-
-            Text("HealthKit does not report the total record count in advance, and some types are much larger than others.")
-                .font(.caption2)
-                .foregroundStyle(.white.opacity(0.62))
         }
     }
 
@@ -271,27 +257,6 @@ private struct ExportProgressDetails: View {
         let lower = max(estimate.lowerBound - elapsedSinceEstimate, 0)
         let upper = max(estimate.upperBound - elapsedSinceEstimate, 0)
         return upper > 0 ? lower...upper : nil
-    }
-
-    private func familyLabel(_ family: HealthTypeFamily) -> String {
-        switch family {
-        case .quantity:
-            "Quantity data"
-        case .category:
-            "Category data"
-        case .characteristic:
-            "Health characteristic"
-        case .correlation:
-            "Related samples"
-        case .clinical:
-            "Clinical record"
-        case .document:
-            "Health document"
-        case .scoredAssessment:
-            "Health assessment"
-        case .workout:
-            "Workout"
-        }
     }
 
     private func durationLabel(
