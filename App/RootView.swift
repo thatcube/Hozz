@@ -298,33 +298,68 @@ private struct ExportSessionHeader: View {
 private struct ExportStepList: View {
     let steps: [ExportViewModel.ExportStep]
     let currentTypeStartedAt: Date
+    @State private var showsEmptyTypes = false
+
+    private var emptySteps: [ExportViewModel.ExportStep] {
+        steps.filter { $0.state == .indeterminate }
+    }
+
+    private var visibleSteps: [ExportViewModel.ExportStep] {
+        showsEmptyTypes ? steps : steps.filter { $0.state != .indeterminate }
+    }
 
     var body: some View {
         ScrollViewReader { proxy in
             List {
-                ForEach(steps) { step in
-                    TimelineView(.periodic(from: .now, by: 1)) { context in
-                        ExportStepRow(
-                            step: step,
-                            currentTypeElapsed: max(
-                                context.date.timeIntervalSince(currentTypeStartedAt),
-                                0
+                if !emptySteps.isEmpty {
+                    Section {
+                        Button {
+                            withAnimation(.easeInOut(duration: 0.2)) {
+                                showsEmptyTypes.toggle()
+                            }
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("\(emptySteps.count) types had no data")
+                                        .font(.subheadline.weight(.medium))
+                                    Text("Normal — nobody records everything.")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                Text(showsEmptyTypes ? "Hide" : "Show")
+                                    .font(.subheadline)
+                            }
+                        }
+                        .buttonStyle(.plain)
+                    }
+                }
+
+                Section {
+                    ForEach(visibleSteps) { step in
+                        TimelineView(.periodic(from: .now, by: 1)) { context in
+                            ExportStepRow(
+                                step: step,
+                                currentTypeElapsed: max(
+                                    context.date.timeIntervalSince(currentTypeStartedAt),
+                                    0
+                                )
                             )
+                        }
+                        .id(step.id)
+                        .listRowBackground(
+                            step.state == .exporting
+                                ? HozzPalette.action.opacity(0.09)
+                                : Color(uiColor: .secondarySystemGroupedBackground)
                         )
                     }
-                    .id(step.id)
-                    .listRowBackground(
-                        step.state == .exporting
-                            ? HozzPalette.action.opacity(0.09)
-                            : Color(uiColor: .secondarySystemGroupedBackground)
-                    )
                 }
             }
             .listStyle(.insetGrouped)
             .onAppear {
                 scrollToCurrent(using: proxy, animated: false)
             }
-            .onChange(of: steps.last?.id) {
+            .onChange(of: visibleSteps.last?.id) {
                 scrollToCurrent(using: proxy, animated: true)
             }
         }
@@ -334,7 +369,7 @@ private struct ExportStepList: View {
         using proxy: ScrollViewProxy,
         animated: Bool
     ) {
-        guard let id = steps.last?.id else {
+        guard let id = visibleSteps.last?.id else {
             return
         }
 
