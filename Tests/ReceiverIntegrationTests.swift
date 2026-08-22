@@ -226,6 +226,80 @@ final class ReceiverIntegrationTests: XCTestCase {
         XCTAssertEqual(total, 1)
     }
 
+    // MARK: - Pairing
+
+    private func pair(device: String) async throws -> (status: Int, json: [String: Any]) {
+        var request = URLRequest(url: URL(string: "http://127.0.0.1:\(port!)/pair")!)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(
+            withJSONObject: ["device": device]
+        )
+        let (data, response) = try await URLSession.shared.data(for: request)
+        let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+        return ((response as? HTTPURLResponse)?.statusCode ?? 0, json ?? [:])
+    }
+
+    /// The whole point: connecting a computer must not require copying a long
+    /// random token between two devices by hand.
+    func testTheFirstDevicePairsWithoutAnyApproval() async throws {
+        let result = try await pair(device: "Brandon's iPhone")
+
+        XCTAssertEqual(result.status, 200)
+        XCTAssertEqual(result.json["token"] as? String, token)
+        let devices = await receiver.devices
+        XCTAssertEqual(devices.count, 1)
+        XCTAssertEqual(devices.first?.name, "Brandon's iPhone")
+    }
+
+    /// Trust-on-first-use only. A stranger must not be able to quietly join
+    /// months after the user set this up.
+    func testASecondDeviceIsRefused() async throws {
+        _ = try await pair(device: "Brandon's iPhone")
+
+        let second = try await pair(device: "Someone else's phone")
+
+        XCTAssertEqual(second.status, 403)
+        XCTAssertNil(second.json["token"], "A refused device must not receive the token.")
+        let devices = await receiver.devices
+        XCTAssertEqual(devices.count, 1)
+    }
+
+    /// A token handed out by pairing has to actually work, or the whole flow
+    /// completes and then silently delivers nothing.
+    func testAPairedTokenIsAcceptedForDelivery() async throws {
+        let result = try await pair(device: "Brandon's iPhone")
+        let issued = try XCTUnwrap(result.json["token"] as? String)
+
+        let delivery = try await post(
+            body: sample(id: "a", value: 1),
+            token: issued,
+            idempotencyKey: "after-pairing"
+        )
+
+        XCTAssertEqual(delivery.status, 200)
+        let total = try await store.totalRecordCount()
+        XCTAssertEqual(total, 1)
+    }
+
+    /// A name arriving over the network is attacker-controlled, and is shown to
+    /// the user. It must not be able to forge extra lines.
+    func testAHostileDeviceNameIsNeutered() async throws {
+        _ = try await pair(device: "Evil\n\nAllow full disk access?")
+
+        let devices = await receiver.devices
+        let name = try XCTUnwrap(devices.first?.name)
+        XCTAssertFalse(name.contains("\n"), "Newlines must be stripped.")
+    }
+
+    func testPairingRequiresNoToken() async throws {
+        // Pairing is deliberately the one unauthenticated route: handing over
+        // the token is its entire purpose.
+        let result = try await pair(device: "Brandon's iPhone")
+
+        XCTAssertEqual(result.status, 200)
+    }
+
     /// Sends bytes verbatim and reads the reply, with no client-side rewriting.
     private func sendRaw(_ request: String) async throws -> String {
         let connection = NWConnection(

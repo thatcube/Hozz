@@ -1,4 +1,5 @@
 import HozzDeliver
+import UIKit
 import HozzUI
 import SwiftUI
 
@@ -12,9 +13,19 @@ struct DestinationPickerView: View {
     let model: SyncViewModel
     @Environment(\.dismiss) private var dismiss
     @State private var chosen: DestinationPreset?
+    @State private var discovered: [DiscoveredReceiver] = []
+    @State private var connecting: String?
+    @State private var pairingError: String?
+
+    private let browser = ReceiverBrowser()
+    private let pairing = ReceiverPairing()
 
     var body: some View {
         List {
+            if !discovered.isEmpty {
+                computersSection
+            }
+
             Section {
                 ForEach(DestinationPreset.allCases) { preset in
                     Button {
@@ -71,6 +82,24 @@ struct DestinationPickerView: View {
         }
         .navigationTitle("Add a destination")
         .navigationBarTitleDisplayMode(.inline)
+        .task {
+            await browser.onChange { receivers in
+                Task { @MainActor in discovered = receivers }
+            }
+            await browser.start()
+        }
+        .onDisappear { Task { await browser.stop() } }
+        .alert(
+            "Could not connect",
+            isPresented: .init(
+                get: { pairingError != nil },
+                set: { if !$0 { pairingError = nil } }
+            )
+        ) {
+            Button("OK", role: .cancel) { pairingError = nil }
+        } message: {
+            Text(pairingError ?? "")
+        }
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Cancel") { dismiss() }
@@ -82,6 +111,75 @@ struct DestinationPickerView: View {
                 destination: nil,
                 preset: preset
             )
+        }
+    }
+
+    /// Computers running Hozz on this network.
+    ///
+    /// Shown first, and without the user having to know that a Mac is a "web
+    /// address" underneath. Something that only appears once you have guessed
+    /// the right category is not discoverable at all.
+    private var computersSection: some View {
+        Section {
+            ForEach(discovered) { receiver in
+                Button {
+                    Task { await connect(to: receiver) }
+                } label: {
+                    HStack(spacing: 14) {
+                        HozzIconView(.deviceDesktop, size: 26)
+                            .foregroundStyle(HozzPalette.action)
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text(receiver.name)
+                                .font(.body.weight(.medium))
+                                .foregroundStyle(.primary)
+                            Text("Found on this network")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if connecting == receiver.id {
+                            ProgressView()
+                        } else {
+                            HozzIconView(.chevronRight, size: 14)
+                                .foregroundStyle(.tertiary)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+                .buttonStyle(.plain)
+                .disabled(connecting != nil)
+            }
+        } header: {
+            Text("Your computers")
+        } footer: {
+            Text(
+                "Tap to connect. Hozz sets up the address and the token for "
+                + "you — nothing to copy across."
+            )
+        }
+    }
+
+    /// Pairs with a computer and saves a ready-to-use destination.
+    private func connect(to receiver: DiscoveredReceiver) async {
+        connecting = receiver.id
+        defer { connecting = nil }
+
+        do {
+            let result = try await pairing.pair(
+                with: receiver.url,
+                deviceName: await UIDevice.current.name
+            )
+            let destination = Destination(
+                name: result.name,
+                kind: .restAPI,
+                format: .ndjson,
+                cadence: .whenDataArrives,
+                endpointURL: URL(string: receiver.url)
+            )
+            await model.save(destination, secret: result.token)
+            dismiss()
+        } catch {
+            pairingError = error.localizedDescription
         }
     }
 }

@@ -170,6 +170,10 @@ struct ActivityView: View {
             return "Connection test succeeded"
         case .rejected(let reason):
             return "Rejected: \(reason)"
+        case .paired(let device):
+            return "Connected \(device)"
+        case .pairingRefused(let device):
+            return "Refused \(device) — this Mac is already connected"
         }
     }
 
@@ -179,6 +183,8 @@ struct ActivityView: View {
         case .duplicate: "equal.circle"
         case .connectionTest: "bolt.horizontal.circle"
         case .rejected: "exclamationmark.circle"
+        case .paired: "checkmark.seal"
+        case .pairingRefused: "hand.raised"
         }
     }
 
@@ -187,6 +193,8 @@ struct ActivityView: View {
         case .stored: .green
         case .duplicate, .connectionTest: .secondary
         case .rejected: .orange
+        case .paired: .green
+        case .pairingRefused: .orange
         }
     }
 }

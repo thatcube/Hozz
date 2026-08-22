@@ -10,6 +10,8 @@ public struct ReceiverEvent: Identifiable, Hashable, Sendable {
         case duplicate
         case connectionTest
         case rejected(String)
+        case paired(device: String)
+        case pairingRefused(device: String)
     }
 
     public let id = UUID()
@@ -56,8 +58,9 @@ public actor HealthReceiver {
     public static let serviceType = HozzService.bonjourType
 
     private let store: IngestStore
-    private let token: String
+    private var token: String
     private let serviceName: String
+    private var pairedDevices: [PairedDevice] = []
     private var listener: NWListener?
     private var connections: Set<ObjectIdentifier> = []
 
@@ -67,10 +70,43 @@ public actor HealthReceiver {
     private var stateObservers: [(ReceiverState) -> Void] = []
     private var eventObservers: [(ReceiverEvent) -> Void] = []
 
-    public init(store: IngestStore, token: String, serviceName: String) {
+    public init(
+        store: IngestStore,
+        token: String,
+        serviceName: String,
+        pairedDevices: [PairedDevice] = []
+    ) {
         self.store = store
         self.token = token
         self.serviceName = serviceName
+        self.pairedDevices = pairedDevices
+    }
+
+    public var devices: [PairedDevice] {
+        pairedDevices
+    }
+
+    /// Replaces the token, which immediately invalidates every paired device.
+    public func rotateToken(to newToken: String) {
+        token = newToken
+        pairedDevices.removeAll()
+    }
+
+    /// Handles a phone asking to be allowed to send to this computer.
+    ///
+    /// The first device is admitted without a prompt, because the receiver
+    /// exposes no way to read Health data and demanding a ceremony from every
+    /// user to protect against injection alone is a bad trade. Once something
+    /// has paired, further requests are refused rather than silently granted.
+    private func pair(with rawName: String?) -> PairingOutcome {
+        let name = PairingPolicy.safeDeviceName(rawName)
+        guard pairedDevices.isEmpty else {
+            record(ReceiverEvent(outcome: .pairingRefused(device: name)))
+            return .needsApproval
+        }
+        pairedDevices.append(PairedDevice(name: name))
+        record(ReceiverEvent(outcome: .paired(device: name)))
+        return .allowed(token: token)
     }
 
     public func onStateChange(_ observer: @escaping @Sendable (ReceiverState) -> Void) {
@@ -193,6 +229,32 @@ public actor HealthReceiver {
     }
 
     func respond(to request: HTTPRequest) async -> HTTPResponse {
+        // Pairing is the one route that is reachable without the token, because
+        // handing the token over is its entire purpose.
+        if request.method == "POST", request.path.hasPrefix("/pair") {
+            let body = (try? JSONSerialization.jsonObject(with: request.body))
+                as? [String: Any]
+            switch pair(with: body?["device"] as? String) {
+            case .allowed(let token):
+                return HTTPResponse(
+                    status: 200,
+                    json: ["token": token, "name": serviceName]
+                )
+            case .needsApproval:
+                return HTTPResponse(
+                    status: 403,
+                    json: [
+                        "error": "already paired",
+                        "detail": """
+                            This Mac is already paired with another device. Open \
+                            Hozz on the Mac and forget it first, or copy the \
+                            token by hand.
+                            """
+                    ]
+                )
+            }
+        }
+
         guard request.method == "POST" else {
             // A browser pointed at the port should get something human, so the
             // user can tell "wrong address" from "not running".
