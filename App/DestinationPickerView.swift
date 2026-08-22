@@ -256,10 +256,19 @@ struct DestinationPickerView: View {
                 await save(name: known.name, url: reachable, token: known.token)
                 return
             }
+            // Local network permission is by far the most common cause, and
+            // it is invisible: every probe simply times out exactly as it
+            // would if the computer were switched off. Naming it first saves
+            // the user hunting for a network fault that is not there.
             pairingError = """
-                \(known.name) did not answer at any of its known addresses. \
-                Make sure Hozz is open on it and both devices are on the same \
-                network.
+                \(known.name) did not answer.
+
+                Check Settings > Privacy & Security > Local Network and make \
+                sure Hozz is allowed. iOS only asks once, so it may have been \
+                declined earlier.
+
+                Otherwise make sure Hozz is open on the computer and both \
+                devices are on the same network.
                 """
             return
         }
