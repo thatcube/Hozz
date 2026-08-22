@@ -16,15 +16,35 @@ struct DestinationPickerView: View {
     @State private var discovered: [DiscoveredReceiver] = []
     @State private var connecting: String?
     @State private var pairingError: String?
+    @State private var browsing: BrowsingState = .idle
+    @State private var known: SharedReceiver?
+
+    /// Everything worth offering: what Bonjour found, plus the computer this
+    /// person already set up, which may not be discoverable on this network.
+    private var computers: [DiscoveredReceiver] {
+        var all = discovered
+        if let known, !known.endpoints.isEmpty,
+           !all.contains(where: { known.endpoints.contains($0.url) }) {
+            all.append(
+                DiscoveredReceiver(
+                    id: known.name,
+                    name: known.name,
+                    // A placeholder; the working address is chosen by probing
+                    // when the user taps, because which one is reachable
+                    // depends entirely on where the phone is right now.
+                    url: known.endpoints[0]
+                )
+            )
+        }
+        return all
+    }
 
     private let browser = ReceiverBrowser()
     private let pairing = ReceiverPairing()
 
     var body: some View {
         List {
-            if !discovered.isEmpty {
-                computersSection
-            }
+            computersSection
 
             Section {
                 ForEach(DestinationPreset.allCases) { preset in
@@ -86,7 +106,15 @@ struct DestinationPickerView: View {
             await browser.onChange { receivers in
                 Task { @MainActor in discovered = receivers }
             }
+            await browser.onStateChange { state in
+                Task { @MainActor in browsing = state }
+            }
             await browser.start()
+            // A computer this person has already set up appears even when the
+            // network refuses to carry mDNS, which many do.
+            known = SharedReceiverStore(
+                accessGroup: SharedReceiverStore.resolvedAccessGroup()
+            ).published()
         }
         .onDisappear { Task { await browser.stop() } }
         .alert(
@@ -121,7 +149,10 @@ struct DestinationPickerView: View {
     /// the right category is not discoverable at all.
     private var computersSection: some View {
         Section {
-            ForEach(discovered) { receiver in
+            if computers.isEmpty {
+                emptyRow
+            }
+            ForEach(computers) { receiver in
                 Button {
                     Task { await connect(to: receiver) }
                 } label: {
@@ -152,10 +183,51 @@ struct DestinationPickerView: View {
         } header: {
             Text("Your computers")
         } footer: {
-            Text(
-                "Tap to connect. Hozz sets up the address and the token for "
-                + "you — nothing to copy across."
-            )
+            Text(footerText)
+        }
+    }
+
+    /// Never renders nothing.
+    ///
+    /// An empty section is indistinguishable from a feature that does not
+    /// exist, which is exactly how this looked: no computer, no explanation,
+    /// no way to tell whether Hozz was even looking.
+    @ViewBuilder
+    private var emptyRow: some View {
+        switch browsing {
+        case .denied:
+            Label {
+                Text("Hozz needs permission to see this network")
+            } icon: {
+                HozzIconView(.alertTriangle, size: 20)
+            }
+            .foregroundStyle(.secondary)
+        case .failed:
+            Label("Could not search this network", systemImage: "wifi.slash")
+                .foregroundStyle(.secondary)
+        case .idle, .searching:
+            HStack(spacing: 10) {
+                ProgressView()
+                Text("Looking for computers…")
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var footerText: String {
+        switch browsing {
+        case .denied:
+            return "Allow Hozz to find devices on your local network in "
+                + "Settings > Hozz, then come back. You can also add your "
+                + "computer by web address instead."
+        case .failed(let reason):
+            return reason
+        case .idle, .searching:
+            return computers.isEmpty
+                ? "Open Hozz on your Mac and it will appear here. Nothing to "
+                    + "type, and nothing to copy across."
+                : "Tap to connect. Hozz sets up the address and the token for "
+                    + "you — nothing to copy across."
         }
     }
 
@@ -173,11 +245,22 @@ struct DestinationPickerView: View {
         if let known = SharedReceiverStore(
             accessGroup: SharedReceiverStore.resolvedAccessGroup()
         ).published() {
-            await save(
-                name: known.name,
-                url: receiver.url,
-                token: known.token
-            )
+            // Try the address Bonjour just found first — it is known good on
+            // this network — then everything the computer published about
+            // itself. Saving an address without checking it is how a setup
+            // completes happily and then times out forever.
+            var ordered = [receiver.url]
+            ordered.append(contentsOf: known.endpoints.filter { $0 != receiver.url })
+
+            if let reachable = await ReceiverProbe().firstReachable(among: ordered) {
+                await save(name: known.name, url: reachable, token: known.token)
+                return
+            }
+            pairingError = """
+                \(known.name) did not answer at any of its known addresses. \
+                Make sure Hozz is open on it and both devices are on the same \
+                network.
+                """
             return
         }
 

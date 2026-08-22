@@ -29,6 +29,15 @@ public struct DiscoveredReceiver: Identifiable, Hashable, Sendable {
 /// The address is still resolved to a concrete host and port and stored, so a
 /// destination keeps working if the receiver is later reached by a fixed
 /// address instead.
+/// What the browser is currently doing, so a caller never has to render
+/// nothing and leave the user guessing.
+public enum BrowsingState: Hashable, Sendable {
+    case idle
+    case searching
+    case denied
+    case failed(String)
+}
+
 public actor ReceiverBrowser {
     private static let log = Logger(
         subsystem: "com.thatcube.Hozz",
@@ -38,6 +47,8 @@ public actor ReceiverBrowser {
     private var browser: NWBrowser?
     private var found: [String: DiscoveredReceiver] = [:]
     private var observers: [@Sendable ([DiscoveredReceiver]) -> Void] = []
+    private var stateObservers: [@Sendable (BrowsingState) -> Void] = []
+    private(set) public var state: BrowsingState = .idle
 
     public init() {}
 
@@ -48,12 +59,33 @@ public actor ReceiverBrowser {
         observer(sorted())
     }
 
+    public func onStateChange(
+        _ observer: @escaping @Sendable (BrowsingState) -> Void
+    ) {
+        stateObservers.append(observer)
+        observer(state)
+    }
+
+    private func update(_ newState: BrowsingState) {
+        state = newState
+        for observer in stateObservers {
+            observer(newState)
+        }
+    }
+
     public func start() {
         guard browser == nil else {
             return
         }
         let parameters = NWParameters()
-        parameters.includePeerToPeer = true
+        // Peer-to-peer is deliberately off. It steers discovery onto the
+        // AirPlay/AWDL interface instead of the network both devices are
+        // actually on, which is precisely how the Mac ended up advertising
+        // somewhere the phone could never see it.
+        parameters.includePeerToPeer = false
+        // A receiver is on the local network by definition; browsing over
+        // cellular can only waste time and battery.
+        parameters.prohibitedInterfaceTypes = [.cellular]
 
         let browser = NWBrowser(
             for: .bonjour(type: HozzService.bonjourType, domain: nil),
@@ -62,17 +94,47 @@ public actor ReceiverBrowser {
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             Task { await self?.apply(results) }
         }
-        browser.stateUpdateHandler = { state in
-            if case .failed(let error) = state {
-                // Almost always the local network permission being refused.
-                // Typing an address by hand still works, so this is not fatal.
-                Self.log.debug(
-                    "Browsing unavailable: \(error.localizedDescription, privacy: .public)"
-                )
-            }
+        browser.stateUpdateHandler = { [weak self] state in
+            Task { await self?.handle(state) }
         }
         browser.start(queue: .main)
         self.browser = browser
+        update(.searching)
+    }
+
+    private func handle(_ state: NWBrowser.State) {
+        switch state {
+        case .ready:
+            update(.searching)
+        case .waiting(let error), .failed(let error):
+            // Refusing local network access is by far the most common cause,
+            // and it is silent: browsing simply never returns anything. Saying
+            // so is the difference between "this feature is broken" and "tap
+            // Allow". Logged at error level because a debug-level message here
+            // is invisible exactly when it is needed.
+            Self.log.error(
+                "Browsing unavailable: \(error.localizedDescription, privacy: .public)"
+            )
+            update(Self.isPermissionProblem(error) ? .denied : .failed(error.localizedDescription))
+        case .cancelled:
+            update(.idle)
+        default:
+            break
+        }
+    }
+
+    private static func isPermissionProblem(_ error: NWError) -> Bool {
+        switch error {
+        case .dns(let code):
+            // The documented signal that local network access was refused.
+            // Easy to miss, because the browser otherwise looks healthy and
+            // simply never returns a result.
+            return code == kDNSServiceErr_PolicyDenied
+        case .posix(let code):
+            return code == .EPERM || code == .EACCES || code == .ENETDOWN
+        default:
+            return false
+        }
     }
 
     public func stop() {
@@ -80,6 +142,7 @@ public actor ReceiverBrowser {
         browser = nil
         found.removeAll()
         notify()
+        update(.idle)
     }
 
     private func apply(_ results: Set<NWBrowser.Result>) {

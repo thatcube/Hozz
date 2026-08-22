@@ -6,12 +6,59 @@ import HozzCore
 public struct SharedReceiver: Codable, Hashable, Sendable {
     public let name: String
     public let token: String
+    /// Every address the computer might be reachable at, best first.
+    ///
+    /// A list rather than one address, because there is no single answer that
+    /// is right everywhere. Bonjour cannot be relied on — plenty of networks
+    /// block mDNS, and a managed Mac may refuse to advertise on its real
+    /// interface — so the addresses travel with the token. And the *correct*
+    /// one depends on where the phone is: a home address works on the same
+    /// Wi-Fi and nowhere else, while a Tailscale address works from anywhere
+    /// but only while both devices are on the tailnet.
+    ///
+    /// The phone tries each and keeps the first that answers, so a computer
+    /// that moves network, changes address, or joins a VPN keeps working
+    /// instead of silently going quiet.
+    public let endpoints: [String]
     public let updatedAt: Date
 
-    public init(name: String, token: String, updatedAt: Date = .now) {
+    public init(
+        name: String,
+        token: String,
+        endpoints: [String] = [],
+        updatedAt: Date = .now
+    ) {
         self.name = name
         self.token = token
+        self.endpoints = endpoints
         self.updatedAt = updatedAt
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, token, endpoints, endpoint, updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        token = try container.decode(String.self, forKey: .token)
+        updatedAt = try container.decodeIfPresent(Date.self, forKey: .updatedAt) ?? .now
+        if let list = try container.decodeIfPresent([String].self, forKey: .endpoints) {
+            endpoints = list
+        } else if let single = try container.decodeIfPresent(String.self, forKey: .endpoint) {
+            // A record written before addresses became a list.
+            endpoints = [single]
+        } else {
+            endpoints = []
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(name, forKey: .name)
+        try container.encode(token, forKey: .token)
+        try container.encode(endpoints, forKey: .endpoints)
+        try container.encode(updatedAt, forKey: .updatedAt)
     }
 }
 
@@ -140,5 +187,142 @@ public extension SharedReceiverStore {
         }
         // "<team>.<bundle id>" — everything up to and including the first dot.
         return String(group[...dot])
+    }
+}
+
+/// This machine's address on the network it actually uses.
+public enum LocalAddress {
+    /// Every address this machine might usefully be reached at, best first.
+    ///
+    /// Ordinary network interfaces come first because they are the fast path on
+    /// a shared network. Tailscale addresses follow: they work from anywhere on
+    /// the tailnet, including over cellular, which is the only thing that keeps
+    /// working when the phone leaves the house.
+    ///
+    /// Other tunnels are deliberately excluded. A corporate VPN address is not
+    /// merely useless to the phone — the same private address very likely
+    /// belongs to a *different* machine on that network, so offering it invites
+    /// sending Health data somewhere it should never go.
+    public static func candidates() -> [String] {
+        var local: [String] = []
+        var tailnet: [String] = []
+
+        for (name, address) in interfaceAddresses() {
+            if isTailscale(address) {
+                tailnet.append(address)
+            } else if name.hasPrefix("en") {
+                // en0 is the usual Wi-Fi interface, so it leads.
+                if name == "en0" {
+                    local.insert(address, at: 0)
+                } else {
+                    local.append(address)
+                }
+            }
+        }
+        return local + tailnet
+    }
+
+    /// Tailscale hands every device an address in the 100.64.0.0/10 range.
+    static func isTailscale(_ address: String) -> Bool {
+        let parts = address.split(separator: ".").compactMap { Int($0) }
+        guard parts.count == 4 else {
+            return false
+        }
+        return parts[0] == 100 && (64...127).contains(parts[1])
+    }
+
+    private static func interfaceAddresses() -> [(String, String)] {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else {
+            return []
+        }
+        defer { freeifaddrs(addresses) }
+
+        var found: [(String, String)] = []
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(pointer.pointee.ifa_flags)
+            guard
+                flags & IFF_UP == IFF_UP,
+                flags & IFF_LOOPBACK == 0,
+                let addr = pointer.pointee.ifa_addr,
+                addr.pointee.sa_family == UInt8(AF_INET)
+            else {
+                continue
+            }
+            let name = String(cString: pointer.pointee.ifa_name)
+            guard !name.hasPrefix("awdl"),
+                  !name.hasPrefix("llw"),
+                  !name.hasPrefix("ap") else {
+                continue
+            }
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(
+                addr,
+                socklen_t(addr.pointee.sa_len),
+                &host,
+                socklen_t(host.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            ) == 0 else {
+                continue
+            }
+            found.append((name, String(cString: host)))
+        }
+        return found
+    }
+
+    /// The IPv4 address of the interface carrying the default route.
+    public static func primaryIPv4() -> String? {
+        var addresses: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&addresses) == 0, let first = addresses else {
+            return nil
+        }
+        defer { freeifaddrs(addresses) }
+
+        var candidate: String?
+        for pointer in sequence(first: first, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(pointer.pointee.ifa_flags)
+            guard
+                flags & IFF_UP == IFF_UP,
+                flags & IFF_LOOPBACK == 0,
+                let addr = pointer.pointee.ifa_addr,
+                addr.pointee.sa_family == UInt8(AF_INET)
+            else {
+                continue
+            }
+            let name = String(cString: pointer.pointee.ifa_name)
+            // Skip the peer-to-peer and tunnel interfaces: they are reachable
+            // from almost nothing, which is exactly the failure being fixed.
+            guard !name.hasPrefix("utun"),
+                  !name.hasPrefix("awdl"),
+                  !name.hasPrefix("llw"),
+                  !name.hasPrefix("ap") else {
+                continue
+            }
+
+            var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            guard getnameinfo(
+                addr,
+                socklen_t(addr.pointee.sa_len),
+                &host,
+                socklen_t(host.count),
+                nil,
+                0,
+                NI_NUMERICHOST
+            ) == 0 else {
+                continue
+            }
+            let text = String(cString: host)
+            // en0 is the usual Wi-Fi interface and is preferred outright;
+            // anything else is kept only as a fallback.
+            if name == "en0" {
+                return text
+            }
+            if candidate == nil {
+                candidate = text
+            }
+        }
+        return candidate
     }
 }

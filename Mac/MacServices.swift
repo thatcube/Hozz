@@ -31,6 +31,8 @@ final class MacServices {
     private(set) var summaries: [TypeSummary] = []
     private(set) var totalRecords = 0
     private(set) var events: [ReceiverEvent] = []
+    private(set) var devices: [PairedDevice] = []
+    private(set) var lastReceivedAt: Date?
 
     private(set) var token = ""
     private(set) var computerName = ""
@@ -87,6 +89,8 @@ final class MacServices {
             accessGroup: SharedReceiverStore.resolvedAccessGroup()
         )
         do {
+            // Published without an address here; the port is not known until
+            // the listener is ready, and republishing then fills it in.
             try shared.publish(
                 SharedReceiver(name: "Hozz on \(name)", token: token)
             )
@@ -142,11 +146,16 @@ final class MacServices {
         }
         await receiver.onEvent { [weak self] event in
             Task { @MainActor in
-                self?.events.insert(event, at: 0)
-                if self?.events.count ?? 0 > 100 {
-                    self?.events.removeLast()
+                guard let self else { return }
+                self.events.insert(event, at: 0)
+                if self.events.count > 100 {
+                    self.events.removeLast()
                 }
-                await self?.refresh()
+                if case .stored = event.outcome {
+                    self.lastReceivedAt = event.at
+                }
+                self.devices = await receiver.devices
+                await self.refresh()
             }
         }
         await receiver.start()
@@ -209,10 +218,40 @@ final class MacServices {
         return "\"\(value.replacingOccurrences(of: "\"", with: "\"\""))\""
     }
 
+    /// Records where this computer can actually be reached.
+    ///
+    /// Bonjour is not dependable — plenty of networks block mDNS, and a managed
+    /// Mac may refuse to advertise on its real interface — so the address goes
+    /// into the same private record as the token. The phone can then find this
+    /// computer with no discovery at all.
+    private func publishAddress(port: UInt16) {
+        let hosts = LocalAddress.candidates()
+        guard !token.isEmpty, !hosts.isEmpty else {
+            return
+        }
+        let record = SharedReceiver(
+            name: computerName.isEmpty ? "Mac" : "Hozz on \(computerName)",
+            token: token,
+            endpoints: hosts.map { "http://\($0):\(port)" }
+        )
+        Task.detached(priority: .utility) {
+            do {
+                try SharedReceiverStore(
+                    accessGroup: SharedReceiverStore.resolvedAccessGroup()
+                ).publish(record)
+            } catch {
+                Self.log.error(
+                    "Could not publish this Mac's address: \(error.localizedDescription, privacy: .public)"
+                )
+            }
+        }
+    }
+
     private func apply(_ state: ReceiverState) {
         switch state {
         case .listening(let port):
             status = .ready(port: port)
+            publishAddress(port: port)
         case .failed(let reason):
             status = .failed(reason)
         case .starting, .stopped:

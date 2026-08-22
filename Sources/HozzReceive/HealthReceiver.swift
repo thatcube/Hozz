@@ -50,6 +50,17 @@ public actor HealthReceiver {
         category: "receiver"
     )
 
+    /// The port the receiver listens on by default.
+    ///
+    /// Fixed rather than system-assigned. An ephemeral port changes every time
+    /// the app launches, so a destination the phone saved yesterday points at a
+    /// port nothing is listening on — the setup appears to work and then times
+    /// out forever, which is far worse than failing outright.
+    ///
+    /// Chosen from the dynamic range, where it is unlikely to collide with a
+    /// service anyone runs deliberately.
+    public static let defaultPort: UInt16 = 54330
+
     /// The Bonjour service type both ends agree on.
     ///
     /// Defined in HozzCore because the phone browses for exactly what this
@@ -61,6 +72,7 @@ public actor HealthReceiver {
     private var token: String
     private let serviceName: String
     private var pairedDevices: [PairedDevice] = []
+    private var hasRetriedOnAnyPort = false
     private var listener: NWListener?
     private var connections: Set<ObjectIdentifier> = []
 
@@ -118,7 +130,7 @@ public actor HealthReceiver {
         eventObservers.append(observer)
     }
 
-    public func start(port: UInt16 = 0) async {
+    public func start(port: UInt16 = HealthReceiver.defaultPort) async {
         guard listener == nil else {
             return
         }
@@ -126,9 +138,18 @@ public actor HealthReceiver {
 
         let parameters = NWParameters.tcp
         parameters.allowLocalEndpointReuse = true
-        // Health data never leaves the local network by accident: the listener
-        // is not exposed beyond the link it is bound to.
-        parameters.includePeerToPeer = true
+        // Deliberately *not* peer-to-peer. Asking for it made the listener
+        // advertise over the AirPlay/AWDL interface and loopback instead of the
+        // actual Wi-Fi network, so the phone — sitting on the same Wi-Fi —
+        // never saw the service and the socket was unreachable at the Mac's
+        // real address. Hozz only ever needs the network both devices are
+        // already on.
+        parameters.includePeerToPeer = false
+        // Accept IPv4 as well as IPv6. Left to itself the listener came up
+        // IPv6-only, which silently refuses a phone connecting to a v4 address.
+        if let tcp = parameters.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            tcp.version = .any
+        }
 
         do {
             let listener: NWListener
@@ -175,6 +196,20 @@ public actor HealthReceiver {
                 Self.log.info("Receiver listening on port \(port, privacy: .public).")
             }
         case .failed(let error):
+            // Almost always the port already being in use — another copy of
+            // Hozz, or something else that claimed it. Falling back to any free
+            // port keeps the app working; the address is published either way,
+            // so the phone still finds it.
+            if !hasRetriedOnAnyPort {
+                hasRetriedOnAnyPort = true
+                Self.log.error(
+                    "Port \(Self.defaultPort, privacy: .public) unavailable, using any free port."
+                )
+                listener?.cancel()
+                listener = nil
+                Task { await self.start(port: 0) }
+                return
+            }
             update(.failed(error.localizedDescription))
         case .cancelled:
             update(.stopped)

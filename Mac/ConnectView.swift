@@ -18,7 +18,10 @@ struct ConnectView: View {
                 case .failed(let reason):
                     failure(reason)
                 case .ready:
-                    pairing
+                    connectionStatus
+                    if services.devices.isEmpty {
+                        pairing
+                    }
                 }
             }
             .padding(28)
@@ -41,6 +44,57 @@ struct ConnectView: View {
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    /// Says plainly whether anything has actually connected.
+    ///
+    /// Without this the screen only ever explained how to connect, so there was
+    /// no way to tell a working setup from a broken one — the user is left
+    /// watching an instruction list and guessing.
+    @ViewBuilder
+    private var connectionStatus: some View {
+        GroupBox {
+            HStack(alignment: .top, spacing: 12) {
+                Image(systemName: services.devices.isEmpty
+                    ? "iphone.badge.exclamationmark"
+                    : "checkmark.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(services.devices.isEmpty ? Color.secondary : Color.green)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    if let device = services.devices.first {
+                        Text("Connected to \(device.name)")
+                            .font(.body.weight(.semibold))
+                        Text(receivedSummary)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Waiting for your iPhone")
+                            .font(.body.weight(.semibold))
+                        Text(
+                            "This Mac is listening. Open Hozz on your iPhone, "
+                            + "add a destination, and pick this computer."
+                        )
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer()
+            }
+            .padding(8)
+        }
+    }
+
+    private var receivedSummary: String {
+        guard services.totalRecords > 0 else {
+            return "Nothing has arrived yet. It will appear here when it does."
+        }
+        let count = services.totalRecords.formatted()
+        guard let last = services.lastReceivedAt else {
+            return "\(count) records received."
+        }
+        return "\(count) records · last \(last.formatted(.relative(presentation: .named)))"
     }
 
     private func failure(_ reason: String) -> some View {
