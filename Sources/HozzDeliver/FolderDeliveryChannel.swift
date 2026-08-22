@@ -7,11 +7,7 @@ import Foundation
 /// Dropbox, OneDrive, Google Drive — does the networking. It also keeps working
 /// while their computer is switched off, which a push to a local receiver
 /// cannot, and it avoids the plaintext-HTTP problem a LAN endpoint creates.
-public final class FolderDeliveryChannel: DeliveryChannel, @unchecked Sendable {
-    /// Set when the resolved bookmark was stale, so the caller can persist a
-    /// fresh one. Only ever written from inside one `deliver` call.
-    public private(set) var refreshedBookmark: Data?
-
+public struct FolderDeliveryChannel: DeliveryChannel {
     public init() {}
 
     public func deliver(
@@ -34,9 +30,12 @@ public final class FolderDeliveryChannel: DeliveryChannel, @unchecked Sendable {
         } catch {
             throw DeliveryError.folderUnavailable
         }
-        // A stale bookmark still resolves; it just means the system wants a
-        // fresh one. Ignoring that would let an ordinary folder move decay into
-        // a permanent failure the user has to re-pick their way out of.
+        // A stale bookmark still resolves; it just means the system would like
+        // a fresh one. It is reported on the receipt rather than stored on the
+        // channel, because one channel instance is shared by every folder
+        // destination and a mutable field there would be written by whichever
+        // delivery happened to run last.
+        var refreshedBookmark: Data?
         if isStale {
             refreshedBookmark = try? folder.bookmarkData(
                 options: .minimalBookmark,
@@ -84,7 +83,8 @@ public final class FolderDeliveryChannel: DeliveryChannel, @unchecked Sendable {
             recordCount: batch.recordCount,
             byteCount: UInt64(batch.payload.count),
             state: .delivered,
-            artifactName: fileName
+            artifactName: fileName,
+            refreshedBookmark: refreshedBookmark
         )
     }
 }

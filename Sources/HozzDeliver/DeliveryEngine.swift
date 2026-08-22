@@ -181,6 +181,15 @@ public actor DeliveryEngine {
 
         do {
             let receipt = try await channel.deliver(batch, to: destination)
+
+            // Persist a refreshed folder bookmark so an ordinary folder move
+            // does not decay into a permanent failure later.
+            if let refreshed = receipt.refreshedBookmark {
+                var updated = destination
+                updated.folderBookmark = refreshed
+                try? await save(updated)
+            }
+
             try await store.saveDeliveryState(
                 DeliveryStateRecord(
                     destinationID: destination.id,

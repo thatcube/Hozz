@@ -238,6 +238,10 @@ public struct DeliveryReceipt: Codable, Hashable, Sendable {
     public let detail: String?
     /// Where the batch landed, when that is meaningful to show.
     public let artifactName: String?
+    /// A replacement bookmark, when the folder's stored one went stale. Carried
+    /// on the receipt rather than held on the channel, because one channel
+    /// serves every destination of its kind.
+    public let refreshedBookmark: Data?
 
     public init(
         destinationID: UUID,
@@ -246,7 +250,8 @@ public struct DeliveryReceipt: Codable, Hashable, Sendable {
         byteCount: UInt64,
         state: DeliveryState,
         detail: String? = nil,
-        artifactName: String? = nil
+        artifactName: String? = nil,
+        refreshedBookmark: Data? = nil
     ) {
         self.destinationID = destinationID
         self.attemptedAt = attemptedAt
@@ -255,6 +260,7 @@ public struct DeliveryReceipt: Codable, Hashable, Sendable {
         self.state = state
         self.detail = detail
         self.artifactName = artifactName
+        self.refreshedBookmark = refreshedBookmark
     }
 }
 
