@@ -45,10 +45,15 @@ public struct DrainCoordinator: Sendable {
         self.sink = sink
     }
 
+    /// - Parameter onBatch: Invoked after each page is durably staged, with the
+    ///   running change count for this type. A single type can hold millions of
+    ///   records, so without this the caller cannot show progress until the
+    ///   whole type finishes.
     public func drain(
         type: HealthTypeKey,
         batchLimit: Int,
-        maximumQueries: Int? = nil
+        maximumQueries: Int? = nil,
+        onBatch: (@Sendable (Int) async -> Void)? = nil
     ) async throws -> DrainReport {
         guard batchLimit > 0 else {
             throw DrainError.invalidBatchLimit
@@ -97,6 +102,10 @@ public struct DrainCoordinator: Sendable {
             anchor = batch.proposedAnchor
             queryCount += 1
             changeCount += batch.changes.count
+
+            if !batch.changes.isEmpty {
+                await onBatch?(changeCount)
+            }
 
             if batch.changes.isEmpty {
                 try await sink.markAnchorClosed(

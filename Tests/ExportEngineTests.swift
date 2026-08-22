@@ -576,10 +576,46 @@ final class ExportEngineTests: XCTestCase {
         XCTAssertEqual(Set(secondIdentifiers), Set(firstIdentifiers))
     }
 
+    /// A single type can hold millions of records. Reporting progress only when
+    /// a type finishes freezes the on-screen counter for minutes at a time.
+    func testProgressIsReportedWhileASingleTypeIsStillDraining() async throws {
+        let store = try makeStore()
+        let source = ScriptedHealthDataSource(
+            streams: [steps: (0..<10).map { upsert("step-\($0)", type: steps) }]
+        )
+        let engine = makeEngine(store: store, source: source, types: [steps], batchSize: 2)
+
+        let recorder = ProgressRecorder()
+        guard
+            case .completed = try await engine.export(
+                format: .gzip,
+                progress: { await recorder.record($0) }
+            )
+        else {
+            return XCTFail("The run should have completed.")
+        }
+
+        let midDrainCounts = await recorder.recordCountsWhileExporting()
+        XCTAssertGreaterThan(
+            midDrainCounts.count,
+            2,
+            "Progress must be emitted per page, not only per type."
+        )
+        XCTAssertEqual(
+            midDrainCounts,
+            midDrainCounts.sorted(),
+            "The running record count must never go backwards."
+        )
+        XCTAssertEqual(
+            midDrainCounts.last,
+            10,
+            "The last in-progress update should account for every record."
+        )
+    }
+
     /// The joiner leaves its inputs alone; only the engine removes them, and
     /// only after the store has recorded the joined artifact.
-    func testNoScratchOrPartFilesSurviveACompletedRun() async throws {
-        let store = try makeStore()
+    func testNoScratchOrPartFilesSurviveACompletedRun() async throws {        let store = try makeStore()
         let source = ScriptedHealthDataSource(
             streams: [steps: (0..<4).map { upsert("step-\($0)", type: steps) }]
         )
@@ -658,5 +694,22 @@ private actor AuthorizationFailingSource: HealthDataSource {
             )
         }
         return try await wrapped.changes(for: type, after: anchor, limit: limit)
+    }
+}
+
+/// Collects every progress update so a test can assert on what the UI would
+/// actually have displayed over time.
+private actor ProgressRecorder {
+    private var updates: [HealthExportProgress] = []
+
+    func record(_ progress: HealthExportProgress) {
+        updates.append(progress)
+    }
+
+    /// Running totals seen while a type was still draining, in order.
+    func recordCountsWhileExporting() -> [Int] {
+        updates
+            .filter { $0.currentTypeState == .exporting && $0.recordCount > 0 }
+            .map(\.recordCount)
     }
 }

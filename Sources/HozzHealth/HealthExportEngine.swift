@@ -344,11 +344,27 @@ public actor HealthExportEngine {
 
             let report: DrainReport
             do {
+                // A single type can hold millions of records, so progress is
+                // reported per page rather than only when the type finishes.
+                let completedSoFar = completedTypes
+                let totalTypes = types.count
                 report = try await coordinator.drain(
                     type: type,
                     batchLimit: batchSize,
                     maximumQueries: Self.maximumQueriesPerType
-                )
+                ) { typeRecordCount in
+                    await progress(
+                        Self.progress(
+                            completedTypes: completedSoFar,
+                            totalTypes: totalTypes,
+                            recordCount: await sink.recordCount,
+                            type: type,
+                            entry: entry,
+                            typeRecordCount: typeRecordCount,
+                            state: .exporting
+                        )
+                    )
+                }
             } catch {
                 let failure = HealthKitFailure.classify(
                     error,

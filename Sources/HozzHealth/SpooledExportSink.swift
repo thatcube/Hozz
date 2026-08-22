@@ -31,9 +31,11 @@ public enum SpooledExportSinkError: Error, LocalizedError, Equatable, Sendable {
 /// can never duplicate a record in the output and can never skip one.
 public actor SpooledExportSink: DurableHealthChangeSink {
     /// Uncompressed bytes buffered into one part before it is sealed. Smaller
-    /// parts cost more seals; larger parts cost more replay after a kill.
-    public static let defaultPartByteBudget = 64 * 1_024 * 1_024
-    public static let defaultPartRecordBudget = 200_000
+    /// parts cost more seals; larger parts cost more replay after a kill. At
+    /// roughly half a kilobyte per record this checkpoints every 20–40 seconds
+    /// of a large export, so an interruption rarely costs more than that.
+    public static let defaultPartByteBudget = 16 * 1_024 * 1_024
+    public static let defaultPartRecordBudget = 50_000
 
     private struct OpenPart {
         let sequence: Int
