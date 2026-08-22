@@ -43,6 +43,8 @@ final class MacServices {
 
     private var store: IngestStore?
     private var receiver: HealthReceiver?
+    private var watcher: FolderIngestWatcher?
+    private(set) var watchedFolder: URL?
 
     /// Where the received database actually lives.
     ///
@@ -172,8 +174,43 @@ final class MacServices {
         await refresh()
     }
 
+    /// Watches a folder the phone writes to.
+    ///
+    /// The path that asks nothing of the network. Receiving over the local
+    /// network is faster when it works, but it needs the router not to isolate
+    /// clients and the firewall to admit an app it does not recognise — neither
+    /// of which the user can be expected to arrange. A file arrives however the
+    /// user already syncs files, from anywhere, over any connection.
+    func watchFolder(_ folder: URL) async {
+        guard let store else {
+            return
+        }
+        let watcher = self.watcher ?? FolderIngestWatcher(store: store)
+        self.watcher = watcher
+        await watcher.onEvent { [weak self] event in
+            Task { @MainActor in
+                self?.events.insert(event, at: 0)
+                if case .stored = event.outcome {
+                    self?.lastReceivedAt = event.at
+                }
+                await self?.refresh()
+            }
+        }
+        await watcher.start(folder: folder)
+        watchedFolder = folder
+        UserDefaults.standard.set(folder.path, forKey: "watchedFolder")
+        await refresh()
+    }
+
+    func stopWatchingFolder() async {
+        await watcher?.stop()
+        watchedFolder = nil
+        UserDefaults.standard.removeObject(forKey: "watchedFolder")
+    }
+
     func stop() async {
         await receiver?.stop()
+        await watcher?.stop()
     }
 
     func refresh() async {
