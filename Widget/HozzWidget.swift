@@ -73,9 +73,16 @@ struct SyncProvider: TimelineProvider {
             let shared = FileManager.default.containerURL(
                 forSecurityApplicationGroupIdentifier: StoreLocation.appGroupIdentifier
             ),
-            let store = try? HozzStore(
-                directory: try StoreLocation.supportDirectory(in: shared)
+            let directory = try? StoreLocation.supportDirectory(in: shared),
+            // Opening a store creates its schema, and the widget refreshes on
+            // its own timeline — including before the app has ever run. Without
+            // this guard the widget can create an empty database in the shared
+            // container that the app then has to recognise as a husk and
+            // discard. Reporting "unavailable" is both honest and harmless.
+            FileManager.default.fileExists(
+                atPath: StoreLocation.databaseURL(in: directory).path
             ),
+            let store = try? HozzStore(directory: directory),
             let states = try? await store.allDeliveryStates()
         else {
             return SyncEntry(

@@ -148,12 +148,18 @@ targets:
         com.apple.developer.healthkit: true
         com.apple.developer.healthkit.background-delivery: true
         com.apple.developer.healthkit.access: []
-        # Enabling the App Groups capability for this bundle id in the Apple
-        # developer portal, then adding
-        #   com.apple.security.application-groups: [group.com.thatcube.Hozz]
-        # here and in the widget, is all the widget needs to show live state.
-        # It is left out because the current development profile lacks the
-        # capability and declaring it fails every device build.
+        # The App Groups entitlement is deliberately not declared here.
+        #
+        # The widget is a separate process with its own container, so it can
+        # only read live sync state through a shared group container. But
+        # declaring an entitlement the provisioning profile lacks fails *every*
+        # device build, so it cannot be committed until the capability is
+        # registered with Apple.
+        #
+        # `tools/device-build.sh` resolves this without anyone editing this
+        # file: it checks the downloaded profiles for the group and injects the
+        # entitlement only when it is actually available. Register the
+        # capability once and device builds start including it automatically.
     info:
       path: App/Info.plist
       properties:
@@ -195,7 +201,9 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.Hozz.widget
         # The widget reads the same store the app writes, which requires the
-        # shared container both sides already use.
+        # shared container both sides already use. The matching entitlement is
+        # injected by tools/device-build.sh when the capability exists; see the
+        # note on the app target above.
         SKIP_INSTALL: true
     info:
       path: Widget/Info.plist

@@ -17,6 +17,20 @@ final class HozzServices: @unchecked Sendable {
     let sync: SyncCoordinator
     let observer: HealthObserver
 
+    /// Collapses observer bursts into single passes. Held here so the app, the
+    /// background task, and the intents all feed the same one.
+    private(set) lazy var coalescer: SyncCoalescer = {
+        let sync = sync
+        return SyncCoalescer { _ in
+            // Dirty types are deliberately not used to narrow the pass. A
+            // narrowed pass still marks the destination as recently attempted,
+            // so an hourly destination that woke for one type would not look
+            // due again for an hour, delaying every type that did not happen
+            // to fire. Checking all types is cheap when there is nothing new.
+            _ = try? await sync.sync()
+        }
+    }()
+
     private let healthStore = HKHealthStore()
 
     init() throws {
@@ -50,13 +64,13 @@ final class HozzServices: @unchecked Sendable {
     /// Begins watching Health so iOS wakes Hozz when new data arrives.
     func startObserving() async {
         let selection = (try? await selectedTypes()) ?? []
-        let sync = sync
-        await observer.start(selection: selection) { _ in
+        let coalescer = coalescer
+        await observer.start(selection: selection) { types in
             // The observer callback owes iOS an answer within seconds, so the
-            // sync is kicked off and not waited on.
-            Task.detached(priority: .utility) {
-                _ = try? await sync.sync()
-            }
+            // sync is requested and not waited on. HealthKit fires every
+            // observer at once after a Watch sync, so this goes through the
+            // coalescer rather than starting a pass per type.
+            await coalescer.request(types: types)
         }
     }
 
