@@ -19,17 +19,11 @@ final class HozzServices: @unchecked Sendable {
 
     /// Collapses observer bursts into single passes. Held here so the app, the
     /// background task, and the intents all feed the same one.
-    private(set) lazy var coalescer: SyncCoalescer = {
-        let sync = sync
-        return SyncCoalescer { _ in
-            // Dirty types are deliberately not used to narrow the pass. A
-            // narrowed pass still marks the destination as recently attempted,
-            // so an hourly destination that woke for one type would not look
-            // due again for an hour, delaying every type that did not happen
-            // to fire. Checking all types is cheap when there is nothing new.
-            _ = try? await sync.sync()
-        }
-    }()
+    ///
+    /// Deliberately not `lazy`: this type is `@unchecked Sendable`, so a lazy
+    /// property could be initialised twice from different threads and quietly
+    /// produce two coalescers that do not coalesce with each other.
+    let coalescer: SyncCoalescer
 
     private let healthStore = HKHealthStore()
 
@@ -50,7 +44,7 @@ final class HozzServices: @unchecked Sendable {
             types: types
         )
         self.observer = HealthObserver(healthStore: healthStore, types: types)
-        self.sync = SyncCoordinator(
+        let sync = SyncCoordinator(
             engine: HealthSyncEngine(
                 store: store,
                 source: source,
@@ -59,6 +53,15 @@ final class HozzServices: @unchecked Sendable {
             ),
             delivery: delivery
         )
+        self.sync = sync
+        self.coalescer = SyncCoalescer { _ in
+            // Dirty types deliberately do not narrow the pass. A narrowed pass
+            // still marks the destination as recently attempted, so an hourly
+            // destination woken for one type would not look due again for an
+            // hour, delaying every type that did not happen to fire. Checking
+            // all types is cheap when there is nothing new to read.
+            _ = try? await sync.sync()
+        }
     }
 
     /// Begins watching Health so iOS wakes Hozz when new data arrives.
