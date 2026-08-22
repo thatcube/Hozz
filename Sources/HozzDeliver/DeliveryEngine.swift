@@ -11,7 +11,7 @@ public actor DeliveryEngine {
     /// Retry schedule after consecutive failures. Deliberately gentle: a
     /// destination that is down is usually a computer that is switched off, and
     /// hammering it costs battery for nothing.
-    static let backoff: [TimeInterval] = [
+    public static let backoff: [TimeInterval] = [
         30, 2 * 60, 10 * 60, 30 * 60, 2 * 60 * 60, 6 * 60 * 60
     ]
 
@@ -269,7 +269,7 @@ public actor DeliveryEngine {
         )
     }
 
-    static func nextAttempt(
+    public static func nextAttempt(
         after failures: Int,
         from now: Date,
         isTransient: Bool

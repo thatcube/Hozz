@@ -188,10 +188,15 @@ targets:
       - target: HozzDeliver
       - target: HozzHealth
       - target: HozzHealthFake
+      - target: Hozz
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzTests
         GENERATE_INFOPLIST_FILE: true
+        # Keychain access needs an application identity, so the tests run
+        # inside the app rather than as a standalone bundle.
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Hozz.app/Hozz"
+        BUNDLE_LOADER: "$(TEST_HOST)"
 
 schemes:
   Hozz:
