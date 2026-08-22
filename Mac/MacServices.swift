@@ -76,6 +76,18 @@ final class MacServices {
         let store = try IngestStore(directory: directory)
         let name = Host.current().localizedName ?? "This Mac"
         let token = try resolveToken()
+
+        // Publish to the user's own iCloud Keychain so their phone already
+        // knows the token and never has to be introduced to this computer.
+        // Best-effort: without the shared-group entitlement or iCloud this does
+        // nothing, and the phone falls back to pairing over the network.
+        let shared = SharedReceiverStore(
+            accessGroup: SharedReceiverStore.resolvedAccessGroup()
+        )
+        try? shared.publish(
+            SharedReceiver(name: "Hozz on \(name)", token: token)
+        )
+
         return Assembled(
             store: store,
             receiver: HealthReceiver(

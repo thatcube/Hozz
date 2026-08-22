@@ -159,27 +159,52 @@ struct DestinationPickerView: View {
         }
     }
 
-    /// Pairs with a computer and saves a ready-to-use destination.
+    /// Connects to a computer and saves a ready-to-use destination.
+    ///
+    /// If this person's own Mac already published its token to their iCloud
+    /// Keychain, it is used directly — two devices on the same Apple account
+    /// are already known to belong to the same person, which is far stronger
+    /// evidence than anything that could be established over a home network.
+    /// Only when that is unavailable does this fall back to pairing.
     private func connect(to receiver: DiscoveredReceiver) async {
         connecting = receiver.id
         defer { connecting = nil }
+
+        if let known = SharedReceiverStore(
+            accessGroup: SharedReceiverStore.resolvedAccessGroup()
+        ).published() {
+            await save(
+                name: known.name,
+                url: receiver.url,
+                token: known.token
+            )
+            return
+        }
 
         do {
             let result = try await pairing.pair(
                 with: receiver.url,
                 deviceName: await UIDevice.current.name
             )
-            let destination = Destination(
+            await save(
                 name: result.name,
-                kind: .restAPI,
-                format: .ndjson,
-                cadence: .whenDataArrives,
-                endpointURL: URL(string: receiver.url)
+                url: receiver.url,
+                token: result.token
             )
-            await model.save(destination, secret: result.token)
-            dismiss()
         } catch {
             pairingError = error.localizedDescription
         }
+    }
+
+    private func save(name: String, url: String, token: String) async {
+        let destination = Destination(
+            name: name,
+            kind: .restAPI,
+            format: .ndjson,
+            cadence: .whenDataArrives,
+            endpointURL: URL(string: url)
+        )
+        await model.save(destination, secret: token)
+        dismiss()
     }
 }

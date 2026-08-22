@@ -25,17 +25,44 @@ public enum CredentialError: Error, LocalizedError, Sendable {
 /// - Secrets never enter the SQLite store, an export, or a log.
 public struct DestinationCredentials: Sendable {
     private let service: String
+    private let synchronizable: Bool
+    private let accessGroup: String?
 
-    public init(service: String = "com.thatcube.Hozz.destinations") {
+    /// - Parameters:
+    ///   - synchronizable: Whether the secret belongs to the *person* rather
+    ///     than to this device, and should follow them via iCloud Keychain.
+    ///     Destination secrets are device-only; the receiver token is not,
+    ///     because the whole point is that the user's own Mac and phone already
+    ///     share an identity and should not have to be introduced by hand.
+    ///   - accessGroup: A shared keychain group, needed when two different
+    ///     apps have to read the same item. Passing one the build is not
+    ///     entitled to fails every call, so callers should supply it only when
+    ///     the entitlement is present.
+    public init(
+        service: String = "com.thatcube.Hozz.destinations",
+        synchronizable: Bool = false,
+        accessGroup: String? = nil
+    ) {
         self.service = service
+        self.synchronizable = synchronizable
+        self.accessGroup = accessGroup
+    }
+
+    /// iCloud Keychain refuses to carry an item marked for this device only, so
+    /// a synchronizable item must relax to `afterFirstUnlock`. The pairing is
+    /// enforced here rather than left to each caller, because getting it wrong
+    /// fails silently: the item saves, and simply never appears anywhere else.
+    private var accessibility: CFString {
+        synchronizable
+            ? kSecAttrAccessibleAfterFirstUnlock
+            : kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
     }
 
     public func save(_ secret: String, for key: String) throws {
         let data = Data(secret.utf8)
         let update: [String: Any] = [
             kSecValueData as String: data,
-            kSecAttrAccessible as String:
-                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            kSecAttrAccessible as String: accessibility
         ]
 
         let status = withKeychain(for: key) { query in
@@ -48,8 +75,7 @@ public struct DestinationCredentials: Sendable {
             }
             var insert = query
             insert[kSecValueData as String] = data
-            insert[kSecAttrAccessible as String] =
-                kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+            insert[kSecAttrAccessible as String] = accessibility
             return SecItemAdd(insert as CFDictionary, nil)
         }
 
@@ -117,9 +143,14 @@ public struct DestinationCredentials: Sendable {
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
             kSecAttrAccount as String: key,
-            // Never synchronise a Health destination secret to another device.
-            kSecAttrSynchronizable as String: false
+            // Must appear on every query — add, update, copy and delete alike —
+            // or a synchronizable item simply will not match and the call
+            // reports "not found" rather than anything explanatory.
+            kSecAttrSynchronizable as String: synchronizable
         ]
+        if let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
         #if os(macOS)
         // Prefer the modern, iOS-style keychain. The legacy file-based one
         // grants access per code signature, so every rebuild or update prompts

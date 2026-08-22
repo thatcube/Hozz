@@ -196,6 +196,14 @@ targets:
         # file: it checks the downloaded profiles for the group and injects the
         # entitlement only when it is actually available. Register the
         # capability once and device builds start including it automatically.
+        #
+        # Shared with the Mac app so the receiver token can travel through the
+        # user's own iCloud Keychain, which is what removes the pairing step
+        # entirely. Declared here rather than set in Xcode because this file
+        # generates the entitlements: anything added in the IDE is erased the
+        # next time the project is regenerated.
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.thatcube.Hozz.shared
     info:
       path: App/Info.plist
       properties:
@@ -410,6 +418,13 @@ targets:
         com.apple.security.app-sandbox: true
         com.apple.security.network.server: true
         com.apple.security.files.user-selected.read-write: true
+        # Shared with the iPhone app so the receiver token can travel through
+        # the user's own iCloud Keychain. Two devices on one Apple account are
+        # already known to be the same person, which is stronger evidence than
+        # anything establishable over a home network — so there is nothing to
+        # pair and no token to copy.
+        keychain-access-groups:
+          - $(AppIdentifierPrefix)com.thatcube.Hozz.shared
     info:
       path: Mac/Info.plist
       properties:

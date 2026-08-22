@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# Builds and runs the Hozz Mac app.
+#
+# Signing is injected here rather than committed, so the repository stays free
+# of team identifiers. This exists mainly so nothing has to be configured in
+# Xcode: project.yml generates the project *and* the entitlements, so anything
+# set in the IDE is erased the next time the project is regenerated.
+set -euo pipefail
+
+TEAM="${HOZZ_TEAM:-N8Z5T4AK3X}"
+DERIVED="${HOZZ_MAC_DERIVED:-}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+
+xcodegen generate >/dev/null
+
+ARGS=(
+  -project Hozz.xcodeproj
+  -scheme HozzMac
+  -configuration Debug
+  -destination "platform=macOS"
+  # Registers this Mac as a development device on first run, and refreshes the
+  # profile when an entitlement changes. Without these, adding a capability
+  # fails with a profile error that reads like a signing problem.
+  -allowProvisioningUpdates
+  -allowProvisioningDeviceRegistration
+  "DEVELOPMENT_TEAM=$TEAM"
+  CODE_SIGN_STYLE=Automatic
+)
+if [ -n "$DERIVED" ]; then
+  ARGS+=(-derivedDataPath "$DERIVED")
+fi
+
+xcodebuild "${ARGS[@]}" build "$@"
+
+APP="$(xcodebuild "${ARGS[@]}" -showBuildSettings 2>/dev/null \
+  | awk -F' = ' '/ BUILT_PRODUCTS_DIR/ {print $2; exit}')/Hozz.app"
+
+echo "Built $APP"
+if [ "${HOZZ_MAC_RUN:-1}" = "1" ]; then
+  # Replace any copy that is already running, or the old one keeps the port.
+  for pid in $(pgrep -f "Hozz.app/Contents/MacOS/Hozz" || true); do
+    kill "$pid" 2>/dev/null || true
+  done
+  sleep 1
+  open "$APP"
+  echo "Launched."
+fi
