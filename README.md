@@ -2,9 +2,15 @@
 
 **Export Apple Health data to destinations you own.**
 
-Hozz is a free and open-source iPhone and iPad app for exporting the Health data
-that Apple permits an app to read. It is being built without subscriptions,
-accounts, analytics, advertising, or a developer-operated relay.
+Hozz is a free and open-source app for exporting the Health data that Apple
+permits an app to read, to destinations you own. It is built without
+subscriptions, accounts, analytics, advertising, or a developer-operated relay.
+
+There are two parts. The **iPhone app** reads Health and exports it, manually or
+automatically, to a folder, a web address, or an MQTT broker. The **Mac app**
+receives what the phone sends, keeps it in a queryable database, and can expose
+it to an AI assistant through the Model Context Protocol — locally, without the
+data passing through anyone's service.
 
 > [!IMPORTANT]
 > Hozz is an early alpha. The current iPhone build creates a real, manual,
@@ -201,7 +207,35 @@ reconciliation counts surfaced in the app rather than only in the receiver.
 Requirements:
 
 - Xcode 27 or newer
-- [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.46 or newer
+- [XcodeGen](https://github.com/yonaskolb/XcodeGen) 2.46 or newer (`brew install xcodegen`)
+
+`Hozz.xcodeproj` is generated from `project.yml` and is not committed, so
+`xcodegen generate` comes first. Anything set in Xcode's UI — a team, a
+capability — is overwritten the next time the project is regenerated, so it
+belongs in `project.yml` or in the gitignored `Local.xcconfig` instead.
+
+### The Mac app
+
+```bash
+tools/mac-build.sh
+```
+
+Builds, signs and launches it. On a first run it writes `Local.xcconfig` with a
+development team, registers the Mac as a development device, and refreshes the
+provisioning profile. Override the team with `HOZZ_TEAM=XXXXXXXXXX`, and pass
+`HOZZ_MAC_RUN=0` to build without launching.
+
+The Mac app listens on port **54330** and needs Local Network permission the
+first time — macOS asks once, and if it is refused the app keeps running while
+being silently unreachable from the phone.
+
+### The iPhone app
+
+```bash
+tools/device-build.sh          # build, sign, install on a connected iPhone
+```
+
+Override the device with `HOZZ_DEVICE=<udid>`. For the simulator:
 
 ```bash
 xcodegen generate
