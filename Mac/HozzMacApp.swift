@@ -9,7 +9,10 @@ struct HozzMacApp: App {
     @State private var startupError: String?
 
     var body: some Scene {
-        WindowGroup("Hozz") {
+        // A single `Window` rather than a `WindowGroup`. Hozz has one thing to
+        // show, and a group can be restored with zero windows — which, with no
+        // New Window command, left the app running and permanently unreachable.
+        Window("Hozz", id: "main") {
             Group {
                 if let services {
                     RootView(services: services)
@@ -22,9 +25,7 @@ struct HozzMacApp: App {
             }
             .frame(minWidth: 900, minHeight: 560)
         }
-        .commands {
-            CommandGroup(replacing: .newItem) {}
-        }
+        .defaultSize(width: 1000, height: 640)
     }
 
     private static let log = Logger(
@@ -34,9 +35,9 @@ struct HozzMacApp: App {
 
     private func bootstrap() async {
         do {
-            let services = try MacServices()
-            await services.start()
+            let services = MacServices()
             self.services = services
+            await services.start()
         } catch {
             // Logged as well as shown: a startup failure the user reports as
             // "it just doesn't work" is otherwise impossible to diagnose.
