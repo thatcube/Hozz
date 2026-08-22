@@ -12,6 +12,14 @@ public struct ExportableHealthType: Sendable {
 }
 
 public enum HealthKitTypeRegistry {
+    /// The families Hozz can read and encode losslessly today.
+    ///
+    /// Correlations are deliberately absent. Including them in the standard
+    /// authorization request crashes authorization, and querying a type that was
+    /// never authorized only produces indeterminate rows, so claiming coverage
+    /// for them would be dishonest. Their constituent quantity and category
+    /// samples are still exported individually; only the grouping edge is
+    /// missing, and it is reported as unsupported.
     public static func exportableTypes(
         operatingSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
     ) -> [ExportableHealthType] {
@@ -30,13 +38,13 @@ public enum HealthKitTypeRegistry {
                 objectType = HKObjectType.categoryType(
                     forIdentifier: HKCategoryTypeIdentifier(rawValue: entry.key.rawValue)
                 )
-            case .correlation:
-                objectType = HKObjectType.correlationType(
-                    forIdentifier: HKCorrelationTypeIdentifier(rawValue: entry.key.rawValue)
-                )
             case .workout:
                 objectType = HKObjectType.workoutType()
-            case .characteristic, .clinical, .document, .scoredAssessment:
+            case .correlation,
+                 .characteristic,
+                 .clinical,
+                 .document,
+                 .scoredAssessment:
                 objectType = nil
             }
 
@@ -54,13 +62,12 @@ public enum HealthKitTypeRegistry {
         }
     }
 
+    /// Every exportable type is requested. A type Hozz reads but never asks for
+    /// can only ever report an indeterminate result, so the two sets are kept
+    /// identical by construction.
     public static func authorizationReadTypes(
         operatingSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
     ) -> Set<HKObjectType> {
-        Set(
-            exportableTypes(operatingSystem: operatingSystem)
-                .filter { $0.catalogEntry.family != .correlation }
-                .map(\.sampleType)
-        )
+        Set(exportableTypes(operatingSystem: operatingSystem).map(\.sampleType))
     }
 }

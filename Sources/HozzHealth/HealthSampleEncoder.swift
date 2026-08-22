@@ -80,6 +80,28 @@ public struct HealthSampleEncoder: Sendable {
         )
     }
 
+    /// Records a sample Hozz could not encode losslessly.
+    ///
+    /// The record is written into the export in the sample's place so the
+    /// output never silently omits an object HealthKit returned.
+    public func encodeEncodingFailure(
+        id: UUID,
+        typeIdentifier: String,
+        message: String
+    ) throws -> Data {
+        let object: [String: Any] = [
+            "kind": "sampleEncodingError",
+            "id": id.uuidString.lowercased(),
+            "type": typeIdentifier,
+            "message": message,
+            "schemaVersion": 1
+        ]
+        return try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+    }
+
     private func baseObject(
         sample: HKSample,
         catalogEntry: HealthCatalogEntry

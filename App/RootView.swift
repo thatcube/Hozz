@@ -3,6 +3,7 @@ import SwiftUI
 
 struct RootView: View {
     @State private var model: ExportViewModel
+    @Environment(\.scenePhase) private var scenePhase
     private let healthDataAvailable: Bool
 
     init(healthDataAvailable: Bool = HealthKitAvailability.isAvailable) {
@@ -18,28 +19,42 @@ struct RootView: View {
                     healthDataAvailable: healthDataAvailable,
                     isRequestingAccess: model.isWorking,
                     exportFormat: model.exportFormat,
+                    resumable: model.resumable,
                     selectExportFormat: model.selectExportFormat,
-                    exportAction: model.exportNow
+                    exportAction: model.exportNow,
+                    discardAction: model.discardResumableRun
                 )
             case .exporting(let presentation):
                 ExportSessionView(
                     presentation: presentation,
-                    exportFormat: model.exportFormat
+                    exportFormat: model.exportFormat,
+                    pauseAction: model.pause
+                )
+            case .paused(let pause):
+                ExportPausedView(
+                    pause: pause,
+                    resumeAction: model.exportNow,
+                    discardAction: model.discardResumableRun
                 )
             case .ready(let result):
                 ExportReadyView(
                     result: result,
                     newExportAction: model.prepareNewExport
                 )
-            case .failed(let message, let partialFileURL):
+            case .failed(let message):
                 ExportFailureView(
                     message: message,
-                    partialFileURL: partialFileURL,
                     tryAgainAction: model.prepareNewExport
                 )
             }
         }
         .tint(HozzPalette.action)
+        .task {
+            await model.prepare()
+        }
+        .onChange(of: scenePhase) { _, phase in
+            model.handleScenePhase(phase)
+        }
     }
 }
 
@@ -47,8 +62,10 @@ private struct ExportSetupView: View {
     let healthDataAvailable: Bool
     let isRequestingAccess: Bool
     let exportFormat: HealthExportFormat
+    let resumable: ExportViewModel.ResumableSummary?
     let selectExportFormat: (HealthExportFormat) -> Void
     let exportAction: () -> Void
+    let discardAction: () -> Void
 
     var body: some View {
         Form {
@@ -61,6 +78,21 @@ private struct ExportSetupView: View {
                         systemImage: "exclamationmark.triangle.fill"
                     )
                     .foregroundStyle(.orange)
+                }
+            }
+
+            if let resumable {
+                Section("Unfinished export") {
+                    Label(
+                        "\(resumable.recordCount.formatted()) records are already saved. Exporting continues from there.",
+                        systemImage: "arrow.clockwise"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                    Button("Discard unfinished export", role: .destructive) {
+                        discardAction()
+                    }
                 }
             }
 
@@ -79,6 +111,7 @@ private struct ExportSetupView: View {
                     Text("Raw (.ndjson)")
                         .tag(HealthExportFormat.raw)
                 }
+                .disabled(resumable != nil)
 
                 Label(
                     exportFormat == .gzip
@@ -92,10 +125,10 @@ private struct ExportSetupView: View {
 
             Section("Current coverage") {
                 CoverageRow("Quantity and category samples", available: true)
-                CoverageRow("Correlations and basic workouts", available: true)
+                CoverageRow("Basic workout records", available: true)
                 CoverageRow("Historical deletions", available: true)
                 CoverageRow(
-                    "Routes, ECG, audiograms, series, and clinical records",
+                    "Correlations, routes, ECG, audiograms, series, and clinical records",
                     available: false
                 )
             }
@@ -115,7 +148,7 @@ private struct ExportSetupView: View {
                     } else {
                         Image(systemName: "square.and.arrow.up")
                     }
-                    Text(isRequestingAccess ? "Waiting for Health access" : "Export now")
+                    Text(buttonTitle)
                         .fontWeight(.semibold)
                 }
                 .frame(maxWidth: .infinity)
@@ -128,6 +161,13 @@ private struct ExportSetupView: View {
             .padding(.vertical, 10)
             .background(.bar)
         }
+    }
+
+    private var buttonTitle: LocalizedStringKey {
+        if isRequestingAccess {
+            return "Waiting for Health access"
+        }
+        return resumable == nil ? "Export now" : "Continue export"
     }
 }
 
@@ -172,6 +212,7 @@ private struct CoverageRow: View {
 private struct ExportSessionView: View {
     let presentation: ExportViewModel.ProgressPresentation
     let exportFormat: HealthExportFormat
+    let pauseAction: () -> Void
 
     var body: some View {
         VStack(spacing: 0) {
@@ -187,6 +228,11 @@ private struct ExportSessionView: View {
         .background(Color(uiColor: .systemGroupedBackground))
         .navigationTitle("Exporting")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button("Pause", role: .cancel, action: pauseAction)
+            }
+        }
         .safeAreaInset(edge: .bottom) {
             TimelineView(.periodic(from: .now, by: 1)) { context in
                 ExportSessionSummary(
@@ -335,6 +381,9 @@ private struct ExportStepRow: View {
         case .completed:
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(.green)
+        case .indeterminate:
+            Image(systemName: "questionmark.circle.fill")
+                .foregroundStyle(.secondary)
         case .failed:
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -346,9 +395,9 @@ private struct ExportStepRow: View {
         case .exporting:
             "\(step.recordCount.formatted()) records · \(durationLabel(currentTypeElapsed))"
         case .completed:
-            step.recordCount == 0
-                ? "No records returned"
-                : "\(step.recordCount.formatted()) records"
+            "\(step.recordCount.formatted()) records"
+        case .indeterminate:
+            "No records returned — denied or empty"
         case .failed:
             "Could not finish this data type"
         }
@@ -453,6 +502,69 @@ private struct SummaryMetric: View {
     }
 }
 
+private struct ExportPausedView: View {
+    let pause: HealthExportPause
+    let resumeAction: () -> Void
+    let discardAction: () -> Void
+
+    var body: some View {
+        VStack(spacing: 24) {
+            Spacer()
+
+            Image(systemName: icon)
+                .font(.system(size: 64))
+                .foregroundStyle(HozzPalette.action)
+
+            VStack(spacing: 8) {
+                Text("Export paused")
+                    .font(.largeTitle.bold())
+                Text(message)
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(
+                "\(pause.recordCount.formatted()) records are saved. "
+                + "Continuing picks up where this left off, with no duplicates."
+            )
+            .font(.footnote)
+            .multilineTextAlignment(.center)
+            .foregroundStyle(.secondary)
+
+            Button(action: resumeAction) {
+                Label("Continue export", systemImage: "play.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+
+            Button("Discard", role: .destructive, action: discardAction)
+
+            Spacer()
+        }
+        .padding(24)
+        .navigationTitle("Hozz")
+    }
+
+    private var icon: String {
+        switch pause.reason {
+        case .deviceLocked:
+            "lock.fill"
+        case .checkpointed:
+            "pause.circle.fill"
+        }
+    }
+
+    private var message: LocalizedStringKey {
+        switch pause.reason {
+        case .deviceLocked:
+            "Health is locked. Unlock this iPhone and Hozz will continue."
+        case .checkpointed:
+            "Hozz saved its progress so nothing has to be read twice."
+        }
+    }
+}
+
 private struct ExportReadyView: View {
     let result: HealthExportResult
     let newExportAction: () -> Void
@@ -504,6 +616,10 @@ private struct ExportReadyView: View {
                             value: result.sampleEncodingErrorCount.formatted()
                         )
                     }
+
+                    if result.wasResumed {
+                        LabeledContent("Resumed", value: "Yes")
+                    }
                 }
                 .font(.subheadline)
                 .padding(.top, 8)
@@ -536,7 +652,6 @@ private struct ExportReadyView: View {
 
 private struct ExportFailureView: View {
     let message: String
-    let partialFileURL: URL?
     let tryAgainAction: () -> Void
 
     var body: some View {
@@ -545,11 +660,8 @@ private struct ExportFailureView: View {
         } description: {
             Text(message)
         } actions: {
-            if let partialFileURL {
-                ShareLink("Save partial export", item: partialFileURL)
-                    .buttonStyle(.borderedProminent)
-            }
             Button("Try again", action: tryAgainAction)
+                .buttonStyle(.borderedProminent)
         }
         .navigationTitle("Hozz")
     }

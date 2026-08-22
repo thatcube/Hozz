@@ -1,6 +1,8 @@
 import Foundation
 import HozzHealth
+import HozzStore
 import Observation
+import SwiftUI
 
 @MainActor
 @Observable
@@ -21,33 +23,58 @@ final class ExportViewModel {
         let estimateCapturedAt: Date?
     }
 
-    enum State {
-        case idle
-        case requestingAccess
-        case exporting(ProgressPresentation)
-        case ready(HealthExportResult)
-        case failed(String, partialFileURL: URL?)
+    struct ResumableSummary: Equatable {
+        let runID: UUID
+        let recordCount: Int
+        let startedAt: Date
     }
 
-    private let exporter: HealthKitManualExporter
-    private(set) var state: State = .idle
+    enum State {
+        case idle(resumable: ResumableSummary?)
+        case requestingAccess
+        case exporting(ProgressPresentation)
+        case paused(HealthExportPause)
+        case ready(HealthExportResult)
+        case failed(String)
+    }
+
+    private(set) var state: State = .idle(resumable: nil)
     private(set) var exportFormat: HealthExportFormat = .gzip
+
+    @ObservationIgnored private var exporter: HealthKitManualExporter?
+    @ObservationIgnored private var exportTask: Task<Void, Never>?
+    @ObservationIgnored private let activityGuard = ExportActivityGuard()
+    @ObservationIgnored private let makeExporter: @Sendable () throws -> HealthKitManualExporter
     @ObservationIgnored private var exportStartedAt: Date?
     @ObservationIgnored private var currentTypeStartedAt: Date?
     @ObservationIgnored private var currentTypeIdentifier: String?
     @ObservationIgnored private var exportSteps: [ExportStep] = []
+    /// Distinguishes a pause the user asked for from one iOS forced on us. Only
+    /// the latter resumes automatically when the app returns to the foreground.
+    @ObservationIgnored private var pauseWasRequestedByUser = false
 
-    init(exporter: HealthKitManualExporter = HealthKitManualExporter()) {
-        self.exporter = exporter
+    init(
+        makeExporter: @escaping @Sendable () throws -> HealthKitManualExporter = {
+            try HealthKitManualExporter.makeDefault()
+        }
+    ) {
+        self.makeExporter = makeExporter
     }
 
     var isWorking: Bool {
         switch state {
         case .requestingAccess, .exporting:
             true
-        case .idle, .ready, .failed:
+        case .idle, .paused, .ready, .failed:
             false
         }
+    }
+
+    var isExporting: Bool {
+        if case .exporting = state {
+            return true
+        }
+        return false
     }
 
     var result: HealthExportResult? {
@@ -57,11 +84,67 @@ final class ExportViewModel {
         return result
     }
 
-    var partialFileURL: URL? {
-        guard case .failed(_, let fileURL) = state else {
+    var resumable: ResumableSummary? {
+        switch state {
+        case .idle(let resumable):
+            return resumable
+        case .paused(let pause):
+            return ResumableSummary(
+                runID: pause.runID,
+                recordCount: pause.recordCount,
+                startedAt: exportStartedAt ?? .now
+            )
+        default:
             return nil
         }
-        return fileURL
+    }
+
+    // MARK: - Lifecycle
+
+    /// Sweeps stale artifacts and surfaces any run that can still be resumed.
+    func prepare() async {
+        do {
+            let exporter = try resolveExporter()
+            try await exporter.sweepUnreferencedArtifacts()
+
+            guard case .idle = state else {
+                return
+            }
+            if let run = try await exporter.resumableRun() {
+                state = .idle(
+                    resumable: ResumableSummary(
+                        runID: run.id,
+                        recordCount: run.recordCount,
+                        startedAt: run.startedAt
+                    )
+                )
+                BackgroundExportScheduler.schedule()
+            } else {
+                state = .idle(resumable: nil)
+            }
+        } catch {
+            state = .failed(error.localizedDescription)
+        }
+    }
+
+    func handleScenePhase(_ phase: ScenePhase) {
+        switch phase {
+        case .background:
+            // The background assertion buys minutes, not hours. Checkpointing
+            // now means an export that outlives its assertion resumes from the
+            // last sealed part instead of starting over.
+            if isExporting {
+                checkpoint(requestedByUser: false)
+            }
+        case .active:
+            // A pause the user asked for stays paused; one iOS forced on us by
+            // suspending the app picks itself back up.
+            if case .paused = state, !pauseWasRequestedByUser {
+                exportNow()
+            }
+        default:
+            break
+        }
     }
 
     func selectExportFormat(_ format: HealthExportFormat) {
@@ -75,24 +158,43 @@ final class ExportViewModel {
         guard !isWorking else {
             return
         }
-        state = .idle
+        state = .idle(resumable: nil)
+        Task { await prepare() }
     }
+
+    // MARK: - Running
 
     func exportNow() {
         guard !isWorking else {
             return
         }
 
-        Task { [self] in
+        let format = exportFormat
+        let startedAt = Date.now
+        exportStartedAt = startedAt
+        currentTypeStartedAt = startedAt
+        currentTypeIdentifier = nil
+        exportSteps = []
+        pauseWasRequestedByUser = false
+
+        activityGuard.begin { [weak self] in
+            self?.checkpoint(requestedByUser: false)
+        }
+
+        exportTask = Task { [weak self] in
+            guard let self else {
+                return
+            }
+            defer {
+                self.activityGuard.end()
+                self.exportTask = nil
+            }
+
             do {
+                let exporter = try resolveExporter()
                 state = .requestingAccess
                 try await exporter.requestAuthorization()
 
-                let startedAt = Date.now
-                exportStartedAt = startedAt
-                currentTypeStartedAt = startedAt
-                currentTypeIdentifier = nil
-                exportSteps = []
                 state = .exporting(
                     ProgressPresentation(
                         export: HealthExportProgress(
@@ -112,24 +214,66 @@ final class ExportViewModel {
                         estimateCapturedAt: nil
                     )
                 )
-                let result = try await exporter.export(format: exportFormat) { progress in
+
+                let outcome = try await exporter.export(format: format) { progress in
                     await MainActor.run {
                         self.state = .exporting(self.presentation(for: progress))
                     }
                 }
-                state = .ready(result)
-            } catch is CancellationError {
-                state = .idle
-            } catch let error as HealthKitManualExporterError {
-                if case .partialExport(let fileURL, _) = error {
-                    state = .failed(error.localizedDescription, partialFileURL: fileURL)
-                } else {
-                    state = .failed(error.localizedDescription, partialFileURL: nil)
+
+                switch outcome {
+                case .completed(let result):
+                    BackgroundExportScheduler.cancel()
+                    state = .ready(result)
+                case .paused(let pause):
+                    BackgroundExportScheduler.schedule()
+                    state = .paused(pause)
                 }
             } catch {
-                state = .failed(error.localizedDescription, partialFileURL: nil)
+                state = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// Stops the export at its next safe point and keeps everything already
+    /// sealed. Nothing is discarded, so resuming costs at most one part.
+    func pause() {
+        checkpoint(requestedByUser: true)
+    }
+
+    private func checkpoint(requestedByUser: Bool) {
+        pauseWasRequestedByUser = requestedByUser
+        exportTask?.cancel()
+    }
+
+    /// Throws away a paused run and every artifact it owns.
+    func discardResumableRun() {
+        guard let resumable else {
+            return
+        }
+        state = .idle(resumable: nil)
+
+        Task { [weak self] in
+            guard let self else {
+                return
+            }
+            BackgroundExportScheduler.cancel()
+            if let exporter = try? resolveExporter() {
+                try? await exporter.discardRun(id: resumable.runID)
+            }
+            await prepare()
+        }
+    }
+
+    // MARK: - Presentation
+
+    private func resolveExporter() throws -> HealthKitManualExporter {
+        if let exporter {
+            return exporter
+        }
+        let exporter = try makeExporter()
+        self.exporter = exporter
+        return exporter
     }
 
     private func presentation(

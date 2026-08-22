@@ -4,6 +4,7 @@
 # Xcode / XcodeGen
 Hozz.xcodeproj/
 DerivedData*/
+build/
 *.xcworkspace/xcuserdata/
 *.xcodeproj/xcuserdata/
 xcuserdata/

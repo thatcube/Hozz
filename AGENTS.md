@@ -10,7 +10,10 @@ Keep this repository simple, privacy-conscious, and honest.
   unavailable, denied-or-empty, and unsupported states must remain visible.
 - `HozzHealth` is the only production module that may import HealthKit.
 - Acquisition never uses date-window watermarks. Anchors are opaque,
-  type-scoped, device-local, and committed only with durable staged data.
+  type-scoped, device-local, and committed only with durable staged data. In
+  practice that means an anchor may only advance inside the same store
+  transaction that seals the part holding its bytes; an unsealed part is
+  discarded on relaunch and its work replays.
 - Do not add a permanent local mirror of Health history without an explicit
   architecture review. The default design uses a bounded canonical spool.
 - Keep credentials device-only in Keychain and Health-derived files protected

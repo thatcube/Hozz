@@ -61,6 +61,18 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzCatalog
 
+  HozzStore:
+    templates:
+      - HozzFramework
+    sources:
+      - Sources/HozzStore
+    dependencies:
+      - target: HozzCore
+      - sdk: libsqlite3.tbd
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzStore
+
   HozzHealth:
     templates:
       - HozzFramework
@@ -68,7 +80,9 @@ targets:
       - Sources/HozzHealth
     dependencies:
       - target: HozzCore
+      - target: HozzAcquire
       - target: HozzCatalog
+      - target: HozzStore
       - sdk: HealthKit.framework
       - sdk: libz.tbd
     settings:
@@ -94,7 +108,9 @@ targets:
       - App
     dependencies:
       - target: HozzCore
+      - target: HozzAcquire
       - target: HozzCatalog
+      - target: HozzStore
       - target: HozzHealth
     settings:
       base:
@@ -142,6 +158,7 @@ targets:
       - target: HozzCore
       - target: HozzAcquire
       - target: HozzCatalog
+      - target: HozzStore
       - target: HozzHealth
       - target: HozzHealthFake
     settings:
