@@ -108,8 +108,67 @@ public enum StoreLocation {
     public static func privateSupportDirectory() throws -> URL {
         let directory = try legacySupportDirectory()
         try prepareDirectory(directory)
+        #if os(macOS)
+        adoptSandboxCounterpart(of: directory)
+        #endif
         return directory
     }
+
+    #if os(macOS)
+    /// Brings across a store written on the other side of the sandbox boundary.
+    ///
+    /// A sandboxed process resolves Application Support inside its container; an
+    /// unsandboxed one resolves the real directory. So an app that gains or
+    /// loses the sandbox silently starts again in a different place, and every
+    /// record received so far appears to have been deleted. The path is not a
+    /// user-visible choice, and nobody would think to look — so the counterpart
+    /// is found and adopted rather than left behind.
+    static func adoptSandboxCounterpart(of directory: URL) {
+        let target = databaseURL(in: directory)
+        guard !carriesUserState(at: target) else {
+            return
+        }
+        for candidate in sandboxCounterparts(of: directory) {
+            let source = databaseURL(in: candidate)
+            guard carriesUserState(at: source) else {
+                continue
+            }
+            guard checkpointWriteAheadLog(at: source) else {
+                continue
+            }
+            for stale in databaseFileURLs(for: target) {
+                try? FileManager.default.removeItem(at: stale)
+            }
+            try? FileManager.default.copyItem(at: source, to: target)
+            return
+        }
+    }
+
+    /// The same directory as this one, on the other side of the sandbox.
+    private static func sandboxCounterparts(of directory: URL) -> [URL] {
+        let path = directory.path
+        let marker = "/Library/Containers/"
+        if let range = path.range(of: marker) {
+            // Inside a container: the real directory is the part after the
+            // container's own Library prefix.
+            let tail = path[range.upperBound...]
+            guard let slash = tail.firstIndex(of: "/") else {
+                return []
+            }
+            let remainder = tail[tail.index(after: slash)...]
+                .replacingOccurrences(of: "Data/Library/", with: "Library/")
+            return [URL(fileURLWithPath: NSHomeDirectory() + "/" + remainder)]
+        }
+        // Outside a container: look in the containers of both bundle ids the
+        // Mac app has shipped under.
+        let home = NSHomeDirectory()
+        let relative = path.replacingOccurrences(of: home + "/", with: "")
+        return ["com.thatcube.Hozz.mac", "com.thatcube.Hozz"].map {
+            URL(fileURLWithPath:
+                "\(home)/Library/Containers/\($0)/Data/\(relative)")
+        }
+    }
+    #endif
 
     /// Where the store lived before the App Groups capability existed.
     public static func legacySupportDirectory() throws -> URL {
