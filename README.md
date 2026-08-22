@@ -18,6 +18,40 @@ accounts, analytics, advertising, or a developer-operated relay.
 > explicitly unsupported until their lossless encoders and device-validation
 > gates pass.
 
+## Automatic export
+
+Add a destination once and new Health data flows to it on its own.
+
+| Destination | What it is |
+| --- | --- |
+| Folder | Anywhere the Files app reaches — iCloud Drive, Dropbox, OneDrive, Google Drive, an SMB share |
+| Home Assistant | A webhook or the REST API, with a long-lived token |
+| Web address | Any endpoint you run, with idempotent batches |
+| MQTT | A broker on your network, one retained topic per metric |
+
+Each is offered as a named preset with its setup steps shown inline. Home
+Assistant and MQTT default to a payload shape those ecosystems already parse, so
+an existing dashboard or automation keeps working when pointed at Hozz.
+
+`enableBackgroundDelivery` asks iOS to activate Hozz when Health records
+something, which is what lets sync continue for months without the app being
+opened. Four limits are real and are stated in the app rather than hidden: the
+device must be unlocked for any app to read Health, iOS decides when background
+work runs, most types are capped at hourly, and force-quitting stops it until
+the app is opened again.
+
+What Hozz guarantees regardless: **nothing is lost**. Each destination has its
+own cursor and only advances it once that destination has accepted the data, so
+a missed window is simply sent next time. Tools that export "the last hour"
+cannot make that promise — a skipped window is gone and an overlapping one
+duplicates.
+
+A [receiver](receiver/) ships alongside: one dependency-free file that turns
+batches into a SQLite database, over HTTP or by watching a synced folder. The
+website repository also carries a browser viewer that turns an export into
+charts without installing anything; it is static files with no backend, so
+there is nowhere for the data to be sent even in principle.
+
 ## Product promise
 
 - No subscription, paywall, account, analytics, or data collection.
