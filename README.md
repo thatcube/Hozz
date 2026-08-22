@@ -9,9 +9,11 @@ accounts, analytics, advertising, or a developer-operated relay.
 > [!IMPORTANT]
 > Hozz is an early alpha. The current iPhone build creates a real, manual,
 > historical NDJSON export for quantity, category, correlation, and basic
-> workout records. Workout statistics, routes, ECG, audiograms, other series,
-> and clinical records remain explicitly unsupported until their lossless
-> encoders and device-validation gates pass.
+> workout records. It streams a standard `.ndjson.gz` file by default to avoid
+> a second uncompressed copy on the phone; raw `.ndjson` remains an advanced
+> option. Workout statistics, routes, ECG, audiograms, other series, and
+> clinical records remain explicitly unsupported until their lossless encoders
+> and device-validation gates pass.
 
 ## Product promise
 
@@ -131,6 +133,12 @@ Security-sensitive behavior must be proven with tests, not policy text alone.
 This includes backup exclusion for SQLite side files and spool files, Keychain
 non-synchronization, redirect isolation, deterministic encoding, and log
 redaction.
+
+Compressed exports open directly with Finder's Archive Utility or:
+
+```bash
+gunzip hozz-health-export-*.ndjson.gz
+```
 
 ## Support development
 

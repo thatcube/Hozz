@@ -1,3 +1,4 @@
+import HozzCatalog
 import HozzHealth
 import SwiftUI
 
@@ -17,6 +18,8 @@ struct RootView: View {
                         state: model.state,
                         healthDataAvailable: healthDataAvailable,
                         isWorking: model.isWorking,
+                        exportFormat: model.exportFormat,
+                        selectExportFormat: model.selectExportFormat,
                         exportAction: model.exportNow
                     )
 
@@ -44,6 +47,8 @@ private struct ExportActionCard: View {
     let state: ExportViewModel.State
     let healthDataAvailable: Bool
     let isWorking: Bool
+    let exportFormat: HealthExportFormat
+    let selectExportFormat: (HealthExportFormat) -> Void
     let exportAction: () -> Void
 
     var body: some View {
@@ -62,17 +67,55 @@ private struct ExportActionCard: View {
                     .foregroundStyle(.white.opacity(0.82))
             }
 
-            if case .exporting(let progress) = state {
-                ProgressView(
-                    value: Double(progress.completedTypes),
-                    total: Double(max(progress.totalTypes, 1))
-                )
-                .tint(.white)
-
-                Text("\(progress.recordCount) records · \(progress.completedTypes) of \(progress.totalTypes) types")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.white.opacity(0.78))
+            if case .exporting(let presentation) = state {
+                TimelineView(.periodic(from: .now, by: 1)) { context in
+                    ExportProgressDetails(
+                        presentation: presentation,
+                        now: context.date
+                    )
+                }
             }
+
+            Menu {
+                Button {
+                    selectExportFormat(.gzip)
+                } label: {
+                    Label(
+                        "Compressed NDJSON (.gz)",
+                        systemImage: exportFormat == .gzip ? "checkmark" : "archivebox"
+                    )
+                }
+
+                Button {
+                    selectExportFormat(.raw)
+                } label: {
+                    Label(
+                        "Raw NDJSON",
+                        systemImage: exportFormat == .raw ? "checkmark" : "doc.plaintext"
+                    )
+                }
+            } label: {
+                HStack(spacing: 12) {
+                    Image(systemName: exportFormat == .gzip ? "archivebox" : "doc.plaintext")
+
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(formatTitle)
+                            .font(.subheadline.weight(.semibold))
+                        Text(formatDetail)
+                            .font(.caption)
+                            .foregroundStyle(.white.opacity(0.68))
+                    }
+
+                    Spacer()
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.caption.weight(.semibold))
+                }
+                .foregroundStyle(.white)
+                .padding(.horizontal, 14)
+                .padding(.vertical, 10)
+                .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 14))
+            }
+            .disabled(isWorking)
 
             Button(action: exportAction) {
                 HStack {
@@ -113,10 +156,10 @@ private struct ExportActionCard: View {
                 : "Health data is unavailable on this device."
         case .requestingAccess:
             "Waiting for your Health access choices…"
-        case .exporting(let progress):
-            progress.currentType.isEmpty
+        case .exporting(let presentation):
+            presentation.export.currentTypeName.isEmpty
                 ? "Preparing your export…"
-                : "Reading \(progress.currentType)…"
+                : "Reading \(presentation.export.currentTypeName)…"
         case .ready(let result):
             "Created an export with \(result.recordCount) records."
         case .failed(let message, _):
@@ -136,6 +179,144 @@ private struct ExportActionCard: View {
             "Export again"
         }
     }
+
+    private var formatTitle: LocalizedStringResource {
+        switch exportFormat {
+        case .gzip:
+            "Compressed (recommended)"
+        case .raw:
+            "Raw NDJSON"
+        }
+    }
+
+    private var formatDetail: LocalizedStringResource {
+        switch exportFormat {
+        case .gzip:
+            "Usually 80–95% smaller; opens with Finder"
+        case .raw:
+            "Largest file; opens directly without decompression"
+        }
+    }
+
+}
+
+private struct ExportProgressDetails: View {
+    let presentation: ExportViewModel.ProgressPresentation
+    let now: Date
+
+    var body: some View {
+        let progress = presentation.export
+
+        VStack(alignment: .leading, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(progress.currentTypeName.isEmpty ? "Preparing export" : progress.currentTypeName)
+                    .font(.headline)
+                    .foregroundStyle(.white)
+
+                if let family = progress.currentTypeFamily {
+                    Text("\(familyLabel(family)) · \(progress.currentTypeRecordCount.formatted()) records · \(durationLabel(currentTypeElapsed)) on this type")
+                        .font(.caption.monospacedDigit())
+                        .foregroundStyle(.white.opacity(0.76))
+                }
+            }
+
+            ProgressView(
+                value: Double(progress.completedTypes),
+                total: Double(max(progress.totalTypes, 1))
+            )
+            .tint(.white)
+
+            Text("\(progress.recordCount.formatted()) records · \(progress.completedTypes) of \(progress.totalTypes) types")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.white.opacity(0.78))
+
+            HStack(spacing: 16) {
+                Label(
+                    "\(durationLabel(exportElapsed)) elapsed",
+                    systemImage: "clock"
+                )
+
+                if let estimate = remainingEstimate {
+                    Label(etaLabel(estimate), systemImage: "hourglass")
+                } else {
+                    Label("No reliable ETA yet", systemImage: "hourglass")
+                }
+            }
+            .font(.caption.monospacedDigit())
+            .foregroundStyle(.white.opacity(0.78))
+
+            Text("HealthKit does not report the total record count in advance, and some types are much larger than others.")
+                .font(.caption2)
+                .foregroundStyle(.white.opacity(0.62))
+        }
+    }
+
+    private var exportElapsed: TimeInterval {
+        max(now.timeIntervalSince(presentation.exportStartedAt), 0)
+    }
+
+    private var currentTypeElapsed: TimeInterval {
+        max(now.timeIntervalSince(presentation.currentTypeStartedAt), 0)
+    }
+
+    private var remainingEstimate: ClosedRange<TimeInterval>? {
+        guard
+            let estimate = presentation.estimatedRemainingSeconds,
+            let capturedAt = presentation.estimateCapturedAt
+        else {
+            return nil
+        }
+
+        let elapsedSinceEstimate = max(now.timeIntervalSince(capturedAt), 0)
+        let lower = max(estimate.lowerBound - elapsedSinceEstimate, 0)
+        let upper = max(estimate.upperBound - elapsedSinceEstimate, 0)
+        return upper > 0 ? lower...upper : nil
+    }
+
+    private func familyLabel(_ family: HealthTypeFamily) -> String {
+        switch family {
+        case .quantity:
+            "Quantity data"
+        case .category:
+            "Category data"
+        case .characteristic:
+            "Health characteristic"
+        case .correlation:
+            "Related samples"
+        case .clinical:
+            "Clinical record"
+        case .document:
+            "Health document"
+        case .scoredAssessment:
+            "Health assessment"
+        case .workout:
+            "Workout"
+        }
+    }
+
+    private func durationLabel(
+        _ seconds: TimeInterval,
+        rounding: FloatingPointRoundingRule = .down
+    ) -> String {
+        guard seconds >= 60 else {
+            return "<1 min"
+        }
+
+        let minutes = Int((seconds / 60).rounded(rounding))
+        guard minutes >= 60 else {
+            return "\(minutes) min"
+        }
+
+        let hours = minutes / 60
+        let remainder = minutes % 60
+        return remainder == 0 ? "\(hours) hr" : "\(hours) hr \(remainder) min"
+    }
+
+    private func etaLabel(_ estimate: ClosedRange<TimeInterval>) -> String {
+        let lower = durationLabel(estimate.lowerBound, rounding: .up)
+        let upper = durationLabel(estimate.upperBound, rounding: .up)
+        return lower == upper ? "About \(upper) left" : "\(lower)–\(upper) left"
+    }
 }
 
 private struct CompletedExportCard: View {
@@ -149,6 +330,10 @@ private struct CompletedExportCard: View {
 
             Text("\(result.recordCount) records across \(result.nonEmptyTypeCount) types that returned data.")
                 .font(.body)
+
+            Text("\(formatTitle) · \(Int64(clamping: result.fileByteCount).formatted(.byteCount(style: .file)))")
+                .font(.subheadline.monospacedDigit())
+                .foregroundStyle(.secondary)
 
             if result.zeroResultTypeCount > 0 {
                 Text("\(result.zeroResultTypeCount) types returned no records. iOS does not reveal whether those types were empty or denied.")
@@ -173,6 +358,15 @@ private struct CompletedExportCard: View {
         .padding(20)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(HozzPalette.surface, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+    }
+
+    private var formatTitle: String {
+        switch result.format {
+        case .gzip:
+            "Compressed NDJSON"
+        case .raw:
+            "Raw NDJSON"
+        }
     }
 }
 
@@ -243,4 +437,33 @@ enum HozzPalette {
 
 #Preview {
     RootView(healthDataAvailable: true)
+}
+
+#Preview("Exporting") {
+    ExportActionCard(
+        state: .exporting(
+            ExportViewModel.ProgressPresentation(
+                export: HealthExportProgress(
+                    completedTypes: 73,
+                    totalTypes: 194,
+                    recordCount: 1_042_819,
+                    currentTypeIdentifier: "HKQuantityTypeIdentifierActiveEnergyBurned",
+                    currentTypeName: "Active Energy Burned",
+                    currentTypeFamily: .quantity,
+                    currentTypeRecordCount: 614_292
+                ),
+                exportStartedAt: .now.addingTimeInterval(-184),
+                currentTypeStartedAt: .now.addingTimeInterval(-71),
+                estimatedRemainingSeconds: 132...396,
+                estimateCapturedAt: .now
+            )
+        ),
+        healthDataAvailable: true,
+        isWorking: true,
+        exportFormat: .gzip,
+        selectExportFormat: { _ in },
+        exportAction: {}
+    )
+    .padding()
+    .background(HozzPalette.canvas)
 }

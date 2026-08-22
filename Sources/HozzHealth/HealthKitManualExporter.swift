@@ -6,18 +6,27 @@ public struct HealthExportProgress: Equatable, Sendable {
     public let completedTypes: Int
     public let totalTypes: Int
     public let recordCount: Int
-    public let currentType: String
+    public let currentTypeIdentifier: String
+    public let currentTypeName: String
+    public let currentTypeFamily: HealthTypeFamily?
+    public let currentTypeRecordCount: Int
 
     public init(
         completedTypes: Int,
         totalTypes: Int,
         recordCount: Int,
-        currentType: String
+        currentTypeIdentifier: String,
+        currentTypeName: String,
+        currentTypeFamily: HealthTypeFamily?,
+        currentTypeRecordCount: Int
     ) {
         self.completedTypes = completedTypes
         self.totalTypes = totalTypes
         self.recordCount = recordCount
-        self.currentType = currentType
+        self.currentTypeIdentifier = currentTypeIdentifier
+        self.currentTypeName = currentTypeName
+        self.currentTypeFamily = currentTypeFamily
+        self.currentTypeRecordCount = currentTypeRecordCount
     }
 }
 
@@ -30,6 +39,8 @@ public struct HealthExportResult: Equatable, Sendable {
     public let zeroResultTypeCount: Int
     public let failedTypeCount: Int
     public let sampleEncodingErrorCount: Int
+    public let fileByteCount: UInt64
+    public let format: HealthExportFormat
 
     public init(
         fileURL: URL,
@@ -39,7 +50,9 @@ public struct HealthExportResult: Equatable, Sendable {
         catalogTypeCount: Int,
         zeroResultTypeCount: Int,
         failedTypeCount: Int,
-        sampleEncodingErrorCount: Int
+        sampleEncodingErrorCount: Int,
+        fileByteCount: UInt64,
+        format: HealthExportFormat
     ) {
         self.fileURL = fileURL
         self.recordCount = recordCount
@@ -49,6 +62,8 @@ public struct HealthExportResult: Equatable, Sendable {
         self.zeroResultTypeCount = zeroResultTypeCount
         self.failedTypeCount = failedTypeCount
         self.sampleEncodingErrorCount = sampleEncodingErrorCount
+        self.fileByteCount = fileByteCount
+        self.format = format
     }
 }
 
@@ -128,6 +143,7 @@ public actor HealthKitManualExporter {
     }
 
     public func export(
+        format: HealthExportFormat = .gzip,
         progress: @escaping @Sendable (HealthExportProgress) async -> Void
     ) async throws -> HealthExportResult {
         guard HKHealthStore.isHealthDataAvailable() else {
@@ -135,8 +151,13 @@ public actor HealthKitManualExporter {
         }
 
         let types = HealthKitTypeRegistry.exportableTypes()
-        let fileURL = try makeExportFile()
-        let handle = try FileHandle(forWritingTo: fileURL)
+        let fileURL = try makeExportFile(format: format)
+        let output: any ExportOutput = switch format {
+        case .gzip:
+            try GzipExportOutput(fileURL: fileURL)
+        case .raw:
+            try RawExportOutput(fileURL: fileURL)
+        }
         var totalRecords = 0
         var zeroResultTypes = 0
         var nonEmptyTypes = 0
@@ -154,7 +175,7 @@ public actor HealthKitManualExporter {
                     "attemptedTypes": types.count,
                     "catalogTypes": HealthTypeCatalog.entries.count
                 ],
-                to: handle
+                to: output
             )
 
             for (index, type) in types.enumerated() {
@@ -163,9 +184,20 @@ public actor HealthKitManualExporter {
                 var typeWrittenRecords = 0
                 var typeObservedRecords = 0
                 var typeEncodingErrors = 0
+                await progress(
+                    HealthExportProgress(
+                        completedTypes: index,
+                        totalTypes: types.count,
+                        recordCount: totalRecords,
+                        currentTypeIdentifier: type.catalogEntry.key.rawValue,
+                        currentTypeName: type.catalogEntry.displayName,
+                        currentTypeFamily: type.catalogEntry.family,
+                        currentTypeRecordCount: 0
+                    )
+                )
 
                 do {
-                    stats = try await export(type: type, to: handle) { batch in
+                    stats = try await export(type: type, to: output) { batch in
                         totalRecords += batch.writtenRecords
                         typeWrittenRecords += batch.writtenRecords
                         typeObservedRecords += batch.observedRecords
@@ -176,7 +208,10 @@ public actor HealthKitManualExporter {
                                 completedTypes: index,
                                 totalTypes: types.count,
                                 recordCount: totalRecords,
-                                currentType: type.catalogEntry.key.rawValue
+                                currentTypeIdentifier: type.catalogEntry.key.rawValue,
+                                currentTypeName: type.catalogEntry.displayName,
+                                currentTypeFamily: type.catalogEntry.family,
+                                currentTypeRecordCount: typeWrittenRecords
                             )
                         )
                     }
@@ -196,14 +231,17 @@ public actor HealthKitManualExporter {
                             "observedRecords": typeObservedRecords,
                             "encodingErrors": typeEncodingErrors
                         ],
-                        to: handle
+                        to: output
                     )
                     await progress(
                         HealthExportProgress(
                             completedTypes: index + 1,
                             totalTypes: types.count,
                             recordCount: totalRecords,
-                            currentType: type.catalogEntry.key.rawValue
+                            currentTypeIdentifier: type.catalogEntry.key.rawValue,
+                            currentTypeName: type.catalogEntry.displayName,
+                            currentTypeFamily: type.catalogEntry.family,
+                            currentTypeRecordCount: typeWrittenRecords
                         )
                     )
                     continue
@@ -224,14 +262,17 @@ public actor HealthKitManualExporter {
                         "encodingErrors": stats.encodingErrors,
                         "state": stats.observedRecords == 0 ? "authorizationIndeterminate" : "anchorClosed"
                     ],
-                    to: handle
+                    to: output
                 )
                 await progress(
                     HealthExportProgress(
                         completedTypes: index + 1,
                         totalTypes: types.count,
                         recordCount: totalRecords,
-                        currentType: type.catalogEntry.key.rawValue
+                        currentTypeIdentifier: type.catalogEntry.key.rawValue,
+                        currentTypeName: type.catalogEntry.displayName,
+                        currentTypeFamily: type.catalogEntry.family,
+                        currentTypeRecordCount: stats.writtenRecords
                     )
                 )
             }
@@ -248,10 +289,9 @@ public actor HealthKitManualExporter {
                     "failedTypes": failedTypes,
                     "sampleEncodingErrors": sampleEncodingErrors
                 ],
-                to: handle
+                to: output
             )
-            try handle.synchronize()
-            try handle.close()
+            let fileByteCount = try output.finish()
 
             return HealthExportResult(
                 fileURL: fileURL,
@@ -261,24 +301,33 @@ public actor HealthKitManualExporter {
                 catalogTypeCount: HealthTypeCatalog.entries.count,
                 zeroResultTypeCount: zeroResultTypes,
                 failedTypeCount: failedTypes,
-                sampleEncodingErrorCount: sampleEncodingErrors
+                sampleEncodingErrorCount: sampleEncodingErrors,
+                fileByteCount: fileByteCount,
+                format: format
             )
         } catch is CancellationError {
-            try? handle.close()
+            output.abandon()
             try? FileManager.default.removeItem(at: fileURL)
             throw CancellationError()
         } catch {
-            try? handle.close()
+            let originalError = error
+            do {
+                _ = try output.finish()
+            } catch {
+                output.abandon()
+                try? FileManager.default.removeItem(at: fileURL)
+                throw originalError
+            }
             throw HealthKitManualExporterError.partialExport(
                 fileURL: fileURL,
-                reason: error.localizedDescription
+                reason: originalError.localizedDescription
             )
         }
     }
 
     private func export(
         type: ExportableHealthType,
-        to handle: FileHandle,
+        to output: any ExportOutput,
         didWriteBatch: (BatchExportStats) async -> Void
     ) async throws -> TypeExportStats {
         var anchor: HKQueryAnchor?
@@ -296,7 +345,7 @@ public actor HealthKitManualExporter {
                 do {
                     try write(
                         encoder.encode(sample: sample, catalogEntry: type.catalogEntry),
-                        to: handle
+                        to: output
                     )
                     writtenRecords += 1
                     batchWrittenRecords += 1
@@ -310,7 +359,7 @@ public actor HealthKitManualExporter {
                             "type": type.catalogEntry.key.rawValue,
                             "message": String(describing: error)
                         ],
-                        to: handle
+                        to: output
                     )
                 }
             }
@@ -320,7 +369,7 @@ public actor HealthKitManualExporter {
                         id: deletion.uuid,
                         typeIdentifier: type.sampleType.identifier
                     ),
-                    to: handle
+                    to: output
                 )
                 writtenRecords += 1
                 batchWrittenRecords += 1
@@ -328,7 +377,7 @@ public actor HealthKitManualExporter {
 
             let batchCount = page.samples.count + page.deletions.count
             observedRecords += batchCount
-            try handle.synchronize()
+            try output.synchronize()
 
             guard let newAnchor = page.newAnchor else {
                 throw HealthKitManualExporterError.missingAnchor
@@ -383,7 +432,7 @@ public actor HealthKitManualExporter {
         }
     }
 
-    private func makeExportFile() throws -> URL {
+    private func makeExportFile(format: HealthExportFormat) throws -> URL {
         let directory = FileManager.default.temporaryDirectory
             .appending(path: "Hozz", directoryHint: .isDirectory)
         try FileManager.default.createDirectory(
@@ -400,7 +449,7 @@ public actor HealthKitManualExporter {
         }
 
         let fileURL = directory.appending(
-            path: "hozz-health-export-\(UUID().uuidString.lowercased()).ndjson"
+            path: "hozz-health-export-\(UUID().uuidString.lowercased()).\(format.fileExtension)"
         )
         guard FileManager.default.createFile(
             atPath: fileURL.path,
@@ -417,17 +466,17 @@ public actor HealthKitManualExporter {
         return fileURL
     }
 
-    private func write(_ object: [String: Any], to handle: FileHandle) throws {
+    private func write(_ object: [String: Any], to output: any ExportOutput) throws {
         let data = try JSONSerialization.data(
             withJSONObject: object,
             options: [.sortedKeys, .withoutEscapingSlashes]
         )
-        try write(data, to: handle)
+        try write(data, to: output)
     }
 
-    private func write(_ data: Data, to handle: FileHandle) throws {
-        try handle.write(contentsOf: data)
-        try handle.write(contentsOf: Data([0x0A]))
+    private func write(_ data: Data, to output: any ExportOutput) throws {
+        try output.write(data)
+        try output.write(Data([0x0A]))
     }
 
     private func timestamp(_ date: Date) -> String {

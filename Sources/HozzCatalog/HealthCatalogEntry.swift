@@ -50,6 +50,39 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
         self.canonicalUnit = canonicalUnit
         self.isDeprecated = isDeprecated
     }
+
+    public var displayName: String {
+        var name = key.rawValue
+        let prefixes = [
+            "HKQuantityTypeIdentifier",
+            "HKCategoryTypeIdentifier",
+            "HKCharacteristicTypeIdentifier",
+            "HKCorrelationTypeIdentifier",
+            "HKClinicalTypeIdentifier",
+            "HKDocumentTypeIdentifier",
+            "HKScoredAssessmentTypeIdentifier",
+            "HKWorkoutTypeIdentifier"
+        ]
+        for prefix in prefixes where name.hasPrefix(prefix) {
+            name.removeFirst(prefix.count)
+            break
+        }
+        if name.isEmpty {
+            return family == .workout ? "Workout" : key.rawValue
+        }
+
+        return name
+            .replacingOccurrences(
+                of: #"([a-z0-9])([A-Z])"#,
+                with: "$1 $2",
+                options: .regularExpression
+            )
+            .replacingOccurrences(
+                of: #"([A-Z]+)([A-Z][a-z])"#,
+                with: "$1 $2",
+                options: .regularExpression
+            )
+    }
 }
 
 public enum HealthTypeCatalog {

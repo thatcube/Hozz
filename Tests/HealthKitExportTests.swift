@@ -1,8 +1,9 @@
 import Foundation
 import HealthKit
 import HozzCatalog
-import HozzHealth
 import XCTest
+import zlib
+@testable import HozzHealth
 
 final class HealthKitExportTests: XCTestCase {
     func testCatalogIdentifiersAreUnique() {
@@ -10,6 +11,28 @@ final class HealthKitExportTests: XCTestCase {
 
         XCTAssertGreaterThan(identifiers.count, 200)
         XCTAssertEqual(Set(identifiers).count, identifiers.count)
+    }
+
+    func testCatalogEntryCreatesReadableDisplayName() throws {
+        let entry = try XCTUnwrap(
+            HealthTypeCatalog.entriesByIdentifier[
+                "HKQuantityTypeIdentifierActiveEnergyBurned"
+            ]
+        )
+
+        XCTAssertEqual(entry.displayName, "Active Energy Burned")
+        XCTAssertEqual(
+            HealthTypeCatalog.entriesByIdentifier[
+                "HKQuantityTypeIdentifierVO2Max"
+            ]?.displayName,
+            "VO2 Max"
+        )
+        XCTAssertEqual(
+            HealthTypeCatalog.entriesByIdentifier[
+                "HKWorkoutTypeIdentifier"
+            ]?.displayName,
+            "Workout"
+        )
     }
 
     func testRegistryResolvesStepCount() {
@@ -55,5 +78,65 @@ final class HealthKitExportTests: XCTestCase {
         XCTAssertEqual(object["kind"] as? String, "quantity")
         XCTAssertEqual(quantity["unit"] as? String, "count")
         XCTAssertEqual(quantity["value"] as? Double, 12_345)
+    }
+
+    func testGzipOutputRoundTripsStreamingData() throws {
+        let source = Data(
+            String(repeating: #"{"kind":"quantity","value":12345}"# + "\n", count: 10_000).utf8
+        )
+        let fileURL = FileManager.default.temporaryDirectory
+            .appending(path: "\(UUID().uuidString).ndjson.gz")
+        defer { try? FileManager.default.removeItem(at: fileURL) }
+        XCTAssertTrue(FileManager.default.createFile(atPath: fileURL.path, contents: nil))
+
+        let output = try GzipExportOutput(fileURL: fileURL)
+        for (index, chunk) in source.chunks(ofCount: 1_024).enumerated() {
+            try output.write(Data(chunk))
+            if index.isMultiple(of: 100) {
+                try output.synchronize()
+                try output.synchronize()
+            }
+        }
+        let compressedSize = try output.finish()
+
+        XCTAssertLessThan(compressedSize, UInt64(source.count / 10))
+        XCTAssertEqual(try gunzip(fileURL), source)
+    }
+
+    private func gunzip(_ fileURL: URL) throws -> Data {
+        guard let file = gzopen(fileURL.path, "rb") else {
+            throw CocoaError(.fileReadUnknown)
+        }
+        defer { gzclose(file) }
+
+        var result = Data()
+        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
+        while true {
+            let count = gzread(file, &buffer, UInt32(buffer.count))
+            guard count >= 0 else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            guard count > 0 else {
+                return result
+            }
+            result.append(buffer, count: Int(count))
+        }
+    }
+}
+
+private extension Data {
+    func chunks(ofCount count: Int) -> AnySequence<SubSequence> {
+        AnySequence(
+            sequence(
+                state: startIndex
+            ) { index -> SubSequence? in
+                guard index < endIndex else {
+                    return nil
+                }
+                let next = Swift.min(index + count, endIndex)
+                defer { index = next }
+                return self[index..<next]
+            }
+        )
     }
 }
