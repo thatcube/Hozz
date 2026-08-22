@@ -130,6 +130,11 @@ public struct SharedReceiverStore: Sendable {
             String(decoding: encoded, as: UTF8.self),
             for: Self.machineIdentifier()
         )
+        // Records used to be written under one shared name, so every computer
+        // overwrote every other and only one could ever exist. That entry is
+        // removed on publish: leaving it would keep offering whichever machine
+        // wrote it last, including machines that have since been shut down.
+        try? credentials.delete(for: "receiver")
     }
 
     /// The computer this person has already set up, if any.
@@ -143,6 +148,11 @@ public struct SharedReceiverStore: Sendable {
     }
 
     /// Every computer this person has opened Hozz on, most recently seen first.
+    ///
+    /// Whether a computer is actually running is decided by asking it, not by
+    /// how recently it published: a record says where a machine was, never that
+    /// it is still there, and a machine that has been shut down cannot withdraw
+    /// its own record.
     public func publishedAll() -> [SharedReceiver] {
         credentials.allSecrets().values
             .compactMap { raw -> SharedReceiver? in

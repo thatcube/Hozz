@@ -18,6 +18,14 @@ struct DestinationPickerView: View {
     @State private var pairingError: String?
     @State private var browsing: BrowsingState = .idle
     @State private var known: [SharedReceiver] = []
+    /// Which computers answered when asked, and at which address.
+    ///
+    /// A published record says where a computer was, never that it is still
+    /// running — and a machine that has been shut down cannot withdraw its own
+    /// record. So each is asked directly, and one that does not answer is shown
+    /// as offline rather than offered as though tapping it would work.
+    @State private var reachable: [String: String] = [:]
+    @State private var checking = false
 
     /// Everything worth offering: what Bonjour found, plus the computer this
     /// person already set up, which may not be discoverable on this network.
@@ -121,6 +129,7 @@ struct DestinationPickerView: View {
             known = SharedReceiverStore(
                 accessGroup: SharedReceiverStore.resolvedAccessGroup()
             ).publishedAll()
+            await checkReachability()
         }
         .onDisappear { Task { await browser.stop() } }
         .alert(
@@ -159,24 +168,25 @@ struct DestinationPickerView: View {
                 emptyRow
             }
             ForEach(computers) { receiver in
+                let isOnline = isOnline(receiver)
                 Button {
                     Task { await connect(to: receiver) }
                 } label: {
                     HStack(spacing: 14) {
                         HozzIconView(.deviceDesktop, size: 26)
-                            .foregroundStyle(HozzPalette.action)
+                            .foregroundStyle(isOnline ? HozzPalette.action : .secondary)
                         VStack(alignment: .leading, spacing: 3) {
                             Text(receiver.name)
                                 .font(.body.weight(.medium))
-                                .foregroundStyle(.primary)
-                            Text("Found on this network")
+                                .foregroundStyle(isOnline ? .primary : .secondary)
+                            Text(status(for: receiver))
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                         }
                         Spacer()
                         if connecting == receiver.id {
                             ProgressView()
-                        } else {
+                        } else if isOnline {
                             HozzIconView(.chevronRight, size: 14)
                                 .foregroundStyle(.tertiary)
                         }
@@ -184,7 +194,9 @@ struct DestinationPickerView: View {
                     .padding(.vertical, 4)
                 }
                 .buttonStyle(.plain)
-                .disabled(connecting != nil)
+                // Offering a computer that cannot answer only produces a
+                // failure the user could not have avoided.
+                .disabled(connecting != nil || !isOnline)
             }
         } header: {
             Text("Your computers")
@@ -237,6 +249,42 @@ struct DestinationPickerView: View {
         }
     }
 
+    /// Asks every known computer whether it is actually running.
+    ///
+    /// Bonjour results are trusted without asking: the service was advertising
+    /// a moment ago, which is the same evidence a probe would gather.
+    private func checkReachability() async {
+        checking = true
+        defer { checking = false }
+
+        let probe = ReceiverProbe(timeout: 2)
+        var found: [String: String] = [:]
+        for computer in known {
+            if let working = await probe.firstReachable(among: computer.endpoints) {
+                found[computer.name] = working
+            }
+        }
+        reachable = found
+    }
+
+    private func isOnline(_ receiver: DiscoveredReceiver) -> Bool {
+        // Anything Bonjour just returned is live by definition.
+        if discovered.contains(where: { $0.id == receiver.id }) {
+            return true
+        }
+        return reachable[receiver.name] != nil
+    }
+
+    private func status(for receiver: DiscoveredReceiver) -> String {
+        if discovered.contains(where: { $0.id == receiver.id }) {
+            return "Found on this network"
+        }
+        if reachable[receiver.name] != nil {
+            return "Ready to connect"
+        }
+        return checking ? "Checking…" : "Offline — open Hozz on it"
+    }
+
     /// Connects to a computer and saves a ready-to-use destination.
     ///
     /// If this person's own Mac already published its token to their iCloud
@@ -259,8 +307,14 @@ struct DestinationPickerView: View {
             // this network — then everything the computer published about
             // itself. Saving an address without checking it is how a setup
             // completes happily and then times out forever.
-            var ordered = [receiver.url]
-            ordered.append(contentsOf: known.endpoints.filter { $0 != receiver.url })
+            var ordered: [String] = []
+            if let confirmed = reachable[receiver.name] {
+                ordered.append(confirmed)
+            }
+            if !ordered.contains(receiver.url) {
+                ordered.append(receiver.url)
+            }
+            ordered.append(contentsOf: known.endpoints.filter { !ordered.contains($0) })
 
             if let reachable = await ReceiverProbe().firstReachable(among: ordered) {
                 await save(name: known.name, url: reachable, token: known.token)
