@@ -84,9 +84,13 @@ public actor HealthSyncEngine {
     /// - Parameter limitTo: Types the observer flagged. Empty means check all.
     public func sync(
         limitTo dirtyTypes: Set<HealthTypeKey> = [],
+        ignoringCadence: Bool = false,
         now: Date = .now
     ) async throws -> SyncOutcome {
-        let destinations = try await delivery.dueDestinations(now: now)
+        let destinations = try await delivery.dueDestinations(
+            now: now,
+            ignoringCadence: ignoringCadence
+        )
         guard !destinations.isEmpty else {
             return .idle
         }

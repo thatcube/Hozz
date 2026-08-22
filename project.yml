@@ -73,6 +73,15 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzStore
 
+  HozzUI:
+    templates:
+      - HozzFramework
+    sources:
+      - Sources/HozzUI
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzUI
+
   HozzDeliver:
     templates:
       - HozzFramework
@@ -126,6 +135,7 @@ targets:
       - target: HozzStore
       - target: HozzDeliver
       - target: HozzHealth
+      - target: HozzUI
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.Hozz

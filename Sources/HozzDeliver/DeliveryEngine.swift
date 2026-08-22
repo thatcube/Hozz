@@ -102,12 +102,21 @@ public actor DeliveryEngine {
     }
 
     /// Destinations that are enabled, configured, and due to run.
-    public func dueDestinations(now: Date = .now) async throws -> [Destination] {
+    public func dueDestinations(
+        now: Date = .now,
+        ignoringCadence: Bool = false
+    ) async throws -> [Destination] {
         try await loadIfNeeded()
         var due: [Destination] = []
 
         for destination in cache.values.sorted(by: { $0.createdAt < $1.createdAt }) {
             guard destination.isEnabled, destination.isConfigured else {
+                continue
+            }
+            if ignoringCadence {
+                // An explicit "sync now" bypasses both the cadence and any
+                // backoff: the user is standing there asking for an answer.
+                due.append(destination)
                 continue
             }
             guard destination.cadence != .manual else {
@@ -218,6 +227,20 @@ public actor DeliveryEngine {
             )
             throw failure
         }
+    }
+
+    /// Sends a batch without touching the destination's recorded state.
+    ///
+    /// Used by the connection test, which must not look like a real delivery in
+    /// the history or move any cursor.
+    public func deliverWithoutRecording(
+        _ batch: DeliveryBatch,
+        to destination: Destination
+    ) async throws -> DeliveryReceipt {
+        guard let channel = channels[destination.kind] else {
+            throw DeliveryError.notConfigured
+        }
+        return try await channel.deliver(batch, to: destination)
     }
 
     /// The next sequence number to use for a destination.

@@ -1,8 +1,10 @@
 import HozzHealth
+import HozzUI
 import SwiftUI
 
 struct RootView: View {
     @State private var model: ExportViewModel
+    @State private var syncModel = SyncViewModel()
     @Environment(\.scenePhase) private var scenePhase
     private let healthDataAvailable: Bool
 
@@ -12,48 +14,85 @@ struct RootView: View {
     }
 
     var body: some View {
-        NavigationStack {
-            switch model.state {
-            case .idle, .requestingAccess:
-                ExportSetupView(
-                    healthDataAvailable: healthDataAvailable,
-                    isRequestingAccess: model.isWorking,
-                    exportFormat: model.exportFormat,
-                    resumable: model.resumable,
-                    selectExportFormat: model.selectExportFormat,
-                    exportAction: model.exportNow,
-                    discardAction: model.discardResumableRun
-                )
-            case .exporting(let presentation):
-                ExportSessionView(
-                    presentation: presentation,
-                    exportFormat: model.exportFormat,
-                    pauseAction: model.pause
-                )
-            case .paused(let pause):
-                ExportPausedView(
-                    pause: pause,
-                    resumeAction: model.exportNow,
-                    discardAction: model.discardResumableRun
-                )
-            case .ready(let result):
-                ExportReadyView(
-                    result: result,
-                    newExportAction: model.prepareNewExport
-                )
-            case .failed(let message):
-                ExportFailureView(
-                    message: message,
-                    tryAgainAction: model.prepareNewExport
-                )
+        TabView {
+            NavigationStack {
+                SyncDashboardView(model: syncModel)
+            }
+            .tabItem {
+                Label {
+                    Text("Automatic")
+                } icon: {
+                    Image(HozzIcon.refresh.rawValue).renderingMode(.template)
+                }
+            }
+
+            NavigationStack {
+                exportFlow
+            }
+            .tabItem {
+                Label {
+                    Text("Export")
+                } icon: {
+                    Image(HozzIcon.download.rawValue).renderingMode(.template)
+                }
+            }
+
+            NavigationStack {
+                AboutView()
+            }
+            .tabItem {
+                Label {
+                    Text("About")
+                } icon: {
+                    Image(HozzIcon.infoCircle.rawValue).renderingMode(.template)
+                }
             }
         }
         .tint(HozzPalette.action)
-        .task {
-            await model.prepare()
-        }
         .onChange(of: scenePhase) { _, phase in
             model.handleScenePhase(phase)
+            if phase == .active {
+                Task { await syncModel.load() }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var exportFlow: some View {
+        switch model.state {
+        case .idle, .requestingAccess:
+            ExportSetupView(
+                healthDataAvailable: healthDataAvailable,
+                isRequestingAccess: model.isWorking,
+                exportFormat: model.exportFormat,
+                resumable: model.resumable,
+                selectExportFormat: model.selectExportFormat,
+                exportAction: model.exportNow,
+                discardAction: model.discardResumableRun
+            )
+            .task { await model.prepare() }
+        case .exporting(let presentation):
+            ExportSessionView(
+                presentation: presentation,
+                exportFormat: model.exportFormat,
+                pauseAction: model.pause
+            )
+        case .paused(let pause):
+            ExportPausedView(
+                pause: pause,
+                resumeAction: model.exportNow,
+                discardAction: model.discardResumableRun
+            )
+        case .ready(let result):
+            ExportReadyView(
+                result: result,
+                newExportAction: model.prepareNewExport
+            )
+        case .failed(let message):
+            ExportFailureView(
+                message: message,
+                tryAgainAction: model.prepareNewExport
+            )
         }
     }
 }
@@ -208,7 +247,7 @@ private struct SetupIntroduction: View {
     }
 }
 
-private struct CoverageRow: View {
+struct CoverageRow: View {
     let title: LocalizedStringResource
     let available: Bool
 
@@ -747,7 +786,7 @@ private func durationLabel(
     return remainder == 0 ? "\(hours) hr" : "\(hours) hr \(remainder) min"
 }
 
-private enum HozzLinks {
+enum HozzLinks {
     static let source = URL(string: "https://github.com/thatcube/hozz")!
     static let sponsors = URL(string: "https://github.com/sponsors/thatcube")!
     static let developer = URL(string: "https://github.com/thatcube")!

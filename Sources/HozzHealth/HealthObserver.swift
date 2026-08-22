@@ -75,21 +75,23 @@ public actor HealthObserver {
                 sampleType: type.sampleType,
                 predicate: nil
             ) { [weak self] _, completionHandler, error in
-                if let error {
-                    Self.log.error(
-                        "Observer failed: \(error.localizedDescription, privacy: .public)"
-                    )
+                // HealthKit hands back a non-Sendable completion handler that
+                // must be called exactly once, from any queue. Boxing it lets
+                // it cross into the actor without Swift copying it.
+                let acknowledgement = ObserverAcknowledgement(completionHandler)
+                if error != nil {
+                    Self.log.error("A Health observer reported an error.")
                     // iOS still needs the acknowledgement, or it backs off.
-                    completionHandler()
+                    acknowledgement.callAsFunction()
                     return
                 }
                 Task { [weak self] in
                     await self?.handleUpdate(for: key)
                     // Acknowledging tells iOS the wake-up was handled. Doing it
-                    // only after the handler has been given the change keeps
-                    // iOS from treating the launch as wasted, without waiting
-                    // for the whole delivery to finish.
-                    completionHandler()
+                    // once the change has been recorded, rather than once the
+                    // whole delivery finishes, keeps iOS from treating the
+                    // launch as wasted while staying inside its time budget.
+                    acknowledgement.callAsFunction()
                 }
             }
             healthStore.execute(query)
@@ -157,6 +159,23 @@ public actor HealthObserver {
         let defaults = Set(HealthObserverDefaults.commonTypeIdentifiers)
         let common = types.filter { defaults.contains($0.catalogEntry.key.rawValue) }
         return Array(common.prefix(Self.maximumObservedTypes))
+    }
+}
+
+/// Carries HealthKit's completion handler across an actor hop.
+///
+/// The handler is not `Sendable` and must be invoked exactly once. The box is
+/// only ever called from the single task that owns one observer callback, so
+/// there is no concurrent access to guard.
+private final class ObserverAcknowledgement: @unchecked Sendable {
+    private let handler: HKObserverQueryCompletionHandler
+
+    init(_ handler: @escaping HKObserverQueryCompletionHandler) {
+        self.handler = handler
+    }
+
+    func callAsFunction() {
+        handler()
     }
 }
 

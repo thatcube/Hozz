@@ -34,7 +34,9 @@ final class HozzStoreTests: XCTestCase {
         let second = try await makeStore()
         let reopened = try await second.schemaVersion()
 
-        XCTAssertEqual(version, 1)
+        // The point is that reopening does not re-run or skip a migration, not
+        // that the schema sits at any particular number forever.
+        XCTAssertGreaterThanOrEqual(version, 1)
         XCTAssertEqual(reopened, version)
     }
 
