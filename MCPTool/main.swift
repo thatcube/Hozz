@@ -38,7 +38,7 @@ func resolveDirectory() -> URL {
     }
     // Only correct when the app is not sandboxed; kept as a convenience for
     // running the tool by hand.
-    guard let directory = try? StoreLocation.supportDirectory() else {
+    guard let directory = try? StoreLocation.privateSupportDirectory() else {
         fail("could not locate Hozz's data. Pass --data-dir <path>.")
     }
     return directory.appending(path: "Received", directoryHint: .isDirectory)

@@ -16,7 +16,7 @@ import os
 @MainActor
 @Observable
 final class MacServices {
-    private static let log = Logger(
+    nonisolated private static let log = Logger(
         subsystem: "com.thatcube.Hozz",
         category: "mac"
     )
@@ -71,7 +71,9 @@ final class MacServices {
     }
 
     nonisolated private static func assemble() throws -> Assembled {
-        let directory = try StoreLocation.supportDirectory()
+        // Deliberately the app's own storage rather than the app-group-aware
+        // path: see StoreLocation.privateSupportDirectory.
+        let directory = try StoreLocation.privateSupportDirectory()
             .appending(path: "Received", directoryHint: .isDirectory)
         let store = try IngestStore(directory: directory)
         let name = Host.current().localizedName ?? "This Mac"
@@ -84,9 +86,18 @@ final class MacServices {
         let shared = SharedReceiverStore(
             accessGroup: SharedReceiverStore.resolvedAccessGroup()
         )
-        try? shared.publish(
-            SharedReceiver(name: "Hozz on \(name)", token: token)
-        )
+        do {
+            try shared.publish(
+                SharedReceiver(name: "Hozz on \(name)", token: token)
+            )
+        } catch {
+            // Not fatal — the phone can still pair over the network — but it is
+            // logged, because a silent failure here looks identical to the
+            // feature working and is otherwise undiagnosable.
+            Self.log.error(
+                "Could not publish this Mac to iCloud Keychain: \(error.localizedDescription, privacy: .public)"
+            )
+        }
 
         return Assembled(
             store: store,

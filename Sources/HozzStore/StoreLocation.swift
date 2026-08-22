@@ -98,6 +98,19 @@ public enum StoreLocation {
         return directory
     }
 
+    /// Storage private to this app, never the shared app group.
+    ///
+    /// The Mac's received database is that computer's own copy of data
+    /// delivered to it, and nothing else reads it — there is no widget or
+    /// extension to share with. Resolving it through the app-group-aware path
+    /// would mean that merely enabling App Groups on the Mac later relocates
+    /// the store, and every record received so far appears to vanish.
+    public static func privateSupportDirectory() throws -> URL {
+        let directory = try legacySupportDirectory()
+        try prepareDirectory(directory)
+        return directory
+    }
+
     /// Where the store lived before the App Groups capability existed.
     public static func legacySupportDirectory() throws -> URL {
         guard let applicationSupport = FileManager.default.urls(
