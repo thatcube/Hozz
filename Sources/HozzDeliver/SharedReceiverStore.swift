@@ -93,7 +93,22 @@ public struct SharedReceiverStore: Sendable {
     public static let accessGroupSuffix = "com.thatcube.Hozz.shared"
 
     private static let service = "com.thatcube.Hozz.shared"
-    private static let account = "receiver"
+
+    /// A stable identifier for this machine.
+    ///
+    /// Records are keyed per computer, not stored under one fixed name. With a
+    /// single record the second computer a person opens Hozz on silently
+    /// replaces the first, and a computer that has been shut down goes on being
+    /// offered because nothing ever removed it.
+    public static func machineIdentifier() -> String {
+        let key = "com.thatcube.Hozz.machineIdentifier"
+        if let existing = UserDefaults.standard.string(forKey: key) {
+            return existing
+        }
+        let created = UUID().uuidString
+        UserDefaults.standard.set(created, forKey: key)
+        return created
+    }
 
     private let credentials: DestinationCredentials
 
@@ -113,7 +128,7 @@ public struct SharedReceiverStore: Sendable {
         let encoded = try JSONEncoder().encode(receiver)
         try credentials.save(
             String(decoding: encoded, as: UTF8.self),
-            for: Self.account
+            for: Self.machineIdentifier()
         )
     }
 
@@ -123,18 +138,25 @@ public struct SharedReceiverStore: Sendable {
     /// unentitled: not knowing is a normal state, and the caller has a working
     /// fallback.
     public func published() -> SharedReceiver? {
-        guard
-            let raw = try? credentials.secret(for: Self.account),
-            let data = raw.data(using: .utf8)
-        else {
-            return nil
-        }
-        return try? JSONDecoder().decode(SharedReceiver.self, from: data)
+        // Most recent first, so a phone with one computer behaves as before.
+        publishedAll().first
     }
 
-    /// Removes the shared record, so a rotated token cannot be resurrected.
+    /// Every computer this person has opened Hozz on, most recently seen first.
+    public func publishedAll() -> [SharedReceiver] {
+        credentials.allSecrets().values
+            .compactMap { raw -> SharedReceiver? in
+                guard let data = raw.data(using: .utf8) else {
+                    return nil
+                }
+                return try? JSONDecoder().decode(SharedReceiver.self, from: data)
+            }
+            .sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    /// Removes this computer's record, so a rotated token cannot be resurrected.
     public func withdraw() {
-        try? credentials.delete(for: Self.account)
+        try? credentials.delete(for: Self.machineIdentifier())
     }
 }
 

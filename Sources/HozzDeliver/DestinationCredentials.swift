@@ -105,6 +105,50 @@ public struct DestinationCredentials: Sendable {
         return String(data: found, encoding: .utf8)
     }
 
+    /// Every secret stored under this service, keyed by account.
+    ///
+    /// Needed because a person may have more than one of something — two
+    /// computers, say — and storing them under one fixed account means the
+    /// second silently replaces the first.
+    public func allSecrets() -> [String: String] {
+        var query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrSynchronizable as String: synchronizable,
+            kSecReturnAttributes as String: true,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitAll
+        ]
+        if let accessGroup {
+            query[kSecAttrAccessGroup as String] = accessGroup
+        }
+
+        var items: CFTypeRef?
+        var status = SecItemCopyMatching(query as CFDictionary, &items)
+        #if os(macOS)
+        if status == errSecMissingEntitlement {
+            query.removeValue(forKey: kSecUseDataProtectionKeychain as String)
+            status = SecItemCopyMatching(query as CFDictionary, &items)
+        }
+        #endif
+        guard status == errSecSuccess, let found = items as? [[String: Any]] else {
+            return [:]
+        }
+
+        var result: [String: String] = [:]
+        for item in found {
+            guard
+                let account = item[kSecAttrAccount as String] as? String,
+                let data = item[kSecValueData as String] as? Data,
+                let text = String(data: data, encoding: .utf8)
+            else {
+                continue
+            }
+            result[account] = text
+        }
+        return result
+    }
+
     public func delete(for key: String) throws {
         let status = withKeychain(for: key) { query in
             SecItemDelete(query as CFDictionary)

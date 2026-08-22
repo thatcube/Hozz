@@ -17,22 +17,28 @@ struct DestinationPickerView: View {
     @State private var connecting: String?
     @State private var pairingError: String?
     @State private var browsing: BrowsingState = .idle
-    @State private var known: SharedReceiver?
+    @State private var known: [SharedReceiver] = []
 
     /// Everything worth offering: what Bonjour found, plus the computer this
     /// person already set up, which may not be discoverable on this network.
     private var computers: [DiscoveredReceiver] {
         var all = discovered
-        if let known, !known.endpoints.isEmpty,
-           !all.contains(where: { known.endpoints.contains($0.url) }) {
+        // Every computer this person has opened Hozz on, not just the last one
+        // to publish. A single record meant a second computer replaced the
+        // first and only one could ever be offered.
+        for computer in known where !computer.endpoints.isEmpty {
+            guard !all.contains(where: { computer.endpoints.contains($0.url) }),
+                  !all.contains(where: { $0.name == computer.name }) else {
+                continue
+            }
             all.append(
                 DiscoveredReceiver(
-                    id: known.name,
-                    name: known.name,
+                    id: computer.name,
+                    name: computer.name,
                     // A placeholder; the working address is chosen by probing
                     // when the user taps, because which one is reachable
                     // depends entirely on where the phone is right now.
-                    url: known.endpoints[0]
+                    url: computer.endpoints[0]
                 )
             )
         }
@@ -114,7 +120,7 @@ struct DestinationPickerView: View {
             // network refuses to carry mDNS, which many do.
             known = SharedReceiverStore(
                 accessGroup: SharedReceiverStore.resolvedAccessGroup()
-            ).published()
+            ).publishedAll()
         }
         .onDisappear { Task { await browser.stop() } }
         .alert(
@@ -242,9 +248,13 @@ struct DestinationPickerView: View {
         connecting = receiver.id
         defer { connecting = nil }
 
-        if let known = SharedReceiverStore(
+        // Match the record to the computer that was tapped, rather than
+        // assuming there is only one.
+        let records = SharedReceiverStore(
             accessGroup: SharedReceiverStore.resolvedAccessGroup()
-        ).published() {
+        ).publishedAll()
+        if let known = records.first(where: { $0.name == receiver.name })
+            ?? records.first(where: { $0.endpoints.contains(receiver.url) }) {
             // Try the address Bonjour just found first — it is known good on
             // this network — then everything the computer published about
             // itself. Saving an address without checking it is how a setup
