@@ -45,6 +45,15 @@ public actor SyncCoalescer {
     private var pendingTypes: Set<HealthTypeKey> = []
     private var hasPendingRequest = false
     private var worker: Task<Void, Never>?
+    /// Identifies the worker that owns the current registration.
+    ///
+    /// `worker` alone is not enough: after a cancel-then-request, an older
+    /// drain finishing would clear the *newer* worker's slot, letting a third
+    /// drain start alongside it.
+    private var workerGeneration = 0
+    /// True while `operation` is actually executing, so nothing starts a
+    /// second pass concurrently.
+    private var isRunning = false
 
     public init(
         quietWindow: Duration = SyncCoalescer.defaultQuietWindow,
@@ -63,13 +72,7 @@ public actor SyncCoalescer {
     public func request(types: Set<HealthTypeKey> = []) {
         pendingTypes.formUnion(types)
         hasPendingRequest = true
-        guard worker == nil else {
-            // A pass is already scheduled or running. It will pick this up.
-            return
-        }
-        worker = Task { [weak self] in
-            await self?.drainRequests()
-        }
+        startWorkerIfNeeded()
     }
 
     /// Runs any outstanding request now, and waits for it to finish.
@@ -77,48 +80,86 @@ public actor SyncCoalescer {
     /// Used by the background refresh task, which has a real deadline and
     /// cannot afford the quiet window.
     public func flush() async {
-        guard hasPendingRequest else {
+        // A pass already running will observe anything still pending when it
+        // loops, so starting a second one here would only duplicate work and
+        // contend for the writer lease.
+        guard !isRunning, hasPendingRequest else {
             return
         }
-        hasPendingRequest = false
-        let types = pendingTypes
-        pendingTypes.removeAll()
-        await operation(types)
+        // Stand the scheduled worker down, or it wakes to an empty batch and
+        // runs a redundant pass after this one.
+        worker?.cancel()
+        worker = nil
+        workerGeneration += 1
+        await runPass()
+        // Anything that arrived during the pass still deserves one.
+        startWorkerIfNeeded()
     }
 
     /// Stops any scheduled pass. A pass already running is left to finish.
     public func cancel() {
         worker?.cancel()
         worker = nil
+        workerGeneration += 1
         hasPendingRequest = false
         pendingTypes.removeAll()
     }
 
     /// True while a pass is scheduled or running.
     public var isActive: Bool {
-        worker != nil
+        worker != nil || isRunning
     }
 
-    private func drainRequests() async {
-        // Clearing `worker` here rather than at every exit keeps the invariant
-        // "worker != nil means a pass is coming" true for `request`.
-        defer { worker = nil }
+    private func startWorkerIfNeeded() {
+        guard worker == nil, hasPendingRequest else {
+            return
+        }
+        workerGeneration += 1
+        let generation = workerGeneration
+        worker = Task { [weak self] in
+            await self?.drainRequests(generation: generation)
+        }
+    }
+
+    private func drainRequests(generation: Int) async {
+        defer {
+            // Only clear the registration this worker owns. A newer worker's
+            // slot must survive.
+            if workerGeneration == generation {
+                worker = nil
+            }
+        }
 
         while hasPendingRequest {
             await sleep(quietWindow)
-            if Task.isCancelled {
+            // A cancel, or a flush that took over, retires this worker.
+            if Task.isCancelled || workerGeneration != generation {
                 return
             }
-            // Claim the current batch before running, so requests arriving
-            // during the operation are seen as new work rather than folded
-            // into the pass that is already reading from the cursor.
-            hasPendingRequest = false
-            let types = pendingTypes
-            pendingTypes.removeAll()
-
-            await operation(types)
-            // Looping re-checks `hasPendingRequest`, which is set again if
-            // anything arrived while the operation was running.
+            await runPass()
         }
+    }
+
+    /// Claims the pending batch and runs exactly one pass.
+    ///
+    /// The batch is claimed *before* the operation runs, so work arriving
+    /// during a pass is treated as new rather than folded into a pass that has
+    /// already read its cursors.
+    private func runPass() async {
+        guard !isRunning else {
+            return
+        }
+        hasPendingRequest = false
+        let types = pendingTypes
+        pendingTypes.removeAll()
+
+        isRunning = true
+        // Detached from the caller's task, so cancelling a *scheduled* pass
+        // cannot tear down a pass that is already writing to the store.
+        let work = Task.detached(priority: .utility) { [operation] in
+            await operation(types)
+        }
+        await work.value
+        isRunning = false
     }
 }

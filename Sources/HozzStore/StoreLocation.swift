@@ -2,11 +2,18 @@ import Foundation
 
 public enum StoreLocationError: Error, LocalizedError, Sendable {
     case directoryUnavailable
+    case storeMovedToAppGroup
 
     public var errorDescription: String? {
         switch self {
         case .directoryUnavailable:
             "Hozz could not prepare its private storage directory."
+        case .storeMovedToAppGroup:
+            """
+            Hozz's data has moved to its shared app group, which this build \
+            cannot reach. Reinstall a build that has the App Groups capability \
+            enabled; the data is still on the device.
+            """
         }
     }
 }
@@ -46,9 +53,16 @@ public enum StoreLocation {
         guard let shared = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: appGroupIdentifier
         ) else {
-            // Falling back keeps the app fully working if the group is
-            // unavailable; only the widget loses its view of the state.
             let directory = try legacySupportDirectory()
+            // Once a migration has run, the store lives in the group container
+            // and this directory is an empty shell. Creating a store here would
+            // not "just lose the widget" — it would silently start over with no
+            // destinations and no cursors, re-exporting the user's entire
+            // history. A build that loses the entitlement is a build problem,
+            // so it fails loudly instead of destroying data quietly.
+            if hasMigrated(at: directory) {
+                throw StoreLocationError.storeMovedToAppGroup
+            }
             try prepareDirectory(directory)
             return directory
         }
@@ -125,6 +139,12 @@ public enum StoreLocation {
     /// The destination is never overwritten. If a database is already there it
     /// is the live one, and the legacy copy is stale — silently replacing it
     /// would be the same data loss in the opposite direction.
+    ///
+    /// The move is ordered so that a failure part-way through is always safe to
+    /// retry. Everything that can fail happens *before* the database itself
+    /// moves, which makes that single `moveItem` the commit point: either the
+    /// database is still in the old location and the whole migration runs again
+    /// next launch, or it is in the new one and the migration is complete.
     public static func migrateStore(from legacy: URL, to directory: URL) throws {
         let fileManager = FileManager.default
         guard legacy.standardizedFileURL != directory.standardizedFileURL,
@@ -140,6 +160,20 @@ public enum StoreLocation {
             return
         }
 
+        // Fold the write-ahead log into the database before anything moves.
+        //
+        // SQLite runs in WAL mode and iOS terminates apps without a clean
+        // close, so the log routinely holds the newest committed cursors. If it
+        // were moved as a separate file, any failure between the two moves
+        // would strand it next to a database that had already moved — and the
+        // "did the legacy database survive" check would report the migration as
+        // done forever, silently discarding those cursors.
+        guard checkpointWriteAheadLog(at: legacyDatabase) else {
+            // Better to retry on the next launch than to move a database whose
+            // most recent commits are still in a log.
+            return
+        }
+
         // A database that exists but holds nothing is not worth preserving, and
         // the real store has to be moved out from under it.
         for stale in databaseFileURLs(for: databaseURL(in: directory)) {
@@ -150,34 +184,82 @@ public enum StoreLocation {
         // works when someone else happened to create the directory is a trap.
         try prepareDirectory(directory)
 
-        // The write-ahead log holds committed transactions that are not yet in
-        // the main file, so moving the database without its side files would
-        // lose the most recent work — exactly the cursors that matter most.
-        for source in databaseFileURLs(for: legacyDatabase) {
-            guard fileManager.fileExists(atPath: source.path) else {
-                continue
-            }
-            let target = directory.appending(path: source.lastPathComponent)
-            try fileManager.moveItem(at: source, to: target)
-            try harden(target)
-        }
-
-        // Spooled parts are referenced by rows in the database that just moved,
-        // so they have to travel with it or a resumable export breaks.
+        // Spooled parts are referenced by rows in the database, so they move
+        // first: if this fails the database has not moved yet and the whole
+        // migration is retried, rather than leaving rows pointing at nothing.
         let legacySpool = legacy.appending(path: "Spool", directoryHint: .isDirectory)
         let targetSpool = directory.appending(path: "Spool", directoryHint: .isDirectory)
         if fileManager.fileExists(atPath: legacySpool.path),
            !fileManager.fileExists(atPath: targetSpool.path) {
             try fileManager.moveItem(at: legacySpool, to: targetSpool)
-            try harden(targetSpool)
+            try? harden(targetSpool)
         }
 
-        // Leaving an empty husk behind would make a later run look migratable
-        // again; anything still inside is left alone rather than deleted.
-        if let remaining = try? fileManager.contentsOfDirectory(atPath: legacy.path),
-           remaining.isEmpty {
-            try? fileManager.removeItem(at: legacy)
+        // The commit point. After the checkpoint the side files hold nothing,
+        // so this one file is the entire store.
+        let target = databaseURL(in: directory)
+        try fileManager.moveItem(at: legacyDatabase, to: target)
+
+        // Everything from here is best-effort. A failed protection-class change
+        // must not strand a store that has already moved successfully.
+        try? harden(target)
+        for leftover in databaseFileURLs(for: legacyDatabase) where leftover != legacyDatabase {
+            try? fileManager.removeItem(at: leftover)
         }
+
+        // A marker rather than deleting the directory: if a later build cannot
+        // reach the group container, this is the only way to tell "the store
+        // moved" apart from "this is a fresh install", and starting over would
+        // wipe the user's configuration and cursors.
+        try? Data(migrationMarkerContents.utf8).write(to: migrationMarker(in: legacy))
+    }
+
+    private static let migrationMarkerContents = "moved-to-app-group"
+
+    static func migrationMarker(in directory: URL) -> URL {
+        directory.appending(path: ".migrated-to-app-group")
+    }
+
+    /// Whether this location's store has already been moved into the group.
+    public static func hasMigrated(at directory: URL) -> Bool {
+        FileManager.default.fileExists(atPath: migrationMarker(in: directory).path)
+    }
+
+    /// Folds the write-ahead log into the main database file.
+    ///
+    /// Returns whether the log is now empty, so a caller can decline to move a
+    /// database whose newest commits still live somewhere else.
+    static func checkpointWriteAheadLog(at url: URL) -> Bool {
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            return false
+        }
+        // A file that is not a SQLite database has no log to fold in, and
+        // refusing to migrate it would strand it forever. Checked by header
+        // rather than by trying to open it, because SQLite opens lazily and
+        // only reports the problem later, which is indistinguishable from a
+        // real checkpoint failure.
+        guard isSQLiteDatabase(at: url) else {
+            return true
+        }
+        guard let database = try? SQLiteDatabase(url: url) else {
+            return false
+        }
+        defer { database.close() }
+        do {
+            try database.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func isSQLiteDatabase(at url: URL) -> Bool {
+        guard let handle = try? FileHandle(forReadingFrom: url) else {
+            return false
+        }
+        defer { try? handle.close() }
+        let header = (try? handle.read(upToCount: 16)) ?? Data()
+        return header == Data("SQLite format 3\u{0}".utf8)
     }
 
     public static func databaseURL(in directory: URL) -> URL {

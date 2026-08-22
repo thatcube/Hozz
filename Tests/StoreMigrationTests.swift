@@ -78,27 +78,6 @@ final class StoreMigrationTests: XCTestCase {
         )
     }
 
-    /// The write-ahead log holds committed transactions not yet folded into the
-    /// main file. Those are the newest cursor commits, so losing the log means
-    /// silently replaying data that was already delivered.
-    func testTheWriteAheadLogTravelsWithTheDatabase() throws {
-        let legacy = root.appending(path: "legacy/Hozz")
-        let shared = root.appending(path: "shared/Hozz")
-        try makeStore(
-            at: legacy,
-            databaseContents: "db",
-            walContents: "recent-commits"
-        )
-
-        try StoreLocation.migrateStore(from: legacy, to: shared)
-
-        let movedWAL = URL(
-            fileURLWithPath: StoreLocation.databaseURL(in: shared).path + "-wal"
-        )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: movedWAL.path))
-        XCTAssertEqual(try contents(of: movedWAL), "recent-commits")
-    }
-
     /// Spooled parts are referenced by rows in the database, so a resumable
     /// export breaks if they do not move with it.
     func testSpooledPartsTravelWithTheDatabase() throws {
@@ -203,6 +182,81 @@ final class StoreMigrationTests: XCTestCase {
             try? contents(of: StoreLocation.databaseURL(in: shared)),
             "stale",
             "A live shared store must survive."
+        )
+    }
+
+    /// Regression: the database used to move before its write-ahead log, so any
+    /// failure in between stranded the log — and the "did the legacy database
+    /// survive" check then reported the migration done forever, silently
+    /// discarding the newest cursors.
+    ///
+    /// The log is folded into the database first, which makes the single
+    /// database move the commit point.
+    func testTheWriteAheadLogIsFoldedInBeforeAnythingMoves() async throws {
+        let legacy = root.appending(path: "legacy/Hozz")
+        let shared = root.appending(path: "shared/Hozz")
+        try FileManager.default.createDirectory(
+            at: legacy,
+            withIntermediateDirectories: true
+        )
+
+        // Real committed state, left with an un-checkpointed log by never
+        // closing the store cleanly.
+        let store = try HozzStore(directory: legacy)
+        try await store.commit(
+            [
+                PendingAnchorCommit(
+                    type: XCTUnwrap(HealthTypeKey(rawValue: "HKQuantityTypeIdentifierStepCount")),
+                    baseAnchor: nil,
+                    anchor: AnchorToken(data: Data("cursor-in-the-log".utf8)),
+                    coverage: .anchorClosed,
+                    addedRecordCount: 7,
+                    addedObservedCount: 7,
+                    anchorClosedAt: nil,
+                    failureReason: nil
+                )
+            ],
+            scope: .global
+        )
+        await store.close()
+
+        try StoreLocation.migrateStore(from: legacy, to: shared)
+
+        XCTAssertFalse(
+            FileManager.default.fileExists(
+                atPath: StoreLocation.databaseURL(in: shared).path + "-wal"
+            ),
+            "A folded-in log must not be left beside the migrated database."
+        )
+
+        // The cursor must be readable from the migrated database alone.
+        let migrated = try HozzStore(directory: shared)
+        let anchor = try await migrated.committedAnchor(
+            scope: .global,
+            type: XCTUnwrap(HealthTypeKey(rawValue: "HKQuantityTypeIdentifierStepCount"))
+        )
+        XCTAssertEqual(
+            anchor?.data,
+            Data("cursor-in-the-log".utf8),
+            "A cursor committed to the log must survive the move."
+        )
+    }
+
+    /// Regression: after migrating, the legacy directory was deleted. A later
+    /// build that could not reach the group container then looked like a fresh
+    /// install and silently started over with no destinations and no cursors.
+    func testAMigratedLocationIsMarkedSoItIsNeverMistakenForAFreshInstall() throws {
+        let legacy = root.appending(path: "legacy/Hozz")
+        let shared = root.appending(path: "shared/Hozz")
+        try makeStore(at: legacy, databaseContents: "db")
+
+        XCTAssertFalse(StoreLocation.hasMigrated(at: legacy))
+
+        try StoreLocation.migrateStore(from: legacy, to: shared)
+
+        XCTAssertTrue(
+            StoreLocation.hasMigrated(at: legacy),
+            "A migrated location must be distinguishable from a fresh install."
         )
     }
 

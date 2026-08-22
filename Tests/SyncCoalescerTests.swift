@@ -57,6 +57,52 @@ private actor Recorder {
     }
 }
 
+/// Tracks how many passes are inside `operation` at the same time.
+private actor ConcurrencyProbe {
+    private var current = 0
+    private(set) var peak = 0
+
+    /// Returns whether this is the first pass to enter.
+    func enter() -> Bool {
+        current += 1
+        peak = max(peak, current)
+        return current == 1 && peak == 1
+    }
+
+    func leave() {
+        current -= 1
+    }
+}
+
+/// Records whether a pass observed cancellation, and lets a test await it.
+private actor Completion {
+    private(set) var wasCancelled = false
+    private var isFinished = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func markCancelled(_ cancelled: Bool) {
+        wasCancelled = cancelled
+    }
+
+    func finish() {
+        isFinished = true
+        let pending = waiters
+        waiters.removeAll()
+        for continuation in pending {
+            continuation.resume()
+        }
+    }
+
+    func wait() async {
+        if isFinished {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+}
+
 final class SyncCoalescerTests: XCTestCase {
     private func key(_ raw: String) -> HealthTypeKey {
         guard let key = HealthTypeKey(rawValue: raw) else {
@@ -200,6 +246,136 @@ final class SyncCoalescerTests: XCTestCase {
 
         let runCount = await recorder.runCount
         XCTAssertEqual(runCount, 0)
+    }
+
+    /// Regression: `cancel()` used to clear the worker slot while a pass was
+    /// still running, so the next request started a second pass alongside it —
+    /// exactly the concurrent writer contention this type prevents.
+    func testCancelDuringAPassDoesNotAllowAConcurrentPass() async {
+        let quietWindow = Gate()
+        await quietWindow.open()
+        let firstPassStarted = Gate()
+        let releaseFirstPass = Gate()
+        let concurrency = ConcurrencyProbe()
+
+        let coalescer = SyncCoalescer(
+            sleep: { _ in await quietWindow.wait() },
+            operation: { _ in
+                let isFirst = await concurrency.enter()
+                if isFirst {
+                    await firstPassStarted.open()
+                    await releaseFirstPass.wait()
+                }
+                await concurrency.leave()
+            }
+        )
+
+        await coalescer.request(types: [key("stepCount")])
+        await firstPassStarted.wait()
+        await coalescer.cancel()
+        await coalescer.request(types: [key("heartRate")])
+        for _ in 0..<20 {
+            await Task.yield()
+        }
+        await releaseFirstPass.open()
+        for _ in 0..<40 {
+            await Task.yield()
+        }
+
+        let peak = await concurrency.peak
+        XCTAssertEqual(peak, 1, "Two passes must never write at once.")
+    }
+
+    /// Regression: a pass already running was torn down by `cancel()` because
+    /// it inherited the scheduled worker's cancellation. A half-finished sync
+    /// is exactly what the durability rules exist to avoid.
+    func testCancelDoesNotAbortAPassAlreadyRunning() async {
+        let quietWindow = Gate()
+        await quietWindow.open()
+        let passStarted = Gate()
+        let releasePass = Gate()
+        let completed = Completion()
+
+        let coalescer = SyncCoalescer(
+            sleep: { _ in await quietWindow.wait() },
+            operation: { _ in
+                await passStarted.open()
+                await releasePass.wait()
+                await completed.markCancelled(Task.isCancelled)
+                await completed.finish()
+            }
+        )
+
+        await coalescer.request(types: [key("stepCount")])
+        await passStarted.wait()
+        await coalescer.cancel()
+        await releasePass.open()
+        await completed.wait()
+
+        let wasCancelled = await completed.wasCancelled
+        XCTAssertFalse(
+            wasCancelled,
+            "A pass already writing must run to completion."
+        )
+    }
+
+    /// Regression: `flush()` left the scheduled worker parked, so when the
+    /// quiet window elapsed it woke to an empty batch and ran a second,
+    /// pointless full sync.
+    func testFlushDoesNotLeaveAWorkerThatRunsARedundantPass() async {
+        let quietWindow = Gate()
+        let recorder = Recorder()
+        let coalescer = SyncCoalescer(
+            sleep: { _ in await quietWindow.wait() },
+            operation: { types in await recorder.record(types) }
+        )
+
+        await coalescer.request(types: [key("stepCount")])
+        await coalescer.flush()
+        // Release the window the scheduled worker was sleeping on.
+        await quietWindow.open()
+        for _ in 0..<40 {
+            await Task.yield()
+        }
+
+        let runs = await recorder.runs
+        XCTAssertEqual(
+            runs,
+            [[key("stepCount")]],
+            "Flushing must not leave a worker behind to run an empty pass."
+        )
+    }
+
+    /// Work arriving during a flush still has to be delivered.
+    func testFlushSchedulesAFollowUpForWorkArrivingDuringIt() async {
+        let quietWindow = Gate()
+        await quietWindow.open()
+        let passStarted = Gate()
+        let releasePass = Gate()
+        let recorder = Recorder()
+
+        let coalescer = SyncCoalescer(
+            sleep: { _ in await quietWindow.wait() },
+            operation: { types in
+                let isFirst = await recorder.runCount == 0
+                await recorder.record(types)
+                if isFirst {
+                    await passStarted.open()
+                    await releasePass.wait()
+                }
+            }
+        )
+
+        await coalescer.request(types: [key("stepCount")])
+        async let flushed: Void = coalescer.flush()
+        await passStarted.wait()
+        await coalescer.request(types: [key("heartRate")])
+        await releasePass.open()
+        await flushed
+        await recorder.waitForRuns(2)
+
+        let runs = await recorder.runs
+        XCTAssertEqual(runs.last, [key("heartRate")])
     }
 
     func testCancelPreventsAScheduledPass() async {
