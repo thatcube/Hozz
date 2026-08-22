@@ -35,7 +35,7 @@ public enum HozzStoreError: Error, LocalizedError, Equatable, Sendable {
 /// The store never holds Health sample values. It holds opaque cursors, coverage
 /// state, counts, and the bookkeeping needed to resume an interrupted export.
 public actor HozzStore {
-    private let database: SQLiteDatabase
+    let database: SQLiteDatabase
     public let directory: URL
     public let databaseURL: URL
     public let spoolDirectory: URL
@@ -137,6 +137,50 @@ public actor HozzStore {
                     """
                 )
                 try database.execute("PRAGMA user_version = 1;")
+            }
+        }
+
+        if version < 2 {
+            try database.transaction {
+                try database.execute(
+                    """
+                    CREATE TABLE destination (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        payload TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        updated_at REAL NOT NULL
+                    );
+
+                    CREATE TABLE delivery_state (
+                        destination_id TEXT PRIMARY KEY NOT NULL
+                            REFERENCES destination(id) ON DELETE CASCADE,
+                        state TEXT NOT NULL,
+                        last_attempt_at REAL,
+                        last_success_at REAL,
+                        next_attempt_at REAL,
+                        consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                        pending_batch_id TEXT,
+                        next_sequence INTEGER NOT NULL DEFAULT 0,
+                        delivered_records INTEGER NOT NULL DEFAULT 0,
+                        detail TEXT
+                    );
+
+                    CREATE TABLE delivery_receipt (
+                        destination_id TEXT NOT NULL
+                            REFERENCES destination(id) ON DELETE CASCADE,
+                        attempted_at REAL NOT NULL,
+                        record_count INTEGER NOT NULL,
+                        byte_count INTEGER NOT NULL,
+                        state TEXT NOT NULL,
+                        detail TEXT,
+                        artifact_name TEXT
+                    );
+
+                    CREATE INDEX delivery_receipt_destination
+                        ON delivery_receipt(destination_id, attempted_at DESC);
+                    """
+                )
+                try database.execute("PRAGMA user_version = 2;")
             }
         }
     }

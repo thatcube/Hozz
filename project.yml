@@ -73,6 +73,18 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzStore
 
+  HozzDeliver:
+    templates:
+      - HozzFramework
+    sources:
+      - Sources/HozzDeliver
+    dependencies:
+      - target: HozzCore
+      - target: HozzStore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzDeliver
+
   HozzHealth:
     templates:
       - HozzFramework
@@ -83,6 +95,7 @@ targets:
       - target: HozzAcquire
       - target: HozzCatalog
       - target: HozzStore
+      - target: HozzDeliver
       - sdk: HealthKit.framework
       - sdk: libz.tbd
     settings:
@@ -111,6 +124,7 @@ targets:
       - target: HozzAcquire
       - target: HozzCatalog
       - target: HozzStore
+      - target: HozzDeliver
       - target: HozzHealth
     settings:
       base:
@@ -159,6 +173,7 @@ targets:
       - target: HozzAcquire
       - target: HozzCatalog
       - target: HozzStore
+      - target: HozzDeliver
       - target: HozzHealth
       - target: HozzHealthFake
     settings:
