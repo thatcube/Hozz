@@ -726,28 +726,62 @@ public actor HealthExportEngine {
         spool: URL,
         finalURL: URL
     ) throws -> UInt64 {
-        switch format {
-        case .raw:
-            return try ExportPartJoiner.join(
-                sourceURLs: parts.map { spool.appending(path: $0.fileName) },
-                into: finalURL
-            )
+        let partURLs = parts.map { spool.appending(path: $0.fileName) }
+        let baseName = "hozz-health-export-\(run.id.uuidString.lowercased())"
 
-        case .zip:
-            let members = parts.map { part in
-                ZipMember(
-                    url: spool.appending(path: part.fileName),
-                    compressedByteCount: part.byteCount,
-                    uncompressedByteCount: part.uncompressedByteCount,
-                    crc32: part.crc32
+        if format == .raw {
+            return try ExportPartJoiner.join(sourceURLs: partURLs, into: finalURL)
+        }
+
+        let archive = try ZipStreamWriter(
+            destinationURL: finalURL,
+            modifiedAt: run.startedAt
+        )
+        do {
+            switch format {
+            case .ndjson:
+                // The parts are already deflate-compressed, so this is a copy.
+                try archive.addEntry(
+                    name: "\(baseName).ndjson",
+                    copying: parts.map { part in
+                        ZipMember(
+                            url: spool.appending(path: part.fileName),
+                            compressedByteCount: part.byteCount,
+                            uncompressedByteCount: part.uncompressedByteCount,
+                            crc32: part.crc32
+                        )
+                    }
                 )
+
+            case .csv, .json:
+                // These have to read every record back, so the spool is first
+                // inflated to a scratch file and streamed from there.
+                let plainURL = spool.appending(
+                    path: "transcode-\(UUID().uuidString.lowercased()).ndjson"
+                )
+                defer { try? FileManager.default.removeItem(at: plainURL) }
+                try ExportPartInflater.inflate(partURLs: partURLs, into: plainURL)
+
+                if format == .csv {
+                    try ExportTranscoder.writeCSV(
+                        readingFrom: plainURL,
+                        into: archive
+                    )
+                } else {
+                    try ExportTranscoder.writeJSON(
+                        readingFrom: plainURL,
+                        into: archive,
+                        entryName: "\(baseName).json"
+                    )
+                }
+
+            case .raw:
+                break
             }
-            return try ZipArchiveWriter.write(
-                members: members,
-                entryName: "hozz-health-export-\(run.id.uuidString.lowercased()).ndjson",
-                modifiedAt: run.startedAt,
-                to: finalURL
-            )
+            return try archive.finish()
+        } catch {
+            archive.abandon()
+            throw error
         }
     }
 }

@@ -96,31 +96,23 @@ private struct ExportSetupView: View {
                 }
             }
 
-            Section("File") {
+            Section("Format") {
                 Picker(
                     "Format",
                     selection: Binding(
                         get: { exportFormat },
-                        set: { format in
-                            selectExportFormat(format)
-                        }
+                        set: { selectExportFormat($0) }
                     )
                 ) {
-                    Text("Compressed (.zip)")
-                        .tag(HealthExportFormat.zip)
-                    Text("Raw (.ndjson)")
-                        .tag(HealthExportFormat.raw)
+                    Text("NDJSON").tag(HealthExportFormat.ndjson)
+                    Text("CSV").tag(HealthExportFormat.csv)
+                    Text("JSON").tag(HealthExportFormat.json)
                 }
                 .disabled(resumable != nil)
 
-                Label(
-                    exportFormat == .zip
-                        ? "Usually 80–95% smaller, and opens with a double-click."
-                        : "Raw files open directly but can be several gigabytes.",
-                    systemImage: exportFormat == .zip ? "archivebox" : "doc.plaintext"
-                )
-                .font(.footnote)
-                .foregroundStyle(.secondary)
+                Label(formatNote, systemImage: formatIcon)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
             }
 
             Section("Current coverage") {
@@ -160,6 +152,32 @@ private struct ExportSetupView: View {
             .padding(.horizontal, 20)
             .padding(.vertical, 10)
             .background(.bar)
+        }
+    }
+
+    private var formatNote: LocalizedStringKey {
+        switch exportFormat {
+        case .ndjson:
+            "One record per line. Keeps everything Health returned."
+        case .csv:
+            "A spreadsheet per data type. Drops metadata and workout details."
+        case .json:
+            "One array. Easiest to read, heaviest to open when large."
+        case .raw:
+            "Uncompressed. Can be several gigabytes."
+        }
+    }
+
+    private var formatIcon: String {
+        switch exportFormat {
+        case .ndjson:
+            "list.bullet.rectangle"
+        case .csv:
+            "tablecells"
+        case .json:
+            "curlybraces"
+        case .raw:
+            "doc.plaintext"
         }
     }
 
@@ -285,10 +303,10 @@ private struct ExportSessionHeader: View {
 
     private var formatLabel: some View {
         Label(
-            exportFormat == .zip ? "Compressed" : "Raw",
-            systemImage: exportFormat == .zip
-                ? "archivebox.fill"
-                : "doc.plaintext.fill"
+            LocalizedStringResource(stringLiteral: exportFormat.displayName),
+            systemImage: exportFormat == .raw
+                ? "doc.plaintext.fill"
+                : "archivebox.fill"
         )
         .font(.caption.weight(.medium))
         .foregroundStyle(.secondary)

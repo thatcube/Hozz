@@ -39,7 +39,7 @@ final class ExportViewModel {
     }
 
     private(set) var state: State = .idle(resumable: nil)
-    private(set) var exportFormat: HealthExportFormat = .zip
+    private(set) var exportFormat: HealthExportFormat = .ndjson
 
     @ObservationIgnored private var exporter: HealthKitManualExporter?
     @ObservationIgnored private var exportTask: Task<Void, Never>?

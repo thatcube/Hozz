@@ -101,7 +101,7 @@ final class HealthKitExportTests: XCTestCase {
 
         let stored = try Data(contentsOf: fileURL)
         let inflated = try ExportArtifactReader.inflateRaw(
-            stored + Data(ZipArchiveWriter.deflateTerminator)
+            stored + Data(ZipStreamWriter.deflateTerminator)
         )
 
         XCTAssertLessThan(summary.compressedByteCount, UInt64(source.count / 10))

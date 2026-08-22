@@ -9,8 +9,8 @@ accounts, analytics, advertising, or a developer-operated relay.
 > [!IMPORTANT]
 > Hozz is an early alpha. The current iPhone build creates a real, manual,
 > historical NDJSON export for quantity, category, and basic workout records. It
-> streams a standard `.zip` file by default to avoid a second uncompressed
-> copy on the phone; raw `.ndjson` remains an advanced option. The
+> writes a standard `.zip` holding NDJSON, CSV, or JSON, so it opens with a
+> double-click on any machine. The
 > export is resumable: it survives the screen sleeping, the app being
 > backgrounded, and the device being killed or rebooted, and it continues from
 > its last durable checkpoint instead of starting over. Correlations, workout
@@ -22,7 +22,7 @@ accounts, analytics, advertising, or a developer-operated relay.
 
 - No subscription, paywall, account, analytics, or data collection.
 - No maintainer-operated server, database, relay, or cloud dependency.
-- No Health data stored in iCloud by Hozz.
+- Nothing leaves the device until you choose a destination and confirm it.
 - Credentials remain device-only in Keychain.
 - Export destinations belong to and are configured by the user.
 - Canonical exports are versioned, streamable, and independently verifiable.
@@ -81,7 +81,7 @@ The app is split along those boundaries:
 | `HozzCanonical` | Deterministic, versioned canonical envelopes |
 | `HozzSpool` | Bounded, shared, immutable segments for multiple destinations |
 | `HozzDeliver` | Destination generations, batches, retries, receipts, and reconciliation |
-| `HozzFormats` | Explicitly lossy CSV and GPX projections |
+| `HozzFormats` | Explicitly lossy CSV and GPX projections (CSV shipped in `HozzHealth`) |
 | `HozzDiagnostics` | Local-only, redacted diagnostics |
 
 ### How an export survives being interrupted
@@ -197,7 +197,7 @@ This includes backup exclusion for SQLite side files and spool files, Keychain
 non-synchronization, redirect isolation, deterministic encoding, and log
 redaction.
 
-Compressed exports are Zip64 archives holding one NDJSON file, so they open
+Compressed exports are Zip64 archives, so they open
 with a double-click on a stock Mac and with `unzip` everywhere else. ZIP rather
 than gzip for two reasons: a resumable export produces several compressed
 segments, and gzip's uncompressed-size field is 32 bits, which wraps on the
@@ -221,3 +221,18 @@ Other projects:
 ## License
 
 [GPL-3.0 with an App Store distribution exception](LICENSE) © 2026 Brandon Moore
+
+## Export formats
+
+| Format | Shape | Notes |
+| --- | --- | --- |
+| NDJSON | One record per line | Default. Lossless, streams at any size, and assembled by copying compressed parts, so it costs nothing extra. |
+| CSV | One spreadsheet per data type | Opens in Excel or Sheets. **Explicitly lossy**: metadata, device details, and nested workout events do not fit a grid. |
+| JSON | A single array | Convenient for small exports and for feeding to other tools. A multi-million-record array is awkward for most parsers; prefer NDJSON at that size. |
+| Raw | Uncompressed NDJSON | For piping straight into something else. |
+
+The spool is always NDJSON, whichever format is chosen. That is deliberate: it
+is the representation the durability machinery is built and tested around, and
+a presentation choice should not reach into the part that has to survive a
+reboot. CSV and JSON are produced by reading that stream once at the end, so
+NDJSON keeps its zero-cost path and the other formats cost one extra pass.

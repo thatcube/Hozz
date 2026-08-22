@@ -74,7 +74,7 @@ final class ExportEngineTests: XCTestCase {
             types: [steps, heartRate]
         )
 
-        let outcome = try await engine.export(format: .zip) { _ in }
+        let outcome = try await engine.export(format: .ndjson) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The run should have completed.")
         }
@@ -101,7 +101,7 @@ final class ExportEngineTests: XCTestCase {
             types: [steps, heartRate]
         )
 
-        let outcome = try await engine.export(format: .zip) { _ in }
+        let outcome = try await engine.export(format: .ndjson) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The run should have completed.")
         }
@@ -123,7 +123,7 @@ final class ExportEngineTests: XCTestCase {
         let source = ScriptedHealthDataSource(streams: [steps: []])
         let engine = makeEngine(store: store, source: source, types: [steps])
 
-        let outcome = try await engine.export(format: .zip) { _ in }
+        let outcome = try await engine.export(format: .ndjson) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The run should have completed.")
         }
@@ -147,7 +147,7 @@ final class ExportEngineTests: XCTestCase {
         // Drain one type into an open part and then simply stop, exactly as a
         // kill or a reboot would. Nothing is sealed, so nothing is durable.
         let run = try await store.createRun(
-            format: HealthExportFormat.zip.rawValue,
+            format: HealthExportFormat.ndjson.rawValue,
             attemptedTypeCount: 2,
             catalogVersion: "test"
         )
@@ -155,7 +155,7 @@ final class ExportEngineTests: XCTestCase {
         let sink = SpooledExportSink(
             store: store,
             runID: run.id,
-            format: .zip,
+            format: .ndjson,
             spoolDirectory: spool,
             nextSequence: 0,
             totalRecordCount: 0
@@ -176,7 +176,7 @@ final class ExportEngineTests: XCTestCase {
             path: SpooledExportSink.partFileName(
                 runID: run.id,
                 sequence: 0,
-                format: .zip
+                format: .ndjson
             )
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: orphanURL.path))
@@ -187,7 +187,7 @@ final class ExportEngineTests: XCTestCase {
             source: source,
             types: [steps, heartRate]
         )
-        let outcome = try await engine.export(format: .zip) { _ in }
+        let outcome = try await engine.export(format: .ndjson) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The resumed run should have completed.")
         }
@@ -219,7 +219,7 @@ final class ExportEngineTests: XCTestCase {
         )
 
         let run = try await store.createRun(
-            format: HealthExportFormat.zip.rawValue,
+            format: HealthExportFormat.ndjson.rawValue,
             attemptedTypeCount: 2,
             catalogVersion: "test"
         )
@@ -227,7 +227,7 @@ final class ExportEngineTests: XCTestCase {
         let sink = SpooledExportSink(
             store: store,
             runID: run.id,
-            format: .zip,
+            format: .ndjson,
             spoolDirectory: spool,
             nextSequence: 0,
             totalRecordCount: 0
@@ -248,7 +248,7 @@ final class ExportEngineTests: XCTestCase {
             source: source,
             types: [steps, heartRate]
         )
-        let outcome = try await engine.export(format: .zip) { _ in }
+        let outcome = try await engine.export(format: .ndjson) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The resumed run should have completed.")
         }
@@ -281,7 +281,7 @@ final class ExportEngineTests: XCTestCase {
         )
 
         let task = Task {
-            try await engine.export(format: .zip) { progress in
+            try await engine.export(format: .ndjson) { progress in
                 if progress.currentTypeState == .completed {
                     withUnsafeCurrentTask { $0?.cancel() }
                 }
@@ -298,7 +298,7 @@ final class ExportEngineTests: XCTestCase {
         XCTAssertEqual(resumable?.id, pause.runID)
         XCTAssertEqual(resumable?.state, .paused)
 
-        let resumed = try await engine.export(format: .zip) { _ in }
+        let resumed = try await engine.export(format: .ndjson) { _ in }
         guard case .completed(let result) = resumed else {
             return XCTFail("The paused run should resume to completion.")
         }
@@ -323,7 +323,7 @@ final class ExportEngineTests: XCTestCase {
             types: [steps, heartRate]
         )
 
-        let outcome = try await engine.export(format: .zip) { _ in }
+        let outcome = try await engine.export(format: .ndjson) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("One failing type must not abort the whole run.")
         }
@@ -356,7 +356,7 @@ final class ExportEngineTests: XCTestCase {
         )
         let engine = makeEngine(store: store, source: source, types: [steps], batchSize: 1)
 
-        let outcome = try await engine.export(format: .zip) { _ in }
+        let outcome = try await engine.export(format: .ndjson) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The run should have completed.")
         }
@@ -374,7 +374,7 @@ final class ExportEngineTests: XCTestCase {
         )
         let engine = makeEngine(store: store, source: source, types: [steps])
 
-        let outcome = try await engine.export(format: .zip) { _ in }
+        let outcome = try await engine.export(format: .ndjson) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The run should have completed.")
         }
@@ -395,14 +395,14 @@ final class ExportEngineTests: XCTestCase {
         let engine = makeEngine(store: store, source: source, types: [steps])
 
         guard
-            case .completed(let first) = try await engine.export(format: .zip, progress: { _ in })
+            case .completed(let first) = try await engine.export(format: .ndjson, progress: { _ in })
         else {
             return XCTFail("The first run should have completed.")
         }
         // A second run drains nothing new, but it still produces its own
         // artifact in its own cursor space.
         guard
-            case .completed(let second) = try await engine.export(format: .zip, progress: { _ in })
+            case .completed(let second) = try await engine.export(format: .ndjson, progress: { _ in })
         else {
             return XCTFail("The second run should have completed.")
         }
@@ -429,7 +429,7 @@ final class ExportEngineTests: XCTestCase {
         let engine = makeEngine(store: store, source: source, types: [steps])
 
         guard
-            case .completed(let result) = try await engine.export(format: .zip, progress: { _ in })
+            case .completed(let result) = try await engine.export(format: .ndjson, progress: { _ in })
         else {
             return XCTFail("The run should have completed.")
         }
@@ -456,7 +456,7 @@ final class ExportEngineTests: XCTestCase {
         let engine = makeEngine(store: store, source: source, types: [steps])
 
         guard
-            case .completed(let first) = try await engine.export(format: .zip, progress: { _ in })
+            case .completed(let first) = try await engine.export(format: .ndjson, progress: { _ in })
         else {
             return XCTFail("A failing type must not abort the run.")
         }
@@ -477,7 +477,7 @@ final class ExportEngineTests: XCTestCase {
         // treating the indeterminate coverage as a finished stream.
         try await store.updateRun(id: first.runID, state: .paused)
         guard
-            case .completed(let resumed) = try await engine.export(format: .zip, progress: { _ in })
+            case .completed(let resumed) = try await engine.export(format: .ndjson, progress: { _ in })
         else {
             return XCTFail("The resumed run should have completed.")
         }
@@ -497,7 +497,7 @@ final class ExportEngineTests: XCTestCase {
         let engine = makeEngine(store: store, source: source, types: [steps])
 
         guard
-            case .completed(let first) = try await engine.export(format: .zip, progress: { _ in })
+            case .completed(let first) = try await engine.export(format: .ndjson, progress: { _ in })
         else {
             return XCTFail("A failing type must not abort the run.")
         }
@@ -527,7 +527,7 @@ final class ExportEngineTests: XCTestCase {
         let acquired = await lease.acquire()
         XCTAssertTrue(acquired, "The lease should start free.")
         do {
-            _ = try await engine.export(format: .zip) { _ in }
+            _ = try await engine.export(format: .ndjson) { _ in }
             XCTFail("A second writer must be refused.")
         } catch HealthExportEngineError.exportAlreadyRunning {
             // Expected.
@@ -535,7 +535,7 @@ final class ExportEngineTests: XCTestCase {
 
         await lease.release()
         guard
-            case .completed = try await engine.export(format: .zip, progress: { _ in })
+            case .completed = try await engine.export(format: .ndjson, progress: { _ in })
         else {
             return XCTFail("The export should run once the lease is free.")
         }
@@ -554,7 +554,7 @@ final class ExportEngineTests: XCTestCase {
         // Stand in for an assembly that wrote its archive and then died.
         let spool = await store.spoolDirectory
         let run = try await store.createRun(
-            format: HealthExportFormat.zip.rawValue,
+            format: HealthExportFormat.ndjson.rawValue,
             attemptedTypeCount: 1,
             catalogVersion: "test"
         )
@@ -569,7 +569,7 @@ final class ExportEngineTests: XCTestCase {
         )
 
         guard
-            case .completed(let result) = try await engine.export(format: .zip, progress: { _ in })
+            case .completed(let result) = try await engine.export(format: .ndjson, progress: { _ in })
         else {
             return XCTFail("The run should have completed.")
         }
@@ -590,7 +590,7 @@ final class ExportEngineTests: XCTestCase {
         let engine = makeEngine(store: store, source: source, types: [steps])
 
         guard
-            case .completed(let result) = try await engine.export(format: .zip, progress: { _ in })
+            case .completed(let result) = try await engine.export(format: .ndjson, progress: { _ in })
         else {
             return XCTFail("The run should have completed.")
         }
@@ -600,6 +600,180 @@ final class ExportEngineTests: XCTestCase {
         XCTAssertEqual(record?.state, .completed)
         XCTAssertEqual(record?.finalFileName, result.fileURL.lastPathComponent)
         XCTAssertNil(resumable)
+    }
+
+    // MARK: - Output formats
+
+    /// A realistic sample, shaped the way HealthSampleEncoder writes them.
+    private func quantitySample(
+        _ identifier: String,
+        value: Int,
+        type: HealthTypeKey
+    ) -> HealthChange {
+        let payload: [String: Any] = [
+            "kind": "quantity",
+            "schemaVersion": 1,
+            "id": UUID().uuidString.lowercased(),
+            "type": type.rawValue,
+            "startDate": "2026-01-01T00:00:00.000Z",
+            "endDate": "2026-01-01T00:01:00.000Z",
+            "quantity": ["unit": "count", "value": value, "description": "\(value) count"],
+            "source": [
+                "name": "Brandon's iPhone, \"test\"",
+                "bundleIdentifier": "com.apple.health",
+                "version": "1.0"
+            ],
+            "device": ["name": "iPhone"],
+            "metadata": ["HKWasUserEntered": ["type": "bool", "value": true]],
+            "sample": identifier
+        ]
+        return .upsert(
+            CapturedHealthObject(
+                id: UUID(),
+                type: type,
+                canonicalPayload: try! JSONSerialization.data(
+                    withJSONObject: payload,
+                    options: [.sortedKeys, .withoutEscapingSlashes]
+                )
+            )
+        )
+    }
+
+    func testCSVWritesOneSpreadsheetPerDataType() async throws {
+        let store = try makeStore()
+        let source = ScriptedHealthDataSource(
+            streams: [
+                steps: (0..<3).map { quantitySample("step-\($0)", value: $0, type: steps) },
+                heartRate: (0..<2).map { quantitySample("hr-\($0)", value: 60 + $0, type: heartRate) }
+            ]
+        )
+        let engine = makeEngine(store: store, source: source, types: [steps, heartRate])
+
+        guard
+            case .completed(let result) = try await engine.export(format: .csv, progress: { _ in })
+        else {
+            return XCTFail("The run should have completed.")
+        }
+
+        let entries = try ExportArtifactReader.readZipEntries(at: result.fileURL)
+        XCTAssertNotNil(entries["StepCount.csv"])
+        XCTAssertNotNil(entries["HeartRate.csv"])
+        XCTAssertNotNil(entries["export-log.ndjson"])
+
+        let steps = String(decoding: entries["StepCount.csv"] ?? Data(), as: UTF8.self)
+        let rows = steps.split(separator: "\n")
+        XCTAssertEqual(rows.count, 4, "A header plus three samples.")
+        XCTAssertTrue(rows[0].hasPrefix("id,type,startDate,endDate,value,unit"))
+        XCTAssertTrue(rows[1].contains("HKQuantityTypeIdentifierStepCount"))
+        XCTAssertTrue(rows[1].contains("count"))
+    }
+
+    /// A source name containing a comma and a quote has to survive, or every
+    /// column after it shifts.
+    func testCSVQuotesFieldsThatWouldBreakTheGrid() async throws {
+        let store = try makeStore()
+        let source = ScriptedHealthDataSource(
+            streams: [steps: [quantitySample("step-0", value: 1, type: steps)]]
+        )
+        let engine = makeEngine(store: store, source: source, types: [steps])
+
+        guard
+            case .completed(let result) = try await engine.export(format: .csv, progress: { _ in })
+        else {
+            return XCTFail("The run should have completed.")
+        }
+
+        let text = String(
+            decoding: try ExportArtifactReader.readZipEntries(at: result.fileURL)["StepCount.csv"] ?? Data(),
+            as: UTF8.self
+        )
+        let dataRow = text.split(separator: "\n")[1]
+
+        XCTAssertTrue(
+            dataRow.contains("\"Brandon's iPhone, \"\"test\"\"\""),
+            "A comma and quotes in a field must be escaped: \(dataRow)"
+        )
+        XCTAssertEqual(
+            dataRow.split(separator: ",", omittingEmptySubsequences: false).count > 11,
+            true
+        )
+    }
+
+    func testJSONWritesOneParsableArray() async throws {
+        let store = try makeStore()
+        let source = ScriptedHealthDataSource(
+            streams: [steps: (0..<4).map { quantitySample("step-\($0)", value: $0, type: steps) }]
+        )
+        let engine = makeEngine(store: store, source: source, types: [steps])
+
+        guard
+            case .completed(let result) = try await engine.export(format: .json, progress: { _ in })
+        else {
+            return XCTFail("The run should have completed.")
+        }
+
+        let entries = try ExportArtifactReader.readZipEntries(at: result.fileURL)
+        let payload = try XCTUnwrap(entries.values.first)
+        let parsed = try JSONSerialization.jsonObject(with: payload) as? [[String: Any]]
+        let array = try XCTUnwrap(parsed, "The whole export must parse as one array.")
+        let samples = array.compactMap { $0["sample"] as? String }
+
+        XCTAssertEqual(Set(samples), Set((0..<4).map { "step-\($0)" }))
+        XCTAssertTrue(array.contains { $0["kind"] as? String == "manifest" })
+    }
+
+    func testCSVAndNDJSONAgreeOnRecordCount() async throws {
+        let changes = (0..<9).map { quantitySample("step-\($0)", value: $0, type: steps) }
+
+        let ndjsonStore = try makeStore()
+        let ndjsonEngine = makeEngine(
+            store: ndjsonStore,
+            source: ScriptedHealthDataSource(streams: [steps: changes]),
+            types: [steps]
+        )
+        guard
+            case .completed(let ndjson) = try await ndjsonEngine.export(
+                format: .ndjson,
+                progress: { _ in }
+            )
+        else {
+            return XCTFail("The NDJSON run should have completed.")
+        }
+
+        let csvDirectory = try TemporaryDirectory()
+        let csvStore = try HozzStore(directory: csvDirectory.url.appending(path: "store"))
+        let csvEngine = HealthExportEngine(
+            store: csvStore,
+            source: ScriptedHealthDataSource(streams: [steps: changes]),
+            types: [steps],
+            batchSize: 2,
+            lease: ExportWriterLease()
+        )
+        guard
+            case .completed(let csv) = try await csvEngine.export(
+                format: .csv,
+                progress: { _ in }
+            )
+        else {
+            return XCTFail("The CSV run should have completed.")
+        }
+
+        let ndjsonSamples = try ExportArtifactReader.records(in: ndjson.fileURL)
+            .filter { $0["kind"] as? String == "quantity" }
+        let csvRows = String(
+            decoding: try ExportArtifactReader.readZipEntries(at: csv.fileURL)["StepCount.csv"] ?? Data(),
+            as: UTF8.self
+        )
+        .split(separator: "\n")
+        .dropFirst()
+
+        XCTAssertEqual(ndjsonSamples.count, 9)
+        XCTAssertEqual(
+            csvRows.count,
+            ndjsonSamples.count,
+            "A lossy projection may drop columns, never rows."
+        )
+        XCTAssertEqual(ndjson.recordCount, csv.recordCount)
     }
 
     /// A single type can hold millions of records. Reporting progress only when
@@ -614,7 +788,7 @@ final class ExportEngineTests: XCTestCase {
         let recorder = ProgressRecorder()
         guard
             case .completed = try await engine.export(
-                format: .zip,
+                format: .ndjson,
                 progress: { await recorder.record($0) }
             )
         else {
@@ -668,7 +842,7 @@ final class ExportEngineTests: XCTestCase {
         )
 
         guard
-            case .completed(let result) = try await engine.export(format: .zip, progress: { _ in })
+            case .completed(let result) = try await engine.export(format: .ndjson, progress: { _ in })
         else {
             return XCTFail("The run should have completed.")
         }

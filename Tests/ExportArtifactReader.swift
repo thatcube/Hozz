@@ -62,13 +62,13 @@ enum ExportArtifactReader {
         }
     }
 
-    /// Reads the single entry out of a Zip64 archive, verifying its CRC.
+    /// Reads every entry out of a Zip64 archive, verifying each checksum.
     ///
-    /// This parses the archive rather than trusting the writer, so a malformed
-    /// header or a bad checksum fails the test instead of shipping.
-    static func readSingleZipEntry(at fileURL: URL) throws -> Data {
+    /// This walks the central directory rather than trusting the writer, so a
+    /// bad offset, size, or CRC fails the test instead of shipping.
+    static func readZipEntries(at fileURL: URL) throws -> [String: Data] {
         let archive = try Data(contentsOf: fileURL)
-        guard archive.count > 30 else {
+        guard archive.count > 22 else {
             throw CocoaError(.fileReadCorruptFile)
         }
 
@@ -86,37 +86,75 @@ enum ExportArtifactReader {
             }
         }
 
-        guard u32(0) == 0x0403_4B50 else {
+        // Locate the Zip64 end-of-central-directory record.
+        guard let locator = (0..<archive.count - 3).reversed().first(where: {
+            u32($0) == 0x0706_4B50
+        }) else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        guard u16(8) == 8 else {
+        let zip64End = Int(u64(locator + 8))
+        guard zip64End + 56 <= archive.count, u32(zip64End) == 0x0606_4B50 else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        let storedCRC = u32(14)
-        let nameLength = Int(u16(26))
-        let extraLength = Int(u16(28))
-        let extraOffset = 30 + nameLength
+        let entryCount = Int(u64(zip64End + 32))
+        var cursor = Int(u64(zip64End + 48))
 
-        guard extraLength >= 20, u16(extraOffset) == 0x0001 else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        let uncompressedSize = u64(extraOffset + 4)
-        let compressedSize = u64(extraOffset + 12)
+        var results: [String: Data] = [:]
+        for _ in 0..<entryCount {
+            guard u32(cursor) == 0x0201_4B50 else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let storedCRC = u32(cursor + 16)
+            let nameLength = Int(u16(cursor + 28))
+            let extraLength = Int(u16(cursor + 30))
+            let commentLength = Int(u16(cursor + 32))
+            let name = String(
+                decoding: archive.subdata(in: (cursor + 46)..<(cursor + 46 + nameLength)),
+                as: UTF8.self
+            )
 
-        let dataStart = extraOffset + extraLength
-        let dataEnd = dataStart + Int(compressedSize)
-        guard dataEnd <= archive.count else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
+            let extraOffset = cursor + 46 + nameLength
+            guard extraLength >= 24, u16(extraOffset) == 0x0001 else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let uncompressedSize = u64(extraOffset + 4)
+            let compressedSize = u64(extraOffset + 12)
+            let headerOffset = Int(u64(extraOffset + 20))
 
-        let inflated = try inflateRaw(archive.subdata(in: dataStart..<dataEnd))
-        guard UInt64(inflated.count) == uncompressedSize else {
+            // Re-derive the payload position from the local header, so a wrong
+            // offset in either record is caught.
+            guard u32(headerOffset) == 0x0403_4B50 else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            let localNameLength = Int(u16(headerOffset + 26))
+            let localExtraLength = Int(u16(headerOffset + 28))
+            let dataStart = headerOffset + 30 + localNameLength + localExtraLength
+            let dataEnd = dataStart + Int(compressedSize)
+            guard dataEnd <= archive.count else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            let inflated = try inflateRaw(archive.subdata(in: dataStart..<dataEnd))
+            guard UInt64(inflated.count) == uncompressedSize else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+            guard crc32(of: inflated) == storedCRC else {
+                throw CocoaError(.fileReadCorruptFile)
+            }
+
+            results[name] = inflated
+            cursor += 46 + nameLength + extraLength + commentLength
+        }
+        return results
+    }
+
+    /// Reads the one entry a single-entry archive holds.
+    static func readSingleZipEntry(at fileURL: URL) throws -> Data {
+        let entries = try readZipEntries(at: fileURL)
+        guard entries.count == 1, let only = entries.values.first else {
             throw CocoaError(.fileReadCorruptFile)
         }
-        guard crc32(of: inflated) == storedCRC else {
-            throw CocoaError(.fileReadCorruptFile)
-        }
-        return inflated
+        return only
     }
 
     /// Parses an NDJSON export into one dictionary per line.

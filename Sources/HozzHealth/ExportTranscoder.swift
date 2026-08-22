@@ -1,0 +1,289 @@
+import Foundation
+
+/// Reads an NDJSON spool back one line at a time.
+///
+/// The spool can be gigabytes, so lines are produced from a rolling buffer
+/// rather than by loading the file.
+struct NDJSONLineReader {
+    private let handle: FileHandle
+    private let bufferSize: Int
+    private var buffer = Data()
+    private var isAtEnd = false
+
+    init(fileURL: URL, bufferSize: Int = 1 * 1_024 * 1_024) throws {
+        handle = try FileHandle(forReadingFrom: fileURL)
+        self.bufferSize = bufferSize
+    }
+
+    mutating func nextLine() throws -> Data? {
+        while true {
+            if let index = buffer.firstIndex(of: 0x0A) {
+                let line = buffer.subdata(in: buffer.startIndex..<index)
+                buffer = buffer.subdata(in: (index + 1)..<buffer.endIndex)
+                if line.isEmpty {
+                    continue
+                }
+                return line
+            }
+            guard !isAtEnd else {
+                guard !buffer.isEmpty else {
+                    return nil
+                }
+                let line = buffer
+                buffer = Data()
+                return line.isEmpty ? nil : line
+            }
+
+            let chunk = try handle.read(upToCount: bufferSize) ?? Data()
+            if chunk.isEmpty {
+                isAtEnd = true
+            } else {
+                buffer.append(chunk)
+            }
+        }
+    }
+
+    func close() {
+        try? handle.close()
+    }
+}
+
+/// Converts the NDJSON spool into the format the user asked for.
+///
+/// The spool is always NDJSON. That is deliberate: it is the format the
+/// durability machinery is built and tested around, and a presentation choice
+/// should not reach back into the part that has to survive a reboot. CSV and
+/// JSON are produced by reading that stream once at the end.
+enum ExportTranscoder {
+    /// Record kinds that describe the run rather than the user's health data.
+    private static let runRecordKinds: Set<String> = [
+        "manifest",
+        "resume",
+        "typeSummary",
+        "typeError",
+        "completion",
+        "sampleEncodingError"
+    ]
+
+    /// Writes one CSV entry per data type, plus a deletions file and the run's
+    /// own records.
+    ///
+    /// Records for a type arrive contiguously, because a type is fully drained
+    /// before the next one starts. A type that reappears anyway gets its own
+    /// numbered file rather than silently overwriting the first.
+    static func writeCSV(
+        readingFrom sourceURL: URL,
+        into archive: ZipStreamWriter
+    ) throws {
+        var reader = try NDJSONLineReader(fileURL: sourceURL)
+        defer { reader.close() }
+
+        var currentType: String?
+        var currentKind: String?
+        var seenTypes: [String: Int] = [:]
+        var deletions: [(id: String, type: String)] = []
+        var runRecords: [Data] = []
+
+        func closeEntry() throws {
+            if currentType != nil {
+                try archive.endEntry()
+                currentType = nil
+                currentKind = nil
+            }
+        }
+
+        while let line = try reader.nextLine() {
+            guard
+                let object = try JSONSerialization.jsonObject(with: line)
+                    as? [String: Any],
+                let kind = object["kind"] as? String
+            else {
+                continue
+            }
+
+            if runRecordKinds.contains(kind) {
+                runRecords.append(line)
+                continue
+            }
+            if kind == "deletion" {
+                deletions.append(
+                    (
+                        id: object["id"] as? String ?? "",
+                        type: object["type"] as? String ?? ""
+                    )
+                )
+                continue
+            }
+            guard let type = object["type"] as? String else {
+                continue
+            }
+
+            if type != currentType {
+                try closeEntry()
+                let occurrence = (seenTypes[type] ?? 0) + 1
+                seenTypes[type] = occurrence
+                let name = fileName(for: type, occurrence: occurrence)
+                try archive.beginEntry(name: name)
+                try archive.write(Data((header(for: kind) + "\n").utf8))
+                currentType = type
+                currentKind = kind
+            }
+
+            try archive.write(
+                Data((row(for: object, kind: currentKind ?? kind) + "\n").utf8)
+            )
+        }
+        try closeEntry()
+
+        if !deletions.isEmpty {
+            try archive.beginEntry(name: "deletions.csv")
+            try archive.write(Data("id,type\n".utf8))
+            for deletion in deletions {
+                try archive.write(
+                    Data("\(escape(deletion.id)),\(escape(deletion.type))\n".utf8)
+                )
+            }
+            try archive.endEntry()
+        }
+
+        try archive.beginEntry(name: "export-log.ndjson")
+        for record in runRecords {
+            try archive.write(record)
+            try archive.write(Data([0x0A]))
+        }
+        try archive.endEntry()
+    }
+
+    /// Writes the whole export as one JSON array.
+    static func writeJSON(
+        readingFrom sourceURL: URL,
+        into archive: ZipStreamWriter,
+        entryName: String
+    ) throws {
+        var reader = try NDJSONLineReader(fileURL: sourceURL)
+        defer { reader.close() }
+
+        try archive.beginEntry(name: entryName)
+        try archive.write(Data("[\n".utf8))
+
+        var isFirst = true
+        while let line = try reader.nextLine() {
+            if !isFirst {
+                try archive.write(Data(",\n".utf8))
+            }
+            try archive.write(line)
+            isFirst = false
+        }
+
+        try archive.write(Data("\n]\n".utf8))
+        try archive.endEntry()
+    }
+
+    // MARK: - CSV shaping
+
+    static func fileName(for type: String, occurrence: Int) -> String {
+        var name = type
+        for prefix in [
+            "HKQuantityTypeIdentifier",
+            "HKCategoryTypeIdentifier",
+            "HKCorrelationTypeIdentifier",
+            "HKWorkoutTypeIdentifier"
+        ] where name.hasPrefix(prefix) {
+            name.removeFirst(prefix.count)
+            break
+        }
+        if name.isEmpty {
+            name = "Workout"
+        }
+        let safe = name.filter { $0.isLetter || $0.isNumber || $0 == "_" }
+        let suffix = occurrence > 1 ? "-\(occurrence)" : ""
+        return "\(safe.isEmpty ? "Unknown" : safe)\(suffix).csv"
+    }
+
+    static func header(for kind: String) -> String {
+        switch kind {
+        case "quantity":
+            "id,type,startDate,endDate,value,unit,sourceName,sourceBundleId,sourceVersion,device,metadata"
+        case "category":
+            "id,type,startDate,endDate,value,sourceName,sourceBundleId,sourceVersion,device,metadata"
+        case "workout":
+            "id,type,startDate,endDate,activityType,duration,sourceName,sourceBundleId,sourceVersion,device,metadata"
+        default:
+            "id,type,startDate,endDate,sourceName,sourceBundleId,sourceVersion,device,metadata"
+        }
+    }
+
+    static func row(for object: [String: Any], kind: String) -> String {
+        let source = object["source"] as? [String: Any] ?? [:]
+        let device = object["device"] as? [String: Any]
+
+        var fields: [String] = [
+            object["id"] as? String ?? "",
+            object["type"] as? String ?? "",
+            object["startDate"] as? String ?? "",
+            object["endDate"] as? String ?? ""
+        ]
+
+        switch kind {
+        case "quantity":
+            let quantity = object["quantity"] as? [String: Any] ?? [:]
+            fields.append(number(quantity["value"]))
+            fields.append(quantity["unit"] as? String ?? "")
+        case "category":
+            fields.append(number(object["value"]))
+        case "workout":
+            fields.append(number(object["activityType"]))
+            fields.append(number(object["duration"]))
+        default:
+            break
+        }
+
+        fields.append(source["name"] as? String ?? "")
+        fields.append(source["bundleIdentifier"] as? String ?? "")
+        fields.append(source["version"] as? String ?? "")
+        fields.append(device?["name"] as? String ?? "")
+        fields.append(compactJSON(object["metadata"]))
+
+        return fields.map(escape).joined(separator: ",")
+    }
+
+    private static func number(_ value: Any?) -> String {
+        switch value {
+        case let value as Int:
+            String(value)
+        case let value as Double:
+            value == value.rounded() && abs(value) < 1e15
+                ? String(Int64(value))
+                : String(value)
+        case let value as NSNumber:
+            value.stringValue
+        default:
+            ""
+        }
+    }
+
+    private static func compactJSON(_ value: Any?) -> String {
+        guard
+            let value,
+            JSONSerialization.isValidJSONObject(value),
+            let data = try? JSONSerialization.data(
+                withJSONObject: value,
+                options: [.sortedKeys, .withoutEscapingSlashes]
+            ),
+            let text = String(data: data, encoding: .utf8),
+            text != "{}"
+        else {
+            return ""
+        }
+        return text
+    }
+
+    /// Quotes a field the way every spreadsheet expects.
+    static func escape(_ field: String) -> String {
+        guard field.contains(where: { $0 == "," || $0 == "\"" || $0 == "\n" || $0 == "\r" })
+        else {
+            return field
+        }
+        return "\"\(field.replacingOccurrences(of: "\"", with: "\"\""))\""
+    }
+}

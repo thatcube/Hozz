@@ -375,8 +375,10 @@ public actor SpooledExportSink: DurableHealthChangeSink {
         }
         try StoreLocation.harden(url)
 
+        // Every compressed format shares one spool representation: deflated
+        // NDJSON. Only the final assembly differs.
         let output: any ExportOutput = switch format {
-        case .zip:
+        case .ndjson, .csv, .json:
             try DeflateExportOutput(fileURL: url)
         case .raw:
             try RawExportOutput(fileURL: url)
