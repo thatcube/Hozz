@@ -41,10 +41,10 @@ public enum SQLiteValue: Equatable, Sendable {
 ///
 /// The type is not `Sendable`: it is owned exclusively by ``HozzStore``, which
 /// is an actor, so every call is already serialized by actor isolation.
-final class SQLiteDatabase {
+public final class SQLiteDatabase {
     private var handle: OpaquePointer?
 
-    init(url: URL) throws {
+    public init(url: URL) throws {
         var handle: OpaquePointer?
         let flags =
             SQLITE_OPEN_READWRITE
@@ -71,7 +71,7 @@ final class SQLiteDatabase {
         }
     }
 
-    func close() {
+    public func close() {
         guard let handle else {
             return
         }
@@ -80,7 +80,7 @@ final class SQLiteDatabase {
     }
 
     /// Executes one or more statements that return no rows.
-    func execute(_ sql: String) throws {
+    public func execute(_ sql: String) throws {
         guard let handle else {
             throw SQLiteError.closed
         }
@@ -97,14 +97,14 @@ final class SQLiteDatabase {
     }
 
     /// Runs a statement that returns no rows.
-    func run(_ sql: String, _ parameters: [SQLiteValue] = []) throws {
+    public func run(_ sql: String, _ parameters: [SQLiteValue] = []) throws {
         let statement = try prepare(sql, parameters)
         defer { sqlite3_finalize(statement) }
         try step(statement, expectingRow: false)
     }
 
     /// Runs a query and maps every row.
-    func query<Row>(
+    public func query<Row>(
         _ sql: String,
         _ parameters: [SQLiteValue] = [],
         row transform: (SQLiteRow) throws -> Row
@@ -120,7 +120,7 @@ final class SQLiteDatabase {
     }
 
     /// The number of rows changed by the most recent statement.
-    var changeCount: Int {
+    public var changeCount: Int {
         guard let handle else {
             return 0
         }
@@ -131,7 +131,7 @@ final class SQLiteDatabase {
     ///
     /// `BEGIN IMMEDIATE` takes the write lock up front so a partially applied
     /// transaction can never be observed by a concurrent reader.
-    func transaction<Result>(_ body: () throws -> Result) throws -> Result {
+    public func transaction<Result>(_ body: () throws -> Result) throws -> Result {
         try execute("BEGIN IMMEDIATE;")
         do {
             let result = try body()
@@ -232,45 +232,45 @@ final class SQLiteDatabase {
     }
 }
 
-struct SQLiteRow {
+public struct SQLiteRow {
     private let statement: OpaquePointer?
 
-    init(statement: OpaquePointer?) {
+    public init(statement: OpaquePointer?) {
         self.statement = statement
     }
 
-    func isNull(_ index: Int32) -> Bool {
+    public func isNull(_ index: Int32) -> Bool {
         sqlite3_column_type(statement, index) == SQLITE_NULL
     }
 
-    func integer(_ index: Int32) -> Int64 {
+    public func integer(_ index: Int32) -> Int64 {
         sqlite3_column_int64(statement, index)
     }
 
-    func optionalInteger(_ index: Int32) -> Int64? {
+    public func optionalInteger(_ index: Int32) -> Int64? {
         isNull(index) ? nil : integer(index)
     }
 
-    func real(_ index: Int32) -> Double {
+    public func real(_ index: Int32) -> Double {
         sqlite3_column_double(statement, index)
     }
 
-    func optionalReal(_ index: Int32) -> Double? {
+    public func optionalReal(_ index: Int32) -> Double? {
         isNull(index) ? nil : real(index)
     }
 
-    func text(_ index: Int32) -> String {
+    public func text(_ index: Int32) -> String {
         guard let pointer = sqlite3_column_text(statement, index) else {
             return ""
         }
         return String(cString: pointer)
     }
 
-    func optionalText(_ index: Int32) -> String? {
+    public func optionalText(_ index: Int32) -> String? {
         isNull(index) ? nil : text(index)
     }
 
-    func blob(_ index: Int32) -> Data? {
+    public func blob(_ index: Int32) -> Data? {
         guard !isNull(index) else {
             return nil
         }

@@ -53,27 +53,40 @@ public enum StoreLocation {
         guard let shared = FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: appGroupIdentifier
         ) else {
-            let directory = try legacySupportDirectory()
-            // Once a migration has run, the store lives in the group container
-            // and this directory is an empty shell. Creating a store here would
-            // not "just lose the widget" — it would silently start over with no
-            // destinations and no cursors, re-exporting the user's entire
-            // history. A build that loses the entitlement is a build problem,
-            // so it fails loudly instead of destroying data quietly.
-            if hasMigrated(at: directory) {
-                throw StoreLocationError.storeMovedToAppGroup
-            }
-            try prepareDirectory(directory)
-            return directory
+            return try legacyDirectory()
         }
 
         let directory = shared.appending(path: "Hozz", directoryHint: .isDirectory)
-        try prepareDirectory(directory)
+        do {
+            try prepareDirectory(directory)
+        } catch {
+            // macOS hands back a group container path whether or not the app
+            // is entitled to it, and the sandbox then denies the write. Refusing
+            // to launch over that would be far worse than using the app's own
+            // container, which is private but perfectly serviceable — only a
+            // widget would notice the difference.
+            return try legacyDirectory()
+        }
+
         // Enabling the App Groups capability changes where the store resolves
         // to, so an existing install must be carried across.
         if let legacy = try? legacySupportDirectory() {
             try migrateStore(from: legacy, to: directory)
         }
+        return directory
+    }
+
+    /// The app's own container, used when no group container is reachable.
+    private static func legacyDirectory() throws -> URL {
+        let directory = try legacySupportDirectory()
+        // Once a migration has run, the store lives in the group container and
+        // this directory is an empty shell. Creating a store here would not
+        // "just lose the widget" — it would silently start over with no
+        // destinations and no cursors, re-exporting the user's entire history.
+        if hasMigrated(at: directory) {
+            throw StoreLocationError.storeMovedToAppGroup
+        }
+        try prepareDirectory(directory)
         return directory
     }
 
@@ -284,11 +297,18 @@ public enum StoreLocation {
     }
 
     public static func prepareDirectory(_ directory: URL) throws {
+        #if os(iOS)
         try FileManager.default.createDirectory(
             at: directory,
             withIntermediateDirectories: true,
             attributes: [.protectionKey: protection]
         )
+        #else
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        #endif
         try harden(directory)
     }
 
@@ -301,10 +321,16 @@ public enum StoreLocation {
             return
         }
 
+        // Per-file data protection is an iOS facility tied to the passcode.
+        // macOS has no equivalent per-file class — whole-disk FileVault is the
+        // real protection there — and asking for one throws, which would stop
+        // the Mac app from creating its store at all.
+        #if os(iOS)
         try FileManager.default.setAttributes(
             [.protectionKey: protection],
             ofItemAtPath: url.path
         )
+        #endif
 
         var values = URLResourceValues()
         values.isExcludedFromBackup = true

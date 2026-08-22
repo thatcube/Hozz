@@ -4,6 +4,7 @@ options:
   bundleIdPrefix: com.thatcube
   deploymentTarget:
     iOS: "17.0"
+    macOS: "14.0"
   createIntermediateGroups: true
   groupSortPosition: top
   minimumXcodeGenVersion: "2.46.0"
@@ -23,6 +24,16 @@ targetTemplates:
     type: framework
     platform: iOS
     deploymentTarget: "17.0"
+    settings:
+      base:
+        SKIP_INSTALL: true
+        DEFINES_MODULE: true
+        GENERATE_INFOPLIST_FILE: true
+
+  HozzMacFramework:
+    type: framework
+    platform: macOS
+    deploymentTarget: "14.0"
     settings:
       base:
         SKIP_INSTALL: true
@@ -93,6 +104,31 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzDeliver
+
+  HozzReceive:
+    templates:
+      - HozzFramework
+    sources:
+      - Sources/HozzReceive
+    dependencies:
+      - target: HozzCore
+      - target: HozzStore
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzReceive
+
+  HozzMCP:
+    templates:
+      - HozzFramework
+    sources:
+      - Sources/HozzMCP
+    dependencies:
+      - target: HozzCore
+      - target: HozzStore
+      - target: HozzReceive
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.HozzMCP
 
   HozzHealth:
     templates:
@@ -226,6 +262,8 @@ targets:
       - target: HozzDeliver
       - target: HozzHealth
       - target: HozzHealthFake
+      - target: HozzReceive
+      - target: HozzMCP
       - target: Hozz
     settings:
       base:
@@ -236,7 +274,161 @@ targets:
         TEST_HOST: "$(BUILT_PRODUCTS_DIR)/Hozz.app/Hozz"
         BUNDLE_LOADER: "$(TEST_HOST)"
 
+  # macOS builds of the cross-platform modules. Only HozzHealth is iOS-only,
+  # because HealthKit has no data to read on a Mac.
+  HozzCoreMac:
+    templates:
+      - HozzMacFramework
+    sources:
+      - Sources/HozzCore
+    settings:
+      base:
+        PRODUCT_NAME: HozzCore
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.mac.HozzCore
+
+  HozzStoreMac:
+    templates:
+      - HozzMacFramework
+    sources:
+      - Sources/HozzStore
+    dependencies:
+      - target: HozzCoreMac
+    settings:
+      base:
+        PRODUCT_NAME: HozzStore
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.mac.HozzStore
+
+  HozzDeliverMac:
+    templates:
+      - HozzMacFramework
+    sources:
+      - Sources/HozzDeliver
+    dependencies:
+      - target: HozzCoreMac
+      - target: HozzStoreMac
+    settings:
+      base:
+        PRODUCT_NAME: HozzDeliver
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.mac.HozzDeliver
+
+  HozzReceiveMac:
+    templates:
+      - HozzMacFramework
+    sources:
+      - Sources/HozzReceive
+    dependencies:
+      - target: HozzCoreMac
+      - target: HozzStoreMac
+    settings:
+      base:
+        PRODUCT_NAME: HozzReceive
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.mac.HozzReceive
+
+  HozzMCPMac:
+    templates:
+      - HozzMacFramework
+    sources:
+      - Sources/HozzMCP
+    dependencies:
+      - target: HozzCoreMac
+      - target: HozzStoreMac
+      - target: HozzReceiveMac
+    settings:
+      base:
+        PRODUCT_NAME: HozzMCP
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.mac.HozzMCP
+
+  hozz-mcp:
+    type: tool
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - MCPTool
+    dependencies:
+      - target: HozzCoreMac
+        embed: false
+      - target: HozzStoreMac
+        embed: false
+      - target: HozzReceiveMac
+        embed: false
+      - target: HozzMCPMac
+        embed: false
+    settings:
+      base:
+        PRODUCT_NAME: hozz-mcp
+        SKIP_INSTALL: true
+        # The tool lives inside the app bundle, so it looks for its frameworks
+        # there rather than beside itself.
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+
+  HozzMac:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - Mac
+    dependencies:
+      - target: HozzCoreMac
+      - target: HozzStoreMac
+      - target: HozzDeliverMac
+      - target: HozzReceiveMac
+      - target: HozzMCPMac
+      - target: hozz-mcp
+        embed: false
+    settings:
+      base:
+        PRODUCT_NAME: Hozz
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.Hozz.mac
+        ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
+        ENABLE_HARDENED_RUNTIME: true
+        COMBINE_HIDPI_IMAGES: true
+    # The MCP tool ships inside the bundle so the assistant configuration can
+    # point at one stable path that moves with the app. Inputs and outputs are
+    # declared because user script sandboxing is on.
+    postBuildScripts:
+      - name: Embed the MCP tool
+        inputFiles:
+          - $(BUILT_PRODUCTS_DIR)/hozz-mcp
+        outputFiles:
+          - $(BUILT_PRODUCTS_DIR)/$(CONTENTS_FOLDER_PATH)/MacOS/hozz-mcp
+        script: |
+          set -eu
+          destination="${BUILT_PRODUCTS_DIR}/${CONTENTS_FOLDER_PATH}/MacOS"
+          mkdir -p "${destination}"
+          # Signing is left to Xcode's own phase, which runs after this and
+          # seals the bundle including anything copied in here.
+          cp -f "${BUILT_PRODUCTS_DIR}/hozz-mcp" "${destination}/hozz-mcp"
+    entitlements:
+      path: Mac/HozzMac.entitlements
+      properties:
+        # Sandboxed, with exactly two holes: listen for the phone, and let the
+        # user pick where an export goes. No outgoing network access at all.
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.server: true
+        com.apple.security.files.user-selected.read-write: true
+    info:
+      path: Mac/Info.plist
+      properties:
+        CFBundleDisplayName: Hozz
+        CFBundleShortVersionString: "$(MARKETING_VERSION)"
+        CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
+        LSMinimumSystemVersion: "14.0"
+        NSHumanReadableCopyright: "Free and open source."
+        # Required before a sandboxed app may advertise or browse Bonjour.
+        NSBonjourServices:
+          - _hozz._tcp
+        NSLocalNetworkUsageDescription: Hozz receives Health data your iPhone sends directly to this Mac over your own network.
+
 schemes:
+  HozzMac:
+    build:
+      targets:
+        HozzMac: all
+    run:
+      config: Debug
+    archive:
+      config: Release
+
   Hozz:
     build:
       targets:
