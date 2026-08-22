@@ -69,6 +69,27 @@ public enum BucketSize: String, CaseIterable, Sendable {
     }
 }
 
+/// A phone that has delivered to this computer.
+public struct KnownDevice: Hashable, Sendable, Identifiable {
+    public var id: String { name }
+    public let name: String
+    public let firstSeenAt: Date
+    public let lastSeenAt: Date
+    public let deliveredRecords: Int
+
+    public init(
+        name: String,
+        firstSeenAt: Date,
+        lastSeenAt: Date,
+        deliveredRecords: Int
+    ) {
+        self.name = name
+        self.firstSeenAt = firstSeenAt
+        self.lastSeenAt = lastSeenAt
+        self.deliveredRecords = deliveredRecords
+    }
+}
+
 public struct IngestResult: Hashable, Sendable {
     public let stored: Int
     public let deleted: Int
@@ -111,7 +132,7 @@ public actor IngestStore {
     private static func migrate(_ database: SQLiteDatabase) throws {
         let version = try database.query("PRAGMA user_version", row: { $0.integer(0) })
             .first ?? 0
-        guard version < 1 else {
+        guard version < 2 else {
             return
         }
         try database.transaction {
@@ -139,6 +160,17 @@ public actor IngestStore {
                 -- A batch that arrives twice must not be stored twice. The key
                 -- is the content hash the phone sends, so a retried delivery
                 -- and a re-drained larger batch are correctly distinguished.
+                -- Which phones have delivered, and when they were last heard
+                -- from. Kept on disk because "is it working" is the question
+                -- the user actually has, and an answer that resets every time
+                -- the app relaunches cannot answer it.
+                CREATE TABLE IF NOT EXISTS device (
+                    name TEXT PRIMARY KEY,
+                    first_seen_at TEXT NOT NULL,
+                    last_seen_at TEXT NOT NULL,
+                    delivered_records INTEGER NOT NULL DEFAULT 0
+                );
+
                 CREATE TABLE IF NOT EXISTS batch (
                     key TEXT PRIMARY KEY,
                     received_at TEXT NOT NULL,
@@ -146,7 +178,7 @@ public actor IngestStore {
                 );
                 """
             )
-            try database.execute("PRAGMA user_version = 1")
+            try database.execute("PRAGMA user_version = 2")
         }
     }
 
@@ -250,6 +282,43 @@ public actor IngestStore {
             [.text(key)],
             row: { $0.integer(0) }
         ).isEmpty
+    }
+
+    /// Records that a phone delivered, and how much.
+    public func noteDelivery(
+        from device: String,
+        records: Int,
+        at date: Date = .now
+    ) throws {
+        let stamp = Timestamps.text(from: date)
+        try database.run(
+            """
+            INSERT INTO device (name, first_seen_at, last_seen_at, delivered_records)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT (name) DO UPDATE SET
+                last_seen_at = excluded.last_seen_at,
+                delivered_records = delivered_records + excluded.delivered_records
+            """,
+            [.text(device), .text(stamp), .text(stamp), .integer(Int64(records))]
+        )
+    }
+
+    /// Every phone that has delivered, most recently heard from first.
+    public func devices() throws -> [KnownDevice] {
+        try database.query(
+            """
+            SELECT name, first_seen_at, last_seen_at, delivered_records
+            FROM device ORDER BY last_seen_at DESC
+            """,
+            row: { row in
+                KnownDevice(
+                    name: row.text(0),
+                    firstSeenAt: Timestamps.date(from: row.text(1)) ?? .distantPast,
+                    lastSeenAt: Timestamps.date(from: row.text(2)) ?? .distantPast,
+                    deliveredRecords: Int(row.integer(3))
+                )
+            }
+        )
     }
 
     public func totalRecordCount() throws -> Int {

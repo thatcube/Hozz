@@ -300,6 +300,57 @@ final class ReceiveTests: XCTestCase {
         XCTAssertEqual(total, 0)
     }
 
+    // MARK: - Knowing whether it is working
+
+    /// The question the user actually has is "is this working", and an answer
+    /// that resets whenever the app relaunches cannot answer it.
+    func testADeliveryIsRememberedAcrossRestarts() async throws {
+        let directory = root.appending(path: "store")
+        let store = try IngestStore(directory: directory)
+        let when = try date("2026-05-01T10:00:00.000Z")
+
+        try await store.noteDelivery(from: "Brandos iPhone", records: 120, at: when)
+        await store.close()
+
+        let reopened = try IngestStore(directory: directory)
+        let devices = try await reopened.devices()
+
+        XCTAssertEqual(devices.count, 1)
+        XCTAssertEqual(devices.first?.name, "Brandos iPhone")
+        XCTAssertEqual(devices.first?.lastSeenAt, when)
+        XCTAssertEqual(devices.first?.deliveredRecords, 120)
+    }
+
+    /// Repeated deliveries move the clock forward and accumulate, rather than
+    /// each one looking like a new device.
+    func testRepeatedDeliveriesUpdateTheSameDevice() async throws {
+        let store = try makeStore()
+        let first = try date("2026-05-01T10:00:00.000Z")
+        let second = try date("2026-05-01T18:00:00.000Z")
+
+        try await store.noteDelivery(from: "Brandos iPhone", records: 100, at: first)
+        try await store.noteDelivery(from: "Brandos iPhone", records: 50, at: second)
+
+        let devices = try await store.devices()
+        XCTAssertEqual(devices.count, 1)
+        XCTAssertEqual(devices.first?.firstSeenAt, first, "The first sighting is kept.")
+        XCTAssertEqual(devices.first?.lastSeenAt, second)
+        XCTAssertEqual(devices.first?.deliveredRecords, 150)
+    }
+
+    func testDevicesComeBackMostRecentlyHeardFromFirst() async throws {
+        let store = try makeStore()
+        try await store.noteDelivery(
+            from: "Old phone", records: 1, at: try date("2026-01-01T10:00:00.000Z")
+        )
+        try await store.noteDelivery(
+            from: "New phone", records: 1, at: try date("2026-06-01T10:00:00.000Z")
+        )
+
+        let devices = try await store.devices()
+        XCTAssertEqual(devices.map(\.name), ["New phone", "Old phone"])
+    }
+
     // MARK: - Questions the data should be able to answer
 
     func testSummariesDescribeEachType() async throws {

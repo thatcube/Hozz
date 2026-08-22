@@ -352,12 +352,19 @@ public actor HealthReceiver {
         // already had the token — shared through the user's own iCloud
         // Keychain, which is the ordinary path — was delivering data while the
         // Mac still said it was waiting for a phone.
-        noteDeviceSeen(named: request.header("x-hozz-device"))
+        let deviceName = PairingPolicy.safeDeviceName(
+            request.header("x-hozz-device") ?? "An iPhone"
+        )
+        noteDeviceSeen(named: deviceName)
 
         do {
             let result = try await store.ingest(
                 batch,
                 idempotencyKey: request.header("idempotency-key")
+            )
+            try? await store.noteDelivery(
+                from: deviceName,
+                records: result.stored
             )
             record(
                 ReceiverEvent(

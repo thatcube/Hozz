@@ -120,38 +120,35 @@ struct ConnectView: View {
             """
     }
 
-    /// Says plainly whether anything has actually connected.
+    /// Says what is actually known: when data last arrived, and from where.
     ///
-    /// Without this the screen only ever explained how to connect, so there was
-    /// no way to tell a working setup from a broken one — the user is left
-    /// watching an instruction list and guessing.
+    /// Deliberately not phrased as "connected". Deliveries are separate HTTP
+    /// requests with nothing held open in between, so there is no connection to
+    /// be in — a phone that synced a minute ago and one that has been switched
+    /// off since look identical from here. Reporting when data last arrived is
+    /// both true and the thing the user actually wants to know.
     @ViewBuilder
     private var connectionStatus: some View {
         GroupBox {
             HStack(alignment: .top, spacing: 12) {
-                Image(systemName: services.devices.isEmpty
-                    ? "iphone.badge.exclamationmark"
-                    : "checkmark.circle.fill")
+                Image(systemName: statusSymbol)
                     .font(.title2)
-                    .foregroundStyle(services.devices.isEmpty ? Color.secondary : Color.green)
+                    .foregroundStyle(statusColour)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    if let device = services.devices.first {
-                        Text("Connected to \(device.name)")
-                            .font(.body.weight(.semibold))
-                        Text(receivedSummary)
-                            .font(.callout)
-                            .foregroundStyle(.secondary)
-                    } else {
-                        Text("Waiting for your iPhone")
-                            .font(.body.weight(.semibold))
-                        Text(
-                            "This Mac is listening. Open Hozz on your iPhone, "
-                            + "add a destination, and pick this computer."
-                        )
+                    Text(statusTitle)
+                        .font(.body.weight(.semibold))
+                    Text(statusDetail)
                         .font(.callout)
                         .foregroundStyle(.secondary)
                         .fixedSize(horizontal: false, vertical: true)
+
+                    if services.devices.count > 1 {
+                        ForEach(services.devices.dropFirst()) { device in
+                            Text("\(device.name) — last \(Self.relative(device.lastSeenAt))")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
                     }
                 }
                 Spacer()
@@ -160,15 +157,67 @@ struct ConnectView: View {
         }
     }
 
-    private var receivedSummary: String {
-        guard services.totalRecords > 0 else {
-            return "Nothing has arrived yet. It will appear here when it does."
+    /// How long ago counts as "recently".
+    ///
+    /// Chosen to match the cadence Hozz actually syncs at: HealthKit caps most
+    /// background delivery at hourly, so a gap of a couple of hours is ordinary
+    /// and not worth alarming anyone about.
+    private static let recentInterval: TimeInterval = 2 * 60 * 60
+
+    private var latest: KnownDevice? {
+        services.devices.max { $0.lastSeenAt < $1.lastSeenAt }
+    }
+
+    private var isRecent: Bool {
+        guard let latest else {
+            return false
+        }
+        return Date().timeIntervalSince(latest.lastSeenAt) < Self.recentInterval
+    }
+
+    private var statusSymbol: String {
+        guard latest != nil else {
+            return "iphone.badge.exclamationmark"
+        }
+        return isRecent ? "checkmark.circle.fill" : "clock.badge.exclamationmark"
+    }
+
+    private var statusColour: Color {
+        guard latest != nil else {
+            return .secondary
+        }
+        return isRecent ? .green : .orange
+    }
+
+    private var statusTitle: String {
+        guard let latest else {
+            return "No data received yet"
+        }
+        return isRecent
+            ? "Receiving from \(latest.name)"
+            : "Nothing new from \(latest.name)"
+    }
+
+    private var statusDetail: String {
+        guard let latest else {
+            return """
+                This Mac is listening. Open Hozz on your iPhone, add a \
+                destination, and pick this computer.
+                """
         }
         let count = services.totalRecords.formatted()
-        guard let last = services.lastReceivedAt else {
-            return "\(count) records received."
+        let when = Self.relative(latest.lastSeenAt)
+        if isRecent {
+            return "\(count) records · last arrived \(when)"
         }
-        return "\(count) records · last \(last.formatted(.relative(presentation: .named)))"
+        return """
+            \(count) records · last arrived \(when). That is normal if the \
+            phone has been away or has nothing new; iOS decides when Hozz runs.
+            """
+    }
+
+    private static func relative(_ date: Date) -> String {
+        date.formatted(.relative(presentation: .named))
     }
 
     private func failure(_ reason: String) -> some View {

@@ -31,7 +31,7 @@ final class MacServices {
     private(set) var summaries: [TypeSummary] = []
     private(set) var totalRecords = 0
     private(set) var events: [ReceiverEvent] = []
-    private(set) var devices: [PairedDevice] = []
+    private(set) var devices: [KnownDevice] = []
     private(set) var lastReceivedAt: Date?
     /// Whether this computer managed to tell the user's other devices about
     /// itself. Surfaced because a silent failure here looks exactly like the
@@ -166,7 +166,6 @@ final class MacServices {
                 if case .stored = event.outcome {
                     self.lastReceivedAt = event.at
                 }
-                self.devices = await receiver.devices
                 await self.refresh()
             }
         }
@@ -220,6 +219,8 @@ final class MacServices {
         do {
             summaries = try await store.summaries()
             totalRecords = try await store.totalRecordCount()
+            devices = try await store.devices()
+            lastReceivedAt = devices.map(\.lastSeenAt).max()
         } catch {
             // A read failure is not worth interrupting the user over; the
             // counts simply stay as they were.
