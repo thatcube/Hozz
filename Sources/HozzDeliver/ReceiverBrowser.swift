@@ -49,6 +49,9 @@ public actor ReceiverBrowser {
     private var observers: [@Sendable ([DiscoveredReceiver]) -> Void] = []
     private var stateObservers: [@Sendable (BrowsingState) -> Void] = []
     private(set) public var state: BrowsingState = .idle
+    /// Guards against restarting forever if mDNSResponder is truly unwell.
+    private var restarts = 0
+    private static let maximumRestarts = 5
 
     public init() {}
 
@@ -105,8 +108,25 @@ public actor ReceiverBrowser {
     private func handle(_ state: NWBrowser.State) {
         switch state {
         case .ready:
+            restarts = 0
             update(.searching)
         case .waiting(let error), .failed(let error):
+            // mDNSResponder is restarted by the system from time to time, and
+            // every browser attached to the old instance is left permanently
+            // defunct rather than being reconnected. The only remedy is to
+            // build a new one; without it, discovery works until the first
+            // network change and then silently never finds anything again.
+            if Self.isDefunct(error), restarts < Self.maximumRestarts {
+                restarts += 1
+                Self.log.info("mDNS connection went defunct; restarting the browser.")
+                browser?.cancel()
+                browser = nil
+                Task { [weak self] in
+                    try? await Task.sleep(for: .seconds(1))
+                    await self?.start()
+                }
+                return
+            }
             // Refusing local network access is by far the most common cause,
             // and it is silent: browsing simply never returns anything. Saying
             // so is the difference between "this feature is broken" and "tap
@@ -121,6 +141,14 @@ public actor ReceiverBrowser {
         default:
             break
         }
+    }
+
+    /// The system restarted mDNSResponder and abandoned this browser.
+    static func isDefunct(_ error: NWError) -> Bool {
+        if case .dns(let code) = error {
+            return code == kDNSServiceErr_DefunctConnection
+        }
+        return false
     }
 
     private static func isPermissionProblem(_ error: NWError) -> Bool {
