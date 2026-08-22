@@ -9,6 +9,13 @@ options:
   groupSortPosition: top
   minimumXcodeGenVersion: "2.46.0"
 
+# Signing lives in a gitignored Local.xcconfig so no team identifier is
+# committed, and so it survives regeneration — setting it in Xcode does not,
+# because this file generates the project.
+configFiles:
+  Debug: Local.xcconfig
+  Release: Local.xcconfig
+
 settings:
   base:
     SWIFT_VERSION: "6.0"
@@ -184,18 +191,10 @@ targets:
         com.apple.developer.healthkit: true
         com.apple.developer.healthkit.background-delivery: true
         com.apple.developer.healthkit.access: []
-        # The App Groups entitlement is deliberately not declared here.
-        #
         # The widget is a separate process with its own container, so it can
-        # only read live sync state through a shared group container. But
-        # declaring an entitlement the provisioning profile lacks fails *every*
-        # device build, so it cannot be committed until the capability is
-        # registered with Apple.
-        #
-        # `tools/device-build.sh` resolves this without anyone editing this
-        # file: it checks the downloaded profiles for the group and injects the
-        # entitlement only when it is actually available. Register the
-        # capability once and device builds start including it automatically.
+        # only read live sync state through this shared group.
+        com.apple.security.application-groups:
+          - group.com.thatcube.Hozz
         #
         # Shared with the Mac app so the receiver token can travel through the
         # user's own iCloud Keychain, which is what removes the pairing step
@@ -248,11 +247,13 @@ targets:
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.Hozz.widget
-        # The widget reads the same store the app writes, which requires the
-        # shared container both sides already use. The matching entitlement is
-        # injected by tools/device-build.sh when the capability exists; see the
-        # note on the app target above.
         SKIP_INSTALL: true
+    entitlements:
+      path: Widget/HozzWidget.entitlements
+      properties:
+        # Must match the app exactly, or the widget reads an empty container.
+        com.apple.security.application-groups:
+          - group.com.thatcube.Hozz
     info:
       path: Widget/Info.plist
       properties:

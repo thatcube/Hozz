@@ -25,3 +25,6 @@ Package.resolved
 
 # Editors
 *.swp
+
+# Local signing settings; never committed.
+Local.xcconfig
