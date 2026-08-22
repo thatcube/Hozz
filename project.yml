@@ -136,6 +136,7 @@ targets:
       - target: HozzDeliver
       - target: HozzHealth
       - target: HozzUI
+      - target: HozzWidget
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.Hozz
@@ -173,6 +174,29 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+
+  HozzWidget:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - Widget
+    dependencies:
+      - target: HozzCore
+      - target: HozzStore
+      - target: HozzDeliver
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.Hozz.widget
+        # The widget reads the same store the app writes, which requires the
+        # shared container both sides already use.
+        SKIP_INSTALL: true
+    info:
+      path: Widget/Info.plist
+      properties:
+        CFBundleDisplayName: Hozz
+        NSExtension:
+          NSExtensionPointIdentifier: com.apple.widgetkit-extension
 
   HozzTests:
     type: bundle.unit-test
