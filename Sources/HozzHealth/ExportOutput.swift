@@ -6,16 +6,27 @@ enum ExportOutputError: Error {
     case compressionFailed(Int32)
 }
 
+/// What a finished part contributed, which is everything the archive writer
+/// needs to describe it without re-reading the bytes.
+struct ExportOutputSummary: Equatable, Sendable {
+    let compressedByteCount: UInt64
+    let uncompressedByteCount: UInt64
+    let crc32: UInt32
+}
+
 protocol ExportOutput: AnyObject {
     func write(_ data: Data) throws
     func synchronize() throws
-    func finish() throws -> UInt64
+    func finish() throws -> ExportOutputSummary
     func abandon()
 }
 
+/// Plain, uncompressed output for the advanced `.ndjson` format.
 final class RawExportOutput: ExportOutput {
     private let handle: FileHandle
     private var isClosed = false
+    private var uncompressedByteCount: UInt64 = 0
+    private var crc: uLong = 0
 
     init(fileURL: URL) throws {
         handle = try FileHandle(forWritingTo: fileURL)
@@ -23,21 +34,31 @@ final class RawExportOutput: ExportOutput {
 
     func write(_ data: Data) throws {
         try handle.write(contentsOf: data)
+        uncompressedByteCount += UInt64(data.count)
+        crc = Self.updateCRC(crc, with: data)
     }
 
     func synchronize() throws {
         try handle.synchronize()
     }
 
-    func finish() throws -> UInt64 {
+    func finish() throws -> ExportOutputSummary {
         guard !isClosed else {
-            return 0
+            return ExportOutputSummary(
+                compressedByteCount: 0,
+                uncompressedByteCount: 0,
+                crc32: 0
+            )
         }
         try synchronize()
         let byteCount = try handle.offset()
         try handle.close()
         isClosed = true
-        return byteCount
+        return ExportOutputSummary(
+            compressedByteCount: byteCount,
+            uncompressedByteCount: uncompressedByteCount,
+            crc32: UInt32(truncatingIfNeeded: crc)
+        )
     }
 
     func abandon() {
@@ -48,28 +69,56 @@ final class RawExportOutput: ExportOutput {
         isClosed = true
     }
 
+    static func updateCRC(_ crc: uLong, with data: Data) -> uLong {
+        guard !data.isEmpty else {
+            return crc
+        }
+        return data.withUnsafeBytes { bytes in
+            zlib.crc32(
+                crc,
+                bytes.bindMemory(to: Bytef.self).baseAddress,
+                uInt(data.count)
+            )
+        }
+    }
+
     deinit {
         abandon()
     }
 }
 
-final class GzipExportOutput: ExportOutput {
+/// A raw deflate stream that can be concatenated with others.
+///
+/// The stream is finished with `Z_SYNC_FLUSH` rather than `Z_FINISH`, so it
+/// ends byte-aligned and *without* a final block. Several such streams placed
+/// end to end form one valid deflate stream once a terminating block is
+/// appended, which is what lets an interrupted export be stitched back together
+/// with no recompression.
+///
+/// Each part starts with an empty history window, so a back-reference can only
+/// point inside its own part. That costs a little compression at each boundary
+/// and buys the ability to resume.
+final class DeflateExportOutput: ExportOutput {
     private static let bufferSize = 64 * 1_024
 
     private let handle: FileHandle
     private var stream = z_stream()
     private var isActive = false
     private var isClosed = false
-    private var needsCompressionFlush = false
+    private var needsFlush = false
     private var failure: (any Error)?
+    private var uncompressedByteCount: UInt64 = 0
+    private var crc: uLong = 0
 
     init(fileURL: URL) throws {
         handle = try FileHandle(forWritingTo: fileURL)
+        // A negative window size selects raw deflate: no zlib or gzip wrapper,
+        // which is exactly what a ZIP entry stores.
         let status = deflateInit2_(
             &stream,
             Z_BEST_SPEED,
             Z_DEFLATED,
-            MAX_WBITS + 16,
+            -MAX_WBITS,
             8,
             Z_DEFAULT_STRATEGY,
             ZLIB_VERSION,
@@ -89,7 +138,7 @@ final class GzipExportOutput: ExportOutput {
         guard !data.isEmpty else {
             return
         }
-        needsCompressionFlush = true
+        needsFlush = true
         do {
             try data.withUnsafeBytes { inputBytes in
                 guard let input = inputBytes.bindMemory(to: Bytef.self).baseAddress else {
@@ -110,6 +159,8 @@ final class GzipExportOutput: ExportOutput {
             failure = error
             throw error
         }
+        uncompressedByteCount += UInt64(data.count)
+        crc = RawExportOutput.updateCRC(crc, with: data)
     }
 
     func synchronize() throws {
@@ -117,9 +168,9 @@ final class GzipExportOutput: ExportOutput {
             throw failure
         }
         do {
-            if needsCompressionFlush {
+            if needsFlush {
                 _ = try drain(flush: Z_SYNC_FLUSH)
-                needsCompressionFlush = false
+                needsFlush = false
             }
             try handle.synchronize()
         } catch {
@@ -128,25 +179,33 @@ final class GzipExportOutput: ExportOutput {
         }
     }
 
-    func finish() throws -> UInt64 {
+    func finish() throws -> ExportOutputSummary {
         guard !isClosed else {
-            return 0
+            return ExportOutputSummary(
+                compressedByteCount: 0,
+                uncompressedByteCount: 0,
+                crc32: 0
+            )
         }
         if let failure {
             throw failure
         }
 
-        var status: Int32
-        repeat {
-            status = try drain(flush: Z_FINISH)
-        } while status != Z_STREAM_END
-
+        // Deliberately not Z_FINISH: a final block here would stop a decoder
+        // from reading the parts that follow.
+        _ = try drain(flush: Z_SYNC_FLUSH)
+        needsFlush = false
         endCompression()
+
         try handle.synchronize()
         let byteCount = try handle.offset()
         try handle.close()
         isClosed = true
-        return byteCount
+        return ExportOutputSummary(
+            compressedByteCount: byteCount,
+            uncompressedByteCount: uncompressedByteCount,
+            crc32: UInt32(truncatingIfNeeded: crc)
+        )
     }
 
     func abandon() {

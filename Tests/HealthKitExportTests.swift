@@ -80,16 +80,16 @@ final class HealthKitExportTests: XCTestCase {
         XCTAssertEqual(quantity["value"] as? Double, 12_345)
     }
 
-    func testGzipOutputRoundTripsStreamingData() throws {
+    func testDeflateOutputRoundTripsStreamingData() throws {
         let source = Data(
             String(repeating: #"{"kind":"quantity","value":12345}"# + "\n", count: 10_000).utf8
         )
         let fileURL = FileManager.default.temporaryDirectory
-            .appending(path: "\(UUID().uuidString).ndjson.gz")
+            .appending(path: "\(UUID().uuidString).deflate")
         defer { try? FileManager.default.removeItem(at: fileURL) }
         XCTAssertTrue(FileManager.default.createFile(atPath: fileURL.path, contents: nil))
 
-        let output = try GzipExportOutput(fileURL: fileURL)
+        let output = try DeflateExportOutput(fileURL: fileURL)
         for (index, chunk) in source.chunks(ofCount: 1_024).enumerated() {
             try output.write(Data(chunk))
             if index.isMultiple(of: 100) {
@@ -97,31 +97,19 @@ final class HealthKitExportTests: XCTestCase {
                 try output.synchronize()
             }
         }
-        let compressedSize = try output.finish()
+        let summary = try output.finish()
 
-        XCTAssertLessThan(compressedSize, UInt64(source.count / 10))
-        XCTAssertEqual(try gunzip(fileURL), source)
+        let stored = try Data(contentsOf: fileURL)
+        let inflated = try ExportArtifactReader.inflateRaw(
+            stored + Data(ZipArchiveWriter.deflateTerminator)
+        )
+
+        XCTAssertLessThan(summary.compressedByteCount, UInt64(source.count / 10))
+        XCTAssertEqual(summary.uncompressedByteCount, UInt64(source.count))
+        XCTAssertEqual(summary.crc32, ExportArtifactReader.crc32(of: source))
+        XCTAssertEqual(inflated, source)
     }
 
-    private func gunzip(_ fileURL: URL) throws -> Data {
-        guard let file = gzopen(fileURL.path, "rb") else {
-            throw CocoaError(.fileReadUnknown)
-        }
-        defer { gzclose(file) }
-
-        var result = Data()
-        var buffer = [UInt8](repeating: 0, count: 64 * 1_024)
-        while true {
-            let count = gzread(file, &buffer, UInt32(buffer.count))
-            guard count >= 0 else {
-                throw CocoaError(.fileReadCorruptFile)
-            }
-            guard count > 0 else {
-                return result
-            }
-            result.append(buffer, count: Int(count))
-        }
-    }
 }
 
 private extension Data {

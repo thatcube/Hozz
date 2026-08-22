@@ -147,6 +147,8 @@ public struct ExportPartRecord: Equatable, Sendable {
     public let fileName: String
     public let state: ExportPartState
     public let byteCount: UInt64
+    public let uncompressedByteCount: UInt64
+    public let crc32: UInt32
     public let recordCount: Int
     public let createdAt: Date
     public let sealedAt: Date?
@@ -157,6 +159,8 @@ public struct ExportPartRecord: Equatable, Sendable {
         fileName: String,
         state: ExportPartState,
         byteCount: UInt64,
+        uncompressedByteCount: UInt64 = 0,
+        crc32: UInt32 = 0,
         recordCount: Int,
         createdAt: Date,
         sealedAt: Date?
@@ -166,6 +170,8 @@ public struct ExportPartRecord: Equatable, Sendable {
         self.fileName = fileName
         self.state = state
         self.byteCount = byteCount
+        self.uncompressedByteCount = uncompressedByteCount
+        self.crc32 = crc32
         self.recordCount = recordCount
         self.createdAt = createdAt
         self.sealedAt = sealedAt

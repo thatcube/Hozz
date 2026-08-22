@@ -74,7 +74,7 @@ final class ExportEngineTests: XCTestCase {
             types: [steps, heartRate]
         )
 
-        let outcome = try await engine.export(format: .gzip) { _ in }
+        let outcome = try await engine.export(format: .zip) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The run should have completed.")
         }
@@ -101,7 +101,7 @@ final class ExportEngineTests: XCTestCase {
             types: [steps, heartRate]
         )
 
-        let outcome = try await engine.export(format: .gzip) { _ in }
+        let outcome = try await engine.export(format: .zip) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The run should have completed.")
         }
@@ -123,7 +123,7 @@ final class ExportEngineTests: XCTestCase {
         let source = ScriptedHealthDataSource(streams: [steps: []])
         let engine = makeEngine(store: store, source: source, types: [steps])
 
-        let outcome = try await engine.export(format: .gzip) { _ in }
+        let outcome = try await engine.export(format: .zip) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The run should have completed.")
         }
@@ -147,7 +147,7 @@ final class ExportEngineTests: XCTestCase {
         // Drain one type into an open part and then simply stop, exactly as a
         // kill or a reboot would. Nothing is sealed, so nothing is durable.
         let run = try await store.createRun(
-            format: HealthExportFormat.gzip.rawValue,
+            format: HealthExportFormat.zip.rawValue,
             attemptedTypeCount: 2,
             catalogVersion: "test"
         )
@@ -155,7 +155,7 @@ final class ExportEngineTests: XCTestCase {
         let sink = SpooledExportSink(
             store: store,
             runID: run.id,
-            format: .gzip,
+            format: .zip,
             spoolDirectory: spool,
             nextSequence: 0,
             totalRecordCount: 0
@@ -176,7 +176,7 @@ final class ExportEngineTests: XCTestCase {
             path: SpooledExportSink.partFileName(
                 runID: run.id,
                 sequence: 0,
-                format: .gzip
+                format: .zip
             )
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: orphanURL.path))
@@ -187,7 +187,7 @@ final class ExportEngineTests: XCTestCase {
             source: source,
             types: [steps, heartRate]
         )
-        let outcome = try await engine.export(format: .gzip) { _ in }
+        let outcome = try await engine.export(format: .zip) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The resumed run should have completed.")
         }
@@ -219,7 +219,7 @@ final class ExportEngineTests: XCTestCase {
         )
 
         let run = try await store.createRun(
-            format: HealthExportFormat.gzip.rawValue,
+            format: HealthExportFormat.zip.rawValue,
             attemptedTypeCount: 2,
             catalogVersion: "test"
         )
@@ -227,7 +227,7 @@ final class ExportEngineTests: XCTestCase {
         let sink = SpooledExportSink(
             store: store,
             runID: run.id,
-            format: .gzip,
+            format: .zip,
             spoolDirectory: spool,
             nextSequence: 0,
             totalRecordCount: 0
@@ -248,7 +248,7 @@ final class ExportEngineTests: XCTestCase {
             source: source,
             types: [steps, heartRate]
         )
-        let outcome = try await engine.export(format: .gzip) { _ in }
+        let outcome = try await engine.export(format: .zip) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The resumed run should have completed.")
         }
@@ -281,7 +281,7 @@ final class ExportEngineTests: XCTestCase {
         )
 
         let task = Task {
-            try await engine.export(format: .gzip) { progress in
+            try await engine.export(format: .zip) { progress in
                 if progress.currentTypeState == .completed {
                     withUnsafeCurrentTask { $0?.cancel() }
                 }
@@ -298,7 +298,7 @@ final class ExportEngineTests: XCTestCase {
         XCTAssertEqual(resumable?.id, pause.runID)
         XCTAssertEqual(resumable?.state, .paused)
 
-        let resumed = try await engine.export(format: .gzip) { _ in }
+        let resumed = try await engine.export(format: .zip) { _ in }
         guard case .completed(let result) = resumed else {
             return XCTFail("The paused run should resume to completion.")
         }
@@ -323,7 +323,7 @@ final class ExportEngineTests: XCTestCase {
             types: [steps, heartRate]
         )
 
-        let outcome = try await engine.export(format: .gzip) { _ in }
+        let outcome = try await engine.export(format: .zip) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("One failing type must not abort the whole run.")
         }
@@ -356,7 +356,7 @@ final class ExportEngineTests: XCTestCase {
         )
         let engine = makeEngine(store: store, source: source, types: [steps], batchSize: 1)
 
-        let outcome = try await engine.export(format: .gzip) { _ in }
+        let outcome = try await engine.export(format: .zip) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The run should have completed.")
         }
@@ -374,7 +374,7 @@ final class ExportEngineTests: XCTestCase {
         )
         let engine = makeEngine(store: store, source: source, types: [steps])
 
-        let outcome = try await engine.export(format: .gzip) { _ in }
+        let outcome = try await engine.export(format: .zip) { _ in }
         guard case .completed(let result) = outcome else {
             return XCTFail("The run should have completed.")
         }
@@ -395,14 +395,14 @@ final class ExportEngineTests: XCTestCase {
         let engine = makeEngine(store: store, source: source, types: [steps])
 
         guard
-            case .completed(let first) = try await engine.export(format: .gzip, progress: { _ in })
+            case .completed(let first) = try await engine.export(format: .zip, progress: { _ in })
         else {
             return XCTFail("The first run should have completed.")
         }
         // A second run drains nothing new, but it still produces its own
         // artifact in its own cursor space.
         guard
-            case .completed(let second) = try await engine.export(format: .gzip, progress: { _ in })
+            case .completed(let second) = try await engine.export(format: .zip, progress: { _ in })
         else {
             return XCTFail("The second run should have completed.")
         }
@@ -429,7 +429,7 @@ final class ExportEngineTests: XCTestCase {
         let engine = makeEngine(store: store, source: source, types: [steps])
 
         guard
-            case .completed(let result) = try await engine.export(format: .gzip, progress: { _ in })
+            case .completed(let result) = try await engine.export(format: .zip, progress: { _ in })
         else {
             return XCTFail("The run should have completed.")
         }
@@ -456,7 +456,7 @@ final class ExportEngineTests: XCTestCase {
         let engine = makeEngine(store: store, source: source, types: [steps])
 
         guard
-            case .completed(let first) = try await engine.export(format: .gzip, progress: { _ in })
+            case .completed(let first) = try await engine.export(format: .zip, progress: { _ in })
         else {
             return XCTFail("A failing type must not abort the run.")
         }
@@ -477,7 +477,7 @@ final class ExportEngineTests: XCTestCase {
         // treating the indeterminate coverage as a finished stream.
         try await store.updateRun(id: first.runID, state: .paused)
         guard
-            case .completed(let resumed) = try await engine.export(format: .gzip, progress: { _ in })
+            case .completed(let resumed) = try await engine.export(format: .zip, progress: { _ in })
         else {
             return XCTFail("The resumed run should have completed.")
         }
@@ -497,7 +497,7 @@ final class ExportEngineTests: XCTestCase {
         let engine = makeEngine(store: store, source: source, types: [steps])
 
         guard
-            case .completed(let first) = try await engine.export(format: .gzip, progress: { _ in })
+            case .completed(let first) = try await engine.export(format: .zip, progress: { _ in })
         else {
             return XCTFail("A failing type must not abort the run.")
         }
@@ -527,7 +527,7 @@ final class ExportEngineTests: XCTestCase {
         let acquired = await lease.acquire()
         XCTAssertTrue(acquired, "The lease should start free.")
         do {
-            _ = try await engine.export(format: .gzip) { _ in }
+            _ = try await engine.export(format: .zip) { _ in }
             XCTFail("A second writer must be refused.")
         } catch HealthExportEngineError.exportAlreadyRunning {
             // Expected.
@@ -535,15 +535,54 @@ final class ExportEngineTests: XCTestCase {
 
         await lease.release()
         guard
-            case .completed = try await engine.export(format: .gzip, progress: { _ in })
+            case .completed = try await engine.export(format: .zip, progress: { _ in })
         else {
             return XCTFail("The export should run once the lease is free.")
         }
     }
 
-    /// Finishing must be idempotent: a crash between publishing the joined file
-    /// and marking the run completed must not join it into itself.
-    func testFinishingTwiceDoesNotDuplicateTheJoinedArtifact() async throws {
+    /// Publishing the archive and completing the run are one transaction, so
+    /// the only crash window left is an archive on disk that the store never
+    /// recorded. Reassembling must replace that file, never build on top of it.
+    func testAnOrphanedArchiveIsReplacedRatherThanAppendedTo() async throws {
+        let store = try makeStore()
+        let source = ScriptedHealthDataSource(
+            streams: [steps: (0..<3).map { upsert("step-\($0)", type: steps) }]
+        )
+        let engine = makeEngine(store: store, source: source, types: [steps])
+
+        // Stand in for an assembly that wrote its archive and then died.
+        let spool = await store.spoolDirectory
+        let run = try await store.createRun(
+            format: HealthExportFormat.zip.rawValue,
+            attemptedTypeCount: 1,
+            catalogVersion: "test"
+        )
+        let orphanURL = spool.appending(
+            path: "hozz-health-export-\(run.id.uuidString.lowercased()).zip"
+        )
+        XCTAssertTrue(
+            FileManager.default.createFile(
+                atPath: orphanURL.path,
+                contents: Data("not a real archive".utf8)
+            )
+        )
+
+        guard
+            case .completed(let result) = try await engine.export(format: .zip, progress: { _ in })
+        else {
+            return XCTFail("The run should have completed.")
+        }
+
+        let identifiers = try sampleIdentifiers(in: result.fileURL)
+        XCTAssertEqual(result.runID, run.id)
+        XCTAssertEqual(Set(identifiers), Set((0..<3).map { "step-\($0)" }))
+        XCTAssertEqual(identifiers.count, Set(identifiers).count)
+    }
+
+    /// A completed run must never be handed back for resumption, which is what
+    /// keeps an already-published archive from being rebuilt without its parts.
+    func testACompletedRunIsNotResumable() async throws {
         let store = try makeStore()
         let source = ScriptedHealthDataSource(
             streams: [steps: (0..<3).map { upsert("step-\($0)", type: steps) }]
@@ -551,29 +590,16 @@ final class ExportEngineTests: XCTestCase {
         let engine = makeEngine(store: store, source: source, types: [steps])
 
         guard
-            case .completed(let first) = try await engine.export(format: .gzip, progress: { _ in })
+            case .completed(let result) = try await engine.export(format: .zip, progress: { _ in })
         else {
             return XCTFail("The run should have completed.")
         }
-        let firstIdentifiers = try sampleIdentifiers(in: first.fileURL)
 
-        // Rewind only the run state, exactly as a crash after
-        // `replacePartsWithFinalFile` but before the completion update would.
-        try await store.updateRun(id: first.runID, state: .paused)
-        guard
-            case .completed(let second) = try await engine.export(format: .gzip, progress: { _ in })
-        else {
-            return XCTFail("The re-finished run should have completed.")
-        }
-
-        let secondIdentifiers = try sampleIdentifiers(in: second.fileURL)
-        XCTAssertEqual(first.runID, second.runID)
-        XCTAssertEqual(
-            secondIdentifiers.count,
-            Set(secondIdentifiers).count,
-            "Re-finishing must not concatenate the artifact onto itself."
-        )
-        XCTAssertEqual(Set(secondIdentifiers), Set(firstIdentifiers))
+        let record = try await store.run(id: result.runID)
+        let resumable = try await engine.resumableRun()
+        XCTAssertEqual(record?.state, .completed)
+        XCTAssertEqual(record?.finalFileName, result.fileURL.lastPathComponent)
+        XCTAssertNil(resumable)
     }
 
     /// A single type can hold millions of records. Reporting progress only when
@@ -588,7 +614,7 @@ final class ExportEngineTests: XCTestCase {
         let recorder = ProgressRecorder()
         guard
             case .completed = try await engine.export(
-                format: .gzip,
+                format: .zip,
                 progress: { await recorder.record($0) }
             )
         else {
@@ -642,7 +668,7 @@ final class ExportEngineTests: XCTestCase {
         )
 
         guard
-            case .completed(let result) = try await engine.export(format: .gzip, progress: { _ in })
+            case .completed(let result) = try await engine.export(format: .zip, progress: { _ in })
         else {
             return XCTFail("The run should have completed.")
         }

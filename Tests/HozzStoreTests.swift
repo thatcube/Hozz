@@ -42,7 +42,7 @@ final class HozzStoreTests: XCTestCase {
         let store = try await makeStore()
         // Force a write so SQLite creates its write-ahead log beside the file.
         _ = try await store.createRun(
-            format: "gzip",
+            format: "zip",
             attemptedTypeCount: 1,
             catalogVersion: "test"
         )
@@ -244,7 +244,7 @@ final class HozzStoreTests: XCTestCase {
     func testSealingAPartCommitsItsAnchorsAtomically() async throws {
         let store = try await makeStore()
         let run = try await store.createRun(
-            format: "gzip",
+            format: "zip",
             attemptedTypeCount: 1,
             catalogVersion: "test"
         )
@@ -254,6 +254,8 @@ final class HozzStoreTests: XCTestCase {
             runID: run.id,
             sequence: 0,
             byteCount: 1_234,
+            uncompressedByteCount: 5_000,
+            crc32: 0xDEAD_BEEF,
             recordCount: 7,
             commits: [
                 PendingAnchorCommit(
@@ -281,7 +283,7 @@ final class HozzStoreTests: XCTestCase {
     func testFailingToSealLeavesThePartOpenAndTheAnchorUnmoved() async throws {
         let store = try await makeStore()
         let run = try await store.createRun(
-            format: "gzip",
+            format: "zip",
             attemptedTypeCount: 1,
             catalogVersion: "test"
         )
@@ -292,6 +294,8 @@ final class HozzStoreTests: XCTestCase {
                 runID: run.id,
                 sequence: 0,
                 byteCount: 10,
+                uncompressedByteCount: 40,
+                crc32: 0,
                 recordCount: 1,
                 commits: [
                     PendingAnchorCommit(
@@ -323,7 +327,7 @@ final class HozzStoreTests: XCTestCase {
     func testDiscardingOpenPartsLeavesSealedPartsAlone() async throws {
         let store = try await makeStore()
         let run = try await store.createRun(
-            format: "gzip",
+            format: "zip",
             attemptedTypeCount: 1,
             catalogVersion: "test"
         )
@@ -332,6 +336,8 @@ final class HozzStoreTests: XCTestCase {
             runID: run.id,
             sequence: 0,
             byteCount: 1,
+            uncompressedByteCount: 4,
+            crc32: 0,
             recordCount: 1,
             commits: [],
             runRecordCount: 1
@@ -348,7 +354,7 @@ final class HozzStoreTests: XCTestCase {
     func testResumableRunIgnoresFinishedRuns() async throws {
         let store = try await makeStore()
         let finished = try await store.createRun(
-            format: "gzip",
+            format: "zip",
             attemptedTypeCount: 1,
             catalogVersion: "test"
         )
@@ -358,7 +364,7 @@ final class HozzStoreTests: XCTestCase {
         XCTAssertNil(none)
 
         let paused = try await store.createRun(
-            format: "gzip",
+            format: "zip",
             attemptedTypeCount: 1,
             catalogVersion: "test"
         )
@@ -371,7 +377,7 @@ final class HozzStoreTests: XCTestCase {
     func testDeletingARunAlsoDropsItsCursorSpace() async throws {
         let store = try await makeStore()
         let run = try await store.createRun(
-            format: "gzip",
+            format: "zip",
             attemptedTypeCount: 1,
             catalogVersion: "test"
         )
@@ -400,19 +406,25 @@ final class HozzStoreTests: XCTestCase {
     func testReferencedFileNamesCoversPartsAndFinalArtifacts() async throws {
         let store = try await makeStore()
         let run = try await store.createRun(
-            format: "gzip",
+            format: "zip",
             attemptedTypeCount: 1,
             catalogVersion: "test"
         )
         _ = try await store.createPart(runID: run.id, sequence: 0, fileName: "part-0")
-        try await store.replacePartsWithFinalFile(
+        try await store.completeRun(
             runID: run.id,
-            fileName: "final.ndjson.gz",
+            fileName: "final.zip",
             byteCount: 5,
             recordCount: 1
         )
 
         let referenced = try await store.referencedFileNames()
-        XCTAssertEqual(referenced, ["final.ndjson.gz"])
+        let completed = try await store.run(id: run.id)
+        XCTAssertEqual(referenced, ["final.zip"])
+        XCTAssertEqual(
+            completed?.state,
+            .completed,
+            "Publishing the artifact and finishing the run must be one step."
+        )
     }
 }

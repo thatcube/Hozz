@@ -125,6 +125,8 @@ public actor HozzStore {
                         file_name TEXT NOT NULL,
                         state TEXT NOT NULL,
                         byte_count INTEGER NOT NULL DEFAULT 0,
+                        uncompressed_byte_count INTEGER NOT NULL DEFAULT 0,
+                        crc32 INTEGER NOT NULL DEFAULT 0,
                         record_count INTEGER NOT NULL DEFAULT 0,
                         created_at REAL NOT NULL,
                         sealed_at REAL,
@@ -510,9 +512,10 @@ public actor HozzStore {
             """
             INSERT INTO export_part (
                 run_id, sequence, file_name, state, byte_count,
-                record_count, created_at, sealed_at
+                uncompressed_byte_count, crc32, record_count,
+                created_at, sealed_at
             )
-            VALUES (?, ?, ?, ?, 0, 0, ?, NULL);
+            VALUES (?, ?, ?, ?, 0, 0, 0, 0, ?, NULL);
             """,
             [
                 .text(runID.uuidString.lowercased()),
@@ -532,7 +535,8 @@ public actor HozzStore {
         try database.query(
             """
             SELECT run_id, sequence, file_name, state, byte_count,
-                   record_count, created_at, sealed_at
+                   uncompressed_byte_count, crc32, record_count,
+                   created_at, sealed_at
             FROM export_part WHERE run_id = ? AND sequence = ?;
             """,
             [.text(runID.uuidString.lowercased()), .integer(Int64(sequence))],
@@ -544,7 +548,8 @@ public actor HozzStore {
         try database.query(
             """
             SELECT run_id, sequence, file_name, state, byte_count,
-                   record_count, created_at, sealed_at
+                   uncompressed_byte_count, crc32, record_count,
+                   created_at, sealed_at
             FROM export_part WHERE run_id = ? ORDER BY sequence;
             """,
             [.text(runID.uuidString.lowercased())],
@@ -561,6 +566,8 @@ public actor HozzStore {
         runID: UUID,
         sequence: Int,
         byteCount: UInt64,
+        uncompressedByteCount: UInt64,
+        crc32: UInt32,
         recordCount: Int,
         commits: [PendingAnchorCommit],
         runRecordCount: Int,
@@ -577,12 +584,15 @@ public actor HozzStore {
             try database.run(
                 """
                 UPDATE export_part SET
-                    state = ?, byte_count = ?, record_count = ?, sealed_at = ?
+                    state = ?, byte_count = ?, uncompressed_byte_count = ?,
+                    crc32 = ?, record_count = ?, sealed_at = ?
                 WHERE run_id = ? AND sequence = ?;
                 """,
                 [
                     .text(ExportPartState.sealed.rawValue),
                     .integer(Int64(bitPattern: byteCount)),
+                    .integer(Int64(bitPattern: uncompressedByteCount)),
+                    .integer(Int64(crc32)),
                     .integer(Int64(recordCount)),
                     .real(date.timeIntervalSince1970),
                     .text(runID.uuidString.lowercased()),
@@ -611,7 +621,8 @@ public actor HozzStore {
         let open = try database.query(
             """
             SELECT run_id, sequence, file_name, state, byte_count,
-                   record_count, created_at, sealed_at
+                   uncompressed_byte_count, crc32, record_count,
+                   created_at, sealed_at
             FROM export_part WHERE run_id = ? AND state = ?;
             """,
             [
@@ -634,8 +645,13 @@ public actor HozzStore {
         return open
     }
 
-    /// Replaces a run's part list with the single joined artifact.
-    public func replacePartsWithFinalFile(
+    /// Replaces a run's part list with the single joined artifact and marks the
+    /// run finished, in one transaction.
+    ///
+    /// These have to happen together. If the artifact could be recorded while
+    /// the run stayed resumable, a resume would append a new part to a run
+    /// whose earlier parts had already been absorbed and deleted.
+    public func completeRun(
         runID: UUID,
         fileName: String,
         byteCount: UInt64,
@@ -651,9 +667,10 @@ public actor HozzStore {
                 """
                 INSERT INTO export_part (
                     run_id, sequence, file_name, state, byte_count,
-                    record_count, created_at, sealed_at
+                    uncompressed_byte_count, crc32, record_count,
+                    created_at, sealed_at
                 )
-                VALUES (?, 0, ?, ?, ?, ?, ?, ?);
+                VALUES (?, 0, ?, ?, ?, 0, 0, ?, ?, ?);
                 """,
                 [
                     .text(runID.uuidString.lowercased()),
@@ -668,16 +685,22 @@ public actor HozzStore {
             try database.run(
                 """
                 UPDATE export_run SET
-                    final_file_name = ?, record_count = ?, updated_at = ?
+                    state = ?, final_file_name = ?, record_count = ?,
+                    finished_at = ?, updated_at = ?
                 WHERE id = ?;
                 """,
                 [
+                    .text(ExportRunState.completed.rawValue),
                     .text(fileName),
                     .integer(Int64(recordCount)),
+                    .real(date.timeIntervalSince1970),
                     .real(date.timeIntervalSince1970),
                     .text(runID.uuidString.lowercased())
                 ]
             )
+            guard database.changeCount > 0 else {
+                throw HozzStoreError.unknownRun(runID)
+            }
         }
     }
 
@@ -710,9 +733,11 @@ public actor HozzStore {
             fileName: row.text(2),
             state: state,
             byteCount: UInt64(bitPattern: row.integer(4)),
-            recordCount: Int(row.integer(5)),
-            createdAt: Date(timeIntervalSince1970: row.real(6)),
-            sealedAt: row.optionalReal(7).map(Date.init(timeIntervalSince1970:))
+            uncompressedByteCount: UInt64(bitPattern: row.integer(5)),
+            crc32: UInt32(truncatingIfNeeded: row.integer(6)),
+            recordCount: Int(row.integer(7)),
+            createdAt: Date(timeIntervalSince1970: row.real(8)),
+            sealedAt: row.optionalReal(9).map(Date.init(timeIntervalSince1970:))
         )
     }
 }

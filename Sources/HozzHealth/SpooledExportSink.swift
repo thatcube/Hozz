@@ -267,12 +267,14 @@ public actor SpooledExportSink: DurableHealthChangeSink {
         let sealing = pending.values.sorted { $0.type < $1.type }
         pending.removeAll()
 
-        let byteCount = try part.output.finish()
+        let summary = try part.output.finish()
         try StoreLocation.harden(part.url)
         try await store.sealPart(
             runID: runID,
             sequence: part.sequence,
-            byteCount: byteCount,
+            byteCount: summary.compressedByteCount,
+            uncompressedByteCount: summary.uncompressedByteCount,
+            crc32: summary.crc32,
             recordCount: part.recordCount,
             commits: sealing,
             runRecordCount: totalRecordCount
@@ -374,8 +376,8 @@ public actor SpooledExportSink: DurableHealthChangeSink {
         try StoreLocation.harden(url)
 
         let output: any ExportOutput = switch format {
-        case .gzip:
-            try GzipExportOutput(fileURL: url)
+        case .zip:
+            try DeflateExportOutput(fileURL: url)
         case .raw:
             try RawExportOutput(fileURL: url)
         }
@@ -401,6 +403,6 @@ public actor SpooledExportSink: DurableHealthChangeSink {
         format: HealthExportFormat
     ) -> String {
         let padded = String(format: "%04d", sequence)
-        return "hozz-export-\(runID.uuidString.lowercased())-part-\(padded).\(format.fileExtension)"
+        return "hozz-export-\(runID.uuidString.lowercased())-part-\(padded).\(format.partFileExtension)"
     }
 }

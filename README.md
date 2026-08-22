@@ -9,8 +9,8 @@ accounts, analytics, advertising, or a developer-operated relay.
 > [!IMPORTANT]
 > Hozz is an early alpha. The current iPhone build creates a real, manual,
 > historical NDJSON export for quantity, category, and basic workout records. It
-> streams a standard `.ndjson.gz` file by default to avoid a second
-> uncompressed copy on the phone; raw `.ndjson` remains an advanced option. The
+> streams a standard `.zip` file by default to avoid a second uncompressed
+> copy on the phone; raw `.ndjson` remains an advanced option. The
 > export is resumable: it survives the screen sleeping, the app being
 > backgrounded, and the device being killed or rebooted, and it continues from
 > its last durable checkpoint instead of starting over. Correlations, workout
@@ -96,9 +96,10 @@ restarted:
    durable cursor.
 3. An open part is not durable. On relaunch it is deleted and the types it
    touched replay from their last sealed cursor.
-4. Finishing a run appends its sealed parts into one artifact. Concatenated
-   gzip members are a valid gzip stream, so joining is a byte copy with no
-   recompression and no second full copy on disk.
+4. Finishing a run assembles its sealed parts into one Zip64 archive. Each part
+   is a raw deflate stream ended with a sync flush rather than a final block, so
+   the parts concatenate into a single valid deflate stream and the archive is
+   written with no recompression.
 
 The consequence is the property that matters: an interrupted export can repeat
 work, but it can never skip a record and never emit one twice. Pausing, the
@@ -196,11 +197,12 @@ This includes backup exclusion for SQLite side files and spool files, Keychain
 non-synchronization, redirect isolation, deterministic encoding, and log
 redaction.
 
-Compressed exports open directly with Finder's Archive Utility or:
-
-```bash
-gunzip hozz-health-export-*.ndjson.gz
-```
+Compressed exports are Zip64 archives holding one NDJSON file, so they open
+with a double-click on a stock Mac and with `unzip` everywhere else. ZIP rather
+than gzip for two reasons: a resumable export produces several compressed
+segments, and gzip's uncompressed-size field is 32 bits, which wraps on the
+multi-gigabyte exports Health routinely produces. Both make a `.gz` unreadable
+to Archive Utility even though the bytes are valid.
 
 ## Support development
 

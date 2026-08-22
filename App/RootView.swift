@@ -106,18 +106,18 @@ private struct ExportSetupView: View {
                         }
                     )
                 ) {
-                    Text("Compressed (.ndjson.gz)")
-                        .tag(HealthExportFormat.gzip)
+                    Text("Compressed (.zip)")
+                        .tag(HealthExportFormat.zip)
                     Text("Raw (.ndjson)")
                         .tag(HealthExportFormat.raw)
                 }
                 .disabled(resumable != nil)
 
                 Label(
-                    exportFormat == .gzip
-                        ? "Compressed is usually 80–95% smaller and opens with Finder."
+                    exportFormat == .zip
+                        ? "Usually 80–95% smaller, and opens with a double-click."
                         : "Raw files open directly but can be several gigabytes.",
-                    systemImage: exportFormat == .gzip ? "archivebox" : "doc.plaintext"
+                    systemImage: exportFormat == .zip ? "archivebox" : "doc.plaintext"
                 )
                 .font(.footnote)
                 .foregroundStyle(.secondary)
@@ -285,8 +285,8 @@ private struct ExportSessionHeader: View {
 
     private var formatLabel: some View {
         Label(
-            exportFormat == .gzip ? "Compressed" : "Raw",
-            systemImage: exportFormat == .gzip
+            exportFormat == .zip ? "Compressed" : "Raw",
+            systemImage: exportFormat == .zip
                 ? "archivebox.fill"
                 : "doc.plaintext.fill"
         )

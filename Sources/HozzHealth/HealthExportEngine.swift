@@ -565,52 +565,41 @@ public actor HealthExportEngine {
         // already accounts for a set of parts. When it does, that artifact
         // becomes the first member of any later join rather than being rebuilt
         // from parts it already absorbed.
-        let current = try await store.run(id: run.id)
-        let joinedIsRecorded = current?.finalFileName == finalName
-        let joinedExists = FileManager.default.fileExists(atPath: finalURL.path)
-        if joinedIsRecorded, !joinedExists {
-            // Refusing here is the honest outcome: the parts that artifact
-            // absorbed are gone, so a rebuild would silently omit them.
-            throw ExportPartJoinerError.missingPart(finalName)
-        }
-
-        let pendingParts = try await store.parts(runID: run.id)
+        // A completed run is never resumed, and the artifact is recorded in
+        // the same transaction that completes the run, so reaching here always
+        // means the artifact still has to be built from the run's parts. Any
+        // archive left on disk by an interrupted attempt is simply replaced.
+        let parts = try await store.parts(runID: run.id)
             .sorted { $0.sequence < $1.sequence }
             .filter { $0.fileName != finalName }
-
-        let byteCount: UInt64
-        if pendingParts.isEmpty, joinedIsRecorded {
-            byteCount = try Self.byteCount(of: finalURL)
-        } else {
-            var sources: [URL] = joinedIsRecorded ? [finalURL] : []
-            sources += pendingParts.map { spool.appending(path: $0.fileName) }
-            byteCount = try ExportPartJoiner.join(
-                sourceURLs: sources,
-                into: finalURL
-            )
-            try StoreLocation.harden(finalURL)
-            try await store.replacePartsWithFinalFile(
-                runID: run.id,
-                fileName: finalName,
-                byteCount: byteCount,
-                recordCount: recordCount
-            )
-            // Only now are the parts unreferenced, so removing them cannot
-            // strand a join that still needs them.
-            for part in pendingParts {
-                try? FileManager.default.removeItem(
-                    at: spool.appending(path: part.fileName)
-                )
+        for part in parts {
+            let url = spool.appending(path: part.fileName)
+            guard FileManager.default.fileExists(atPath: url.path) else {
+                throw ExportPartJoinerError.missingPart(part.fileName)
             }
         }
 
-        try await store.updateRun(
-            id: run.id,
-            state: .completed,
-            recordCount: recordCount,
-            finalFileName: finalName,
-            finishedAt: .now
+        let byteCount = try assemble(
+            run: run,
+            format: format,
+            parts: parts,
+            spool: spool,
+            finalURL: finalURL
         )
+        try StoreLocation.harden(finalURL)
+        try await store.completeRun(
+            runID: run.id,
+            fileName: finalName,
+            byteCount: byteCount,
+            recordCount: recordCount
+        )
+        // Only now are the parts unreferenced, so removing them cannot strand
+        // an assembly that still needs them.
+        for part in parts {
+            try? FileManager.default.removeItem(
+                at: spool.appending(path: part.fileName)
+            )
+        }
 
         return .completed(
             HealthExportResult(
@@ -722,5 +711,43 @@ public actor HealthExportEngine {
         let size = try FileManager.default.attributesOfItem(atPath: url.path)[.size]
             as? NSNumber
         return size?.uint64Value ?? 0
+    }
+
+    /// Produces the single artifact a run hands to the user.
+    ///
+    /// A ZIP export cannot fold a previously produced archive back in as a
+    /// member, because the archive is a container rather than a bare stream. It
+    /// does not need to: every part is still on disk until the store records
+    /// the archive, so the archive is simply rebuilt from the parts.
+    private func assemble(
+        run: ExportRunRecord,
+        format: HealthExportFormat,
+        parts: [ExportPartRecord],
+        spool: URL,
+        finalURL: URL
+    ) throws -> UInt64 {
+        switch format {
+        case .raw:
+            return try ExportPartJoiner.join(
+                sourceURLs: parts.map { spool.appending(path: $0.fileName) },
+                into: finalURL
+            )
+
+        case .zip:
+            let members = parts.map { part in
+                ZipMember(
+                    url: spool.appending(path: part.fileName),
+                    compressedByteCount: part.byteCount,
+                    uncompressedByteCount: part.uncompressedByteCount,
+                    crc32: part.crc32
+                )
+            }
+            return try ZipArchiveWriter.write(
+                members: members,
+                entryName: "hozz-health-export-\(run.id.uuidString.lowercased()).ndjson",
+                modifiedAt: run.startedAt,
+                to: finalURL
+            )
+        }
     }
 }

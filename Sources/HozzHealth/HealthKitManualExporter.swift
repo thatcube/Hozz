@@ -83,7 +83,7 @@ public actor HealthKitManualExporter {
     }
 
     public func export(
-        format: HealthExportFormat = .gzip,
+        format: HealthExportFormat = .zip,
         progress: @escaping @Sendable (HealthExportProgress) async -> Void
     ) async throws -> HealthExportOutcome {
         guard HKHealthStore.isHealthDataAvailable() else {
