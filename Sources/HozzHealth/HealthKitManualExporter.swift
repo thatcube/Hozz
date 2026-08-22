@@ -2,6 +2,12 @@ import Foundation
 import HealthKit
 import HozzCatalog
 
+public enum HealthExportTypeState: Equatable, Sendable {
+    case exporting
+    case completed
+    case failed
+}
+
 public struct HealthExportProgress: Equatable, Sendable {
     public let completedTypes: Int
     public let totalTypes: Int
@@ -10,6 +16,7 @@ public struct HealthExportProgress: Equatable, Sendable {
     public let currentTypeName: String
     public let currentTypeFamily: HealthTypeFamily?
     public let currentTypeRecordCount: Int
+    public let currentTypeState: HealthExportTypeState
 
     public init(
         completedTypes: Int,
@@ -18,7 +25,8 @@ public struct HealthExportProgress: Equatable, Sendable {
         currentTypeIdentifier: String,
         currentTypeName: String,
         currentTypeFamily: HealthTypeFamily?,
-        currentTypeRecordCount: Int
+        currentTypeRecordCount: Int,
+        currentTypeState: HealthExportTypeState
     ) {
         self.completedTypes = completedTypes
         self.totalTypes = totalTypes
@@ -27,6 +35,7 @@ public struct HealthExportProgress: Equatable, Sendable {
         self.currentTypeName = currentTypeName
         self.currentTypeFamily = currentTypeFamily
         self.currentTypeRecordCount = currentTypeRecordCount
+        self.currentTypeState = currentTypeState
     }
 }
 
@@ -192,7 +201,8 @@ public actor HealthKitManualExporter {
                         currentTypeIdentifier: type.catalogEntry.key.rawValue,
                         currentTypeName: type.catalogEntry.displayName,
                         currentTypeFamily: type.catalogEntry.family,
-                        currentTypeRecordCount: 0
+                        currentTypeRecordCount: 0,
+                        currentTypeState: .exporting
                     )
                 )
 
@@ -211,7 +221,8 @@ public actor HealthKitManualExporter {
                                 currentTypeIdentifier: type.catalogEntry.key.rawValue,
                                 currentTypeName: type.catalogEntry.displayName,
                                 currentTypeFamily: type.catalogEntry.family,
-                                currentTypeRecordCount: typeWrittenRecords
+                                currentTypeRecordCount: typeWrittenRecords,
+                                currentTypeState: .exporting
                             )
                         )
                     }
@@ -241,7 +252,8 @@ public actor HealthKitManualExporter {
                             currentTypeIdentifier: type.catalogEntry.key.rawValue,
                             currentTypeName: type.catalogEntry.displayName,
                             currentTypeFamily: type.catalogEntry.family,
-                            currentTypeRecordCount: typeWrittenRecords
+                            currentTypeRecordCount: typeWrittenRecords,
+                            currentTypeState: .failed
                         )
                     )
                     continue
@@ -272,7 +284,8 @@ public actor HealthKitManualExporter {
                         currentTypeIdentifier: type.catalogEntry.key.rawValue,
                         currentTypeName: type.catalogEntry.displayName,
                         currentTypeFamily: type.catalogEntry.family,
-                        currentTypeRecordCount: stats.writtenRecords
+                        currentTypeRecordCount: stats.writtenRecords,
+                        currentTypeState: .completed
                     )
                 )
             }

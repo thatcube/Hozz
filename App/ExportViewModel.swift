@@ -5,8 +5,16 @@ import Observation
 @MainActor
 @Observable
 final class ExportViewModel {
+    struct ExportStep: Identifiable {
+        let id: String
+        let name: String
+        let recordCount: Int
+        let state: HealthExportTypeState
+    }
+
     struct ProgressPresentation {
         let export: HealthExportProgress
+        let steps: [ExportStep]
         let exportStartedAt: Date
         let currentTypeStartedAt: Date
         let estimatedRemainingSeconds: ClosedRange<TimeInterval>?
@@ -27,6 +35,7 @@ final class ExportViewModel {
     @ObservationIgnored private var exportStartedAt: Date?
     @ObservationIgnored private var currentTypeStartedAt: Date?
     @ObservationIgnored private var currentTypeIdentifier: String?
+    @ObservationIgnored private var exportSteps: [ExportStep] = []
 
     init(exporter: HealthKitManualExporter = HealthKitManualExporter()) {
         self.exporter = exporter
@@ -62,6 +71,13 @@ final class ExportViewModel {
         exportFormat = format
     }
 
+    func prepareNewExport() {
+        guard !isWorking else {
+            return
+        }
+        state = .idle
+    }
+
     func exportNow() {
         guard !isWorking else {
             return
@@ -76,6 +92,7 @@ final class ExportViewModel {
                 exportStartedAt = startedAt
                 currentTypeStartedAt = startedAt
                 currentTypeIdentifier = nil
+                exportSteps = []
                 state = .exporting(
                     ProgressPresentation(
                         export: HealthExportProgress(
@@ -85,8 +102,10 @@ final class ExportViewModel {
                             currentTypeIdentifier: "",
                             currentTypeName: "",
                             currentTypeFamily: nil,
-                            currentTypeRecordCount: 0
+                            currentTypeRecordCount: 0,
+                            currentTypeState: .exporting
                         ),
+                        steps: [],
                         exportStartedAt: startedAt,
                         currentTypeStartedAt: startedAt,
                         estimatedRemainingSeconds: nil,
@@ -122,6 +141,17 @@ final class ExportViewModel {
             currentTypeIdentifier = progress.currentTypeIdentifier
             currentTypeStartedAt = now
         }
+        let step = ExportStep(
+            id: progress.currentTypeIdentifier,
+            name: progress.currentTypeName,
+            recordCount: progress.currentTypeRecordCount,
+            state: progress.currentTypeState
+        )
+        if let index = exportSteps.firstIndex(where: { $0.id == step.id }) {
+            exportSteps[index] = step
+        } else if !step.id.isEmpty {
+            exportSteps.append(step)
+        }
 
         let elapsed = max(now.timeIntervalSince(startedAt), 0)
         let remainingTypes = max(progress.totalTypes - progress.completedTypes, 0)
@@ -138,6 +168,7 @@ final class ExportViewModel {
 
         return ProgressPresentation(
             export: progress,
+            steps: exportSteps,
             exportStartedAt: startedAt,
             currentTypeStartedAt: currentTypeStartedAt ?? now,
             estimatedRemainingSeconds: estimate,
