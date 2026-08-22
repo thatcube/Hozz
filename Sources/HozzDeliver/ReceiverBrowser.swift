@@ -198,9 +198,23 @@ public actor ReceiverBrowser {
     /// resolves to something quite different — so the endpoint is resolved by
     /// actually connecting to it. Guessing the address from the name would
     /// produce a destination that silently never delivers.
+    ///
+    /// IPv4 is asked for by name. The address discovered here is not used by
+    /// this connection: it is written down and handed to `URLSession` later, as
+    /// a string, with none of the interface scope that made it work. Left to
+    /// itself Network.framework prefers IPv6 and hands back a link-local
+    /// address, which is meaningless without the interface it arrived on — so
+    /// the computer resolved, appeared in the list, and then never answered
+    /// anything again. What the receiver publishes about itself is IPv4 for the
+    /// same reason.
     private func resolve(name: String, endpoint: NWEndpoint) async {
         let resolved: (host: String, port: UInt16)? = await withCheckedContinuation { continuation in
-            let connection = NWConnection(to: endpoint, using: .tcp)
+            let parameters = NWParameters.tcp
+            if let ip = parameters.defaultProtocolStack.internetProtocol
+                as? NWProtocolIP.Options {
+                ip.version = .v4
+            }
+            let connection = NWConnection(to: endpoint, using: parameters)
             let box = ResumeOnce(continuation)
 
             connection.stateUpdateHandler = { state in
@@ -214,7 +228,12 @@ public actor ReceiverBrowser {
                         connection.cancel()
                         return
                     }
-                    box.resume((Self.text(for: host), port.rawValue))
+                    guard let text = Self.text(for: host) else {
+                        box.resume(nil)
+                        connection.cancel()
+                        return
+                    }
+                    box.resume((text, port.rawValue))
                     connection.cancel()
                 case .failed, .cancelled:
                     box.resume(nil)
@@ -244,15 +263,30 @@ public actor ReceiverBrowser {
         notify()
     }
 
-    private static func text(for host: NWEndpoint.Host) -> String {
+    /// The address as a URL host, or `nil` when it cannot honestly be written
+    /// as one.
+    ///
+    /// A link-local address only means anything alongside the interface it was
+    /// seen on, and that scope cannot survive the trip through a stored string
+    /// and a fresh `URLSession` request. Stripping the `%en0` and keeping the
+    /// rest produced an address that parses, connects to nothing, and reports
+    /// the computer as not answering — which is a worse outcome than not
+    /// offering it, because the computer is plainly switched on and the message
+    /// says otherwise. Nothing is returned instead, so the browser waits for an
+    /// address it can actually use.
+    private static func text(for host: NWEndpoint.Host) -> String? {
         switch host {
         case .name(let name, _):
             name
         case .ipv4(let address):
-            "\(address)".split(separator: "%").first.map(String.init) ?? "\(address)"
+            address.isLinkLocal
+                ? nil
+                : "\(address)".split(separator: "%").first.map(String.init) ?? "\(address)"
         case .ipv6(let address):
             // A bracketed literal, or the URL cannot be parsed.
-            "[\("\(address)".split(separator: "%").first.map(String.init) ?? "\(address)")]"
+            address.isLinkLocal
+                ? nil
+                : "[\("\(address)".split(separator: "%").first.map(String.init) ?? "\(address)")]"
         @unknown default:
             "\(host)"
         }
