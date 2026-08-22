@@ -118,7 +118,7 @@ final class ExportViewModel {
                         startedAt: run.startedAt
                     )
                 )
-                BackgroundExportScheduler.schedule()
+                BackgroundExportScheduler.scheduleProcessing()
             } else {
                 state = .idle(resumable: nil)
             }
@@ -223,10 +223,10 @@ final class ExportViewModel {
 
                 switch outcome {
                 case .completed(let result):
-                    BackgroundExportScheduler.cancel()
+                    BackgroundExportScheduler.cancelProcessing()
                     state = .ready(result)
                 case .paused(let pause):
-                    BackgroundExportScheduler.schedule()
+                    BackgroundExportScheduler.scheduleProcessing()
                     state = .paused(pause)
                 }
             } catch {
@@ -257,7 +257,7 @@ final class ExportViewModel {
             guard let self else {
                 return
             }
-            BackgroundExportScheduler.cancel()
+            BackgroundExportScheduler.cancelProcessing()
             if let exporter = try? resolveExporter() {
                 try? await exporter.discardRun(id: resumable.runID)
             }

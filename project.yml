@@ -157,8 +157,10 @@ targets:
         NSHealthShareUsageDescription: Hozz reads the Health data you select so you can export it to destinations you own.
         BGTaskSchedulerPermittedIdentifiers:
           - com.thatcube.Hozz.processing
+          - com.thatcube.Hozz.refresh
         UIBackgroundModes:
           - processing
+          - fetch
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
         UILaunchScreen: {}
