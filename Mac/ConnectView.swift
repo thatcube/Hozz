@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 import HozzReceive
 
 /// The pairing screen: everything needed to point a phone at this computer.
@@ -6,11 +7,14 @@ struct ConnectView: View {
     let services: MacServices
     @State private var didCopyToken = false
     @State private var didCopyURL = false
+    @State private var isChoosingFolder = false
 
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
                 header
+
+                folderSection
 
                 switch services.status {
                 case .starting:
@@ -44,6 +48,76 @@ struct ConnectView: View {
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
         }
+    }
+
+    /// The path that does not depend on the network allowing anything.
+    ///
+    /// Offered first, and described plainly, because receiving over the local
+    /// network needs the router not to isolate clients and the firewall to
+    /// admit an app it does not recognise. Neither is something a person can
+    /// reasonably be asked to arrange, and macOS refuses silently — the app
+    /// looks like it is running and simply never receives anything.
+    private var folderSection: some View {
+        GroupBox {
+            VStack(alignment: .leading, spacing: 12) {
+                HStack(alignment: .top, spacing: 12) {
+                    Image(systemName: services.watchedFolder == nil
+                        ? "folder.badge.plus"
+                        : "folder.fill.badge.checkmark")
+                        .font(.title2)
+                        .foregroundStyle(services.watchedFolder == nil ? Color.secondary : Color.green)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(services.watchedFolder == nil
+                            ? "Receive from a folder"
+                            : "Watching a folder")
+                            .font(.body.weight(.semibold))
+                        Text(folderDescription)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                }
+
+                HStack {
+                    Button(services.watchedFolder == nil ? "Choose a folder…" : "Change…") {
+                        isChoosingFolder = true
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    if services.watchedFolder != nil {
+                        Button("Stop watching") {
+                            Task { await services.stopWatchingFolder() }
+                        }
+                    }
+                }
+            }
+            .padding(8)
+        }
+        .fileImporter(
+            isPresented: $isChoosingFolder,
+            allowedContentTypes: [.folder]
+        ) { result in
+            guard case .success(let url) = result else {
+                return
+            }
+            Task { await services.watchFolder(url) }
+        }
+    }
+
+    private var folderDescription: String {
+        if let folder = services.watchedFolder {
+            return """
+                \(folder.lastPathComponent) — anything your iPhone writes here \
+                is read automatically.
+                """
+        }
+        return """
+            Point your iPhone at a folder that syncs to this Mac — iCloud Drive, \
+            Dropbox, anything — and pick the same folder here. This works from \
+            anywhere, including cellular, and needs nothing from your network.
+            """
     }
 
     /// Says plainly whether anything has actually connected.
