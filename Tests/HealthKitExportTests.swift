@@ -13,13 +13,16 @@ final class HealthKitExportTests: XCTestCase {
     }
 
     func testRegistryResolvesStepCount() {
-        let identifiers = Set(
-            HealthKitTypeRegistry.exportableTypes()
-                .map(\.catalogEntry.key.rawValue)
-        )
+        let types = HealthKitTypeRegistry.exportableTypes()
+        let identifiers = Set(types.map(\.catalogEntry.key.rawValue))
 
         XCTAssertTrue(identifiers.contains("HKQuantityTypeIdentifierStepCount"))
         XCTAssertTrue(identifiers.contains("HKWorkoutTypeIdentifier"))
+        XCTAssertTrue(types.allSatisfy { !$0.sampleType.requiresPerObjectAuthorization() })
+        XCTAssertTrue(
+            HealthKitTypeRegistry.authorizationReadTypes()
+                .allSatisfy { !($0 is HKCorrelationType) }
+        )
     }
 
     func testQuantityEncodingUsesCatalogUnitAndIsDeterministic() throws {

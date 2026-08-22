@@ -56,6 +56,7 @@ public enum HealthKitManualExporterError: Error, LocalizedError, Sendable {
     case healthDataUnavailable
     case missingAnchor
     case cannotCreateExport
+    case authorizationNotCompleted
     case partialExport(fileURL: URL, reason: String)
 
     public var errorDescription: String? {
@@ -66,6 +67,8 @@ public enum HealthKitManualExporterError: Error, LocalizedError, Sendable {
             "HealthKit returned data without a continuation anchor."
         case .cannotCreateExport:
             "Hozz could not create the export file."
+        case .authorizationNotCompleted:
+            "Health access was not completed."
         case .partialExport(_, let reason):
             "Hozz preserved a partial export after an unexpected failure: \(reason)"
         }
@@ -104,10 +107,24 @@ public actor HealthKitManualExporter {
             throw HealthKitManualExporterError.healthDataUnavailable
         }
 
-        let readTypes = Set(
-            HealthKitTypeRegistry.exportableTypes().map(\.sampleType)
-        )
-        try await healthStore.requestAuthorization(toShare: [], read: readTypes)
+        let readTypes = HealthKitTypeRegistry.authorizationReadTypes()
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            healthStore.requestAuthorization(
+                toShare: nil,
+                read: readTypes
+            ) { success, error in
+                if let error {
+                    continuation.resume(throwing: error)
+                } else if success {
+                    continuation.resume()
+                } else {
+                    continuation.resume(
+                        throwing: HealthKitManualExporterError.authorizationNotCompleted
+                    )
+                }
+            }
+        }
     }
 
     public func export(

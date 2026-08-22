@@ -48,7 +48,7 @@ final class ExportViewModel {
             return
         }
 
-        Task {
+        Task { [self] in
             do {
                 state = .requestingAccess
                 try await exporter.requestAuthorization()
@@ -61,9 +61,9 @@ final class ExportViewModel {
                         currentType: ""
                     )
                 )
-                let result = try await exporter.export { [weak self] progress in
+                let result = try await exporter.export { progress in
                     await MainActor.run {
-                        self?.state = .exporting(progress)
+                        self.state = .exporting(progress)
                     }
                 }
                 state = .ready(result)

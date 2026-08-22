@@ -105,6 +105,7 @@ targets:
       properties:
         com.apple.developer.healthkit: true
         com.apple.developer.healthkit.background-delivery: true
+        com.apple.developer.healthkit.access: []
     info:
       path: App/Info.plist
       properties:

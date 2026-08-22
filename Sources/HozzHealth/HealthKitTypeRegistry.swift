@@ -43,11 +43,24 @@ public enum HealthKitTypeRegistry {
             guard let objectType else {
                 return nil
             }
+            guard !objectType.requiresPerObjectAuthorization() else {
+                return nil
+            }
             return ExportableHealthType(catalogEntry: entry, sampleType: objectType)
         }
 
         return generated.sorted {
             $0.catalogEntry.key.rawValue < $1.catalogEntry.key.rawValue
         }
+    }
+
+    public static func authorizationReadTypes(
+        operatingSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+    ) -> Set<HKObjectType> {
+        Set(
+            exportableTypes(operatingSystem: operatingSystem)
+                .filter { $0.catalogEntry.family != .correlation }
+                .map(\.sampleType)
+        )
     }
 }
