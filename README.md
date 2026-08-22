@@ -80,7 +80,8 @@ The app is split along those boundaries:
 | `HozzStore` | Migrations, cursors, coverage, export runs, and sealed spool parts |
 | `HozzCanonical` | Deterministic, versioned canonical envelopes |
 | `HozzSpool` | Bounded, shared, immutable segments for multiple destinations |
-| `HozzDeliver` | Destination generations, batches, retries, receipts, and reconciliation |
+| `HozzDeliver` | Destinations, credentials, batches, retries, and receipts |
+| `HozzUI` | Shared iconography and view helpers |
 | `HozzFormats` | Explicitly lossy CSV and GPX projections (CSV shipped in `HozzHealth`) |
 | `HozzDiagnostics` | Local-only, redacted diagnostics |
 
@@ -128,8 +129,8 @@ already started with.
 | M3 — Canonical model | Partial | Golden fixtures are byte-deterministic across locale and timezone; every public field and child family is represented or explicitly unsupported |
 | M4 — Acquisition | Partial | Millions of synthetic changes converge under cancellation and injected crashes with bounded memory and no date watermark |
 | M5 — Files | Partial | Interrupted exports never appear complete; manifests verify every part and disclose every coverage limitation |
-| M6 — Background | Next | Physical-device observer and task testing converges after lock, reboot, expiration, and network loss without overstating latency |
-| M7 — Network delivery | Planned | TLS-first, idempotent batches and atomic replacement snapshots reconcile against the open-source reference receiver |
+| M6 — Background | Partial | Physical-device observer and task testing converges after lock, reboot, expiration, and network loss without overstating latency |
+| M7 — Network delivery | Partial | TLS-first, idempotent batches and atomic replacement snapshots reconcile against the open-source reference receiver |
 | M8 — Multi-device | Planned | Stale writer epochs are rejected and explicit takeover converges without copying device-local anchors |
 | M9 — Release | Planned | Accessibility, localization, privacy disclosures, App Review checks, multi-year endurance, and physical-device reconciliation pass |
 
@@ -145,18 +146,15 @@ Automatic export is the point of the app, so the next milestone is one narrow
 vertical slice rather than finishing every family first:
 
 1. ~~Persist per-type anchors, tombstones, and coverage state across launches.~~
-   Done: `HozzStore` persists opaque cursors, coverage, and run bookkeeping, and
-   commits them only alongside durable data.
-2. Mark types dirty with `HKObserverQuery` and background delivery.
-3. Drain changes incrementally into a bounded, protected, backup-excluded spool.
-4. Deliver to one user-configured HTTPS destination with a background
-   `URLSession` and idempotent batches.
-5. Ship a small open-source receiver that stores batches and reports counts.
-6. Report queued, waiting for iOS, delivered, blocked, and failed honestly.
+2. ~~Mark types dirty with `HKObserverQuery` and background delivery.~~
+3. ~~Drain changes incrementally and deliver them in bounded batches.~~
+4. ~~Deliver to user-configured folder and HTTPS destinations with idempotent
+   batches.~~
+5. ~~Ship a small open-source receiver that stores batches and reports counts.~~
+6. ~~Report queued, waiting for iOS, delivered, blocked, and failed honestly.~~
 
-Its acceptance gate: add and delete Health data, force-quit and reboot the
-phone, and let the receiver converge on the device's state with no gaps and no
-duplicates.
+Remaining for M6 and M7: multi-day endurance on a physical device, and
+reconciliation counts surfaced in the app rather than only in the receiver.
 
 ## Build
 
