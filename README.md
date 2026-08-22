@@ -82,18 +82,39 @@ The app is split along those boundaries:
 
 ## Milestone gates
 
-| Milestone | Acceptance gate |
-| --- | --- |
-| M0 — Contract | Every known HealthKit family has a query, authorization, deletion, background, and limitation classification; privacy and threat models are documented |
-| M1 — Foundation | Swift 6 targets build; fake Health source and fault tests prove retries cannot over-advance an anchor |
-| M2 — Catalog and authorization | The SDK catalog diff is empty or acknowledged; special authorization flows are separated; zero-result types remain indeterminate |
-| M3 — Canonical model | Golden fixtures are byte-deterministic across locale and timezone; every public field and child family is represented or explicitly unsupported |
-| M4 — Acquisition | Millions of synthetic changes converge under cancellation and injected crashes with bounded memory and no date watermark |
-| M5 — Files | Interrupted exports never appear complete; manifests verify every part and disclose every coverage limitation |
-| M6 — Background | Physical-device observer and task testing converges after lock, reboot, expiration, and network loss without overstating latency |
-| M7 — Network delivery | TLS-first, idempotent batches and atomic replacement snapshots reconcile against the open-source reference receiver |
-| M8 — Multi-device | Stale writer epochs are rejected and explicit takeover converges without copying device-local anchors |
-| M9 — Release | Accessibility, localization, privacy disclosures, App Review checks, multi-year endurance, and physical-device reconciliation pass |
+| Milestone | Status | Acceptance gate |
+| --- | --- | --- |
+| M0 — Contract | Done | Every known HealthKit family has a query, authorization, deletion, background, and limitation classification; privacy and threat models are documented |
+| M1 — Foundation | Done | Swift 6 targets build; fake Health source and fault tests prove retries cannot over-advance an anchor |
+| M2 — Catalog and authorization | Done | The SDK catalog diff is empty or acknowledged; special authorization flows are separated; zero-result types remain indeterminate |
+| M3 — Canonical model | Partial | Golden fixtures are byte-deterministic across locale and timezone; every public field and child family is represented or explicitly unsupported |
+| M4 — Acquisition | Next | Millions of synthetic changes converge under cancellation and injected crashes with bounded memory and no date watermark |
+| M5 — Files | Partial | Interrupted exports never appear complete; manifests verify every part and disclose every coverage limitation |
+| M6 — Background | Next | Physical-device observer and task testing converges after lock, reboot, expiration, and network loss without overstating latency |
+| M7 — Network delivery | Planned | TLS-first, idempotent batches and atomic replacement snapshots reconcile against the open-source reference receiver |
+| M8 — Multi-device | Planned | Stale writer epochs are rejected and explicit takeover converges without copying device-local anchors |
+| M9 — Release | Planned | Accessibility, localization, privacy disclosures, App Review checks, multi-year endurance, and physical-device reconciliation pass |
+
+M3 and M5 are partial because the shipped exporter covers quantity, category,
+correlation, and basic workout records with a run manifest, but not the special
+families or a full reconciliation receipt.
+
+## Next: automatic export
+
+Automatic export is the point of the app, so the next milestone is one narrow
+vertical slice rather than finishing every family first:
+
+1. Persist per-type anchors, tombstones, and coverage state across launches.
+2. Mark types dirty with `HKObserverQuery` and background delivery.
+3. Drain changes incrementally into a bounded, protected, backup-excluded spool.
+4. Deliver to one user-configured HTTPS destination with a background
+   `URLSession` and idempotent batches.
+5. Ship a small open-source receiver that stores batches and reports counts.
+6. Report queued, waiting for iOS, delivered, blocked, and failed honestly.
+
+Its acceptance gate: add and delete Health data, force-quit and reboot the
+phone, and let the receiver converge on the device's state with no gaps and no
+duplicates.
 
 ## Build
 

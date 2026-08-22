@@ -81,6 +81,8 @@ public enum HealthKitManualExporterError: Error, LocalizedError, Sendable {
     case missingAnchor
     case cannotCreateExport
     case authorizationNotCompleted
+    case nonAdvancingAnchor(typeIdentifier: String)
+    case exceededQueryBudget(typeIdentifier: String)
     case partialExport(fileURL: URL, reason: String)
 
     public var errorDescription: String? {
@@ -93,6 +95,10 @@ public enum HealthKitManualExporterError: Error, LocalizedError, Sendable {
             "Hozz could not create the export file."
         case .authorizationNotCompleted:
             "Health access was not completed."
+        case .nonAdvancingAnchor(let typeIdentifier):
+            "HealthKit stopped advancing while reading \(typeIdentifier)."
+        case .exceededQueryBudget(let typeIdentifier):
+            "Reading \(typeIdentifier) exceeded its safety limit."
         case .partialExport(_, let reason):
             "Hozz preserved a partial export after an unexpected failure: \(reason)"
         }
@@ -100,6 +106,11 @@ public enum HealthKitManualExporterError: Error, LocalizedError, Sendable {
 }
 
 public actor HealthKitManualExporter {
+    /// Bounds a single type's pagination so a HealthKit stream that never
+    /// reports exhaustion cannot spin indefinitely. At the default batch size
+    /// this still allows tens of millions of records for one type.
+    private static let maximumQueriesPerType = 50_000
+
     private struct TypeExportStats {
         let writtenRecords: Int
         let observedRecords: Int
@@ -347,12 +358,20 @@ public actor HealthKitManualExporter {
         var writtenRecords = 0
         var observedRecords = 0
         var encodingErrors = 0
+        var queryCount = 0
 
         while true {
             try Task.checkCancellation()
             let page = try await query(type: type.sampleType, anchor: anchor)
             var batchWrittenRecords = 0
             var batchEncodingErrors = 0
+            queryCount += 1
+
+            guard queryCount <= Self.maximumQueriesPerType else {
+                throw HealthKitManualExporterError.exceededQueryBudget(
+                    typeIdentifier: type.catalogEntry.key.rawValue
+                )
+            }
 
             for sample in page.samples {
                 do {
@@ -394,6 +413,11 @@ public actor HealthKitManualExporter {
 
             guard let newAnchor = page.newAnchor else {
                 throw HealthKitManualExporterError.missingAnchor
+            }
+            if batchCount > 0, newAnchor == anchor {
+                throw HealthKitManualExporterError.nonAdvancingAnchor(
+                    typeIdentifier: type.catalogEntry.key.rawValue
+                )
             }
             anchor = newAnchor
             await didWriteBatch(
