@@ -56,11 +56,19 @@ public actor DeliveryEngine {
         )
         cache[destination.id] = destination
 
-        if try await store.deliveryState(for: destination.id) == nil {
+        // Re-saving a destination is how the user says "I fixed it", so a
+        // parked destination is released. Without this, re-picking a moved
+        // folder would leave it excluded from every automatic pass forever.
+        let existing = try await store.deliveryState(for: destination.id)
+        if existing == nil || existing?.state == DeliveryState.needsAttention.rawValue {
             try await store.saveDeliveryState(
                 DeliveryStateRecord(
                     destinationID: destination.id,
-                    state: DeliveryState.idle.rawValue
+                    state: DeliveryState.idle.rawValue,
+                    lastSuccessAt: existing?.lastSuccessAt,
+                    consecutiveFailures: 0,
+                    nextSequence: existing?.nextSequence ?? 0,
+                    deliveredRecords: existing?.deliveredRecords ?? 0
                 )
             )
         }

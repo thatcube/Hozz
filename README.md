@@ -234,3 +234,23 @@ is the representation the durability machinery is built and tested around, and
 a presentation choice should not reach into the part that has to survive a
 reboot. CSV and JSON are produced by reading that stream once at the end, so
 NDJSON keeps its zero-cost path and the other formats cost one extra pass.
+
+## One manual step for the widget
+
+The widget shows "Open Hozz for status" until the **App Groups** capability is
+enabled for `com.thatcube.Hozz` in the Apple developer portal. An iOS extension
+has its own data container, so without a shared group the widget cannot read the
+app's database at all.
+
+Once the capability exists, add to both the app and widget targets in
+`project.yml`:
+
+```yaml
+        com.apple.security.application-groups:
+          - group.com.thatcube.Hozz
+```
+
+The code already prefers that container and falls back to the app's own when it
+is unavailable, so nothing else needs to change. It is left out of the committed
+project because the current development profile lacks the capability, and
+declaring an entitlement the profile does not carry fails every device build.

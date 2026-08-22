@@ -58,8 +58,9 @@ struct TypePickerView: View {
                 Text(
                     selection.isEmpty
                         ? "Hozz will send every type it has access to."
-                        : "\(selection.count) types selected. Fewer types means "
-                          + "iOS wakes Hozz less often, which uses less battery."
+                        : "\(selection.count) selected. Fewer types means iOS wakes "
+                          + "Hozz less often, which uses less battery. Turn the "
+                          + "switch above on to send everything instead."
                 )
             }
 
@@ -76,7 +77,11 @@ struct TypePickerView: View {
                                     Spacer()
                                     if selection.contains(entry.key) {
                                         HozzIconView(.check, size: 18)
-                                            .foregroundStyle(HozzPalette.action)
+                                            .foregroundStyle(
+                                                selection.count > 1
+                                                    ? HozzPalette.action
+                                                    : .secondary
+                                            )
                                     }
                                 }
                             }
@@ -119,6 +124,12 @@ struct TypePickerView: View {
 
     private func toggle(_ key: HealthTypeKey) {
         if selection.contains(key) {
+            // An empty set means "everything" elsewhere, so letting the last
+            // row be unchecked would silently turn a one-type destination into
+            // a full export. Only the explicit switch above may produce empty.
+            guard selection.count > 1 else {
+                return
+            }
             selection.remove(key)
         } else {
             selection.insert(key)

@@ -117,11 +117,22 @@ public actor HealthSyncEngine {
         var waitingForUnlock = false
 
         for destination in destinations {
-            let result = try await sync(
-                destination: destination,
-                dirtyTypes: dirtyTypes,
-                now: now
-            )
+            // Anything unexpected while handling one destination — an encoding
+            // failure, a SQLite error — must not skip the destinations after
+            // it. They are ordered deterministically, so the same ones would be
+            // starved on every pass.
+            let result: SyncOutcome
+            do {
+                result = try await sync(
+                    destination: destination,
+                    dirtyTypes: dirtyTypes,
+                    now: now
+                )
+            } catch {
+                Self.log.error("A destination could not be synced this pass.")
+                interrupted = true
+                continue
+            }
             deliveredRecords += result.deliveredRecords
             typesDrained = max(typesDrained, result.typesDrained)
             interrupted = interrupted || result.wasInterrupted

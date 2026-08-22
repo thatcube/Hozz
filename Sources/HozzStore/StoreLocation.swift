@@ -26,6 +26,13 @@ public enum StoreLocation {
     /// class would widen exposure without enabling any additional work.
     public static let protection = FileProtectionType.completeUnlessOpen
 
+    /// The app group both the app and its widget can reach.
+    ///
+    /// An app extension has its own data container, so without a shared group
+    /// the widget would quietly create and read a second, empty database and
+    /// permanently report that nothing had ever synced.
+    public static let appGroupIdentifier = "group.com.thatcube.Hozz"
+
     /// The private, non-user-visible directory holding the store and its spool.
     public static func supportDirectory(
         in container: URL? = nil
@@ -33,7 +40,13 @@ public enum StoreLocation {
         let base: URL
         if let container {
             base = container
+        } else if let shared = FileManager.default.containerURL(
+            forSecurityApplicationGroupIdentifier: appGroupIdentifier
+        ) {
+            base = shared
         } else {
+            // Falling back keeps the app fully working if the group is
+            // unavailable; only the widget loses its view of the state.
             guard let applicationSupport = FileManager.default.urls(
                 for: .applicationSupportDirectory,
                 in: .userDomainMask

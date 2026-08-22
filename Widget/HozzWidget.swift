@@ -10,13 +10,21 @@ struct SyncEntry: TimelineEntry {
     let recordCount: Int
     let needsAttention: Bool
     let hasDestination: Bool
+    /// True when the widget could not reach the app's data at all.
+    ///
+    /// A widget runs in its own container, so it can only read the shared store
+    /// once the App Groups capability is enabled for this bundle id. Until then
+    /// the widget says it cannot see the state, rather than claiming there is
+    /// no destination — which would be a confident and wrong answer.
+    let isUnavailable: Bool
 
     static let placeholder = SyncEntry(
         date: .now,
         lastSuccessAt: Date(timeIntervalSinceNow: -1_800),
         recordCount: 128_450,
         needsAttention: false,
-        hasDestination: true
+        hasDestination: true,
+        isUnavailable: false
     )
 }
 
@@ -57,23 +65,36 @@ struct SyncProvider: TimelineProvider {
     }
 
     private static func currentEntry() async -> SyncEntry {
-        guard let store = try? HozzStore.makeDefault() else {
+        // The store lives in the shared app group. If it cannot be opened —
+        // which on a Lock Screen refresh usually means the device is still
+        // locked and the protected file is unreadable — the widget says so
+        // rather than claiming there is no destination.
+        guard
+            let shared = FileManager.default.containerURL(
+                forSecurityApplicationGroupIdentifier: StoreLocation.appGroupIdentifier
+            ),
+            let store = try? HozzStore(
+                directory: try StoreLocation.supportDirectory(in: shared)
+            ),
+            let states = try? await store.allDeliveryStates()
+        else {
             return SyncEntry(
                 date: .now,
                 lastSuccessAt: nil,
                 recordCount: 0,
                 needsAttention: false,
-                hasDestination: false
+                hasDestination: false,
+                isUnavailable: true
             )
         }
-        let states = (try? await store.allDeliveryStates()) ?? []
 
         return SyncEntry(
             date: .now,
             lastSuccessAt: states.compactMap(\.lastSuccessAt).max(),
             recordCount: states.reduce(0) { $0 + $1.deliveredRecords },
             needsAttention: states.contains { $0.state == "needsAttention" },
-            hasDestination: !states.isEmpty
+            hasDestination: !states.isEmpty,
+            isUnavailable: false
         )
     }
 }
@@ -127,6 +148,9 @@ struct HozzWidgetView: View {
     }
 
     private var headline: String {
+        guard !entry.isUnavailable else {
+            return "Open Hozz for status"
+        }
         guard entry.hasDestination else {
             return "No destination yet"
         }
@@ -142,6 +166,7 @@ struct HozzWidgetView: View {
     }
 
     private var symbol: String {
+        if entry.isUnavailable { return "questionmark.circle" }
         if !entry.hasDestination { return "tray" }
         if entry.needsAttention { return "exclamationmark.triangle.fill" }
         return entry.lastSuccessAt == nil ? "clock" : "checkmark.icloud.fill"

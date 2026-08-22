@@ -51,7 +51,7 @@ public struct FolderDeliveryChannel: DeliveryChannel {
         }
         defer { folder.stopAccessingSecurityScopedResource() }
 
-        let fileName = batch.fileName()
+        let fileName = batch.fileName(destinationID: destination.id)
         let target = folder.appending(path: fileName)
 
         var coordinationError: NSError?

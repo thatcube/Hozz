@@ -63,6 +63,15 @@ def connect(path):
     return db
 
 
+class PartialBatch(Exception):
+    """Raised when a batch cannot be stored in full.
+
+    Acknowledging a partial batch is the one thing a receiver must never do:
+    Hozz would advance its cursor past records that were dropped, and they
+    would never be sent again.
+    """
+
+
 def ingest_lines(db, lines, batch_key=None):
     """Store one batch. Returns (stored, deleted, skipped_duplicate_batch)."""
     if batch_key:
@@ -76,14 +85,17 @@ def ingest_lines(db, lines, batch_key=None):
             return 0, 0, True
 
     stored = deleted = 0
-    for line in lines:
+    for index, line in enumerate(lines):
         line = line.strip()
         if not line:
             continue
         try:
             record = json.loads(line)
-        except json.JSONDecodeError:
-            continue
+        except json.JSONDecodeError as error:
+            # Most often a body truncated by a dropped connection. Refusing the
+            # whole batch makes Hozz retry it, which is exactly right.
+            db.rollback()
+            raise PartialBatch(f"line {index + 1} is not valid JSON") from error
 
         kind = record.get("kind")
         # Run bookkeeping, not health data.
@@ -174,9 +186,24 @@ def ingest_compatible(db, envelope, batch_key=None):
                 "quantity": {"value": point.get("qty"), "unit": units},
                 "source": {"name": point.get("source")},
             }))
-    for deletion in data.get("deletions", []):
-        lines.append(json.dumps({"kind": "deletion", "id": deletion.get("id")}))
-    return ingest_lines(db, lines, batch_key)
+    # Upserts from this envelope are keyed by name and date, because the format
+    # carries no per-sample identifier. Deletions arrive with HealthKit's real
+    # identifier, which would match nothing, so they are applied by the same
+    # (type, date) pair the upserts used.
+    deletions = [
+        (deletion.get("name") or deletion.get("type"), deletion.get("date"))
+        for deletion in data.get("deletions", [])
+    ]
+    stored, deleted, duplicate = ingest_lines(db, lines, batch_key)
+    for name, date in deletions:
+        if not name or not date:
+            continue
+        cursor = db.execute(
+            "DELETE FROM samples WHERE type = ? AND start_date = ?", (name, date)
+        )
+        deleted += cursor.rowcount
+    db.commit()
+    return stored, deleted, duplicate
 
 
 def serve(args):
@@ -193,8 +220,16 @@ def serve(args):
             payload = self.rfile.read(length)
             key = self.headers.get("Idempotency-Key")
 
+            # A socket read returns short at EOF, so a connection dropped
+            # mid-post yields a truncated body. Storing part of it and
+            # answering 200 would lose the rest permanently.
+            if len(payload) != length:
+                return self.finish_with(400, {"error": "incomplete body"})
+
             try:
                 stored, deleted, duplicate = ingest_payload(db, payload, key)
+            except PartialBatch as error:
+                return self.finish_with(400, {"error": str(error)})
             except Exception as error:  # noqa: BLE001 - report, never crash
                 return self.finish_with(500, {"error": str(error)})
 

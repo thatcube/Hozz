@@ -311,12 +311,20 @@ public struct DeliveryBatch: Sendable {
     }
 
     /// A name that sorts chronologically and never collides.
-    public func fileName(prefix: String = "hozz") -> String {
+    ///
+    /// The destination is part of the name because two destinations may point
+    /// at the same folder, and every batch in one pass shares a timestamp and
+    /// starts at sequence zero. Without it their first files would be named
+    /// identically and the second would silently replace the first.
+    public func fileName(prefix: String = "hozz", destinationID: UUID? = nil) -> String {
         let stamp = Date.ISO8601FormatStyle(timeZone: .gmt)
             .format(createdAt)
             .replacingOccurrences(of: ":", with: "")
             .replacingOccurrences(of: "-", with: "")
-        return "\(prefix)-\(stamp)-\(String(format: "%06d", sequence)).\(format.fileExtension)"
+        let owner = destinationID.map {
+            "-" + $0.uuidString.lowercased().prefix(8)
+        } ?? ""
+        return "\(prefix)-\(stamp)\(owner)-\(String(format: "%06d", sequence)).\(format.fileExtension)"
     }
 }
 
