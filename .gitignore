@@ -1,0 +1,26 @@
+# macOS
+.DS_Store
+
+# Xcode / XcodeGen
+Hozz.xcodeproj/
+DerivedData/
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+xcuserdata/
+*.xcuserstate
+App/Info.plist
+App/Hozz.entitlements
+
+# SwiftPM
+.build/
+.swiftpm/
+Package.resolved
+
+# Signing and local configuration
+.env
+.env.*
+*.p8
+*.xcconfig.local
+
+# Editors
+*.swp
