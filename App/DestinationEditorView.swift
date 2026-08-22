@@ -29,13 +29,19 @@ struct DestinationEditorView: View {
     @State private var isPickingTypes = false
 
     private let existing: Destination?
+    private let preset: DestinationPreset?
 
-    init(model: SyncViewModel, destination: Destination?) {
+    init(
+        model: SyncViewModel,
+        destination: Destination?,
+        preset: DestinationPreset? = nil
+    ) {
         self.model = model
         self.existing = destination
-        _name = State(initialValue: destination?.name ?? "")
-        _kind = State(initialValue: destination?.kind ?? .folder)
-        _format = State(initialValue: destination?.format ?? .ndjson)
+        self.preset = preset
+        _name = State(initialValue: destination?.name ?? preset?.defaultName ?? "")
+        _kind = State(initialValue: destination?.kind ?? preset?.kind ?? .folder)
+        _format = State(initialValue: destination?.format ?? preset?.format ?? .ndjson)
         _cadence = State(initialValue: destination?.cadence ?? .whenDataArrives)
         _isEnabled = State(initialValue: destination?.isEnabled ?? true)
         _endpoint = State(initialValue: destination?.endpointURL?.absoluteString ?? "")
@@ -47,24 +53,54 @@ struct DestinationEditorView: View {
 
     var body: some View {
         Form {
-            Section {
-                Picker("Send to", selection: $kind) {
-                    ForEach(DestinationKind.allCases, id: \.self) { kind in
-                        Text(kind.displayName).tag(kind)
+            if let preset {
+                Section {
+                    ForEach(Array(preset.steps.enumerated()), id: \.offset) { index, step in
+                        HStack(alignment: .top, spacing: 10) {
+                            Text("\(index + 1)")
+                                .font(.caption.weight(.bold))
+                                .foregroundStyle(HozzPalette.action)
+                                .frame(width: 18, height: 18)
+                                .background(
+                                    HozzPalette.action.opacity(0.15),
+                                    in: Circle()
+                                )
+                            Text(step)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
                     }
-                }
-                .pickerStyle(.segmented)
-                .disabled(existing != nil)
 
-                Text(kindExplanation)
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    if let caveat = preset.caveat {
+                        HozzLabel(.infoCircle, size: 16) {
+                            Text(caveat)
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Setting up \(preset.displayName)")
+                }
+            } else {
+                Section {
+                    Picker("Send to", selection: $kind) {
+                        ForEach(DestinationKind.allCases, id: \.self) { kind in
+                            Text(kind.displayName).tag(kind)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(existing != nil)
+
+                    Text(kindExplanation)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             switch kind {
             case .folder:
                 folderSection
-            case .restAPI:
+            case .restAPI, .mqtt:
                 endpointSection
             }
 
@@ -192,16 +228,16 @@ struct DestinationEditorView: View {
 
     private var endpointSection: some View {
         Section {
-            TextField("https://example.com/health", text: $endpoint)
+            TextField(preset?.addressPlaceholder ?? "https://example.com/health", text: $endpoint)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .keyboardType(.URL)
 
-            SecureField("Authorization header (optional)", text: $secret)
+            SecureField(preset?.secretPlaceholder ?? "Authorization header (optional)", text: $secret)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
         } header: {
-            Text("Web address")
+            Text(kind == .mqtt ? "Broker" : "Web address")
         } footer: {
             Text(
                 "Hozz posts batches here and includes an idempotency key, so a "
@@ -218,6 +254,8 @@ struct DestinationEditorView: View {
             "Easiest. No server to run, and it works away from home."
         case .restAPI:
             "For a database or a service you run yourself."
+        case .mqtt:
+            "For a broker on your network."
         }
     }
 
@@ -242,10 +280,15 @@ struct DestinationEditorView: View {
         case .folder:
             return folderBookmark != nil
         case .restAPI:
-            guard let url = URL(string: endpoint) else {
+            guard let url = URL(string: endpoint), url.host != nil else {
                 return false
             }
             return url.scheme == "https" || url.scheme == "http"
+        case .mqtt:
+            guard let url = URL(string: endpoint), url.host != nil else {
+                return false
+            }
+            return url.scheme == "mqtt" || url.scheme == "mqtts"
         }
     }
 
@@ -285,7 +328,7 @@ struct DestinationEditorView: View {
             cadence: cadence,
             isEnabled: isEnabled,
             folderBookmark: folderBookmark,
-            endpointURL: kind == .restAPI ? URL(string: endpoint) : nil,
+            endpointURL: kind == .folder ? nil : URL(string: endpoint),
             headers: existing?.headers ?? [:],
             includedTypes: includedTypes,
             createdAt: existing?.createdAt ?? .now

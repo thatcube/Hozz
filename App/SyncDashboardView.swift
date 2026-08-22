@@ -71,7 +71,7 @@ struct SyncDashboardView: View {
         }
         .sheet(isPresented: $isAddingDestination) {
             NavigationStack {
-                DestinationEditorView(model: model, destination: nil)
+                DestinationPickerView(model: model)
             }
         }
         .sheet(item: $editingDestination) { destination in
@@ -193,6 +193,14 @@ private struct DestinationRow: View {
         case .waitingForUnlock: .lock
         case .waitingForSystem: .hourglass
         case .idle: summary.destination.kind == .folder ? .folder : .api
+        }
+    }
+
+    private var kindIcon: HozzIcon {
+        switch summary.destination.kind {
+        case .folder: .folder
+        case .restAPI: .api
+        case .mqtt: .plugConnected
         }
     }
 

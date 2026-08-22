@@ -19,6 +19,8 @@ public enum DestinationKind: String, Codable, CaseIterable, Sendable {
     /// An HTTPS endpoint the user runs. For people who want the data in a
     /// database rather than in files.
     case restAPI
+    /// An MQTT broker, for home automation setups.
+    case mqtt
 
     public var displayName: String {
         switch self {
@@ -26,11 +28,13 @@ public enum DestinationKind: String, Codable, CaseIterable, Sendable {
             "Folder"
         case .restAPI:
             "REST API"
+        case .mqtt:
+            "MQTT"
         }
     }
 
     public var requiresNetwork: Bool {
-        self == .restAPI
+        self != .folder
     }
 }
 
@@ -192,7 +196,7 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
         switch kind {
         case .folder:
             folderBookmark != nil
-        case .restAPI:
+        case .restAPI, .mqtt:
             endpointURL != nil
         }
     }

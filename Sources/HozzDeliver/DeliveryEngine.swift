@@ -26,7 +26,8 @@ public actor DeliveryEngine {
         credentials: DestinationCredentials = DestinationCredentials(),
         channels: [DestinationKind: any DeliveryChannel] = [
             .folder: FolderDeliveryChannel(),
-            .restAPI: RESTDeliveryChannel()
+            .restAPI: RESTDeliveryChannel(),
+            .mqtt: MQTTDeliveryChannel()
         ]
     ) {
         self.store = store

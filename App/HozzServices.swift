@@ -114,6 +114,8 @@ extension DeliveryEngine {
                 return "Wrote \(receipt.artifactName ?? "a test file") successfully."
             case .restAPI:
                 return "The destination accepted the test. \(receipt.detail ?? "")"
+            case .mqtt:
+                return "The broker accepted the test. \(receipt.detail ?? "")"
             }
         } catch let error as DeliveryError {
             return error.errorDescription ?? "The test failed."
