@@ -382,8 +382,12 @@ private struct ExportStepRow: View {
             Image(systemName: "checkmark.circle.fill")
                 .foregroundStyle(.green)
         case .indeterminate:
-            Image(systemName: "questionmark.circle.fill")
-                .foregroundStyle(.secondary)
+            // Finishing with nothing is a normal, successful outcome for most
+            // people on most types, so it reads as done rather than as a
+            // problem. The caveat that Apple will not say whether a type was
+            // unshared or simply empty is stated once, in the summary.
+            Image(systemName: "checkmark.circle")
+                .foregroundStyle(.tertiary)
         case .failed:
             Image(systemName: "exclamationmark.triangle.fill")
                 .foregroundStyle(.orange)
@@ -397,7 +401,7 @@ private struct ExportStepRow: View {
         case .completed:
             "\(step.recordCount.formatted()) records"
         case .indeterminate:
-            "No records returned — denied or empty"
+            "No records"
         case .failed:
             "Could not finish this data type"
         }
@@ -593,15 +597,25 @@ private struct ExportReadyView: View {
             }
 
             DisclosureGroup("Export details") {
-                VStack(spacing: 10) {
+                VStack(alignment: .leading, spacing: 10) {
                     LabeledContent(
                         "Types with records",
                         value: result.nonEmptyTypeCount.formatted()
                     )
                     LabeledContent(
-                        "No records returned",
+                        "Types with no records",
                         value: result.zeroResultTypeCount.formatted()
                     )
+
+                    Text(
+                        "Most people have no data for most types, so empty is "
+                        + "normal. Apple does not let Hozz tell an empty type "
+                        + "from one you did not share, so the export marks "
+                        + "those as indeterminate rather than claiming they "
+                        + "were read."
+                    )
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                     if result.failedTypeCount > 0 {
                         LabeledContent(
