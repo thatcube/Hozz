@@ -256,6 +256,44 @@ xcodebuild \
   test
 ```
 
+## Notes for anyone working on the Mac app
+
+Two macOS behaviours cost a lot of time to diagnose. Both look like a network
+fault and are not one.
+
+**A sandboxed app needs `com.apple.security.network.client` to answer, not just
+`com.apple.security.network.server` to listen.** A reply travels to the phone's
+ephemeral port, which the sandbox classifies as an outbound connection. With
+only the server entitlement the listener accepts a connection and is then
+silently forbidden from writing the response, so the request hangs and times
+out exactly as though the computer were switched off. The kernel says so
+plainly, and this is the fastest way to confirm it:
+
+```bash
+log show --last 5m --predicate 'eventMessage CONTAINS "deny("' --info \
+  | grep -i hozz
+# Sandbox: Hozz(2625) deny(1) network-outbound remote:*:60607
+```
+
+Strongbox, a sandboxed Mac App Store app that syncs with an iPhone over
+`NWListener`, declares both entitlements for the same reason.
+
+**Local Network authorisation is keyed to the executable's UUID, and cannot be
+reset.** It is not TCC — it is a packet filter in the Network Extension
+framework — so `tccutil reset LocalNetwork` fails, and Apple documents that
+there is no way to return the state to undetermined (FB14944392). Every rebuild
+produces a new UUID, so a grant can go stale while System Settings still shows
+the app as allowed. Listening does not require this grant, but advertising over
+Bonjour does. When developing, exempt the subnet rather than fighting it:
+
+```bash
+sudo defaults write com.apple.network.local-network \
+  AllowedWiFiLocalNetworkAddresses -array "192.168.0.0/16"
+sudo reboot
+```
+
+Remove that before testing what a real user would experience.
+
 ## Privacy and security
 
 Hozz sends nothing until the user configures and confirms a destination. Network

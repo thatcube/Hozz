@@ -425,24 +425,17 @@ targets:
     entitlements:
       path: Mac/HozzMac.entitlements
       properties:
-        # Not sandboxed, which is a deliberate and uncomfortable choice.
-        #
-        # The App Sandbox is a permission jail: a sandboxed app gets its own
-        # private container instead of the real home directory, and every
-        # capability it wants — network, files, hardware — must be requested
-        # with an entitlement. It limits the damage a compromised app can do.
-        #
-        # Hozz asked for the one entitlement that exists for this,
-        # com.apple.security.network.server, and it was present in the signed
-        # binary. Inbound connections from the iPhone were still dropped on
-        # macOS 26: the socket accepts and then nothing arrives, while an
-        # unsandboxed process on the same machine and port works immediately.
-        # The same build with only this flag flipped receives normally.
-        #
-        # What is given up is narrow. Hozz is distributed outside the App Store,
-        # so the sandbox is not required, and the hardened runtime still
-        # applies. What would be lost by keeping it is the entire feature.
-        com.apple.security.app-sandbox: false
+        # Sandboxed, with three holes: accept the phone's connections, reply
+        # to them, and let the user pick where an export goes.
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.server: true
+        # Required even though Hozz only ever answers. A reply travels to the
+        # phone's ephemeral port, which the sandbox classifies as outbound, so
+        # without this the listener accepts a connection and is then silently
+        # forbidden from writing the response — the request hangs and times out
+        # exactly as though the computer were switched off. The kernel says so
+        # plainly: "deny(1) network-outbound".
+        com.apple.security.network.client: true
         com.apple.security.files.user-selected.read-write: true
         # Shared with the iPhone app so the receiver token can travel through
         # the user's own iCloud Keychain. Two devices on one Apple account are
