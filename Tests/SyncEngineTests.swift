@@ -55,6 +55,40 @@ private actor RecordingChannel: DeliveryChannel {
     }
 }
 
+/// A source that hands back only a few records per page, the way the series
+/// reader does, so a page is bounded by size rather than by the caller's count.
+private actor ChunkedHealthDataSource: HealthDataSource {
+    private let changes: [HealthChange]
+    private let type: HealthTypeKey
+    private let perPage: Int
+
+    init(changes: [HealthChange], type: HealthTypeKey, perPage: Int) {
+        self.changes = changes
+        self.type = type
+        self.perPage = perPage
+    }
+
+    func changes(
+        for type: HealthTypeKey,
+        after anchor: AnchorToken?,
+        limit: Int
+    ) async throws -> HealthChangeBatch {
+        guard type == self.type else {
+            return HealthChangeBatch(
+                changes: [],
+                proposedAnchor: AnchorToken(data: Data("0".utf8))
+            )
+        }
+        let offset = anchor
+            .flatMap { Int(String(decoding: $0.data, as: UTF8.self)) } ?? 0
+        let end = min(offset + min(perPage, limit), changes.count)
+        return HealthChangeBatch(
+            changes: Array(changes[offset..<end]),
+            proposedAnchor: AnchorToken(data: Data(String(end).utf8))
+        )
+    }
+}
+
 final class SyncEngineTests: XCTestCase {
     private var directory: TemporaryDirectory!
     private let steps = HealthTypeKey("HKQuantityTypeIdentifierStepCount")
@@ -356,5 +390,109 @@ final class SyncEngineTests: XCTestCase {
 
         let payloads = await channel.payloads(for: destination.id)
         XCTAssertEqual(payloads.count, 1, "An idle pass must not resend.")
+    }
+
+    // MARK: - Bounded passes
+
+    /// Series records carry five hundred points each and are tens of kilobytes,
+    /// so a pass bounded only by record count would gather hundreds of
+    /// megabytes in a background launch and be killed for it.
+    func testAPassStopsOnSizeRatherThanOnlyOnCount() async throws {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = Destination(
+            name: "Folder",
+            kind: .folder,
+            folderBookmark: Data("a".utf8)
+        )
+        try await delivery.save(destination)
+
+        // Far fewer records than the count limit, but far more bytes. Paged
+        // the way a series type pages, a few large records at a time.
+        let recordBytes = 64 * 1_024
+        let source = ChunkedHealthDataSource(
+            changes: (0..<400).map { index in
+                fat("fat-\(index)", type: steps, bytes: recordBytes)
+            },
+            type: steps,
+            perPage: 8
+        )
+        let engine = HealthSyncEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps],
+            lease: ExportWriterLease()
+        )
+
+        let outcome = try await engine.sync()
+
+        XCTAssertTrue(
+            outcome.wasInterrupted,
+            "A pass that hit its size budget must say it did not finish."
+        )
+        let delivered = await channel.payloads(for: destination.id)
+        let bytes = delivered.reduce(0) { $0 + $1.count }
+        // A page's size cannot be known before it is read, so the bound is the
+        // budget plus at most one more page.
+        XCTAssertLessThan(
+            bytes,
+            HealthSyncEngine.batchByteLimit + 8 * 2 * recordBytes,
+            "One pass must not gather an unbounded amount of Health data."
+        )
+        XCTAssertGreaterThan(bytes, 0, "It must still make progress.")
+
+        // The rest is not lost: the cursor stayed where the pass stopped, so
+        // later passes carry on from there.
+        var passes = 1
+        while passes < 40 {
+            let next = try await engine.sync(
+                now: Date(timeIntervalSinceNow: Double(passes) * 3_600)
+            )
+            passes += 1
+            if next.deliveredRecords == 0 {
+                break
+            }
+        }
+        let identifiers = await channel.sampleIDs(for: destination.id)
+        XCTAssertEqual(
+            Set(identifiers).count,
+            400,
+            "Every record must arrive across the passes."
+        )
+        XCTAssertEqual(
+            identifiers.count,
+            400,
+            "No record may be sent twice."
+        )
+    }
+
+    /// A record whose payload is deliberately large, standing in for a workout
+    /// route page or a block of ECG voltages.
+    private func fat(
+        _ identifier: String,
+        type: HealthTypeKey,
+        bytes: Int
+    ) -> HealthChange {
+        let payload: [String: Any] = [
+            "kind": "quantity",
+            "id": UUID().uuidString.lowercased(),
+            "type": type.rawValue,
+            "startDate": "2026-01-01T00:00:00.000Z",
+            "endDate": "2026-01-01T00:00:00.000Z",
+            "sample": identifier,
+            "filler": String(repeating: "x", count: bytes)
+        ]
+        return .upsert(
+            CapturedHealthObject(
+                id: UUID(),
+                type: type,
+                canonicalPayload: try! JSONSerialization.data(
+                    withJSONObject: payload,
+                    options: [.sortedKeys]
+                )
+            )
+        )
     }
 }

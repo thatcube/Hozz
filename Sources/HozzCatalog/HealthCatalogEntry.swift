@@ -10,6 +10,9 @@ public enum HealthTypeFamily: String, Codable, CaseIterable, Sendable {
     case document
     case scoredAssessment
     case workout
+    /// A hearing test: not a single value, but a set of sensitivity readings
+    /// carried on the sample itself.
+    case audiogram
     /// Samples whose real content is a stream attached to them rather than a
     /// value on them — a workout's route, for instance. They are read through
     /// the ordinary anchored path and then streamed in bounded pieces.
@@ -66,7 +69,9 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
             "HKDocumentTypeIdentifier",
             "HKScoredAssessmentTypeIdentifier",
             "HKWorkoutRouteTypeIdentifier",
-            "HKWorkoutTypeIdentifier"
+            "HKWorkoutTypeIdentifier",
+            "HKAudiogramTypeIdentifier",
+            "HKDataTypeIdentifier"
         ]
         for prefix in prefixes where name.hasPrefix(prefix) {
             name.removeFirst(prefix.count)
@@ -76,6 +81,7 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
             return switch key.rawValue {
             case "HKWorkoutTypeIdentifier": "Workout"
             case "HKWorkoutRouteTypeIdentifier": "Workout Route"
+            case "HKAudiogramTypeIdentifier": "Audiogram"
             default: key.rawValue
             }
         }
@@ -104,14 +110,26 @@ public enum HealthTypeCatalog {
                 family: .workout,
                 introduced: IOSVersion(major: 8, minor: 0)
             ),
-            // Not in the generated catalog because it is not a type identifier
-            // Apple lists with the others: a route is reached through
-            // `HKSeriesType.workoutRoute()`. It is anchored and drained like
-            // any other sample, and its locations are streamed separately.
+            // Not in the generated catalog because they are not type
+            // identifiers Apple lists with the others: a route is reached
+            // through `HKSeriesType.workoutRoute()` and an electrocardiogram
+            // through `HKObjectType.electrocardiogramType()`. Both are
+            // anchored and drained like any other sample, and their contents
+            // are streamed separately.
             HealthCatalogEntry(
                 identifier: "HKWorkoutRouteTypeIdentifier",
                 family: .series,
                 introduced: IOSVersion(major: 11, minor: 0)
+            ),
+            HealthCatalogEntry(
+                identifier: "HKDataTypeIdentifierElectrocardiogram",
+                family: .series,
+                introduced: IOSVersion(major: 14, minor: 0)
+            ),
+            HealthCatalogEntry(
+                identifier: "HKAudiogramTypeIdentifier",
+                family: .audiogram,
+                introduced: IOSVersion(major: 13, minor: 0)
             )
         ]
 

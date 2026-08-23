@@ -91,7 +91,8 @@ enum ExportTranscoder {
         // One row per route, not per point, so this stays small however long
         // the rides were. The points themselves are streamed straight out.
         var routeRows: [RouteCSVRow] = []
-        var routeLocationCounts: [String: Int] = [:]
+        var ecgRows: [ECGCSVRow] = []
+        var seriesCounts: [String: Int] = [:]
 
         func closeEntry() throws {
             if currentType != nil {
@@ -129,35 +130,55 @@ enum ExportTranscoder {
                 continue
             }
 
-            // A route's three record kinds all share one type identifier, so
-            // the per-type grouping below cannot hold them: a grid of route
+            // A series type's three record kinds all share one type identifier,
+            // so the per-type grouping below cannot hold them: a grid of route
             // headers and a grid of points are different shapes. They get their
-            // own files, and the points are written as they stream past rather
-            // than gathered up first.
+            // own files, and the elements are written as they stream past
+            // rather than gathered up first.
             if kind == "workoutRoute" {
                 routeRows.append(routeCSVRow(from: object))
                 continue
             }
-            if kind == "workoutRouteEnd" {
-                if
-                    let route = object["route"] as? String,
-                    let count = object["locations"] as? Int
-                {
-                    routeLocationCounts[route] = count
+            if kind == "electrocardiogram" {
+                ecgRows.append(electrocardiogramCSVRow(from: object))
+                continue
+            }
+            if kind == "audiogram" {
+                // A hearing test is a set of readings, not one value, so it
+                // gets a row per reading rather than a cell full of JSON.
+                if currentType != audiogramEntry {
+                    try closeEntry()
+                    try archive.beginEntry(name: audiogramEntry)
+                    try archive.write(Data((audiogramHeader + "\n").utf8))
+                    currentType = audiogramEntry
+                    currentKind = kind
+                }
+                for row in audiogramCSVRows(from: object) {
+                    try archive.write(Data((row + "\n").utf8))
                 }
                 continue
             }
-            if kind == "workoutRouteLocations" {
-                if currentType != routeLocationsEntry {
+            if let shape = seriesShape(endKind: kind) {
+                if
+                    let sample = object["sample"] as? String,
+                    let count = object[shape.elementsKey] as? Int
+                {
+                    seriesCounts[sample] = count
+                }
+                continue
+            }
+            if let shape = seriesShape(elementKind: kind) {
+                let entry = seriesElementEntry(for: shape)
+                if currentType != entry {
                     try closeEntry()
-                    try archive.beginEntry(name: routeLocationsEntry)
+                    try archive.beginEntry(name: entry)
                     try archive.write(
-                        Data((routeLocationHeader + "\n").utf8)
+                        Data((seriesElementHeader(for: shape) + "\n").utf8)
                     )
-                    currentType = routeLocationsEntry
+                    currentType = entry
                     currentKind = kind
                 }
-                for row in routeLocationCSVRows(from: object) {
+                for row in seriesElementCSVRows(shape: shape, from: object) {
                     try archive.write(Data((row + "\n").utf8))
                 }
                 continue
@@ -207,11 +228,25 @@ enum ExportTranscoder {
                 // written, so it is filled in here rather than guessed earlier.
                 // A route with no count never reached its end marker, and is
                 // left blank instead of being reported as zero.
-                let count = routeLocationCounts[route.id]
                 try archive.write(
                     Data(
-                        (route.fields(locations: count) + "\n").utf8
+                        (route.fields(locations: seriesCounts[route.id]) + "\n").utf8
                     )
+                )
+            }
+            try archive.endEntry()
+        }
+
+        if !ecgRows.isEmpty {
+            try archive.beginEntry(name: "Electrocardiograms.csv")
+            try archive.write(
+                Data(
+                    "id,startDate,endDate,classification,symptomsStatus,averageHeartRate,samplingFrequency,reportedVoltages,exportedVoltages,sourceName,device\n".utf8
+                )
+            )
+            for ecg in ecgRows {
+                try archive.write(
+                    Data((ecg.fields(exported: seriesCounts[ecg.id]) + "\n").utf8)
                 )
             }
             try archive.endEntry()
@@ -261,11 +296,121 @@ enum ExportTranscoder {
         try archive.endEntry()
     }
 
-    // MARK: - Workout routes
+    // MARK: - Audiograms
 
-    static let routeLocationsEntry = "WorkoutRouteLocations.csv"
-    static let routeLocationHeader =
-        "route,sequence,offset,timestamp,latitude,longitude,altitude,horizontalAccuracy,verticalAccuracy,course,speed,floor"
+    static let audiogramEntry = "Audiograms.csv"
+    static let audiogramHeader =
+        "audiogram,startDate,endDate,frequencyHz,ear,sensitivityDBHL,conduction,masked,clampedAtLeast,clampedAtMost,sourceName"
+
+    /// One row per ear reading. A hearing test with nothing recorded for an
+    /// ear produces no row for it, rather than a row saying zero.
+    static func audiogramCSVRows(from object: [String: Any]) -> [String] {
+        guard let points = object["sensitivityPoints"] as? [[String: Any]] else {
+            return []
+        }
+        let id = object["id"] as? String ?? ""
+        let start = object["startDate"] as? String ?? ""
+        let end = object["endDate"] as? String ?? ""
+        let source = object["source"] as? [String: Any] ?? [:]
+        let sourceName = source["name"] as? String ?? ""
+
+        return points.flatMap { point -> [String] in
+            let frequency = number(
+                (point["frequency"] as? [String: Any])?["value"]
+            )
+            let ears = point["ears"] as? [[String: Any]] ?? []
+            return ears.map { ear in
+                let clamping = ear["clampingRange"] as? [String: Any]
+                return [
+                    id,
+                    start,
+                    end,
+                    frequency,
+                    ear["ear"] as? String ?? "",
+                    number((ear["sensitivity"] as? [String: Any])?["value"]),
+                    ear["conduction"] as? String ?? "",
+                    (ear["masked"] as? Bool).map(String.init) ?? "",
+                    number((clamping?["lowerBound"] as? [String: Any])?["value"]),
+                    number((clamping?["upperBound"] as? [String: Any])?["value"]),
+                    sourceName
+                ].map(escape).joined(separator: ",")
+            }
+        }
+    }
+
+    // MARK: - Series types
+
+    private static let seriesShapes: [SeriesShape] = [
+        WorkoutRouteEncoding.shape,
+        ElectrocardiogramEncoding.shape
+    ]
+
+    static func seriesShape(elementKind: String) -> SeriesShape? {
+        seriesShapes.first { $0.elementKind == elementKind }
+    }
+
+    static func seriesShape(endKind: String) -> SeriesShape? {
+        seriesShapes.first { $0.endKind == endKind }
+    }
+
+    static func seriesElementEntry(for shape: SeriesShape) -> String {
+        switch shape.elementKind {
+        case WorkoutRouteEncoding.shape.elementKind:
+            "WorkoutRouteLocations.csv"
+        default:
+            "ElectrocardiogramVoltages.csv"
+        }
+    }
+
+    static func seriesElementHeader(for shape: SeriesShape) -> String {
+        switch shape.elementKind {
+        case WorkoutRouteEncoding.shape.elementKind:
+            "route,sequence,offset,timestamp,latitude,longitude,altitude,horizontalAccuracy,verticalAccuracy,course,speed,floor"
+        default:
+            "electrocardiogram,sequence,offset,timestamp,timeSinceStart,volts"
+        }
+    }
+
+    /// One row per element, so a recording survives the grid instead of
+    /// collapsing into a single unreadable cell.
+    static func seriesElementCSVRows(
+        shape: SeriesShape,
+        from object: [String: Any]
+    ) -> [String] {
+        guard
+            let elements = object[shape.elementsKey] as? [[String: Any]]
+        else {
+            return []
+        }
+        let sample = object["sample"] as? String ?? ""
+        let sequence = number(object["sequence"])
+        let offset = (object["offset"] as? Int) ?? 0
+        let isRoute = shape.elementKind == WorkoutRouteEncoding.shape.elementKind
+
+        return elements.enumerated().map { index, element in
+            var fields = [sample, sequence, String(offset + index)]
+            if isRoute {
+                fields += [
+                    element["timestamp"] as? String ?? "",
+                    number(element["latitude"]),
+                    number(element["longitude"]),
+                    number(element["altitude"]),
+                    number(element["horizontalAccuracy"]),
+                    number(element["verticalAccuracy"]),
+                    number(element["course"]),
+                    number(element["speed"]),
+                    number(element["floor"])
+                ]
+            } else {
+                fields += [
+                    object["startDate"] as? String ?? "",
+                    number(element["timeSinceStart"]),
+                    number(element["volts"])
+                ]
+            }
+            return fields.map(escape).joined(separator: ",")
+        }
+    }
 
     /// A route's own row, held until its point count is known.
     struct RouteCSVRow {
@@ -310,32 +455,59 @@ enum ExportTranscoder {
         )
     }
 
-    /// One row per point, so a route survives the grid instead of collapsing
-    /// into a single unreadable cell.
-    static func routeLocationCSVRows(from object: [String: Any]) -> [String] {
-        guard let locations = object["locations"] as? [[String: Any]] else {
-            return []
-        }
-        let route = object["route"] as? String ?? ""
-        let sequence = number(object["sequence"])
-        let offset = (object["offset"] as? Int) ?? 0
+    /// A recording's own row, held until its voltage count is known.
+    struct ECGCSVRow {
+        let id: String
+        let startDate: String
+        let endDate: String
+        let classification: String
+        let symptomsStatus: String
+        let averageHeartRate: String
+        let samplingFrequency: String
+        let reportedVoltages: String
+        let sourceName: String
+        let device: String
 
-        return locations.enumerated().map { index, location in
+        func fields(exported: Int?) -> String {
             [
-                route,
-                sequence,
-                String(offset + index),
-                location["timestamp"] as? String ?? "",
-                number(location["latitude"]),
-                number(location["longitude"]),
-                number(location["altitude"]),
-                number(location["horizontalAccuracy"]),
-                number(location["verticalAccuracy"]),
-                number(location["course"]),
-                number(location["speed"]),
-                number(location["floor"])
+                id,
+                startDate,
+                endDate,
+                classification,
+                symptomsStatus,
+                averageHeartRate,
+                samplingFrequency,
+                reportedVoltages,
+                // Health's own count and the number actually written are kept
+                // side by side. If a recording was cut short, the two disagree
+                // and say so rather than quietly matching.
+                exported.map(String.init) ?? "",
+                sourceName,
+                device
             ].map(escape).joined(separator: ",")
         }
+    }
+
+    static func electrocardiogramCSVRow(from object: [String: Any]) -> ECGCSVRow {
+        let classification = object["classification"] as? [String: Any] ?? [:]
+        let symptoms = object["symptomsStatus"] as? [String: Any] ?? [:]
+        let heartRate = object["averageHeartRate"] as? [String: Any]
+        let frequency = object["samplingFrequency"] as? [String: Any]
+        let source = object["source"] as? [String: Any] ?? [:]
+        let device = object["device"] as? [String: Any]
+
+        return ECGCSVRow(
+            id: object["id"] as? String ?? "",
+            startDate: object["startDate"] as? String ?? "",
+            endDate: object["endDate"] as? String ?? "",
+            classification: classification["name"] as? String ?? "",
+            symptomsStatus: symptoms["name"] as? String ?? "",
+            averageHeartRate: number(heartRate?["value"]),
+            samplingFrequency: number(frequency?["value"]),
+            reportedVoltages: number(object["numberOfVoltageMeasurements"]),
+            sourceName: source["name"] as? String ?? "",
+            device: device?["name"] as? String ?? ""
+        )
     }
 
     // MARK: - CSV shaping

@@ -3,12 +3,12 @@ import Foundation
 import HealthKit
 import HozzCore
 
-/// The real ``WorkoutRouteBackend``: HealthKit queries, and nothing else.
+/// The real workout route backend: HealthKit queries, and nothing else.
 ///
-/// Everything about paging, offsets, and replay lives in ``WorkoutRouteReader``.
+/// Everything about paging, offsets, and replay lives in ``SeriesReader``.
 /// This type only turns Health's callbacks into `Sendable` values, so no
 /// `HKSample` or `CLLocation` ever leaves HealthKit's own queue.
-public struct HealthKitWorkoutRouteBackend: WorkoutRouteBackend {
+public struct HealthKitWorkoutRouteBackend: SeriesBackend {
     // Safe to share: `HKHealthStore` documents its queries as usable from any
     // thread, and this type only ever executes them.
     private nonisolated(unsafe) let healthStore: HKHealthStore
@@ -22,7 +22,35 @@ public struct HealthKitWorkoutRouteBackend: WorkoutRouteBackend {
         self.encoder = encoder
     }
 
-    public func nextRoutePage(after anchor: Data?) async throws -> WorkoutRoutePage {
+    public func nextPage(after anchor: Data?) async throws -> SeriesPage {
+        let page = try await rawPage(after: anchor)
+        guard let header = page.header else {
+            return page
+        }
+        // The workout needs queries of its own, so it cannot be known where
+        // the sample was encoded. It is resolved here and folded into the
+        // header before the reader ever sees it.
+        let link = await resolveWorkout(
+            routeID: header.id,
+            start: header.startDate,
+            end: header.endDate
+        )
+        return SeriesPage(
+            header: SeriesHeader(
+                id: header.id,
+                startDate: header.startDate,
+                endDate: header.endDate,
+                basePayload: try WorkoutRouteEncoding.basePayload(
+                    header.basePayload,
+                    workout: link
+                )
+            ),
+            deletions: page.deletions,
+            anchor: page.anchor
+        )
+    }
+
+    private func rawPage(after anchor: Data?) async throws -> SeriesPage {
         let startAnchor = try HealthKitAnchorCoding.anchor(
             for: anchor.map { AnchorToken(data: $0) }
         )
@@ -55,9 +83,9 @@ public struct HealthKitWorkoutRouteBackend: WorkoutRouteBackend {
 
                 do {
                     let token = try HealthKitAnchorCoding.token(for: newAnchor)
-                    var header: WorkoutRouteEncoding.Header?
+                    var header: SeriesHeader?
                     if let sample = samples?.first {
-                        header = WorkoutRouteEncoding.Header(
+                        header = SeriesHeader(
                             id: sample.uuid,
                             startDate: sample.startDate,
                             endDate: sample.endDate,
@@ -67,7 +95,7 @@ public struct HealthKitWorkoutRouteBackend: WorkoutRouteBackend {
                         )
                     }
                     continuation.resume(
-                        returning: WorkoutRoutePage(
+                        returning: SeriesPage(
                             header: header,
                             deletions: (deletions ?? []).map(\.uuid),
                             anchor: token.data
@@ -81,7 +109,7 @@ public struct HealthKitWorkoutRouteBackend: WorkoutRouteBackend {
         }
     }
 
-    public func routeFacts(id: UUID) async throws -> WorkoutRouteFacts? {
+    public func facts(id: UUID) async throws -> SeriesFacts? {
         try await withCheckedThrowingContinuation { continuation in
             let query = HKSampleQuery(
                 sampleType: HKSeriesType.workoutRoute(),
@@ -103,7 +131,7 @@ public struct HealthKitWorkoutRouteBackend: WorkoutRouteBackend {
                     return
                 }
                 continuation.resume(
-                    returning: WorkoutRouteFacts(
+                    returning: SeriesFacts(
                         startDate: sample.startDate,
                         endDate: sample.endDate
                     )
@@ -118,7 +146,7 @@ public struct HealthKitWorkoutRouteBackend: WorkoutRouteBackend {
     /// `AsyncThrowingStream` is used rather than hopping each batch onto an
     /// actor, because its yields are ordered. Delivering batches through
     /// unordered tasks would silently scramble a ride.
-    public func locations(
+    public func elements(
         for routeID: UUID
     ) -> AsyncThrowingStream<[RouteLocation], any Error> {
         let healthStore = healthStore
@@ -168,7 +196,7 @@ public struct HealthKitWorkoutRouteBackend: WorkoutRouteBackend {
     /// are workouts that overlap the route in time, and each is then asked
     /// whether this route is actually its own. Overlap alone would attach a
     /// ride to whatever else happened to be recorded at the same moment.
-    public func resolveWorkout(
+    func resolveWorkout(
         routeID: UUID,
         start: Date,
         end: Date
