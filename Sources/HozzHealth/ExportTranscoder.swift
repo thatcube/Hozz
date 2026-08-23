@@ -88,6 +88,10 @@ enum ExportTranscoder {
         var deletions: [(id: String, type: String)] = []
         var runRecords: [Data] = []
         var characteristicRows: [String] = []
+        // One row per route, not per point, so this stays small however long
+        // the rides were. The points themselves are streamed straight out.
+        var routeRows: [RouteCSVRow] = []
+        var routeLocationCounts: [String: Int] = [:]
 
         func closeEntry() throws {
             if currentType != nil {
@@ -124,6 +128,41 @@ enum ExportTranscoder {
                 )
                 continue
             }
+
+            // A route's three record kinds all share one type identifier, so
+            // the per-type grouping below cannot hold them: a grid of route
+            // headers and a grid of points are different shapes. They get their
+            // own files, and the points are written as they stream past rather
+            // than gathered up first.
+            if kind == "workoutRoute" {
+                routeRows.append(routeCSVRow(from: object))
+                continue
+            }
+            if kind == "workoutRouteEnd" {
+                if
+                    let route = object["route"] as? String,
+                    let count = object["locations"] as? Int
+                {
+                    routeLocationCounts[route] = count
+                }
+                continue
+            }
+            if kind == "workoutRouteLocations" {
+                if currentType != routeLocationsEntry {
+                    try closeEntry()
+                    try archive.beginEntry(name: routeLocationsEntry)
+                    try archive.write(
+                        Data((routeLocationHeader + "\n").utf8)
+                    )
+                    currentType = routeLocationsEntry
+                    currentKind = kind
+                }
+                for row in routeLocationCSVRows(from: object) {
+                    try archive.write(Data((row + "\n").utf8))
+                }
+                continue
+            }
+
             guard let type = object["type"] as? String else {
                 continue
             }
@@ -151,6 +190,28 @@ enum ExportTranscoder {
             for deletion in deletions {
                 try archive.write(
                     Data("\(escape(deletion.id)),\(escape(deletion.type))\n".utf8)
+                )
+            }
+            try archive.endEntry()
+        }
+
+        if !routeRows.isEmpty {
+            try archive.beginEntry(name: "WorkoutRoutes.csv")
+            try archive.write(
+                Data(
+                    "id,startDate,endDate,workoutId,workoutActivityType,workoutState,locations,sourceName,device\n".utf8
+                )
+            )
+            for route in routeRows {
+                // The point count is only known once the route has been fully
+                // written, so it is filled in here rather than guessed earlier.
+                // A route with no count never reached its end marker, and is
+                // left blank instead of being reported as zero.
+                let count = routeLocationCounts[route.id]
+                try archive.write(
+                    Data(
+                        (route.fields(locations: count) + "\n").utf8
+                    )
                 )
             }
             try archive.endEntry()
@@ -198,6 +259,83 @@ enum ExportTranscoder {
 
         try archive.write(Data("\n]\n".utf8))
         try archive.endEntry()
+    }
+
+    // MARK: - Workout routes
+
+    static let routeLocationsEntry = "WorkoutRouteLocations.csv"
+    static let routeLocationHeader =
+        "route,sequence,offset,timestamp,latitude,longitude,altitude,horizontalAccuracy,verticalAccuracy,course,speed,floor"
+
+    /// A route's own row, held until its point count is known.
+    struct RouteCSVRow {
+        let id: String
+        let startDate: String
+        let endDate: String
+        let workoutID: String
+        let workoutActivityType: String
+        let workoutState: String
+        let sourceName: String
+        let device: String
+
+        func fields(locations: Int?) -> String {
+            [
+                id,
+                startDate,
+                endDate,
+                workoutID,
+                workoutActivityType,
+                workoutState,
+                locations.map(String.init) ?? "",
+                sourceName,
+                device
+            ].map(escape).joined(separator: ",")
+        }
+    }
+
+    static func routeCSVRow(from object: [String: Any]) -> RouteCSVRow {
+        let workout = object["workout"] as? [String: Any] ?? [:]
+        let source = object["source"] as? [String: Any] ?? [:]
+        let device = object["device"] as? [String: Any]
+
+        return RouteCSVRow(
+            id: object["id"] as? String ?? "",
+            startDate: object["startDate"] as? String ?? "",
+            endDate: object["endDate"] as? String ?? "",
+            workoutID: workout["id"] as? String ?? "",
+            workoutActivityType: number(workout["activityType"]),
+            workoutState: workout["state"] as? String ?? "",
+            sourceName: source["name"] as? String ?? "",
+            device: device?["name"] as? String ?? ""
+        )
+    }
+
+    /// One row per point, so a route survives the grid instead of collapsing
+    /// into a single unreadable cell.
+    static func routeLocationCSVRows(from object: [String: Any]) -> [String] {
+        guard let locations = object["locations"] as? [[String: Any]] else {
+            return []
+        }
+        let route = object["route"] as? String ?? ""
+        let sequence = number(object["sequence"])
+        let offset = (object["offset"] as? Int) ?? 0
+
+        return locations.enumerated().map { index, location in
+            [
+                route,
+                sequence,
+                String(offset + index),
+                location["timestamp"] as? String ?? "",
+                number(location["latitude"]),
+                number(location["longitude"]),
+                number(location["altitude"]),
+                number(location["horizontalAccuracy"]),
+                number(location["verticalAccuracy"]),
+                number(location["course"]),
+                number(location["speed"]),
+                number(location["floor"])
+            ].map(escape).joined(separator: ",")
+        }
     }
 
     // MARK: - CSV shaping

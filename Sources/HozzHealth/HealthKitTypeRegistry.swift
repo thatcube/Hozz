@@ -63,6 +63,10 @@ public enum HealthKitTypeRegistry {
                 )
             case .workout:
                 objectType = HKObjectType.workoutType()
+            case .series:
+                objectType = entry.key.rawValue == "HKWorkoutRouteTypeIdentifier"
+                    ? HKSeriesType.workoutRoute()
+                    : nil
             case .correlation,
                  .characteristic,
                  .clinical,
