@@ -71,6 +71,12 @@ public enum HealthKitTypeRegistry {
                 } else {
                     objectType = nil
                 }
+            case .medication:
+                if #available(iOS 26.0, *) {
+                    objectType = HKObjectType.medicationDoseEventType()
+                } else {
+                    objectType = nil
+                }
             case .series:
                 objectType = switch entry.key.rawValue {
                 case WorkoutRouteEncoding.typeIdentifier:

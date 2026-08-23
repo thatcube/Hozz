@@ -33,6 +33,7 @@ public actor HealthKitHealthDataSource: HealthDataSource {
     private let routes: SeriesReader<HealthKitWorkoutRouteBackend>
     private let electrocardiograms: SeriesReader<HealthKitElectrocardiogramBackend>
     private var encodingErrors: [HealthTypeKey: Int] = [:]
+    private var medicationDirectory: [AnyHashable: MedicationConceptFacts]?
 
     public init(
         healthStore: HKHealthStore = HKHealthStore(),
@@ -101,7 +102,8 @@ public actor HealthKitHealthDataSource: HealthDataSource {
         let page = try await page(
             type: exportable,
             anchor: startAnchor,
-            limit: limit
+            limit: limit,
+            medications: try await medications(for: exportable)
         )
         encodingErrors[type, default: 0] += page.encodingErrors
         return page.batch
@@ -112,10 +114,38 @@ public actor HealthKitHealthDataSource: HealthDataSource {
         let encodingErrors: Int
     }
 
+    /// The medication list, read once and reused.
+    ///
+    /// A course of tablets is thousands of dose events pointing at the same
+    /// handful of medicines, so looking each one up per dose would be absurd.
+    /// A medication added mid-drain simply misses the cache and its dose says
+    /// the medication is unresolved, which is true rather than invented.
+    private func medications(
+        for type: ExportableHealthType
+    ) async throws -> [AnyHashable: MedicationConceptFacts] {
+        guard type.catalogEntry.family == .medication else {
+            return [:]
+        }
+        if let medicationDirectory {
+            return medicationDirectory
+        }
+        guard #available(iOS 26.0, *) else {
+            return [:]
+        }
+        // A directory that cannot be read leaves every dose unresolved rather
+        // than failing the type: the doses themselves are still worth having.
+        let loaded = (try? await HealthKitMedicationDirectory(
+            healthStore: healthStore
+        ).load()) ?? [:]
+        medicationDirectory = loaded
+        return loaded
+    }
+
     private func page(
         type: ExportableHealthType,
         anchor: HKQueryAnchor?,
-        limit: Int
+        limit: Int,
+        medications: [AnyHashable: MedicationConceptFacts]
     ) async throws -> Page {
         let encoder = encoder
         let key = type.catalogEntry.key
@@ -155,7 +185,8 @@ public actor HealthKitHealthDataSource: HealthDataSource {
                     do {
                         let payload = try encoder.encode(
                             sample: sample,
-                            catalogEntry: catalogEntry
+                            catalogEntry: catalogEntry,
+                            medications: medications
                         )
                         changes.append(
                             .upsert(

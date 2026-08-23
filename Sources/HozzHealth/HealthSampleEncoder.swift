@@ -13,7 +13,8 @@ public struct HealthSampleEncoder: Sendable {
 
     public func encode(
         sample: HKSample,
-        catalogEntry: HealthCatalogEntry
+        catalogEntry: HealthCatalogEntry,
+        medications: [AnyHashable: MedicationConceptFacts] = [:]
     ) throws -> Data {
         var object = baseObject(sample: sample)
 
@@ -25,6 +26,24 @@ public struct HealthSampleEncoder: Sendable {
             object.merge(StateOfMindEncoding.object(for: stateOfMind)) {
                 current, _ in current
             }
+            return try serialize(object)
+        }
+
+        // Handled ahead of the switch for the same reason as State of Mind:
+        // `HKMedicationDoseEvent` does not exist on this deployment target and
+        // cannot appear in a case pattern.
+        if #available(iOS 26.0, *), let dose = sample as? HKMedicationDoseEvent {
+            object["kind"] = "medicationDose"
+            object.merge(
+                MedicationEncoding.object(
+                    for: HealthKitMedicationDirectory.facts(for: dose),
+                    medication: medications[
+                        AnyHashable(dose.medicationConceptIdentifier)
+                    ] ?? .unresolved(
+                        reason: "Hozz could not find the medication this dose refers to."
+                    )
+                )
+            ) { current, _ in current }
             return try serialize(object)
         }
 

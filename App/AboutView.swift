@@ -38,6 +38,7 @@ struct AboutView: View {
                 CoverageRow("Electrocardiograms", available: true)
                 CoverageRow("Audiograms", available: true)
                 CoverageRow("State of Mind", available: true)
+                CoverageRow("Medication doses", available: true)
                 CoverageRow("Health characteristics", available: true)
                 CoverageRow("Historical deletions", available: true)
                 CoverageRow(

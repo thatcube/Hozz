@@ -143,6 +143,22 @@ enum ExportTranscoder {
                 ecgRows.append(electrocardiogramCSVRow(from: object))
                 continue
             }
+            if kind == "medicationDose" {
+                // A dose is a status plus two optional quantities and a
+                // medication that may not have resolved. None of that fits the
+                // generic sample grid.
+                if currentType != medicationEntry {
+                    try closeEntry()
+                    try archive.beginEntry(name: medicationEntry)
+                    try archive.write(Data((medicationHeader + "\n").utf8))
+                    currentType = medicationEntry
+                    currentKind = kind
+                }
+                try archive.write(
+                    Data((medicationCSVRow(from: object) + "\n").utf8)
+                )
+                continue
+            }
             if kind == "stateOfMind" {
                 // A mood entry is a valence plus two lists, none of which fit
                 // the generic sample grid, so it gets its own file.
@@ -309,6 +325,41 @@ enum ExportTranscoder {
 
         try archive.write(Data("\n]\n".utf8))
         try archive.endEntry()
+    }
+
+    // MARK: - Medications
+
+    static let medicationEntry = "MedicationDoses.csv"
+    static let medicationHeader =
+        "id,startDate,endDate,medication,nickname,generalForm,logStatus,scheduleType,scheduledDate,doseQuantity,scheduledDoseQuantity,unit,isArchived,sourceName"
+
+    static func medicationCSVRow(from object: [String: Any]) -> String {
+        let medication = object["medication"] as? [String: Any] ?? [:]
+        let source = object["source"] as? [String: Any] ?? [:]
+        let isResolved = medication["state"] as? String == "resolved"
+
+        return [
+            object["id"] as? String ?? "",
+            object["startDate"] as? String ?? "",
+            object["endDate"] as? String ?? "",
+            // An unresolved medication says so in the cell rather than leaving
+            // a blank that reads as "no medication".
+            isResolved
+                ? (medication["displayText"] as? String ?? "")
+                : "unresolved",
+            medication["nickname"] as? String ?? "",
+            medication["generalForm"] as? String ?? "",
+            (object["logStatus"] as? [String: Any])?["name"] as? String ?? "",
+            (object["scheduleType"] as? [String: Any])?["name"] as? String ?? "",
+            object["scheduledDate"] as? String ?? "",
+            // Left blank when nothing was recorded. A dose nobody logged is
+            // not a dose of zero.
+            number(object["doseQuantity"]),
+            number(object["scheduledDoseQuantity"]),
+            object["unit"] as? String ?? "",
+            (medication["isArchived"] as? Bool).map(String.init) ?? "",
+            source["name"] as? String ?? ""
+        ].map(escape).joined(separator: ",")
     }
 
     // MARK: - State of Mind

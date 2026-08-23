@@ -15,6 +15,8 @@ public enum HealthTypeFamily: String, Codable, CaseIterable, Sendable {
     case audiogram
     /// A mood entry: how someone felt, rather than a measurement of them.
     case stateOfMind
+    /// A logged medication dose: taken, skipped, or never answered.
+    case medication
     /// Samples whose real content is a stream attached to them rather than a
     /// value on them — a workout's route, for instance. They are read through
     /// the ordinary anchored path and then streamed in bounded pieces.
@@ -64,7 +66,8 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
     private static let displayNameOverrides: [String: String] = [
         "HKWorkoutTypeIdentifier": "Workout",
         "HKWorkoutRouteTypeIdentifier": "Workout Route",
-        "HKDataTypeStateOfMind": "State of Mind"
+        "HKDataTypeStateOfMind": "State of Mind",
+        "HKMedicationDoseEventTypeIdentifierMedicationDoseEvent": "Medication Dose"
     ]
 
     public var displayName: String {
@@ -141,6 +144,11 @@ public enum HealthTypeCatalog {
                 identifier: "HKDataTypeStateOfMind",
                 family: .stateOfMind,
                 introduced: IOSVersion(major: 18, minor: 0)
+            ),
+            HealthCatalogEntry(
+                identifier: "HKMedicationDoseEventTypeIdentifierMedicationDoseEvent",
+                family: .medication,
+                introduced: IOSVersion(major: 26, minor: 0)
             )
         ]
 

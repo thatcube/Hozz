@@ -6,7 +6,7 @@ Hozz is a free, open-source iPhone app with a companion Mac receiver. The iPhone
 
 There is no subscription, account, analytics, advertising, hosted relay, or default network destination. Nothing leaves the iPhone until you add a destination and confirm it.
 
-Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, workout routes, electrocardiograms, audiograms, State of Mind entries, historical deletions, and the six Health characteristics. Correlations, other series, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
+Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, workout routes, electrocardiograms, audiograms, State of Mind entries, medication doses, historical deletions, and the six Health characteristics. Correlations, other series, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
 
 ## What works today
 
@@ -83,6 +83,8 @@ Hozz does not use date-window watermarks. Each HealthKit type has its own opaque
 
 For a manual export, records are written to an open spool part and anchors are only committed when that part is sealed in the same store transaction. An unsealed part is deleted on relaunch and replayed from the previous anchor. The result is the property that matters: interruption can repeat work, but it cannot skip records or publish a half-finished export as complete.
 
+A pass gives every type a small share before spending what is left on whatever has the most to send, and the order rotates hourly. Draining strictly in catalogue order meant the first type with a backlog took the whole pass and everything behind it waited — someone with years of stand hours saw no step count for weeks. A type is recorded as caught up only when Health returns an empty page; one the budget cut short stays `draining`, so the store never claims a type is finished when it is not.
+
 Automatic sync uses the same anchor rule per destination. Each destination has its own cursor, so a failed destination cannot advance past data it did not accept, and one broken destination does not block a healthy one. Batches use stable content-derived identifiers and `Idempotency-Key` headers so a retry can be accepted safely.
 
 Apple does not let apps distinguish “the user denied this Health type” from “there is no matching data.” Hozz therefore reports authorization-scoped coverage and keeps denied-or-empty, unavailable, unsupported, and failed states visible.
@@ -154,6 +156,18 @@ The care here is about what a blank would mean. **Zero valence is a neutral mood
 Every label, association, classification, and entry kind is written as a name *and* the number behind it, so a feeling Apple adds in a later release still arrives as something instead of becoming a gap in someone's mood history.
 
 In a CSV export mood entries become `StateOfMind.csv`, and in the SQLite export valence is the value a mood can be charted on over time.
+
+## Medication doses
+
+Doses logged in Health on iOS 26 and newer. This is the dose-logging API, not the clinical `MedicationRecord`, and it needs no special entitlement.
+
+A dose event names its medication only through an opaque concept identifier — HealthKit exposes no stable string for it — so the name, form, and codings are fetched separately and matched up. That list is read once per drain rather than once per dose, because a course of tablets is thousands of events pointing at the same handful of medicines. A dose whose medication cannot be found is still exported, and says the medication is `unresolved` rather than being dropped or given a name it does not have.
+
+The log status is the whole meaning of a dose: `taken`, `skipped`, `snoozed`, and `notInteracted` are different facts about someone's treatment, and only the first means the medicine was used. Each is written with its name and the number behind it.
+
+Quantities stay optional. A dose nobody logged is absent rather than zero, because "took none" and "logged nothing" are different, and only one of them is a dose of zero. A recorded dose of zero is kept as the reading it is.
+
+In a CSV export doses become `MedicationDoses.csv`, one row per dose.
 
 ## Mac receiver
 
@@ -265,7 +279,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 372 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, aggregate sample counts, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 392 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medication doses, fair-share drain ordering, aggregate sample counts, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

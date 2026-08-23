@@ -150,6 +150,7 @@ private extension HealthTypeFamily {
         case .scoredAssessment: "Assessments"
         case .audiogram: "Hearing tests"
         case .stateOfMind: "State of Mind"
+        case .medication: "Medications"
         case .series: "Routes and series"
         }
     }
