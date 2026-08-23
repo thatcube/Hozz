@@ -227,7 +227,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 260 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, workout routes, export formats, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 261 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, workout routes, export formats, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

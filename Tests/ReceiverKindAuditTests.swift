@@ -1,5 +1,6 @@
 import Foundation
 import HozzReceive
+import HozzStore
 import XCTest
 
 /// Every record kind the phone can emit has to survive the trip to the Mac.
@@ -383,5 +384,66 @@ final class ReceiverKindAuditTests: XCTestCase {
         XCTAssertEqual(result.stored, 3)
         XCTAssertEqual(result.characteristics, 3)
         XCTAssertEqual(result.unhandled, 1)
+    }
+
+    // MARK: - Upgrading an existing receiver
+
+    /// Every Mac already running Hozz has a version 2 database with real data
+    /// in it. The upgrade has to add the new tables without disturbing that.
+    func testAVersionTwoDatabaseGainsTheNewTablesWithoutLosingData() async throws {
+        let storeDirectory = directory.url.appending(path: "store")
+
+        // A receiver as it exists today: schema 2, with a sample already in it.
+        do {
+            let store = try makeStore()
+            _ = try await store.ingest(
+                try BatchParser.parse(
+                    try payload([
+                        sampleShaped(
+                            kind: "quantity",
+                            type: "HKQuantityTypeIdentifierStepCount",
+                            id: "existing-1"
+                        )
+                    ])
+                ),
+                idempotencyKey: "before-upgrade"
+            )
+            await store.close()
+        }
+
+        let databaseURL = storeDirectory.appending(path: "hozz-received.sqlite")
+        let database = try SQLiteDatabase(url: databaseURL)
+        try database.execute("DROP TABLE IF EXISTS characteristic")
+        try database.execute("DROP TABLE IF EXISTS unhandled_record")
+        try database.execute("PRAGMA user_version = 2")
+        database.close()
+
+        // Reopening runs the migration.
+        let upgraded = try IngestStore(directory: storeDirectory)
+        _ = try await upgraded.ingest(
+            try BatchParser.parse(try payload([characteristicsRecord()])),
+            idempotencyKey: "after-upgrade"
+        )
+
+        let migratedCharacteristics = try await upgraded.characteristics().count
+        XCTAssertEqual(
+            migratedCharacteristics,
+            3,
+            "The new table has to exist after upgrading, not only on a fresh install."
+        )
+        let survivingSamples = try await upgraded.totalRecordCount()
+        XCTAssertEqual(
+            survivingSamples,
+            1,
+            "The sample that was already there must survive the upgrade."
+        )
+
+        await upgraded.close()
+        let reopened = try SQLiteDatabase(url: databaseURL)
+        defer { reopened.close() }
+        XCTAssertEqual(
+            try reopened.query("PRAGMA user_version", row: { $0.integer(0) }).first,
+            3
+        )
     }
 }
