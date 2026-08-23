@@ -101,6 +101,14 @@ points. Speed, course, and Core Location's accuracies have no element in base
 GPX and are published under Hozz's own namespace in `<extensions>` rather than
 invented as bare elements that would fail validation.
 
+## What each format reads
+
+Most formats present the whole of Health, so a run reads everything Hozz can read. GPX is different: it is a filter rather than a projection, since a GPX file holds a route and nothing else. A GPX run therefore reads only workouts and their routes.
+
+That is a speed difference measured in hours for someone with years of history — reading two hundred types to write out a handful of tracks produces a file that could not have contained the difference. It is safe as well as faster because a manual export keeps its cursors under its own run, so a narrowed run cannot advance a cursor that a full export or an automatic destination depends on.
+
+Progress is reported out of what the run actually reads. A run covering two types says two, rather than appearing stuck at one percent of the catalogue.
+
 ## Health acquisition and durability
 
 Hozz does not use date-window watermarks. Each HealthKit type has its own opaque, device-local anchor, drained with `HKAnchoredObjectQuery`. An anchor advances only after the records it covers have been durably staged.
@@ -142,6 +150,10 @@ Health computes its own aggregates for a workout and carries them on the sample,
 A workout made of several efforts, like a triathlon, also carries each leg with its own figures, because an average across all three describes none of them.
 
 These are **summaries of samples that are exported separately**, not copies of them. Every reading appears exactly once in an export, as itself; nothing here repeats one.
+
+**Hozz does not export which individual samples belonged to a workout.** HealthKit will list the objects belonging to a workout, but offers nothing in the other direction — a sample does not know its workout, and no workout identifier appears in its metadata — so recording the link would mean a query per workout per type, tens of thousands of them for a real history.
+
+Matching by time range is therefore an approximation, and worth knowing you are making one. It is a good approximation for most workouts and wrong in two situations: workouts that overlap in time, and samples recorded inside the window by something other than the workout — a phone counting steps in a pocket during a ride, for instance. The workout's own statistics above are exact, because Health computed them; a time-range join is your reconstruction, not Health's answer.
 
 ## Series types: routes and electrocardiograms
 
@@ -308,7 +320,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 442 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, aggregate sample counts, fair-share acquisition, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 448 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, aggregate sample counts, fair-share acquisition, export formats, GPX track assembly, restricted-format runs, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

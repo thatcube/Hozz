@@ -1,4 +1,5 @@
 import Foundation
+import HozzCore
 
 public enum HealthExportFormat: String, CaseIterable, Sendable {
     /// Newline-delimited JSON: one record per line, lossless, and streamable at
@@ -27,6 +28,31 @@ public enum HealthExportFormat: String, CaseIterable, Sendable {
     case gpx
     /// Uncompressed NDJSON, for piping straight into something else.
     case raw
+
+    /// The Health types a run in this format needs to read.
+    ///
+    /// `nil` means everything Hozz can read, which is the right answer for
+    /// every format that presents the whole of Health.
+    ///
+    /// A format that is a *filter* rather than a projection has no reason to
+    /// drain the rest. A GPX file holds a route and nothing else, so reading
+    /// two hundred types to write out a handful of tracks spends someone's
+    /// afternoon producing a file that could not have contained the
+    /// difference. A manual export's cursors are scoped to its own run, so a
+    /// restricted run cannot advance a cursor any other run or destination
+    /// depends on — which is what makes narrowing safe rather than merely
+    /// faster.
+    public var requiredTypes: Set<HealthTypeKey>? {
+        switch self {
+        case .gpx:
+            [
+                HealthTypeKey("HKWorkoutTypeIdentifier"),
+                WorkoutRouteEncoding.typeKey
+            ]
+        case .ndjson, .csv, .json, .markdown, .sqlite, .raw:
+            nil
+        }
+    }
 
     public var fileExtension: String {
         switch self {
