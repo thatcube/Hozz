@@ -6,7 +6,7 @@ Hozz is a free, open-source iPhone app with a companion Mac receiver. The iPhone
 
 There is no subscription, account, analytics, advertising, hosted relay, or default network destination. Nothing leaves the iPhone until you add a destination and confirm it.
 
-Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, workout routes, electrocardiograms, audiograms, historical deletions, and the six Health characteristics. Correlations, other series, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
+Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, workout routes, electrocardiograms, audiograms, State of Mind entries, historical deletions, and the six Health characteristics. Correlations, other series, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
 
 ## What works today
 
@@ -130,9 +130,19 @@ Two things a flat reading would throw away are kept. An ear with nothing recorde
 
 In a CSV export a hearing test becomes `Audiograms.csv`, one row per ear reading.
 
+## State of Mind
+
+Mood entries logged in Health on iOS 18 and newer: a valence from -1 to 1, the classification Health derives from it, whether the entry was a momentary feeling or a whole day's mood, and the labels and life associations the person chose.
+
+The care here is about what a blank would mean. **Zero valence is a neutral mood, not a missing reading**, so it is always written and never omitted — the same trap as 0 dBHL in a hearing test. An empty list of labels means the person picked none, which is a fact rather than an absence, so the list is written empty rather than left out.
+
+Every label, association, classification, and entry kind is written as a name *and* the number behind it, so a feeling Apple adds in a later release still arrives as something instead of becoming a gap in someone's mood history.
+
+In a CSV export mood entries become `StateOfMind.csv`, and in the SQLite export valence is the value a mood can be charted on over time.
+
 ## Mac receiver
 
-The Mac app is a local receiver and browser for data the phone sends. It starts an `NWListener` HTTP receiver, advertises `_hozz._tcp`, normally listens on port **54330**, accepts `/pair` without a token, and requires the token for deliveries. It stores accepted batches in `hozz-received.sqlite` with schema version 4, idempotent batch records, deletions, characteristics, and per-device “last heard from” state.
+The Mac app is a local receiver and browser for data the phone sends. It starts an `NWListener` HTTP receiver, advertises `_hozz._tcp`, normally listens on port **54330**, accepts `/pair` without a token, and requires the token for deliveries. It stores accepted batches in `hozz-received.sqlite` with schema version 5, idempotent batch records, deletions, characteristics, and per-device “last heard from” state.
 
 Setup is designed to avoid typing an address. The phone first browses Bonjour, also reads receiver records published through the user's own iCloud Keychain, then falls back to a private `/24` local-network sweep on port 54330. Every remembered address is probed before it is offered or reused, so a computer that does not answer is shown as offline instead of saved as a dead destination.
 
@@ -237,7 +247,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 284 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, export formats, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains NNN tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, export formats, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

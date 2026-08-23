@@ -14,7 +14,7 @@ import HozzCore
 /// marks as clamped is reported with its bound, because a clamped 90 dBHL
 /// means "at least 90", not "90".
 public enum AudiogramEncoding {
-    public static let typeIdentifier = "HKAudiogramTypeIdentifier"
+    public static let typeIdentifier = "HKDataTypeIdentifierAudiogram"
     public static let typeKey = HealthTypeKey(typeIdentifier)
 
     static let hertz = "Hz"

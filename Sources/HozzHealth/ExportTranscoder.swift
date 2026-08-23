@@ -143,6 +143,21 @@ enum ExportTranscoder {
                 ecgRows.append(electrocardiogramCSVRow(from: object))
                 continue
             }
+            if kind == "stateOfMind" {
+                // A mood entry is a valence plus two lists, none of which fit
+                // the generic sample grid, so it gets its own file.
+                if currentType != stateOfMindEntry {
+                    try closeEntry()
+                    try archive.beginEntry(name: stateOfMindEntry)
+                    try archive.write(Data((stateOfMindHeader + "\n").utf8))
+                    currentType = stateOfMindEntry
+                    currentKind = kind
+                }
+                try archive.write(
+                    Data((stateOfMindCSVRow(from: object) + "\n").utf8)
+                )
+                continue
+            }
             if kind == "audiogram" {
                 // A hearing test is a set of readings, not one value, so it
                 // gets a row per reading rather than a cell full of JSON.
@@ -294,6 +309,40 @@ enum ExportTranscoder {
 
         try archive.write(Data("\n]\n".utf8))
         try archive.endEntry()
+    }
+
+    // MARK: - State of Mind
+
+    static let stateOfMindEntry = "StateOfMind.csv"
+    static let stateOfMindHeader =
+        "id,startDate,endDate,kind,valence,valenceClassification,labels,associations,sourceName"
+
+    static func stateOfMindCSVRow(from object: [String: Any]) -> String {
+        let source = object["source"] as? [String: Any] ?? [:]
+
+        return [
+            object["id"] as? String ?? "",
+            object["startDate"] as? String ?? "",
+            object["endDate"] as? String ?? "",
+            (object["kindOfEntry"] as? [String: Any])?["name"] as? String ?? "",
+            // Written even when it is zero: a neutral mood is a reading, and a
+            // blank cell here would read as "no entry".
+            number(object["valence"]),
+            (object["valenceClassification"] as? [String: Any])?["name"]
+                as? String ?? "",
+            names(in: object["labels"]),
+            names(in: object["associations"]),
+            source["name"] as? String ?? ""
+        ].map(escape).joined(separator: ",")
+    }
+
+    private static func names(in value: Any?) -> String {
+        guard let entries = value as? [[String: Any]] else {
+            return ""
+        }
+        return entries
+            .compactMap { $0["name"] as? String }
+            .joined(separator: ";")
     }
 
     // MARK: - Audiograms

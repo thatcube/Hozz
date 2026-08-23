@@ -174,6 +174,7 @@ private struct ExportSetupView: View {
                 CoverageRow("Workout routes", available: true)
                 CoverageRow("Electrocardiograms", available: true)
                 CoverageRow("Audiograms", available: true)
+                CoverageRow("State of Mind", available: true)
                 CoverageRow("Health characteristics", available: true)
                 CoverageRow("Historical deletions", available: true)
                 CoverageRow(
