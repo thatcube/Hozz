@@ -150,21 +150,117 @@ public actor MCPServer {
     private func summarise(_ arguments: [String: Any]) async throws -> String {
         let summaries = try await store.summaries()
         let total = try await store.totalRecordCount()
-        guard !summaries.isEmpty else {
+        let characteristics = try await store.characteristics()
+
+        guard !summaries.isEmpty || !characteristics.isEmpty else {
             return "No Health data has been received yet."
         }
+
+        var text = ""
+
+        // Deliberately part of this tool rather than one of its own.
+        //
+        // These are what the measurements have to be read against: a resting
+        // heart rate of 48 is athletic in a 34-year-old and worth a question in
+        // a 70-year-old. A separate tool would be cleaner to describe and worse
+        // in practice, because an assistant that is not required to call it
+        // will answer "is this normal for me" without ever having asked who
+        // "me" is. Putting it here means the context arrives with the
+        // orientation step that every session already begins with.
+        if !characteristics.isEmpty {
+            text += "About the person:\n"
+            for characteristic in characteristics {
+                text += "- \(characteristic.displayName): "
+                text += Self.describe(characteristic) + "\n"
+            }
+            text += "\n"
+        }
+
+        guard !summaries.isEmpty else {
+            return text + "No measurements have been received yet."
+        }
+
         let earliest = summaries.compactMap(\.earliest).min()
         let latest = summaries.compactMap(\.latest).max()
-        var text = "\(total) records across \(summaries.count) types."
+        text += "\(total) records across \(summaries.count) types."
         if let earliest, let latest {
             text += " Covering \(Self.day(earliest)) to \(Self.day(latest))."
         }
+
+        // A receiver holding records it could not interpret is not the same as
+        // one holding nothing, and an assistant should not describe a partial
+        // picture as a complete one.
+        let unhandled = try await store.unhandledSummary()
+        if !unhandled.isEmpty {
+            let count = unhandled.reduce(0) { $0 + $1.count }
+            text += " \(count) further "
+            text += count == 1 ? "record was" : "records were"
+            text += " received in a form this version of Hozz cannot read yet ("
+            text += unhandled.map(\.kind).joined(separator: ", ")
+            text += "); they are stored but not queryable here."
+        }
+
         let biggest = summaries.sorted { $0.recordCount > $1.recordCount }.prefix(10)
         text += "\n\nLargest types:\n"
         text += biggest
             .map { "- \($0.type): \($0.recordCount)" }
             .joined(separator: "\n")
         return text
+    }
+
+    /// One characteristic, in the form an assistant can reason with.
+    ///
+    /// A date of birth is reported with the age it implies, because age is what
+    /// every reference range is actually keyed to and an assistant that has to
+    /// derive it may get it wrong. States other than "known" are reported as
+    /// themselves: "not set" is a fact about the person, and reporting it as a
+    /// blank would invite a confident answer built on a guess.
+    public static func describe(_ characteristic: StoredCharacteristic) -> String {
+        guard characteristic.isKnown, let value = characteristic.value else {
+            return switch characteristic.state {
+            case "notSet": "not set by the person"
+            case "unavailable": "not available on their device"
+            case "unrecognised": "a value this version of Hozz has no name for"
+            case "unreadable": "could not be read"
+            default: "unknown"
+            }
+        }
+
+        if characteristic.type.hasSuffix("DateOfBirth"),
+           let age = Self.age(fromDateOfBirth: value) {
+            return "\(value) (age \(age))"
+        }
+        return value
+    }
+
+    /// Whole years between a `yyyy-MM-dd` birth date and today.
+    public static func age(fromDateOfBirth text: String, now: Date = .now) -> Int? {
+        let parts = text.prefix(10).split(separator: "-")
+        guard
+            parts.count == 3,
+            let year = Int(parts[0]),
+            let month = Int(parts[1]),
+            let day = Int(parts[2])
+        else {
+            return nil
+        }
+        let today = Calendar(identifier: .gregorian).dateComponents(
+            [.year, .month, .day],
+            from: now
+        )
+        guard
+            let nowYear = today.year,
+            let nowMonth = today.month,
+            let nowDay = today.day
+        else {
+            return nil
+        }
+        var age = nowYear - year
+        // A birthday later this year has not happened yet.
+        if (nowMonth, nowDay) < (month, day) {
+            age -= 1
+        }
+        return age >= 0 ? age : nil
     }
 
     private func aggregate(_ arguments: [String: Any]) async throws -> String {
@@ -334,7 +430,12 @@ enum Tools {
             "name": "summarise_health_data",
             "description": """
                 An overview of everything received: total records, how many \
-                types, the date range covered, and the largest types.
+                types, the date range covered, and the largest types. Also \
+                returns the person's own characteristics — age, biological \
+                sex, blood type and so on — where they have been shared. Call \
+                this before interpreting any measurement, because reference \
+                ranges depend on them: a resting heart rate of 48 means \
+                something different at 34 than at 70.
                 """,
             "inputSchema": ["type": "object", "properties": [:] as [String: Any]]
         ],

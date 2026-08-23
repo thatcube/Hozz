@@ -220,4 +220,109 @@ final class MCPTests: XCTestCase {
             "A truncated list must say so, or the caller treats it as complete."
         )
     }
+
+    // MARK: - Characteristics
+
+    private func seedCharacteristics(_ store: IngestStore) async throws {
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"kind":"characteristics","schemaVersion":1,"readAt":"2026-01-02T15:00:00.000Z","characteristics":{"HKCharacteristicTypeIdentifierDateOfBirth":{"state":"known","value":"1985-03-04"},"HKCharacteristicTypeIdentifierBiologicalSex":{"state":"known","value":"Male","rawValue":2},"HKCharacteristicTypeIdentifierBloodType":{"state":"notSet"}}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "characteristics"
+        )
+    }
+
+    /// An assistant asked "is this normal for me" cannot answer without
+    /// knowing who "me" is, so the context arrives with the overview rather
+    /// than behind a second call it might never make.
+    func testTheOverviewCarriesThePersonsOwnCharacteristics() async throws {
+        let store = try makeStore()
+        try await seed(store)
+        try await seedCharacteristics(store)
+        let server = MCPServer(store: store)
+
+        let body = try text(
+            try await send(server, [
+                "jsonrpc": "2.0", "id": 20, "method": "tools/call",
+                "params": ["name": "summarise_health_data", "arguments": [:] as [String: Any]]
+            ])
+        )
+
+        XCTAssertTrue(body.contains("About the person"), body)
+        XCTAssertTrue(body.contains("Biological Sex: Male"), body)
+        XCTAssertTrue(
+            body.contains("age "),
+            "Reference ranges are keyed to age, so it is derived here rather than left to the caller: \(body)"
+        )
+        XCTAssertTrue(
+            body.contains("Blood Type: not set by the person"),
+            "'Not set' is a fact about the person, not a blank: \(body)"
+        )
+        // The measurements still come through.
+        XCTAssertTrue(body.contains("HKQuantityTypeIdentifierStepCount"), body)
+    }
+
+    func testTheOverviewSaysWhenRecordsCouldNotBeUnderstood() async throws {
+        let store = try makeStore()
+        try await seed(store)
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(#"{"kind":"electrocardiogram","averageHeartRate":62}"#.utf8)
+            ),
+            idempotencyKey: "future"
+        )
+        let server = MCPServer(store: store)
+
+        let body = try text(
+            try await send(server, [
+                "jsonrpc": "2.0", "id": 21, "method": "tools/call",
+                "params": ["name": "summarise_health_data", "arguments": [:] as [String: Any]]
+            ])
+        )
+
+        XCTAssertTrue(
+            body.contains("cannot read yet"),
+            "A partial picture must not be described as a complete one: \(body)"
+        )
+        XCTAssertTrue(body.contains("electrocardiogram"), body)
+    }
+
+    /// A store holding only characteristics is not an empty store.
+    func testAStoreWithOnlyCharacteristicsIsNotReportedAsEmpty() async throws {
+        let store = try makeStore()
+        try await seedCharacteristics(store)
+        let server = MCPServer(store: store)
+
+        let body = try text(
+            try await send(server, [
+                "jsonrpc": "2.0", "id": 22, "method": "tools/call",
+                "params": ["name": "summarise_health_data", "arguments": [:] as [String: Any]]
+            ])
+        )
+
+        XCTAssertTrue(body.contains("About the person"), body)
+        XCTAssertFalse(
+            body.hasPrefix("No Health data has been received yet."),
+            "Characteristics had arrived, so this is not 'nothing received': \(body)"
+        )
+    }
+
+    func testAgeIsWholeYearsAndRespectsAnUnreachedBirthday() {
+        let reference = Timestamps.date(from: "2026-03-03T12:00:00.000Z")!
+        XCTAssertEqual(
+            MCPServer.age(fromDateOfBirth: "1985-03-04", now: reference),
+            40,
+            "The birthday has not happened yet this year."
+        )
+        let afterBirthday = Timestamps.date(from: "2026-03-05T12:00:00.000Z")!
+        XCTAssertEqual(
+            MCPServer.age(fromDateOfBirth: "1985-03-04", now: afterBirthday),
+            41
+        )
+        XCTAssertNil(MCPServer.age(fromDateOfBirth: "not a date"))
+    }
 }
