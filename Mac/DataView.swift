@@ -90,6 +90,25 @@ struct DataView: View {
 
                 chart(for: summary)
 
+                // Deliberately without `.fixedSize(horizontal: false, vertical: true)`.
+                //
+                // That modifier asks this text for its ideal height at the
+                // proposed width, and inside a pane that fills the window there
+                // is no settled width to answer against yet. The text reported
+                // the width it would need to run on one line, the pane resized
+                // to that, and the answer changed again — a loop the window
+                // never got out of.
+                //
+                // What it did to the app depended only on how the pane was
+                // built. Inside an `HSplitView` AppKit stopped it and killed the
+                // process; inside an `HStack` it gives up quietly instead, and
+                // the window keeps every frame it had already worked out and
+                // draws none of them. That is the empty window: the sidebar,
+                // the type list, and this pane were all still there, all the
+                // right size, and all invisible.
+                //
+                // Nothing is lost by removing it. A `Text` given a real width
+                // already wraps to as many lines as it needs.
                 Text(
                     """
                     Sum and average are both shown because the right one \
@@ -99,7 +118,6 @@ struct DataView: View {
                 )
                 .font(.callout)
                 .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
 
                 Spacer()
             }
