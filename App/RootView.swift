@@ -148,12 +148,28 @@ private struct ExportSetupView: View {
                     Text("JSON").tag(HealthExportFormat.json)
                     Text("SQLite").tag(HealthExportFormat.sqlite)
                     Text("Markdown").tag(HealthExportFormat.markdown)
+                    Text("GPX").tag(HealthExportFormat.gpx)
                 }
                 .disabled(resumable != nil)
 
                 Label(formatNote, systemImage: formatIcon)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+
+                if exportFormat.coversRoutesOnly {
+                    // Not a footnote. Someone picking this expecting a health
+                    // export gets an archive that looks broken, and finding
+                    // that out afterwards is the whole problem.
+                    Label(
+                        "GPX holds routes only. This exports workouts that "
+                        + "recorded GPS and nothing else — no heart rate, no "
+                        + "sleep, no weight. Choose NDJSON or SQLite for "
+                        + "everything.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
+                }
 
                 if resumable != nil {
                     // Changing format now would throw away everything the
@@ -226,6 +242,8 @@ private struct ExportSetupView: View {
             "A database you can query. Keeps every record as it was written."
         case .markdown:
             "A note per day for Obsidian. Drops the records behind the totals."
+        case .gpx:
+            "One GPX track per workout with GPS, for maps and fitness tools."
         case .raw:
             "Uncompressed. Can be several gigabytes."
         }
@@ -243,6 +261,8 @@ private struct ExportSetupView: View {
             "cylinder.split.1x2"
         case .markdown:
             "calendar"
+        case .gpx:
+            "map"
         case .raw:
             "doc.plaintext"
         }

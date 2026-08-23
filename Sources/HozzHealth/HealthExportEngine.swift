@@ -766,7 +766,7 @@ public actor HealthExportEngine {
                 )
             }
 
-        case .csv, .json, .markdown, .sqlite:
+        case .csv, .json, .markdown, .sqlite, .gpx:
             // These read every record back, so the spool is inflated once to a
             // scratch file and streamed from there.
             let plainURL = spool.appending(
@@ -797,6 +797,21 @@ public actor HealthExportEngine {
                     try ExportTranscoder.writeCSV(
                         readingFrom: plainURL,
                         into: archive
+                    )
+                }
+
+            case .gpx:
+                return try inArchive(
+                    finalURL: finalURL,
+                    modifiedAt: run.startedAt
+                ) { archive in
+                    try ExportGPXWriter.write(
+                        readingFrom: plainURL,
+                        into: archive,
+                        metadata: ExportGPXWriter.Metadata(
+                            runID: run.id,
+                            startedAt: run.startedAt
+                        )
                     )
                 }
 

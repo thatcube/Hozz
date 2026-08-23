@@ -30,7 +30,12 @@ final class ReceiverIntegrationTests: XCTestCase {
             token: token,
             serviceName: "Hozz Test \(UUID().uuidString.prefix(6))"
         )
-        await receiver.start()
+        // Port zero, not the real one. These tests do not care which port they
+        // get, and binding the fixed 54330 means two test runs on one machine
+        // collide with "Address already in use" — which a self-hosted agent
+        // running builds in parallel hits for real. The receiver reports the
+        // port it actually bound, so everything downstream still works.
+        await receiver.start(port: 0)
         port = try await waitForPort()
     }
 

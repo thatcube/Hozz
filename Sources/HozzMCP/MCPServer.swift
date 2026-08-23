@@ -127,12 +127,292 @@ public actor MCPServer {
             return try await voltages(arguments)
         case "list_audiograms":
             return try await audiograms(arguments)
+        case "analyse_health_trend":
+            return try await analyseTrend(arguments)
+        case "compare_health_types":
+            return try await compareTypes(arguments)
+        case "find_health_anomalies":
+            return try await findAnomalies(arguments)
         default:
             throw MCPError.unknownTool(name)
         }
     }
 
     // MARK: - Tools
+
+
+    // MARK: - Analysis
+
+    /// Which daily figure represents a type.
+    ///
+    /// Steps accumulate through a day, so a day's step count is the sum. A
+    /// heart rate is sampled, so a day's heart rate is the average. Summing
+    /// heart rates produces a number that means nothing, and the tools say
+    /// which they used so nobody has to guess.
+    private static let accumulatedTypes: Set<String> = [
+        "HKQuantityTypeIdentifierStepCount",
+        "HKQuantityTypeIdentifierDistanceWalkingRunning",
+        "HKQuantityTypeIdentifierDistanceCycling",
+        "HKQuantityTypeIdentifierDistanceSwimming",
+        "HKQuantityTypeIdentifierActiveEnergyBurned",
+        "HKQuantityTypeIdentifierBasalEnergyBurned",
+        "HKQuantityTypeIdentifierAppleExerciseTime",
+        "HKQuantityTypeIdentifierAppleStandTime",
+        "HKQuantityTypeIdentifierFlightsClimbed",
+        "HKQuantityTypeIdentifierDietaryEnergyConsumed",
+        "HKQuantityTypeIdentifierDietaryWater"
+    ]
+
+    private static func isAccumulated(_ type: String) -> Bool {
+        accumulatedTypes.contains(type)
+    }
+
+    private static func statisticName(for type: String) -> String {
+        isAccumulated(type) ? "daily total" : "daily average"
+    }
+
+    /// A type's daily series, plus how many records backed each day.
+    private func dailySeries(
+        type: String,
+        days: Int,
+        now: Date
+    ) async throws -> [HealthStatistics.DailyValue] {
+        let start = now.addingTimeInterval(-Double(days) * 86_400)
+        let buckets = try await store.aggregate(
+            type: type,
+            bucket: .day,
+            from: start,
+            to: now
+        )
+        return buckets.map { bucket in
+            HealthStatistics.DailyValue(
+                day: (bucket.start.timeIntervalSince1970 / 86_400).rounded(.down),
+                value: Self.isAccumulated(type) ? bucket.sum : bucket.average,
+                recordCount: bucket.count
+            )
+        }
+    }
+
+    /// Says why a type has nothing, because "not synced yet" and "no such
+    /// type" and "nothing in this window" are three different answers and only
+    /// one of them means the person has no such data.
+    private func explainEmptySeries(_ type: String, days: Int) async throws -> String {
+        let known = try await store.summaries()
+        guard let summary = known.first(where: { $0.type == type }) else {
+            let names = known.map(\.type).sorted().prefix(20).joined(separator: ", ")
+            return """
+                No \(type) has reached this Mac yet. Your phone syncs one type \
+                at a time and may not have reached this one; it is not \
+                evidence that you have no such data. Types received so far: \
+                \(names.isEmpty ? "none" : names).
+                """
+        }
+        return """
+            \(type) has \(summary.recordCount) records, but none in the last \
+            \(days) days. Widen the window to reach them.
+            """
+    }
+
+    private func analyseTrend(_ arguments: [String: Any]) async throws -> String {
+        guard let type = arguments["type"] as? String else {
+            throw MCPError.missingArgument("type")
+        }
+        let days = min(max((arguments["days"] as? Int) ?? 90, 1), 3_650)
+        let series = try await dailySeries(type: type, days: days, now: .now)
+
+        guard !series.isEmpty else {
+            return try await explainEmptySeries(type, days: days)
+        }
+
+        let points = series.map { (day: $0.day, value: $0.value) }
+        guard let trend = HealthStatistics.trend(points) else {
+            return """
+                Only \(series.count) days of \(type) in the last \(days) days. \
+                A trend needs at least \(HealthStatistics.minimumTrendDays) \
+                days; below that a fitted line describes the noise. No \
+                direction should be reported.
+                """
+        }
+
+        let unit = (try await store.summaries())
+            .first { $0.type == type }?.unit ?? ""
+        var text = "\(type), \(Self.statisticName(for: type)), "
+        text += "\(trend.dayCount) days with data in the last \(days).\n\n"
+
+        guard trend.isDetectable else {
+            // The interval spans zero, so a flat line fits as well as a sloped
+            // one. Reporting the slope's sign here would be inventing a
+            // direction the data does not carry.
+            text += """
+                No detectable change. The fitted slope is \
+                \(Self.number(trend.perWeek)) \(unit) per week, but its 95% \
+                interval spans zero \
+                (\(Self.number(trend.confidenceLow * 7)) to \
+                \(Self.number(trend.confidenceHigh * 7)) per week), so a flat \
+                line fits these points just as well. Do not describe this as \
+                rising or falling.
+                """
+            return text
+        }
+
+        text += """
+            \(trend.direction.capitalized): \(Self.number(trend.perWeek)) \
+            \(unit) per week (95% interval \
+            \(Self.number(trend.confidenceLow * 7)) to \
+            \(Self.number(trend.confidenceHigh * 7))). \
+            About \(Self.number(trend.startValue)) at the start of the window \
+            and \(Self.number(trend.endValue)) at the end.
+            """
+        if trend.rSquared < 0.2 {
+            text += """
+                \n\nThe line accounts for only \
+                \(Int((trend.rSquared * 100).rounded()))% of the variation, so \
+                day-to-day scatter is much larger than the drift. The direction \
+                is supportable; describing it as pronounced is not.
+                """
+        }
+        return text
+    }
+
+    private func compareTypes(_ arguments: [String: Any]) async throws -> String {
+        guard let first = arguments["first"] as? String else {
+            throw MCPError.missingArgument("first")
+        }
+        guard let second = arguments["second"] as? String else {
+            throw MCPError.missingArgument("second")
+        }
+        let days = min(max((arguments["days"] as? Int) ?? 180, 1), 3_650)
+        let now = Date.now
+
+        let firstSeries = try await dailySeries(type: first, days: days, now: now)
+        let secondSeries = try await dailySeries(type: second, days: days, now: now)
+
+        // The backfill sends one type at a time, so a missing second type is
+        // usually "not synced yet" rather than "you have none of this".
+        if firstSeries.isEmpty {
+            return try await explainEmptySeries(first, days: days)
+        }
+        if secondSeries.isEmpty {
+            return try await explainEmptySeries(second, days: days)
+        }
+
+        guard
+            let correlation = HealthStatistics.correlation(
+                firstSeries.map { (day: $0.day, value: $0.value) },
+                secondSeries.map { (day: $0.day, value: $0.value) }
+            )
+        else {
+            let overlap = Set(firstSeries.map(\.day))
+                .intersection(secondSeries.map(\.day))
+                .count
+            return """
+                Only \(overlap) days have both \(first) and \(second). \
+                Comparing two types needs at least \
+                \(HealthStatistics.minimumCorrelationDays) shared days, so no \
+                relationship should be reported either way.
+                """
+        }
+
+        var text = "\(first) vs \(second), "
+        text += "\(correlation.pairedDays) shared days "
+        text += "(worth about \(Int(correlation.effectiveDays.rounded())) "
+        text += "independent days once day-to-day similarity is accounted for)."
+        text += "\n\n"
+
+        guard correlation.isDetectable else {
+            text += """
+                No detectable relationship. The correlation is \
+                \(Self.number(correlation.coefficient)) but its 95% interval \
+                (\(Self.number(correlation.confidenceLow)) to \
+                \(Self.number(correlation.confidenceHigh))) includes zero. \
+                Do not describe these as related.
+                """
+            return text
+        }
+
+        text += """
+            \(correlation.strength.capitalized) \
+            \(correlation.coefficient > 0 ? "positive" : "negative") \
+            correlation: \(Self.number(correlation.coefficient)) \
+            (95% interval \(Self.number(correlation.confidenceLow)) to \
+            \(Self.number(correlation.confidenceHigh))). They tend to move \
+            \(correlation.coefficient > 0 ? "together" : "in opposite directions").
+            """
+
+        if correlation.bothTrending {
+            // The most common way this number misleads.
+            text += """
+                \n\nCaution: both are trending over this window. Two \
+                quantities that both drift will correlate whether or not they \
+                are related, so this may reflect nothing more than that shared \
+                drift.
+                """
+        }
+        text += """
+            \n\nThis is association, not cause. Nothing here shows one \
+            affects the other, and an unmeasured third thing may drive both.
+            """
+        return text
+    }
+
+    private func findAnomalies(_ arguments: [String: Any]) async throws -> String {
+        guard let type = arguments["type"] as? String else {
+            throw MCPError.missingArgument("type")
+        }
+        let days = min(max((arguments["days"] as? Int) ?? 90, 1), 3_650)
+        let series = try await dailySeries(type: type, days: days, now: .now)
+
+        guard !series.isEmpty else {
+            return try await explainEmptySeries(type, days: days)
+        }
+        guard let report = HealthStatistics.anomalies(series) else {
+            return """
+                Only \(series.count) days of \(type) in the last \(days) days. \
+                Judging a day as unusual needs at least \
+                \(HealthStatistics.minimumBaselineDays) days to establish what \
+                usual is.
+                """
+        }
+
+        let unit = (try await store.summaries())
+            .first { $0.type == type }?.unit ?? ""
+        var text = "\(type), \(Self.statisticName(for: type)). "
+        text += "Usual value \(Self.number(report.median)) \(unit) "
+        text += "across \(report.consideredDays) days judged.\n\n"
+
+        if report.outliers.isEmpty {
+            text += "Nothing unusual: no day differs from the usual value by "
+            text += "more than three robust deviations."
+        } else {
+            text += "Unusual days:\n"
+            text += report.outliers.prefix(20)
+                .map { outlier in
+                    let day = Date(timeIntervalSince1970: outlier.day * 86_400)
+                    return "- \(Self.day(day)): \(Self.number(outlier.value)) "
+                        + "\(unit), \(Self.number(abs(outlier.deviations))) "
+                        + "deviations \(outlier.isHigh ? "above" : "below") usual "
+                        + "(\(outlier.recordCount) records)"
+                }
+                .joined(separator: "\n")
+        }
+
+        if !report.lowCoverageDays.isEmpty {
+            // Reported separately and explicitly, because a day the watch was
+            // off looks exactly like a collapsed reading to anything that does
+            // not check how much was recorded.
+            text += "\n\n\(report.lowCoverageDays.count) "
+            text += report.lowCoverageDays.count == 1 ? "day was" : "days were"
+            text += " not judged because too little was recorded that day — "
+            text += "most likely the device was not worn. These are missing "
+            text += "measurements, not low readings, and must not be reported "
+            text += "as unusual values: "
+            text += report.lowCoverageDays.sorted().prefix(10)
+                .map { Self.day(Date(timeIntervalSince1970: $0 * 86_400)) }
+                .joined(separator: ", ")
+            text += "."
+        }
+        return text
+    }
 
     // MARK: - ECG and hearing
 
@@ -618,6 +898,81 @@ enum Tools {
                         "description": "ISO 8601 end of range, inclusive. Optional."
                     ]
                 ],
+                "required": ["type"]
+            ]
+        ],
+        [
+            "name": "analyse_health_trend",
+            "description": """
+                Whether one type is drifting up or down over a window, with \
+                the uncertainty attached. Returns "no detectable change" when \
+                a flat line fits the data as well as a sloped one, and refuses \
+                to answer at all below two weeks of days — a slope through \
+                nine days describes noise. Do not describe a trend this tool \
+                reports as undetectable, however suggestive the number looks.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "type": [
+                        "type": "string",
+                        "description": "The HealthKit type identifier, from list_health_types."
+                    ],
+                    "days": [
+                        "type": "integer",
+                        "description": "How far back to look. Defaults to 90."
+                    ]
+                ] as [String: Any],
+                "required": ["type"]
+            ]
+        ],
+        [
+            "name": "compare_health_types",
+            "description": """
+                Whether two types move together day to day — sleep against \
+                step count, say. Reports the correlation with a confidence \
+                interval computed on an autocorrelation-adjusted sample size, \
+                because consecutive days are not independent evidence. Warns \
+                when both series are trending, which produces strong \
+                correlations between unrelated things. Never describe a \
+                relationship this tool reports as undetectable, and never \
+                describe any correlation as one type causing the other.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "first": ["type": "string", "description": "First HealthKit type identifier."],
+                    "second": ["type": "string", "description": "Second HealthKit type identifier."],
+                    "days": [
+                        "type": "integer",
+                        "description": "How far back to look. Defaults to 180."
+                    ]
+                ] as [String: Any],
+                "required": ["first", "second"]
+            ]
+        ],
+        [
+            "name": "find_health_anomalies",
+            "description": """
+                Days that stand out from what is usual for this person, using \
+                the median and median absolute deviation so one bad day cannot \
+                hide the others. Days with too few records to judge — the \
+                watch was not worn — are reported separately as exactly that, \
+                never as low readings. Do not report a day listed under low \
+                coverage as an unusual measurement.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "type": [
+                        "type": "string",
+                        "description": "The HealthKit type identifier, from list_health_types."
+                    ],
+                    "days": [
+                        "type": "integer",
+                        "description": "How far back to look. Defaults to 90."
+                    ]
+                ] as [String: Any],
                 "required": ["type"]
             ]
         ],
