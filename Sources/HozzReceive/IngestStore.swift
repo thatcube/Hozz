@@ -226,7 +226,7 @@ public actor IngestStore {
     private static func migrate(_ database: SQLiteDatabase) throws {
         let version = try database.query("PRAGMA user_version", row: { $0.integer(0) })
             .first ?? 0
-        guard version < 5 else {
+        guard version < 6 else {
             return
         }
         try database.transaction {
@@ -388,6 +388,52 @@ public actor IngestStore {
 
                 CREATE INDEX IF NOT EXISTS audiogram_start ON audiogram (start_date);
 
+                -- Mood entries keep their sample row as well as this one:
+                -- valence is a real number on a real scale, so it charts and
+                -- compares through the ordinary tools. What does not fit a
+                -- single column lives here.
+                CREATE TABLE IF NOT EXISTS state_of_mind (
+                    id TEXT PRIMARY KEY,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT,
+                    valence REAL NOT NULL,
+                    classification TEXT,
+                    -- momentaryEmotion or dailyMood. Averaging the two mixes a
+                    -- snapshot with a summary of a whole day.
+                    kind_of_entry TEXT,
+                    labels TEXT,
+                    associations TEXT,
+                    source_name TEXT,
+                    raw BLOB NOT NULL,
+                    received_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS mood_start ON state_of_mind (start_date);
+
+                -- A dose event's answer is its status, not a number. Only
+                -- `taken` means the medicine was taken; skipped, snoozed and
+                -- never-answered are three different ways of not taking it,
+                -- and collapsing them answers "did I take my medication?"
+                -- wrongly, which is worse than not answering.
+                CREATE TABLE IF NOT EXISTS medication_dose (
+                    id TEXT PRIMARY KEY,
+                    start_date TEXT NOT NULL,
+                    log_status TEXT NOT NULL,
+                    schedule_type TEXT,
+                    dose_quantity REAL,
+                    scheduled_dose_quantity REAL,
+                    unit TEXT,
+                    medication_name TEXT,
+                    medication_form TEXT,
+                    source_name TEXT,
+                    raw BLOB NOT NULL,
+                    received_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS dose_start ON medication_dose (start_date);
+                CREATE INDEX IF NOT EXISTS dose_medication
+                    ON medication_dose (medication_name, start_date);
+
                 CREATE TABLE IF NOT EXISTS audiogram_point (
                     audiogram_id TEXT NOT NULL,
                     frequency REAL NOT NULL,
@@ -420,7 +466,7 @@ public actor IngestStore {
                 )
             }
 
-            try database.execute("PRAGMA user_version = 5")
+            try database.execute("PRAGMA user_version = 6")
         }
     }
 
@@ -709,6 +755,77 @@ public actor IngestStore {
                 )
             }
             storedAudiograms += 1
+        }
+
+        for mood in batch.moodEntries {
+            try database.run(
+                """
+                INSERT INTO state_of_mind
+                    (id, start_date, end_date, valence, classification,
+                     kind_of_entry, labels, associations, source_name, raw, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    start_date = excluded.start_date,
+                    end_date = excluded.end_date,
+                    valence = excluded.valence,
+                    classification = excluded.classification,
+                    kind_of_entry = excluded.kind_of_entry,
+                    labels = excluded.labels,
+                    associations = excluded.associations,
+                    source_name = excluded.source_name,
+                    raw = excluded.raw
+                """,
+                [
+                    .text(mood.id),
+                    .text(Timestamps.text(from: mood.startDate)),
+                    mood.endDate.map { SQLiteValue.text(Timestamps.text(from: $0)) } ?? .null,
+                    .real(mood.valence),
+                    mood.classification.map { SQLiteValue.text($0) } ?? .null,
+                    mood.kindOfEntry.map { SQLiteValue.text($0) } ?? .null,
+                    .text(mood.labels.joined(separator: ", ")),
+                    .text(mood.associations.joined(separator: ", ")),
+                    mood.sourceName.map { SQLiteValue.text($0) } ?? .null,
+                    .blob(mood.raw),
+                    .text(timestamp)
+                ]
+            )
+        }
+
+        for dose in batch.medicationDoses {
+            try database.run(
+                """
+                INSERT INTO medication_dose
+                    (id, start_date, log_status, schedule_type, dose_quantity,
+                     scheduled_dose_quantity, unit, medication_name,
+                     medication_form, source_name, raw, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    start_date = excluded.start_date,
+                    log_status = excluded.log_status,
+                    schedule_type = excluded.schedule_type,
+                    dose_quantity = excluded.dose_quantity,
+                    scheduled_dose_quantity = excluded.scheduled_dose_quantity,
+                    unit = excluded.unit,
+                    medication_name = excluded.medication_name,
+                    medication_form = excluded.medication_form,
+                    source_name = excluded.source_name,
+                    raw = excluded.raw
+                """,
+                [
+                    .text(dose.id),
+                    .text(Timestamps.text(from: dose.startDate)),
+                    .text(dose.logStatus),
+                    dose.scheduleType.map { SQLiteValue.text($0) } ?? .null,
+                    dose.doseQuantity.map { SQLiteValue.real($0) } ?? .null,
+                    dose.scheduledDoseQuantity.map { SQLiteValue.real($0) } ?? .null,
+                    dose.unit.map { SQLiteValue.text($0) } ?? .null,
+                    dose.medicationName.map { SQLiteValue.text($0) } ?? .null,
+                    dose.medicationForm.map { SQLiteValue.text($0) } ?? .null,
+                    dose.sourceName.map { SQLiteValue.text($0) } ?? .null,
+                    .blob(dose.raw),
+                    .text(timestamp)
+                ]
+            )
         }
         _ = (storedElectrocardiograms, storedVoltagePages, storedAudiograms)
 
@@ -1202,6 +1319,113 @@ public actor IngestStore {
                 points: points
             )
         }
+    }
+
+
+    public struct StoredMoodEntry: Hashable, Sendable {
+        public let startDate: Date
+        public let valence: Double
+        public let classification: String?
+        public let kindOfEntry: String?
+        public let labels: String
+        public let associations: String
+    }
+
+    public func moodEntries(
+        from start: Date? = nil,
+        limit: Int = 500
+    ) throws -> [StoredMoodEntry] {
+        var sql = """
+            SELECT start_date, valence, classification, kind_of_entry,
+                   labels, associations
+              FROM state_of_mind
+            """
+        var parameters: [SQLiteValue] = []
+        if let start {
+            sql += " WHERE start_date >= ?"
+            parameters.append(.text(Timestamps.text(from: start)))
+        }
+        sql += " ORDER BY start_date DESC LIMIT ?"
+        parameters.append(.integer(Int64(limit)))
+
+        return try database.query(sql, parameters) { row in
+            StoredMoodEntry(
+                startDate: Timestamps.date(from: row.text(0)) ?? .distantPast,
+                valence: row.real(1),
+                classification: row.optionalText(2),
+                kindOfEntry: row.optionalText(3),
+                labels: row.text(4),
+                associations: row.text(5)
+            )
+        }
+    }
+
+    public struct MedicationAdherence: Hashable, Sendable {
+        public let medication: String
+        /// Counts per status, kept apart rather than reduced to a rate,
+        /// because skipped, snoozed and never-answered are three different
+        /// facts and only one of the four means the medicine was taken.
+        public let statusCounts: [String: Int]
+        public let earliest: Date?
+        public let latest: Date?
+
+        public var total: Int {
+            statusCounts.values.reduce(0, +)
+        }
+
+        public var taken: Int {
+            statusCounts["taken"] ?? 0
+        }
+    }
+
+    public func medicationAdherence(
+        from start: Date? = nil
+    ) throws -> [MedicationAdherence] {
+        var sql = """
+            SELECT COALESCE(medication_name, 'Unnamed medication'), log_status,
+                   COUNT(*), MIN(start_date), MAX(start_date)
+              FROM medication_dose
+            """
+        var parameters: [SQLiteValue] = []
+        if let start {
+            sql += " WHERE start_date >= ?"
+            parameters.append(.text(Timestamps.text(from: start)))
+        }
+        sql += " GROUP BY 1, 2 ORDER BY 1"
+
+        let rows = try database.query(sql, parameters) { row in
+            (
+                row.text(0),
+                row.text(1),
+                Int(row.integer(2)),
+                Timestamps.date(from: row.text(3)),
+                Timestamps.date(from: row.text(4))
+            )
+        }
+
+        var byMedication: [String: (counts: [String: Int], first: Date?, last: Date?)] = [:]
+        for (name, status, count, first, last) in rows {
+            var entry = byMedication[name] ?? ([:], nil, nil)
+            entry.counts[status, default: 0] += count
+            if let first {
+                entry.first = min(entry.first ?? first, first)
+            }
+            if let last {
+                entry.last = max(entry.last ?? last, last)
+            }
+            byMedication[name] = entry
+        }
+
+        return byMedication
+            .map {
+                MedicationAdherence(
+                    medication: $0.key,
+                    statusCounts: $0.value.counts,
+                    earliest: $0.value.first,
+                    latest: $0.value.last
+                )
+            }
+            .sorted { $0.medication < $1.medication }
     }
 
     /// Aggregates one type into time buckets.

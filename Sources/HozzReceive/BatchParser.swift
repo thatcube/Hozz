@@ -313,6 +313,8 @@ public struct ParsedBatch: Hashable, Sendable {
     public let electrocardiograms: [ReceivedElectrocardiogram]
     public let voltagePages: [ReceivedVoltagePage]
     public let audiograms: [ReceivedAudiogram]
+    public let moodEntries: [ReceivedMoodEntry]
+    public let medicationDoses: [ReceivedMedicationDose]
     /// Records the receiver could not interpret. They are still stored, so this
     /// is a list of things to teach it about rather than a list of losses.
     public let unhandled: [UnhandledRecord]
@@ -327,6 +329,8 @@ public struct ParsedBatch: Hashable, Sendable {
             && electrocardiograms.isEmpty
             && voltagePages.isEmpty
             && audiograms.isEmpty
+            && moodEntries.isEmpty
+            && medicationDoses.isEmpty
             && unhandled.isEmpty
     }
 
@@ -337,6 +341,8 @@ public struct ParsedBatch: Hashable, Sendable {
         electrocardiograms: [ReceivedElectrocardiogram] = [],
         voltagePages: [ReceivedVoltagePage] = [],
         audiograms: [ReceivedAudiogram] = [],
+        moodEntries: [ReceivedMoodEntry] = [],
+        medicationDoses: [ReceivedMedicationDose] = [],
         unhandled: [UnhandledRecord] = [],
         unreadableCount: Int
     ) {
@@ -346,6 +352,8 @@ public struct ParsedBatch: Hashable, Sendable {
         self.electrocardiograms = electrocardiograms
         self.voltagePages = voltagePages
         self.audiograms = audiograms
+        self.moodEntries = moodEntries
+        self.medicationDoses = medicationDoses
         self.unhandled = unhandled
         self.unreadableCount = unreadableCount
     }
@@ -381,7 +389,8 @@ public enum BatchParser {
     /// - 1: samples, deletions.
     /// - 2: characteristics, and quarantine instead of dropping.
     /// - 3: ECG readings, their voltage pages, and audiograms.
-    public static let parserVersion = 3
+    /// - 4: State of Mind valence, and medication doses.
+    public static let parserVersion = 4
 
     public static func parse(_ payload: Data) throws -> ParsedBatch {
         let text = String(decoding: payload, as: UTF8.self)
@@ -468,6 +477,8 @@ public enum BatchParser {
             electrocardiograms: batch.electrocardiograms,
             voltagePages: batch.voltagePages,
             audiograms: batch.audiograms,
+            moodEntries: batch.moodEntries,
+            medicationDoses: batch.medicationDoses,
             unhandled: batch.unhandled + quarantined,
             unreadableCount: batch.unreadableCount + unreadable
         )
@@ -480,6 +491,8 @@ public enum BatchParser {
         var electrocardiograms: [ReceivedElectrocardiogram] = []
         var voltagePages: [ReceivedVoltagePage] = []
         var audiograms: [ReceivedAudiogram] = []
+        var moodEntries: [ReceivedMoodEntry] = []
+        var medicationDoses: [ReceivedMedicationDose] = []
         var unhandled: [UnhandledRecord] = []
         var unreadable = 0
 
@@ -530,6 +543,23 @@ public enum BatchParser {
             // classification was invisible. So they are read properly here,
             // before the generic path can claim them.
             switch kind {
+            case MoodAndMedicationShape.moodKind:
+                // Deliberately not `continue`: a mood entry is one reading
+                // with one number, so it also becomes an ordinary sample row
+                // and stays chartable and comparable through every tool that
+                // already exists.
+                if let mood = MoodAndMedicationShape.mood(in: object) {
+                    moodEntries.append(mood)
+                }
+            case MoodAndMedicationShape.doseKind:
+                // A dose has no number to chart — its answer is a status — so
+                // unlike mood it does not also become a sample row, where it
+                // would sit with an empty value and hide the only thing that
+                // matters about it.
+                if let dose = MoodAndMedicationShape.dose(in: object) {
+                    medicationDoses.append(dose)
+                    continue
+                }
             case ElectrocardiogramShape.headerKind:
                 if let ecg = ElectrocardiogramShape.reading(in: object) {
                     electrocardiograms.append(ecg)
@@ -579,6 +609,8 @@ public enum BatchParser {
             electrocardiograms: electrocardiograms,
             voltagePages: voltagePages,
             audiograms: audiograms,
+            moodEntries: moodEntries,
+            medicationDoses: medicationDoses,
             unhandled: unhandled,
             unreadableCount: unreadable
         )
@@ -635,6 +667,15 @@ public enum BatchParser {
         } else {
             value = numeric(object["value"])
             unit = object["unit"] as? String
+        }
+        // A State of Mind entry's number is its valence, and it is called
+        // that. Without this the row carries no value at all, so mood cannot
+        // be charted, trended, or compared against anything — and every tool
+        // that filters on a value reports the entries as absent while they sit
+        // in the table.
+        if value == nil, let valence = numeric(object["valence"]) {
+            value = valence
+            unit = unit ?? "valence"
         }
 
         var sourceName: String?
@@ -1038,5 +1079,165 @@ enum AudiogramShape {
             return BatchParser.numeric(value)
         }
         return BatchParser.numeric(object["value"])
+    }
+}
+
+/// One State of Mind entry: a mood the person logged.
+///
+/// Kept alongside its sample row rather than instead of it. Unlike an ECG,
+/// this genuinely is one reading with one number — the valence — so it belongs
+/// in `sample` where every existing tool can chart it, and this carries the
+/// parts a single column cannot: what kind of entry it was, how Health
+/// classified the feeling, and what the person attributed it to.
+public struct ReceivedMoodEntry: Hashable, Sendable {
+    public let id: String
+    public let startDate: Date
+    public let endDate: Date?
+    /// -1 (very unpleasant) through +1 (very pleasant).
+    public let valence: Double
+    public let classification: String?
+    /// `momentaryEmotion` or `dailyMood`. Averaging the two together would mix
+    /// a snapshot with a summary of a whole day.
+    public let kindOfEntry: String?
+    public let labels: [String]
+    public let associations: [String]
+    public let sourceName: String?
+    public let raw: Data
+
+    public init(
+        id: String,
+        startDate: Date,
+        endDate: Date?,
+        valence: Double,
+        classification: String?,
+        kindOfEntry: String?,
+        labels: [String],
+        associations: [String],
+        sourceName: String?,
+        raw: Data
+    ) {
+        self.id = id
+        self.startDate = startDate
+        self.endDate = endDate
+        self.valence = valence
+        self.classification = classification
+        self.kindOfEntry = kindOfEntry
+        self.labels = labels
+        self.associations = associations
+        self.sourceName = sourceName
+        self.raw = raw
+    }
+}
+
+/// One medication dose event.
+///
+/// The status is the whole record. Only `taken` means the medicine was
+/// actually taken; `skipped`, `snoozed` and `notAnswered` are three different
+/// ways of not taking it, and flattening them answers "did I take my
+/// medication?" wrongly — which is worse than not answering at all.
+public struct ReceivedMedicationDose: Hashable, Sendable {
+    public let id: String
+    public let startDate: Date
+    public let logStatus: String
+    public let scheduleType: String?
+    public let doseQuantity: Double?
+    public let scheduledDoseQuantity: Double?
+    public let unit: String?
+    public let medicationName: String?
+    public let medicationForm: String?
+    public let sourceName: String?
+    public let raw: Data
+
+    /// The one status that means the dose was taken.
+    public var wasTaken: Bool {
+        logStatus == "taken"
+    }
+
+    public init(
+        id: String,
+        startDate: Date,
+        logStatus: String,
+        scheduleType: String?,
+        doseQuantity: Double?,
+        scheduledDoseQuantity: Double?,
+        unit: String?,
+        medicationName: String?,
+        medicationForm: String?,
+        sourceName: String?,
+        raw: Data
+    ) {
+        self.id = id
+        self.startDate = startDate
+        self.logStatus = logStatus
+        self.scheduleType = scheduleType
+        self.doseQuantity = doseQuantity
+        self.scheduledDoseQuantity = scheduledDoseQuantity
+        self.unit = unit
+        self.medicationName = medicationName
+        self.medicationForm = medicationForm
+        self.sourceName = sourceName
+        self.raw = raw
+    }
+}
+
+/// The shapes the phone uses for mood and medication.
+enum MoodAndMedicationShape {
+    static let moodKind = "stateOfMind"
+    static let doseKind = "medicationDose"
+
+    static func mood(in object: [String: Any]) -> ReceivedMoodEntry? {
+        guard
+            let id = object["id"] as? String,
+            let startText = object["startDate"] as? String,
+            let start = Timestamps.date(from: startText),
+            let valence = BatchParser.numeric(object["valence"])
+        else {
+            return nil
+        }
+        return ReceivedMoodEntry(
+            id: id,
+            startDate: start,
+            endDate: (object["endDate"] as? String).flatMap(Timestamps.date(from:)),
+            valence: valence,
+            classification: (object["valenceClassification"] as? [String: Any])?["name"] as? String,
+            kindOfEntry: (object["kindOfEntry"] as? [String: Any])?["name"] as? String,
+            labels: names(in: object["labels"]),
+            associations: names(in: object["associations"]),
+            sourceName: (object["source"] as? [String: Any])?["name"] as? String,
+            raw: ElectrocardiogramShape.canonical(object)
+        )
+    }
+
+    static func dose(in object: [String: Any]) -> ReceivedMedicationDose? {
+        guard
+            let id = object["id"] as? String,
+            let startText = object["startDate"] as? String,
+            let start = Timestamps.date(from: startText)
+        else {
+            return nil
+        }
+        let medication = object["medication"] as? [String: Any] ?? [:]
+        return ReceivedMedicationDose(
+            id: id,
+            startDate: start,
+            // An unnamed status is recorded as unrecorded rather than guessed
+            // at, because every guess here is a claim about whether someone
+            // took their medicine.
+            logStatus: (object["logStatus"] as? [String: Any])?["name"] as? String
+                ?? "unrecorded",
+            scheduleType: (object["scheduleType"] as? [String: Any])?["name"] as? String,
+            doseQuantity: BatchParser.numeric(object["doseQuantity"]),
+            scheduledDoseQuantity: BatchParser.numeric(object["scheduledDoseQuantity"]),
+            unit: object["unit"] as? String,
+            medicationName: medication["displayText"] as? String
+                ?? medication["nickname"] as? String,
+            medicationForm: (medication["generalForm"] as? [String: Any])?["name"] as? String,
+            sourceName: (object["source"] as? [String: Any])?["name"] as? String,
+            raw: ElectrocardiogramShape.canonical(object)
+        )
+    }
+
+    private static func names(in value: Any?) -> [String] {
+        (value as? [[String: Any]])?.compactMap { $0["name"] as? String } ?? []
     }
 }

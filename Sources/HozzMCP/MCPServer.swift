@@ -133,6 +133,10 @@ public actor MCPServer {
             return try await compareTypes(arguments)
         case "find_health_anomalies":
             return try await findAnomalies(arguments)
+        case "list_mood_entries":
+            return try await moodEntries(arguments)
+        case "summarise_medication_adherence":
+            return try await medicationAdherence(arguments)
         default:
             throw MCPError.unknownTool(name)
         }
@@ -205,6 +209,22 @@ public actor MCPServer {
                 at a time and may not have reached this one; it is not \
                 evidence that you have no such data. Types received so far: \
                 \(names.isEmpty ? "none" : names).
+                """
+        }
+        // "None in this window" is only true if the dates are the reason. A
+        // type whose records carry no number at all is present and unchartable,
+        // and reporting that as a date problem is a false explanation.
+        let inWindow = try await store.samples(
+            type: type,
+            from: Date.now.addingTimeInterval(-Double(days) * 86_400),
+            to: .now,
+            limit: 1
+        )
+        guard inWindow.isEmpty else {
+            return """
+                \(type) has \(summary.recordCount) records, including some in \
+                the last \(days) days, but none of them carry a number this \
+                tool can chart. Use list_health_samples to see them.
                 """
         }
         return """
@@ -410,6 +430,73 @@ public actor MCPServer {
                 .map { Self.day(Date(timeIntervalSince1970: $0 * 86_400)) }
                 .joined(separator: ", ")
             text += "."
+        }
+        return text
+    }
+
+
+    private func moodEntries(_ arguments: [String: Any]) async throws -> String {
+        let days = min(max((arguments["days"] as? Int) ?? 90, 1), 3_650)
+        let limit = min((arguments["limit"] as? Int) ?? 100, 1_000)
+        let entries = try await store.moodEntries(
+            from: Date.now.addingTimeInterval(-Double(days) * 86_400),
+            limit: limit
+        )
+        guard !entries.isEmpty else {
+            return """
+                No State of Mind entries in the last \(days) days. If your \
+                phone has not finished its first sync this may simply not have \
+                arrived yet, rather than not existing.
+                """
+        }
+
+        var text = "\(entries.count) mood entries. Valence runs -1 (very "
+        text += "unpleasant) to +1 (very pleasant).\n\n"
+        text += "date, valence, felt, kind, labels, associations\n"
+        text += entries
+            .map { entry in
+                [
+                    Self.day(entry.startDate),
+                    Self.number(entry.valence),
+                    entry.classification ?? "",
+                    entry.kindOfEntry ?? "",
+                    entry.labels,
+                    entry.associations
+                ].joined(separator: ", ")
+            }
+            .joined(separator: "\n")
+        return text
+    }
+
+    private func medicationAdherence(_ arguments: [String: Any]) async throws -> String {
+        let days = min(max((arguments["days"] as? Int) ?? 90, 1), 3_650)
+        let adherence = try await store.medicationAdherence(
+            from: Date.now.addingTimeInterval(-Double(days) * 86_400)
+        )
+        guard !adherence.isEmpty else {
+            return """
+                No medication doses in the last \(days) days. If your phone \
+                has not finished its first sync this may simply not have \
+                arrived yet, rather than not existing.
+                """
+        }
+
+        var text = ""
+        for entry in adherence {
+            text += "\(entry.medication): \(entry.total) logged "
+            text += entry.total == 1 ? "dose" : "doses"
+            if let earliest = entry.earliest, let latest = entry.latest {
+                text += " between \(Self.day(earliest)) and \(Self.day(latest))"
+            }
+            text += "\n"
+            for status in entry.statusCounts.keys.sorted() {
+                let count = entry.statusCounts[status] ?? 0
+                text += "  \(status): \(count)\n"
+            }
+            // Stated per medicine so the distinction cannot be lost in a
+            // summary written above it.
+            text += "  (only 'taken' means it was taken; skipped, snoozed and "
+            text += "notAnswered each mean it was not)\n\n"
         }
         return text
     }
@@ -974,6 +1061,42 @@ enum Tools {
                     ]
                 ] as [String: Any],
                 "required": ["type"]
+            ]
+        ],
+        [
+            "name": "list_mood_entries",
+            "description": """
+                State of Mind entries with their valence, how Health \
+                classified the feeling, whether it was a momentary emotion or \
+                a whole day's mood, and what the person attributed it to. \
+                Mood also charts through aggregate_health_data and \
+                analyse_health_trend as an ordinary type, so use those for \
+                "is my mood declining"; use this when the labels and \
+                associations matter.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "days": ["type": "integer", "description": "How far back to look. Defaults to 90."],
+                    "limit": ["type": "integer", "description": "How many entries. Defaults to 100."]
+                ] as [String: Any]
+            ]
+        ],
+        [
+            "name": "summarise_medication_adherence",
+            "description": """
+                Medication dose events per medicine, counted by status. Only \
+                "taken" means the medicine was actually taken — skipped, \
+                snoozed and never-answered are three different ways of not \
+                taking it and are reported separately. Never collapse them \
+                into a single adherence figure, and never treat a \
+                never-answered dose as evidence either way.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "days": ["type": "integer", "description": "How far back to look. Defaults to 90."]
+                ] as [String: Any]
             ]
         ],
         [

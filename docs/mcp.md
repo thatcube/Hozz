@@ -83,6 +83,22 @@ knowing who *me* is the failure worth designing against.
 | `list_electrocardiograms` | Every ECG reading, with what the Watch classified it as, average heart rate, symptom status, and whether the full waveform has arrived. |
 | `get_electrocardiogram_voltages` | One reading's waveform as time/volt pairs. |
 | `list_audiograms` | Hearing tests, with the threshold at each frequency for each ear. |
+| `list_mood_entries` | State of Mind entries with their classification, kind, labels and associations. |
+| `summarise_medication_adherence` | Dose events per medicine, counted by status. |
+
+Mood is also an ordinary chartable type: its valence lands in `sample` as a real
+value, so `aggregate_health_data`, `analyse_health_trend` and
+`compare_health_types` all work on it. "Has my mood been declining" is a trend
+question, and it is answered by the trend tool with the same honesty gates as
+anything else. Use `list_mood_entries` when the labels and associations matter.
+
+Medication doses are the opposite: a dose has no number to chart, its answer is
+a status, and **only `taken` means the medicine was taken**. `skipped`,
+`snoozed` and `notAnswered` are three different ways of not taking it and are
+always reported separately. Never collapse them into one adherence figure, and
+never read a never-answered dose as evidence either way. An unrecognised status
+is reported as `unrecorded` rather than guessed at, because every guess there is
+a claim about whether someone took their medicine.
 
 `aggregate_health_data` returns both sum and average rather than one "value",
 because which is correct depends entirely on the type. Summing heart rates is

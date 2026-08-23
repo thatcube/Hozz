@@ -171,7 +171,7 @@ In a CSV export doses become `MedicationDoses.csv`, one row per dose.
 
 ## Mac receiver
 
-The Mac app is a local receiver and browser for data the phone sends. It starts an `NWListener` HTTP receiver, advertises `_hozz._tcp`, normally listens on port **54330**, accepts `/pair` without a token, and requires the token for deliveries. It stores accepted batches in `hozz-received.sqlite` with schema version 5, idempotent batch records, deletions, characteristics, and per-device “last heard from” state.
+The Mac app is a local receiver and browser for data the phone sends. It starts an `NWListener` HTTP receiver, advertises `_hozz._tcp`, normally listens on port **54330**, accepts `/pair` without a token, and requires the token for deliveries. It stores accepted batches in `hozz-received.sqlite` with schema version 6, idempotent batch records, deletions, characteristics, and per-device “last heard from” state.
 
 Setup is designed to avoid typing an address. The phone first browses Bonjour, also reads receiver records published through the user's own iCloud Keychain, then falls back to a private `/24` local-network sweep on port 54330. Every remembered address is probed before it is offered or reused, so a computer that does not answer is shown as offline instead of saved as a dead destination.
 
@@ -274,7 +274,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 402 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, aggregate sample counts, fair-share acquisition, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 409 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, aggregate sample counts, fair-share acquisition, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

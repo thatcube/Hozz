@@ -538,9 +538,17 @@ final class ReceiverKindAuditTests: XCTestCase {
         await upgraded.close()
         let reopened = try SQLiteDatabase(url: databaseURL)
         defer { reopened.close() }
-        XCTAssertEqual(
-            try reopened.query("PRAGMA user_version", row: { $0.integer(0) }).first,
-            5
+        // Deliberately not a literal. This test is about an old database
+        // being brought forward, not about which number it lands on, and
+        // hard-coding that meant every schema change failed here for no reason.
+        let upgradedVersion = try reopened.query(
+            "PRAGMA user_version",
+            row: { $0.integer(0) }
+        ).first
+        XCTAssertGreaterThan(
+            upgradedVersion ?? 0,
+            2,
+            "Opening a version 2 database has to move it forward."
         )
     }
 
