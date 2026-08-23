@@ -49,8 +49,21 @@ final class SyncViewModel {
     /// invented — and a progress bar is a promise about time remaining, which
     /// is the one thing that genuinely cannot be known here.
     struct BackfillProgress: Equatable {
-        /// Types that have had at least one record drained and committed.
-        let typesReached: Int
+        /// Types every destination that wants them has read to the end.
+        ///
+        /// This is the number that means something. A type is complete only
+        /// when Health returned an empty page for it — the one piece of
+        /// evidence that there is nothing more to send — and only when every
+        /// destination that wants it has got that far.
+        let typesComplete: Int
+        /// Types Hozz has read at least once.
+        ///
+        /// Kept alongside `typesComplete` rather than instead of it. The drain
+        /// gives every type a share of each pass, so this climbs to almost
+        /// everything within a pass or two and then stops moving while the
+        /// real work continues. Shown on its own it would read as a finished
+        /// export that is inexplicably missing most of the data.
+        let typesStarted: Int
         /// Types this phone is set up to send.
         let typesSelected: Int
         let recordsDelivered: Int
@@ -60,7 +73,7 @@ final class SyncViewModel {
         let typesFailed: Int
 
         var isUnderway: Bool {
-            typesSelected > 0 && typesReached < typesSelected
+            typesSelected > 0 && typesComplete < typesSelected
         }
     }
 
@@ -137,55 +150,108 @@ final class SyncViewModel {
     /// A type counts as *reached* once a cursor has been committed for it,
     /// which is exactly what "Hozz has drained some of this type" means.
     ///
-    /// It deliberately does **not** claim a type is *finished*, though it now
-    /// could. The drain records the difference: a type cut off by the budget
-    /// commits as `draining` with no closure time, and only an empty page
-    /// closes a type. Counting `anchorClosedAt != nil` would therefore be an
-    /// honest `typesComplete`, and this is the only place that has to change.
+    /// A type counts as complete only when Health returned an empty page for
+    /// it, which is the one piece of evidence that there is nothing more to
+    /// send, and only when every destination that wants it has got that far.
+    /// A type the budget cut short commits as `draining` with no closure time
+    /// and is counted as started instead.
     private static func backfillProgress(
         services: HozzServices,
         destinations: [Destination]
     ) async throws -> BackfillProgress? {
-        let selected = destinations.reduce(into: Set<HealthTypeKey>()) {
-            $0.formUnion($1.includedTypes)
+        var gathered: [(destination: Destination, streams: [StreamRecord])] = []
+        for destination in destinations {
+            gathered.append(
+                (
+                    destination,
+                    try await services.store.streamRecords(
+                        scope: .destination(destination.id)
+                    )
+                )
+            )
+        }
+        return backfillProgress(
+            gathered: gathered,
+            everything: Set(services.syncTypes)
+        )
+    }
+
+    /// Counts the backfill from what the store holds.
+    ///
+    /// Kept pure and separate from the fetching so a test can drive it with
+    /// real stream records rather than reimplementing the arithmetic, which
+    /// would only prove the copy agrees with itself.
+    nonisolated static func backfillProgress(
+        gathered: [(destination: Destination, streams: [StreamRecord])],
+        everything: Set<HealthTypeKey>
+    ) -> BackfillProgress? {
+        // A destination that names no types means every type Hozz drains, so
+        // that is the denominator for it. Counting the whole catalogue would
+        // be wrong — most of it is never read — and counting nothing at all,
+        // which is what this used to do, hid the display from everyone who had
+        // not narrowed their selection.
+        let selected = gathered.reduce(into: Set<HealthTypeKey>()) {
+            $0.formUnion(
+                $1.destination.includedTypes.isEmpty
+                    ? everything
+                    : $1.destination.includedTypes
+            )
         }
         guard !selected.isEmpty else {
-            // Every type, rather than a chosen subset. Counting the catalog
-            // here would be wrong for someone who narrowed their selection.
             return nil
         }
 
-        var reached: Set<HealthTypeKey> = []
-        var empty: Set<HealthTypeKey> = []
+        var started: Set<HealthTypeKey> = []
+        var incomplete: Set<HealthTypeKey> = []
+        var closed: Set<HealthTypeKey> = []
+        var withRecords: Set<HealthTypeKey> = []
         var failed: Set<HealthTypeKey> = []
+        var wanted: Set<HealthTypeKey> = []
         var records = 0
 
-        for destination in destinations {
-            let streams = try await services.store.streamRecords(
-                scope: .destination(destination.id)
+        for (destination, streams) in gathered {
+            let byType = Dictionary(
+                streams.map { ($0.type, $0) },
+                uniquingKeysWith: { first, _ in first }
             )
-            for stream in streams where selected.contains(stream.type) {
+
+            for type in selected where destination.includes(type) {
+                wanted.insert(type)
+                guard let stream = byType[type] else {
+                    // This destination has never reached the type, so it
+                    // cannot be complete however far the others have got.
+                    incomplete.insert(type)
+                    continue
+                }
                 records += stream.recordCount
                 if stream.recordCount > 0 {
-                    reached.insert(stream.type)
-                } else if stream.coverage == .authorizationIndeterminate {
-                    empty.insert(stream.type)
+                    withRecords.insert(type)
+                    started.insert(type)
+                }
+                if stream.anchorClosedAt != nil {
+                    closed.insert(type)
+                    started.insert(type)
+                } else {
+                    // Committed but still draining: read, not finished.
+                    incomplete.insert(type)
                 }
                 if stream.failureReason != nil {
-                    failed.insert(stream.type)
+                    failed.insert(type)
                 }
             }
         }
 
-        // A type that produced records is reached whatever else it also did.
-        empty.subtract(reached)
-        failed.subtract(reached)
+        // Complete means every destination that wants it reached the end. One
+        // destination still owed data is data still owed.
+        let complete = closed.subtracting(incomplete)
+        failed.subtract(complete)
 
         return BackfillProgress(
-            typesReached: reached.count + empty.count,
-            typesSelected: selected.count,
+            typesComplete: complete.count,
+            typesStarted: started.count,
+            typesSelected: wanted.count,
             recordsDelivered: records,
-            typesEmpty: empty.count,
+            typesEmpty: complete.subtracting(withRecords).count,
             typesFailed: failed.count
         )
     }

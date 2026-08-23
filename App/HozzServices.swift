@@ -17,6 +17,10 @@ final class HozzServices: @unchecked Sendable {
     let sync: SyncCoordinator
     let observer: HealthObserver
 
+    /// The types the drain actually visits. A destination that names no types
+    /// means "everything", and this is what everything is.
+    let syncTypes: [HealthTypeKey]
+
     /// Collapses observer bursts into single passes. Held here so the app, the
     /// background task, and the intents all feed the same one.
     ///
@@ -38,6 +42,7 @@ final class HozzServices: @unchecked Sendable {
 
         self.store = store
         self.delivery = delivery
+        self.syncTypes = types.map(\.catalogEntry.key)
         self.exporter = HealthKitManualExporter(
             healthStore: healthStore,
             store: store,

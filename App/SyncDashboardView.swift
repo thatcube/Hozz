@@ -89,9 +89,13 @@ struct SyncDashboardView: View {
         }
     }
 
-    /// Says which types have been reached, so a sweep still working through
-    /// someone's history reads as in progress rather than as a finished export
-    /// that is inexplicably missing almost everything.
+    /// Leads with how many types are *complete*, and carries how many have
+    /// started underneath it.
+    ///
+    /// Completeness is the slow, meaningful number. Because the drain gives
+    /// every type a share of each pass, the started count reaches almost
+    /// everything within a pass or two and then sits still — shown on its own
+    /// it would look like a finished export missing most of the data.
     @ViewBuilder
     private var backfillSection: some View {
         if let backfill = model.backfill, backfill.typesSelected > 0 {
@@ -99,7 +103,7 @@ struct SyncDashboardView: View {
                 Label {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(
-                            "\(backfill.typesReached) of \(backfill.typesSelected) health types reached"
+                            "\(backfill.typesComplete) of \(backfill.typesSelected) health types complete"
                         )
                         .font(.body.weight(.medium))
 
@@ -130,11 +134,13 @@ struct SyncDashboardView: View {
             // No percentage and no estimate: Health will not say how much a
             // type holds without reading all of it, so both would be invented,
             // and an invented estimate is a promise that gets broken.
-            text = "Hozz works through your types a batch at a time, so the "
-                + "ones not listed yet are queued rather than missing. "
-                + "\(backfill.recordsDelivered.formatted()) records sent so far."
+            text = "Hozz reads a little of every type each time, so records "
+                + "keep arriving long before a type is finished. "
+                + "\(backfill.typesStarted) of \(backfill.typesSelected) have "
+                + "started. \(backfill.recordsDelivered.formatted()) records "
+                + "sent so far."
         } else {
-            text = "Every type you selected has been reached. "
+            text = "Every type you selected has been read to the end. "
                 + "\(backfill.recordsDelivered.formatted()) records sent so far."
         }
         if backfill.typesEmpty > 0 {

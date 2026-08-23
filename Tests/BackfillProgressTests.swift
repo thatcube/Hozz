@@ -5,6 +5,7 @@ import HozzHealth
 import HozzHealthFake
 import HozzStore
 import XCTest
+@testable import Hozz
 
 /// A first sweep through years of history drains a bounded batch at a time, in
 /// catalog order, so a phone can spend days on its earliest types and have
@@ -40,27 +41,22 @@ final class BackfillProgressTests: XCTestCase {
     }
 
     /// The progress figures, computed the way the dashboard computes them.
+    /// Drives the real counting rather than a copy of it. A test that
+    /// reimplements the arithmetic only proves the copy agrees with itself.
     private func progress(
         store: HozzStore,
-        destinationID: UUID,
-        selected: Set<HealthTypeKey>
-    ) async throws -> (reached: Int, empty: Int, records: Int) {
+        destination: Destination,
+        everything: Set<HealthTypeKey>
+    ) async throws -> SyncViewModel.BackfillProgress {
         let streams = try await store.streamRecords(
-            scope: .destination(destinationID)
+            scope: .destination(destination.id)
         )
-        var reached: Set<HealthTypeKey> = []
-        var empty: Set<HealthTypeKey> = []
-        var records = 0
-        for stream in streams where selected.contains(stream.type) {
-            records += stream.recordCount
-            if stream.recordCount > 0 {
-                reached.insert(stream.type)
-            } else if stream.coverage == .authorizationIndeterminate {
-                empty.insert(stream.type)
-            }
-        }
-        empty.subtract(reached)
-        return (reached.count + empty.count, empty.count, records)
+        return try XCTUnwrap(
+            SyncViewModel.backfillProgress(
+                gathered: [(destination: destination, streams: streams)],
+                everything: everything
+            )
+        )
     }
 
     private func makeEngine(
@@ -111,18 +107,18 @@ final class BackfillProgressTests: XCTestCase {
 
         let after = try await progress(
             store: store,
-            destinationID: destination.id,
-            selected: [stand, heart, steps]
+            destination: destination,
+            everything: [stand, heart, steps]
         )
         // Since the drain gives every type a share before spending the
         // remainder, all three are seen in the first pass rather than two of
         // them waiting for the big one to finish.
         XCTAssertEqual(
-            after.reached,
+            after.typesStarted,
             3,
             "Every type should be seen in the first pass, not just the first one."
         )
-        XCTAssertEqual(after.records, 5_000, "One pass is bounded at 5,000.")
+        XCTAssertEqual(after.recordsDelivered, 5_000, "One pass is bounded at 5,000.")
 
         // The point of the test still stands: being seen is not being
         // finished, and the big type must not claim to be caught up.
@@ -173,8 +169,8 @@ final class BackfillProgressTests: XCTestCase {
         _ = try await engine.sync(ignoringCadence: true)
         let first = try await progress(
             store: store,
-            destinationID: destination.id,
-            selected: [stand, heart, steps]
+            destination: destination,
+            everything: [stand, heart, steps]
         )
 
         _ = try await engine.sync(
@@ -183,19 +179,19 @@ final class BackfillProgressTests: XCTestCase {
         )
         let second = try await progress(
             store: store,
-            destinationID: destination.id,
-            selected: [stand, heart, steps]
+            destination: destination,
+            everything: [stand, heart, steps]
         )
 
         XCTAssertEqual(
-            first.reached,
+            first.typesStarted,
             3,
             "Every type is reached in the first pass now that the budget is shared."
         )
-        XCTAssertEqual(second.reached, 3)
+        XCTAssertEqual(second.typesStarted, 3)
         XCTAssertGreaterThan(
-            second.records,
-            first.records,
+            second.recordsDelivered,
+            first.recordsDelivered,
             "Progress now shows in the record count rather than in types waiting their turn."
         )
 
@@ -208,9 +204,101 @@ final class BackfillProgressTests: XCTestCase {
         XCTAssertNotNil(big?.anchorClosedAt)
     }
 
+    // MARK: - What complete means
+
+    private func stream(
+        _ type: HealthTypeKey,
+        records: Int,
+        closed: Bool
+    ) -> StreamRecord {
+        StreamRecord(
+            type: type,
+            coverage: closed
+                ? (records == 0 ? .authorizationIndeterminate : .anchorClosed)
+                : .draining,
+            committedAnchor: AnchorToken(data: Data([1])),
+            recordCount: records,
+            observedCount: records,
+            anchorClosedAt: closed ? Date(timeIntervalSince1970: 1) : nil,
+            failureReason: nil,
+            updatedAt: Date(timeIntervalSince1970: 1)
+        )
+    }
+
+    /// Someone who never narrowed their selection used to see no progress at
+    /// all, because "no types named" was read as "no types wanted" rather than
+    /// as "every type".
+    func testADestinationThatWantsEverythingStillShowsProgress() throws {
+        let destination = Destination(
+            name: "Mac",
+            kind: .folder,
+            folderBookmark: Data("a".utf8)
+        )
+
+        let progress = try XCTUnwrap(
+            SyncViewModel.backfillProgress(
+                gathered: [
+                    (
+                        destination,
+                        [
+                            stream(heart, records: 5, closed: true),
+                            stream(stand, records: 900, closed: false)
+                        ]
+                    )
+                ],
+                everything: [heart, stand, steps]
+            )
+        )
+
+        XCTAssertEqual(progress.typesSelected, 3)
+        XCTAssertEqual(progress.typesComplete, 1)
+        XCTAssertEqual(
+            progress.typesStarted,
+            2,
+            "Started counts what has been read; the third has not been touched."
+        )
+        XCTAssertTrue(progress.isUnderway)
+    }
+
+    /// Data still owed to one destination is data still owed, however far the
+    /// others have got.
+    func testATypeIsCompleteOnlyWhenEveryDestinationHasFinishedIt() throws {
+        let finished = Destination(
+            name: "Mac",
+            kind: .folder,
+            folderBookmark: Data("a".utf8),
+            includedTypes: [heart]
+        )
+        let behind = Destination(
+            name: "Folder",
+            kind: .folder,
+            folderBookmark: Data("b".utf8),
+            includedTypes: [heart]
+        )
+
+        let progress = try XCTUnwrap(
+            SyncViewModel.backfillProgress(
+                gathered: [
+                    (finished, [stream(heart, records: 10, closed: true)]),
+                    (behind, [stream(heart, records: 4, closed: false)])
+                ],
+                everything: [heart]
+            )
+        )
+
+        XCTAssertEqual(progress.typesSelected, 1)
+        XCTAssertEqual(
+            progress.typesComplete,
+            0,
+            "One destination still owed the rest means the type is not done."
+        )
+        XCTAssertEqual(progress.typesStarted, 1)
+        XCTAssertEqual(progress.recordsDelivered, 14)
+    }
+
     /// A type Health answered for with nothing is a complete export of
     /// nothing, and must not sit forever as an unreached type.
-    func testATypeWithNoDataCountsAsReachedRatherThanPending() async throws {
+    func testATypeWithNoDataCountsAsCompleteRatherThanPending() async throws {
         let store = try HozzStore(directory: directory.url.appending(path: "store"))
         let channel = AcceptingChannel()
         let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
@@ -238,14 +326,19 @@ final class BackfillProgressTests: XCTestCase {
 
         let after = try await progress(
             store: store,
-            destinationID: destination.id,
-            selected: [heart, steps]
+            destination: destination,
+            everything: [heart, steps]
         )
-        XCTAssertEqual(after.records, 3)
-        XCTAssertGreaterThanOrEqual(
-            after.reached,
+        XCTAssertEqual(after.recordsDelivered, 3)
+        XCTAssertEqual(
+            after.typesComplete,
+            2,
+            "Both ran out: one with records, one with none. Both are finished."
+        )
+        XCTAssertEqual(
+            after.typesEmpty,
             1,
-            "The type that produced records is reached."
+            "An empty type is a complete export of nothing, not an unreached one."
         )
     }
 
@@ -258,7 +351,8 @@ final class BackfillProgressTests: XCTestCase {
         let destination = Destination(
             name: "Mac",
             kind: .folder,
-            folderBookmark: Data("a".utf8)
+            folderBookmark: Data("a".utf8),
+            includedTypes: [heart]
         )
         try await delivery.save(destination)
 
@@ -279,12 +373,17 @@ final class BackfillProgressTests: XCTestCase {
         // Someone who narrowed their selection to one type must not see two.
         let narrowed = try await progress(
             store: store,
-            destinationID: destination.id,
-            selected: [heart]
+            destination: destination,
+            everything: [heart, steps]
         )
-        XCTAssertLessThanOrEqual(narrowed.reached, 1)
         XCTAssertEqual(
-            narrowed.records,
+            narrowed.typesSelected,
+            1,
+            "The denominator is what this destination wants, not what exists."
+        )
+        XCTAssertLessThanOrEqual(narrowed.typesStarted, 1)
+        XCTAssertEqual(
+            narrowed.recordsDelivered,
             3,
             "Only the selected type's records are counted."
         )
