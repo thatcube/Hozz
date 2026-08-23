@@ -6,7 +6,7 @@ Hozz is a free, open-source iPhone app with a companion Mac receiver. The iPhone
 
 There is no subscription, account, analytics, advertising, hosted relay, or default network destination. Nothing leaves the iPhone until you add a destination and confirm it.
 
-Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, workout routes, electrocardiograms, historical deletions, and the six Health characteristics. Correlations, audiograms, other series, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
+Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, workout routes, electrocardiograms, audiograms, historical deletions, and the six Health characteristics. Correlations, other series, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
 
 ## What works today
 
@@ -94,6 +94,14 @@ HealthKit has no back-pointer from a route to its workout, so Hozz takes the wor
 **Electrocardiograms** carry the reading that makes them interpretable — `sinusRhythm`, `atrialFibrillation`, one of the inconclusive results — alongside the raw enumeration value, so a classification from a later OS is still readable rather than becoming a gap. A reading the lead did not report is written as a gap rather than as zero volts, an absent average heart rate is left out rather than written as zero, and the number of readings Health said the recording holds is kept beside the number actually exported, so a short read is visible instead of looking complete.
 
 In a CSV export these become `WorkoutRoutes.csv`, `WorkoutRouteLocations.csv`, `Electrocardiograms.csv`, and `ElectrocardiogramVoltages.csv` — one row per sample and one row per element, because a recording collapsed into a single cell would not be data any more.
+
+## Audiograms
+
+A hearing test is not a series: its sensitivity readings sit on the sample itself, at most thirty of them, so it travels the ordinary anchored path.
+
+Two things a flat reading would throw away are kept. An ear with nothing recorded produces no reading at all, rather than a zero — 0 dBHL is perfect hearing, so writing it for an ear that was never measured would be a claim rather than a gap. And a reading Health marks as clamped is written with its bound, because a clamped 90 dBHL means "at least 90", not "90". Where the OS supports it, conduction type and whether the test was masked are carried too.
+
+In a CSV export a hearing test becomes `Audiograms.csv`, one row per ear reading.
 
 ## Mac receiver
 
@@ -194,7 +202,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 230 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 236 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

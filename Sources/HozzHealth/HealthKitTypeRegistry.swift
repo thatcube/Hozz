@@ -63,6 +63,8 @@ public enum HealthKitTypeRegistry {
                 )
             case .workout:
                 objectType = HKObjectType.workoutType()
+            case .audiogram:
+                objectType = HKObjectType.audiogramSampleType()
             case .series:
                 objectType = switch entry.key.rawValue {
                 case WorkoutRouteEncoding.typeIdentifier:

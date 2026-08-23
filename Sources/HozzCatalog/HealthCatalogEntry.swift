@@ -10,6 +10,9 @@ public enum HealthTypeFamily: String, Codable, CaseIterable, Sendable {
     case document
     case scoredAssessment
     case workout
+    /// A hearing test: not a single value, but a set of sensitivity readings
+    /// carried on the sample itself.
+    case audiogram
     /// Samples whose real content is a stream attached to them rather than a
     /// value on them — a workout's route, for instance. They are read through
     /// the ordinary anchored path and then streamed in bounded pieces.
@@ -67,6 +70,7 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
             "HKScoredAssessmentTypeIdentifier",
             "HKWorkoutRouteTypeIdentifier",
             "HKWorkoutTypeIdentifier",
+            "HKAudiogramTypeIdentifier",
             "HKDataTypeIdentifier"
         ]
         for prefix in prefixes where name.hasPrefix(prefix) {
@@ -77,6 +81,7 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
             return switch key.rawValue {
             case "HKWorkoutTypeIdentifier": "Workout"
             case "HKWorkoutRouteTypeIdentifier": "Workout Route"
+            case "HKAudiogramTypeIdentifier": "Audiogram"
             default: key.rawValue
             }
         }
@@ -120,6 +125,11 @@ public enum HealthTypeCatalog {
                 identifier: "HKDataTypeIdentifierElectrocardiogram",
                 family: .series,
                 introduced: IOSVersion(major: 14, minor: 0)
+            ),
+            HealthCatalogEntry(
+                identifier: "HKAudiogramTypeIdentifier",
+                family: .audiogram,
+                introduced: IOSVersion(major: 13, minor: 0)
             )
         ]
 

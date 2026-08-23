@@ -143,6 +143,21 @@ enum ExportTranscoder {
                 ecgRows.append(electrocardiogramCSVRow(from: object))
                 continue
             }
+            if kind == "audiogram" {
+                // A hearing test is a set of readings, not one value, so it
+                // gets a row per reading rather than a cell full of JSON.
+                if currentType != audiogramEntry {
+                    try closeEntry()
+                    try archive.beginEntry(name: audiogramEntry)
+                    try archive.write(Data((audiogramHeader + "\n").utf8))
+                    currentType = audiogramEntry
+                    currentKind = kind
+                }
+                for row in audiogramCSVRows(from: object) {
+                    try archive.write(Data((row + "\n").utf8))
+                }
+                continue
+            }
             if let shape = seriesShape(endKind: kind) {
                 if
                     let sample = object["sample"] as? String,
@@ -279,6 +294,48 @@ enum ExportTranscoder {
 
         try archive.write(Data("\n]\n".utf8))
         try archive.endEntry()
+    }
+
+    // MARK: - Audiograms
+
+    static let audiogramEntry = "Audiograms.csv"
+    static let audiogramHeader =
+        "audiogram,startDate,endDate,frequencyHz,ear,sensitivityDBHL,conduction,masked,clampedAtLeast,clampedAtMost,sourceName"
+
+    /// One row per ear reading. A hearing test with nothing recorded for an
+    /// ear produces no row for it, rather than a row saying zero.
+    static func audiogramCSVRows(from object: [String: Any]) -> [String] {
+        guard let points = object["sensitivityPoints"] as? [[String: Any]] else {
+            return []
+        }
+        let id = object["id"] as? String ?? ""
+        let start = object["startDate"] as? String ?? ""
+        let end = object["endDate"] as? String ?? ""
+        let source = object["source"] as? [String: Any] ?? [:]
+        let sourceName = source["name"] as? String ?? ""
+
+        return points.flatMap { point -> [String] in
+            let frequency = number(
+                (point["frequency"] as? [String: Any])?["value"]
+            )
+            let ears = point["ears"] as? [[String: Any]] ?? []
+            return ears.map { ear in
+                let clamping = ear["clampingRange"] as? [String: Any]
+                return [
+                    id,
+                    start,
+                    end,
+                    frequency,
+                    ear["ear"] as? String ?? "",
+                    number((ear["sensitivity"] as? [String: Any])?["value"]),
+                    ear["conduction"] as? String ?? "",
+                    (ear["masked"] as? Bool).map(String.init) ?? "",
+                    number((clamping?["lowerBound"] as? [String: Any])?["value"]),
+                    number((clamping?["upperBound"] as? [String: Any])?["value"]),
+                    sourceName
+                ].map(escape).joined(separator: ",")
+            }
+        }
     }
 
     // MARK: - Series types
