@@ -33,7 +33,13 @@ public struct ClinicalRecordFacts: Equatable, Sendable {
     public let healthKitID: UUID
     public let clinicalType: String
     public let displayName: String
+    public let sourceName: String
     public let sourceBundleIdentifier: String
+    /// The dates Health assigned, which for a clinical record are when it was
+    /// added to Health rather than when the care happened. The clinical dates
+    /// live inside the FHIR resource.
+    public let startDate: Date
+    public let endDate: Date
     /// Absent for a record Health holds without a FHIR resource behind it.
     public let fhir: FHIRResourceFacts?
 
@@ -41,13 +47,19 @@ public struct ClinicalRecordFacts: Equatable, Sendable {
         healthKitID: UUID,
         clinicalType: String,
         displayName: String,
+        sourceName: String = "",
         sourceBundleIdentifier: String,
+        startDate: Date = Date(timeIntervalSince1970: 0),
+        endDate: Date = Date(timeIntervalSince1970: 0),
         fhir: FHIRResourceFacts?
     ) {
         self.healthKitID = healthKitID
         self.clinicalType = clinicalType
         self.displayName = displayName
+        self.sourceName = sourceName
         self.sourceBundleIdentifier = sourceBundleIdentifier
+        self.startDate = startDate
+        self.endDate = endDate
         self.fhir = fhir
     }
 }

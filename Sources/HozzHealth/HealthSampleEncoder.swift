@@ -150,8 +150,11 @@ public struct HealthSampleEncoder: Sendable {
             healthKitID: record.uuid,
             clinicalType: record.clinicalType.identifier,
             displayName: record.displayName,
+            sourceName: record.sourceRevision.source.name,
             sourceBundleIdentifier: record.sourceRevision.source
                 .bundleIdentifier,
+            startDate: record.startDate,
+            endDate: record.endDate,
             fhir: fhir
         )
     }
