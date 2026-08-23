@@ -189,6 +189,20 @@ It speaks JSON-RPC 2.0 over stdio, advertises protocol version `2024-11-05`, ser
 - `list_electrocardiograms`
 - `get_electrocardiogram_voltages`
 - `list_audiograms`
+- `analyse_health_trend`
+- `compare_health_types`
+- `find_health_anomalies`
+
+The three analysis tools are built to be hard to overstate, because their output
+goes straight to a language model that will narrate a story around any number.
+A trend reports "no detectable change" when a flat line fits as well as a sloped
+one, and refuses below two weeks of days. A correlation puts its interval on an
+autocorrelation-adjusted sample size, since consecutive days are not independent
+evidence, and warns when both series are trending — two things that both drift
+correlate whether or not they are related. Anomalies use the median and median
+absolute deviation, and days with too few records are reported as *the device
+was not worn* rather than as low readings, because those two look identical to
+anything that ignores how much was recorded.
 
 `summarise_health_data` also returns the person's own characteristics — age,
 biological sex, blood type — where they have been shared. That is deliberately
@@ -265,7 +279,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 372 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, aggregate sample counts, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 382 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, aggregate sample counts, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 
