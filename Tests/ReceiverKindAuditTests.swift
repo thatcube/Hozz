@@ -1,5 +1,5 @@
 import Foundation
-import HozzReceive
+@testable import HozzReceive
 import HozzStore
 import XCTest
 
@@ -443,7 +443,173 @@ final class ReceiverKindAuditTests: XCTestCase {
         defer { reopened.close() }
         XCTAssertEqual(
             try reopened.query("PRAGMA user_version", row: { $0.integer(0) }).first,
-            3
+            4
         )
+    }
+
+    // MARK: - Quarantine is temporary, not terminal
+
+    /// The whole sequence, because keeping the bytes is only worth doing if
+    /// something eventually reads them.
+    ///
+    /// A record arrives that this parser cannot read, is quarantined, and is
+    /// invisible to every query. The parser then learns the shape. The record
+    /// has to appear in full, with its values intact, and the quarantined copy
+    /// has to be gone.
+    func testARecordQuarantinedBeforeTheParserLearnedItIsPromotedAfterwards() async throws {
+        let storeDirectory = directory.url.appending(path: "store")
+
+        // A record shape this receiver does not understand. It is quarantined
+        // exactly as an unrecognised kind would be.
+        let unreadable: [String: Any] = [
+            "kind": "somethingThisBuildCannotRead",
+            "schemaVersion": 1,
+            "id": "future-1",
+            "type": "HKQuantityTypeIdentifierStepCount",
+            "startDate": "2026-01-02T15:00:00.000Z",
+            "endDate": "2026-01-02T15:01:00.000Z",
+            "quantity": ["unit": "count", "value": 812]
+        ]
+
+        do {
+            let store = try IngestStore(directory: storeDirectory)
+            // Quarantine it directly, standing in for a parser that could not
+            // read this shape at the time it arrived.
+            try await store.quarantineForTesting(
+                raw: try JSONSerialization.data(
+                    withJSONObject: unreadable,
+                    options: [.sortedKeys]
+                ),
+                kind: "somethingThisBuildCannotRead",
+                parserVersion: BatchParser.parserVersion - 1
+            )
+
+            let quarantined = try await store.unhandledCount()
+            XCTAssertEqual(quarantined, 1)
+            let visible = try await store.totalRecordCount()
+            XCTAssertEqual(
+                visible,
+                0,
+                "A quarantined record is deliberately invisible to queries."
+            )
+            await store.close()
+        }
+
+        // Reopening is where a newer parser meets the older database. The
+        // record is readable by the current parser — it has id, type and dates
+        // — so it should now be promoted.
+        let upgraded = try IngestStore(directory: storeDirectory)
+
+        let promotedCount = try await upgraded.totalRecordCount()
+        XCTAssertEqual(
+            promotedCount,
+            1,
+            "A record the parser can now read must reach the table it belongs in."
+        )
+        let leftover = try await upgraded.unhandledCount()
+        XCTAssertEqual(
+            leftover,
+            0,
+            "The quarantined copy is removed once the real row is committed."
+        )
+
+        // The values have to survive, not just the row.
+        let samples = try await upgraded.samples(
+            type: "HKQuantityTypeIdentifierStepCount",
+            limit: 10
+        )
+        XCTAssertEqual(samples.count, 1)
+        XCTAssertEqual(samples.first?.id, "future-1")
+        XCTAssertEqual(samples.first?.value, 812)
+        XCTAssertEqual(samples.first?.unit, "count")
+        XCTAssertEqual(samples.first?.kind, "somethingThisBuildCannotRead")
+
+        // And the invariant still holds afterwards: one record delivered, one
+        // record accounted for.
+        let stillQuarantined = try await upgraded.unhandledSummary()
+        XCTAssertTrue(stillQuarantined.isEmpty)
+        await upgraded.close()
+    }
+
+    /// A record the parser still cannot read stays exactly where it is.
+    func testARecordTheParserStillCannotReadIsLeftAlone() async throws {
+        let storeDirectory = directory.url.appending(path: "store")
+        let store = try IngestStore(directory: storeDirectory)
+
+        try await store.quarantineForTesting(
+            raw: Data("this was never JSON".utf8),
+            kind: nil,
+            parserVersion: 0
+        )
+
+        let result = try await store.promoteUnhandledRecords()
+        XCTAssertEqual(result.promoted, 0)
+        XCTAssertEqual(result.stillUnhandled, 1)
+
+        let remaining = try await store.unhandledCount()
+        XCTAssertEqual(
+            remaining,
+            1,
+            "Nothing understood it, so nothing may throw it away."
+        )
+    }
+
+    /// The pass runs on every open, so running it twice must not double
+    /// anything or resurrect what it already moved.
+    func testPromotionIsIdempotent() async throws {
+        let storeDirectory = directory.url.appending(path: "store")
+        let store = try IngestStore(directory: storeDirectory)
+
+        try await store.quarantineForTesting(
+            raw: try JSONSerialization.data(
+                withJSONObject: sampleShaped(
+                    kind: "quantity",
+                    type: "HKQuantityTypeIdentifierStepCount",
+                    id: "promoted-1"
+                ),
+                options: [.sortedKeys]
+            ),
+            kind: "quantity",
+            parserVersion: BatchParser.parserVersion - 1
+        )
+
+        let first = try await store.promoteUnhandledRecords()
+        XCTAssertEqual(first.promoted, 1)
+
+        let second = try await store.promoteUnhandledRecords()
+        XCTAssertEqual(
+            second.promoted,
+            0,
+            "There is nothing left to promote the second time."
+        )
+
+        let total = try await store.totalRecordCount()
+        XCTAssertEqual(total, 1, "Promotion must not duplicate the row.")
+    }
+
+    /// A row that has already been examined by this parser is not read again,
+    /// which is what keeps the pass cheap on a receiver holding a lot of them.
+    func testAnAlreadyExaminedRowIsNotReconsidered() async throws {
+        let store = try IngestStore(directory: directory.url.appending(path: "store"))
+
+        try await store.quarantineForTesting(
+            raw: Data("still not JSON".utf8),
+            kind: nil,
+            parserVersion: 0
+        )
+
+        let first = try await store.promoteUnhandledRecords()
+        XCTAssertEqual(first.stillUnhandled, 1)
+
+        // The row is now stamped with this parser's version, so a second pass
+        // has nothing to look at.
+        let second = try await store.promoteUnhandledRecords()
+        XCTAssertEqual(
+            second.stillUnhandled,
+            0,
+            "A row is only reconsidered when the parser has actually changed."
+        )
+        let held = try await store.unhandledCount()
+        XCTAssertEqual(held, 1, "It is skipped, not discarded.")
     }
 }

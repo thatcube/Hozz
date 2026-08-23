@@ -233,6 +233,19 @@ public enum BatchParseError: Error, LocalizedError, Sendable {
 /// destination at it. So the shape is detected rather than configured, because
 /// a mismatch that silently stores nothing is the worst possible outcome.
 public enum BatchParser {
+    /// How much this parser understands, bumped whenever it learns a new
+    /// record shape.
+    ///
+    /// Quarantined records remember the version that failed to read them, so
+    /// the promotion pass can reconsider exactly the rows a newer parser might
+    /// now handle and skip the rest. Without it, teaching the parser anything
+    /// would mean rescanning every quarantined record on every launch forever.
+    ///
+    /// Bump this in the same commit that teaches the parser a shape.
+    /// - 1: samples, deletions.
+    /// - 2: characteristics, and quarantine instead of dropping.
+    public static let parserVersion = 2
+
     public static func parse(_ payload: Data) throws -> ParsedBatch {
         let text = String(decoding: payload, as: UTF8.self)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)

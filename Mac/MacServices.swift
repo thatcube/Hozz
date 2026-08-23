@@ -37,6 +37,10 @@ final class MacServices {
     /// Records stored without being understood, which means this Mac is behind
     /// the phone. Nothing is lost, but it is worth being able to see.
     private(set) var unhandled: [UnhandledSummary] = []
+    /// Records that were waiting to be understood and have since been read.
+    /// Worth saying out loud: it is the visible proof that holding them was
+    /// not the same as losing them.
+    private(set) var promotedRecords = 0
     private(set) var events: [ReceiverEvent] = []
     private(set) var devices: [KnownDevice] = []
     private(set) var lastReceivedAt: Date?
@@ -228,6 +232,16 @@ final class MacServices {
             totalRecords = try await store.totalRecordCount()
             characteristics = try await store.characteristics()
             unhandled = try await store.unhandledSummary()
+            // Opening the store already re-read anything an older parser could
+            // not. Running it again here is a no-op on a healthy receiver and
+            // is what lets the count be shown after an in-place update.
+            if let promotion = try? await store.promoteUnhandledRecords(),
+               promotion.promoted > 0 {
+                promotedRecords += promotion.promoted
+                summaries = try await store.summaries()
+                totalRecords = try await store.totalRecordCount()
+                unhandled = try await store.unhandledSummary()
+            }
             devices = try await store.devices()
             lastReceivedAt = devices.map(\.lastSeenAt).max()
         } catch {

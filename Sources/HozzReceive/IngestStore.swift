@@ -150,6 +150,20 @@ public struct UnhandledSummary: Hashable, Sendable, Identifiable {
     }
 }
 
+/// What a promotion pass recovered.
+public struct PromotionResult: Hashable, Sendable {
+    /// Records that were quarantined and are now stored properly.
+    public let promoted: Int
+    /// Records this parser still cannot read. They stay quarantined, and are
+    /// not looked at again until the parser changes.
+    public let stillUnhandled: Int
+
+    public init(promoted: Int, stillUnhandled: Int) {
+        self.promoted = promoted
+        self.stillUnhandled = stillUnhandled
+    }
+}
+
 public struct IngestResult: Hashable, Sendable {
     public let stored: Int
     public let deleted: Int
@@ -198,6 +212,11 @@ public actor IngestStore {
             url: directory.appending(path: "hozz-received.sqlite")
         )
         try Self.migrate(database)
+        // Opening the store is the moment a newer parser first meets an older
+        // database, so it is where anything quarantined by a previous version
+        // gets its second reading. On a healthy receiver this is one indexed
+        // lookup that matches nothing.
+        try? Self.promoteUnhandledRecords(in: database)
     }
 
     public func close() {
@@ -207,7 +226,7 @@ public actor IngestStore {
     private static func migrate(_ database: SQLiteDatabase) throws {
         let version = try database.query("PRAGMA user_version", row: { $0.integer(0) })
             .first ?? 0
-        guard version < 3 else {
+        guard version < 4 else {
             return
         }
         try database.transaction {
@@ -290,19 +309,47 @@ public actor IngestStore {
                 -- uninterpreted is the only option that neither loses nor
                 -- wedges, and the count is surfaced so someone can see there
                 -- is something here to teach the receiver about.
+                -- `parser_version` is the version of the parser that failed
+                -- to read this row. It is what makes quarantine temporary
+                -- rather than terminal: when the parser learns a shape, the
+                -- promotion pass reconsiders exactly the rows an older parser
+                -- gave up on, and leaves the rest alone.
                 CREATE TABLE IF NOT EXISTS unhandled_record (
                     fingerprint TEXT PRIMARY KEY,
                     kind TEXT,
                     reason TEXT,
                     raw BLOB NOT NULL,
-                    received_at TEXT NOT NULL
+                    received_at TEXT NOT NULL,
+                    parser_version INTEGER NOT NULL DEFAULT 0
                 );
 
                 CREATE INDEX IF NOT EXISTS unhandled_kind
                     ON unhandled_record (kind);
+                -- The promotion pass asks "anything an older parser gave up
+                -- on?", which on a healthy receiver matches nothing at all.
+                CREATE INDEX IF NOT EXISTS unhandled_parser_version
+                    ON unhandled_record (parser_version);
                 """
             )
-            try database.execute("PRAGMA user_version = 3")
+
+            // A receiver upgrading from 3 already has the table without the
+            // column, so it is added rather than recreated. The default of 0
+            // is deliberately below every real parser version, so rows
+            // quarantined before promotion existed are all reconsidered once.
+            let columns = try database.query(
+                "PRAGMA table_info(unhandled_record)",
+                row: { $0.text(1) }
+            )
+            if !columns.contains("parser_version") {
+                try database.execute(
+                    """
+                    ALTER TABLE unhandled_record
+                        ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+            }
+
+            try database.execute("PRAGMA user_version = 4")
         }
     }
 
@@ -331,114 +378,8 @@ public actor IngestStore {
         // A half-applied batch would be indistinguishable from a complete one
         // on the next delivery, and the missing half would never be resent.
         try database.transaction {
-            for record in batch.records {
-                try database.run(
-                    """
-                    INSERT INTO sample
-                        (id, type, kind, start_date, end_date, value, unit,
-                         source_name, raw, received_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (id, type) DO UPDATE SET
-                        kind = excluded.kind,
-                        start_date = excluded.start_date,
-                        end_date = excluded.end_date,
-                        value = excluded.value,
-                        unit = excluded.unit,
-                        source_name = excluded.source_name,
-                        raw = excluded.raw,
-                        received_at = excluded.received_at
-                    """,
-                    [
-                        .text(record.id),
-                        .text(record.type),
-                        record.kind.map { SQLiteValue.text($0) } ?? .null,
-                        .text(Timestamps.text(from: record.startDate)),
-                        .text(Timestamps.text(from: record.endDate)),
-                        record.value.map { SQLiteValue.real($0) } ?? .null,
-                        record.unit.map { SQLiteValue.text($0) } ?? .null,
-                        record.sourceName.map { SQLiteValue.text($0) } ?? .null,
-                        .blob(record.raw),
-                        .text(timestamp)
-                    ]
-                )
-                stored += 1
-            }
-
-            for deletion in batch.deletions {
-                if let startDate = deletion.startDate, let type = deletion.type {
-                    // The metrics shape carries no sample identifier, so a
-                    // deletion can only be matched the same way its upserts
-                    // were keyed.
-                    try database.run(
-                        "DELETE FROM sample WHERE type = ? AND start_date = ?",
-                        [.text(type), .text(Timestamps.text(from: startDate))]
-                    )
-                } else {
-                    try database.run(
-                        "DELETE FROM sample WHERE id = ?",
-                        [.text(deletion.id)]
-                    )
-                }
-                deleted += database.changeCount
-            }
-
-            // A characteristic is a current fact, so re-delivery replaces the
-            // value rather than appending another. Stored in the same
-            // transaction as everything else, so a batch is still wholly
-            // present or wholly absent.
-            for characteristic in batch.characteristics {
-                try database.run(
-                    """
-                    INSERT INTO characteristic
-                        (type, state, value, raw_value, read_at, raw, received_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT (type) DO UPDATE SET
-                        state = excluded.state,
-                        value = excluded.value,
-                        raw_value = excluded.raw_value,
-                        read_at = excluded.read_at,
-                        raw = excluded.raw,
-                        received_at = excluded.received_at
-                    """,
-                    [
-                        .text(characteristic.type),
-                        characteristic.state.map { SQLiteValue.text($0) } ?? .null,
-                        characteristic.value.map { SQLiteValue.text($0) } ?? .null,
-                        characteristic.rawValue
-                            .map { SQLiteValue.integer(Int64($0)) } ?? .null,
-                        characteristic.readAt
-                            .map { SQLiteValue.text(Timestamps.text(from: $0)) }
-                            ?? .null,
-                        .blob(characteristic.raw),
-                        .text(timestamp)
-                    ]
-                )
-                storedCharacteristics += 1
-            }
-
-            // Kept rather than dropped. Keyed by content, so a retried
-            // delivery stores one row instead of a second copy.
-            for record in batch.unhandled {
-                try database.run(
-                    """
-                    INSERT INTO unhandled_record
-                        (fingerprint, kind, reason, raw, received_at)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT (fingerprint) DO UPDATE SET
-                        kind = excluded.kind,
-                        reason = excluded.reason,
-                        raw = excluded.raw
-                    """,
-                    [
-                        .text(record.fingerprint),
-                        record.kind.map { SQLiteValue.text($0) } ?? .null,
-                        .text(record.reason),
-                        .blob(record.raw),
-                        .text(timestamp)
-                    ]
-                )
-                storedUnhandled += 1
-            }
+            (stored, deleted, storedCharacteristics, storedUnhandled) =
+                try Self.write(batch, at: timestamp, into: database)
 
             if let idempotencyKey {
                 try database.run(
@@ -460,6 +401,134 @@ public actor IngestStore {
             characteristics: storedCharacteristics,
             unhandled: storedUnhandled
         )
+    }
+
+    /// Writes a batch's contents. The caller owns the transaction, because both
+    /// callers need other work committed alongside these rows: `ingest` records
+    /// the idempotency key, and promotion deletes the quarantined copy.
+    @discardableResult
+    private static func write(
+        _ batch: ParsedBatch,
+        at timestamp: String,
+        into database: SQLiteDatabase
+    ) throws -> (Int, Int, Int, Int) {
+        var stored = 0
+        var deleted = 0
+        var storedCharacteristics = 0
+        var storedUnhandled = 0
+
+        for record in batch.records {
+            try database.run(
+                """
+                INSERT INTO sample
+                    (id, type, kind, start_date, end_date, value, unit,
+                     source_name, raw, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id, type) DO UPDATE SET
+                    kind = excluded.kind,
+                    start_date = excluded.start_date,
+                    end_date = excluded.end_date,
+                    value = excluded.value,
+                    unit = excluded.unit,
+                    source_name = excluded.source_name,
+                    raw = excluded.raw,
+                    received_at = excluded.received_at
+                """,
+                [
+                    .text(record.id),
+                    .text(record.type),
+                    record.kind.map { SQLiteValue.text($0) } ?? .null,
+                    .text(Timestamps.text(from: record.startDate)),
+                    .text(Timestamps.text(from: record.endDate)),
+                    record.value.map { SQLiteValue.real($0) } ?? .null,
+                    record.unit.map { SQLiteValue.text($0) } ?? .null,
+                    record.sourceName.map { SQLiteValue.text($0) } ?? .null,
+                    .blob(record.raw),
+                    .text(timestamp)
+                ]
+            )
+            stored += 1
+        }
+
+        for deletion in batch.deletions {
+            if let startDate = deletion.startDate, let type = deletion.type {
+                // The metrics shape carries no sample identifier, so a
+                // deletion can only be matched the same way its upserts
+                // were keyed.
+                try database.run(
+                    "DELETE FROM sample WHERE type = ? AND start_date = ?",
+                    [.text(type), .text(Timestamps.text(from: startDate))]
+                )
+            } else {
+                try database.run(
+                    "DELETE FROM sample WHERE id = ?",
+                    [.text(deletion.id)]
+                )
+            }
+            deleted += database.changeCount
+        }
+
+        // A characteristic is a current fact, so re-delivery replaces the
+        // value rather than appending another. Stored in the same
+        // transaction as everything else, so a batch is still wholly
+        // present or wholly absent.
+        for characteristic in batch.characteristics {
+            try database.run(
+                """
+                INSERT INTO characteristic
+                    (type, state, value, raw_value, read_at, raw, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (type) DO UPDATE SET
+                    state = excluded.state,
+                    value = excluded.value,
+                    raw_value = excluded.raw_value,
+                    read_at = excluded.read_at,
+                    raw = excluded.raw,
+                    received_at = excluded.received_at
+                """,
+                [
+                    .text(characteristic.type),
+                    characteristic.state.map { SQLiteValue.text($0) } ?? .null,
+                    characteristic.value.map { SQLiteValue.text($0) } ?? .null,
+                    characteristic.rawValue
+                        .map { SQLiteValue.integer(Int64($0)) } ?? .null,
+                    characteristic.readAt
+                        .map { SQLiteValue.text(Timestamps.text(from: $0)) }
+                        ?? .null,
+                    .blob(characteristic.raw),
+                    .text(timestamp)
+                ]
+            )
+            storedCharacteristics += 1
+        }
+
+        // Kept rather than dropped. Keyed by content, so a retried
+        // delivery stores one row instead of a second copy.
+        for record in batch.unhandled {
+            try database.run(
+                """
+                INSERT INTO unhandled_record
+                    (fingerprint, kind, reason, raw, received_at, parser_version)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (fingerprint) DO UPDATE SET
+                    kind = excluded.kind,
+                    reason = excluded.reason,
+                    raw = excluded.raw,
+                    parser_version = excluded.parser_version
+                """,
+                [
+                    .text(record.fingerprint),
+                    record.kind.map { SQLiteValue.text($0) } ?? .null,
+                    .text(record.reason),
+                    .blob(record.raw),
+                    .text(timestamp),
+                    .integer(Int64(BatchParser.parserVersion))
+                ]
+            )
+        storedUnhandled += 1
+        }
+
+        return (stored, deleted, storedCharacteristics, storedUnhandled)
     }
 
     private func isKnownBatch(_ key: String) throws -> Bool {
@@ -585,6 +654,131 @@ public actor IngestStore {
                 "SELECT COUNT(*) FROM unhandled_record",
                 row: { $0.integer(0) }
             ).first ?? 0
+        )
+    }
+
+    /// Re-reads quarantined records with the current parser and moves anything
+    /// now understood into its proper place.
+    ///
+    /// This is what makes quarantine temporary rather than terminal. A record
+    /// the receiver could not read is kept because the phone will never send it
+    /// again — the spool is bounded and there is no redelivery path — so
+    /// without this it would be durable as bytes and permanently invisible to
+    /// the charts, the exports, and every MCP tool. Keeping the bytes was only
+    /// ever worth doing because of this pass.
+    ///
+    /// The transaction discipline is the same rule the acquisition anchors
+    /// follow: the quarantined copy is deleted only inside the transaction that
+    /// commits the real row. A crash between the two would otherwise lose the
+    /// record for good, which is the exact outcome quarantine exists to
+    /// prevent. A row that still does not parse is left untouched apart from
+    /// its parser version, so it is not reconsidered until the parser has
+    /// actually changed again.
+    @discardableResult
+    public func promoteUnhandledRecords(now: Date = .now) throws -> PromotionResult {
+        try Self.promoteUnhandledRecords(in: database, now: now)
+    }
+
+    /// The pass itself, written against the database rather than the actor so
+    /// that opening the store can run it before the actor is fully formed.
+    @discardableResult
+    private static func promoteUnhandledRecords(
+        in database: SQLiteDatabase,
+        now: Date = .now
+    ) throws -> PromotionResult {
+        // On a healthy receiver this matches nothing, which is the common case
+        // and costs one indexed lookup.
+        let pending = try database.query(
+            """
+            SELECT fingerprint, raw FROM unhandled_record
+             WHERE parser_version < ?
+             ORDER BY received_at
+            """,
+            [.integer(Int64(BatchParser.parserVersion))],
+            row: { ($0.text(0), $0.blob(1) ?? Data()) }
+        )
+        guard !pending.isEmpty else {
+            return PromotionResult(promoted: 0, stillUnhandled: 0)
+        }
+
+        var promoted = 0
+        var remaining = 0
+        let timestamp = Timestamps.text(from: now)
+
+        for (fingerprint, raw) in pending {
+            let batch: ParsedBatch?
+            do {
+                batch = try BatchParser.parse(raw)
+            } catch {
+                // A connection test, or something else that is not a batch.
+                // Nothing to promote and nothing to lose.
+                batch = nil
+            }
+
+            guard let batch, understood(batch) else {
+                // Still beyond this parser. Recording the version it was last
+                // examined by is the only change, so the next launch skips it.
+                try database.run(
+                    "UPDATE unhandled_record SET parser_version = ? WHERE fingerprint = ?",
+                    [.integer(Int64(BatchParser.parserVersion)), .text(fingerprint)]
+                )
+                remaining += 1
+                continue
+            }
+
+            try database.transaction {
+                try write(batch, at: timestamp, into: database)
+                // Only now, and only here: the real row and the removal of the
+                // quarantined copy commit together or not at all.
+                try database.run(
+                    "DELETE FROM unhandled_record WHERE fingerprint = ?",
+                    [.text(fingerprint)]
+                )
+            }
+            promoted += 1
+        }
+
+        return PromotionResult(promoted: promoted, stillUnhandled: remaining)
+    }
+
+    /// Whether re-parsing actually produced something storable.
+    ///
+    /// A batch that comes back with the record still unhandled has not been
+    /// understood, however successfully it parsed as JSON.
+    private static func understood(_ batch: ParsedBatch) -> Bool {
+        !batch.records.isEmpty
+            || !batch.deletions.isEmpty
+            || !batch.characteristics.isEmpty
+    }
+
+    /// Places a record in quarantine directly, for tests that need to stand in
+    /// for a parser older than the one running.
+    ///
+    /// The promotion path is only meaningful across a version boundary, and a
+    /// test cannot travel back to a build that did not understand a shape. This
+    /// creates the state that build would have left behind.
+    func quarantineForTesting(
+        raw: Data,
+        kind: String?,
+        parserVersion: Int,
+        now: Date = .now
+    ) throws {
+        try database.run(
+            """
+            INSERT INTO unhandled_record
+                (fingerprint, kind, reason, raw, received_at, parser_version)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT (fingerprint) DO UPDATE SET
+                parser_version = excluded.parser_version
+            """,
+            [
+                .text(BatchParser.fingerprint(of: raw)),
+                kind.map { SQLiteValue.text($0) } ?? .null,
+                .text("Quarantined by an earlier parser."),
+                .blob(raw),
+                .text(Timestamps.text(from: now)),
+                .integer(Int64(parserVersion))
+            ]
         )
     }
 
