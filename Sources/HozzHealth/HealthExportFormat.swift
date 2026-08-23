@@ -11,6 +11,9 @@ public enum HealthExportFormat: String, CaseIterable, Sendable {
     /// A single JSON array. Convenient for small exports and awkward for large
     /// ones, since most tools load the whole array into memory.
     case json
+    /// One Markdown note per day, for a journal. Explicitly lossy: a note
+    /// keeps a day's totals, never the records they were derived from.
+    case markdown
     /// One SQLite database, ready to be queried. Not lossy: the typed columns
     /// are a projection for querying and every row keeps its original record.
     case sqlite
@@ -19,7 +22,7 @@ public enum HealthExportFormat: String, CaseIterable, Sendable {
 
     public var fileExtension: String {
         switch self {
-        case .ndjson, .csv, .json:
+        case .ndjson, .csv, .json, .markdown:
             "zip"
         case .sqlite:
             "sqlite"
@@ -31,7 +34,7 @@ public enum HealthExportFormat: String, CaseIterable, Sendable {
     /// The extension used for a run's individual, not-yet-assembled parts.
     var partFileExtension: String {
         switch self {
-        case .ndjson, .csv, .json, .sqlite:
+        case .ndjson, .csv, .json, .markdown, .sqlite:
             "deflate"
         case .raw:
             "ndjson"
@@ -44,13 +47,17 @@ public enum HealthExportFormat: String, CaseIterable, Sendable {
         switch self {
         case .ndjson:
             true
-        case .csv, .json, .sqlite, .raw:
+        case .csv, .json, .markdown, .sqlite, .raw:
             false
         }
     }
 
+    /// Whether the format cannot carry everything the export holds.
+    ///
+    /// Both of these are lossy on purpose — a grid and a daily note are for
+    /// reading, not for keeping — and both say so where the format is chosen.
     public var isLossy: Bool {
-        self == .csv
+        self == .csv || self == .markdown
     }
 
     public var displayName: String {
@@ -61,6 +68,8 @@ public enum HealthExportFormat: String, CaseIterable, Sendable {
             "CSV"
         case .json:
             "JSON"
+        case .markdown:
+            "Markdown"
         case .sqlite:
             "SQLite"
         case .raw:
