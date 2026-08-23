@@ -43,6 +43,11 @@ final class ExportViewModel {
         case idle(resumable: ResumableSummary?)
         case requestingAccess
         case exporting(ProgressPresentation)
+        /// Something else holds the writer, and we are queued behind it.
+        /// Distinct from `exporting` because nothing of this person's export
+        /// has begun yet, and distinct from `failed` because it is expected
+        /// to succeed on its own.
+        case waitingForWriter(ExportWriterLease.Owner)
         case paused(HealthExportPause)
         case ready(HealthExportResult)
         case failed(String)
@@ -73,7 +78,7 @@ final class ExportViewModel {
 
     var isWorking: Bool {
         switch state {
-        case .requestingAccess, .exporting:
+        case .requestingAccess, .exporting, .waitingForWriter:
             true
         case .idle, .paused, .ready, .failed:
             false
@@ -246,7 +251,14 @@ final class ExportViewModel {
                     )
                 )
 
-                let outcome = try await exporter.export(format: format) { progress in
+                let outcome = try await exporter.export(
+                    format: format,
+                    waitingForWriter: { owner in
+                        await MainActor.run {
+                            self.state = .waitingForWriter(owner)
+                        }
+                    }
+                ) { progress in
                     await MainActor.run {
                         self.state = .exporting(self.presentation(for: progress))
                     }
@@ -261,7 +273,15 @@ final class ExportViewModel {
                     state = .paused(pause)
                 }
             } catch {
-                state = .failed(error.localizedDescription)
+                // Cancelling while queued behind another writer is the person
+                // changing their mind, not a failure. Nothing of their export
+                // had started, so there is nothing to report or resume.
+                if pauseWasRequestedByUser, case .busy = error as? HealthExportEngineError {
+                    state = .idle(resumable: nil)
+                    await prepare()
+                } else {
+                    state = .failed(error.localizedDescription)
+                }
             }
         }
     }

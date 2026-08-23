@@ -72,6 +72,8 @@ Hozz does not use date-window watermarks. Each HealthKit type has its own opaque
 
 For a manual export, records are written to an open spool part and anchors are only committed when that part is sealed in the same store transaction. An unsealed part is deleted on relaunch and replayed from the previous anchor. The result is the property that matters: interruption can repeat work, but it cannot skip records or publish a half-finished export as complete.
 
+One thing writes an export's spool at a time, because two writers would pick the same next part sequence and unlink each other's open file. An automatic sync takes that same writer, and one starts whenever the app is opened, so pressing **Export now** a moment later finds it busy. Hozz waits for it and says which activity it is waiting for, rather than refusing with a message naming an export that is not running.
+
 An automatic sync pass gives every selected type a small share before spending what is left on whatever still has the most to send, trims each HealthKit page to the share, and rotates the order hourly. A type is recorded as caught up only when Health returns an empty page; one the budget cut short stays `draining`, so the store never claims a type is finished when it is not.
 
 Automatic sync uses the same anchor rule per destination. Each destination has its own cursor, so a failed destination cannot advance past data it did not accept, and one broken destination does not block a healthy one. Batches use stable content-derived identifiers and `Idempotency-Key` headers so a retry can be accepted safely.
@@ -225,7 +227,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 512 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, unfinished-export recovery, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 519 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, the export writer lease, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, unfinished-export recovery, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

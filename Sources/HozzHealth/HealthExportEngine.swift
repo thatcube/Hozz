@@ -123,12 +123,17 @@ public enum HealthExportOutcome: Equatable, Sendable {
 }
 
 public enum HealthExportEngineError: Error, LocalizedError, Equatable, Sendable {
-    case exportAlreadyRunning
+    /// Something else is writing the spool and did not finish in time.
+    ///
+    /// Carries what actually held the lease, because the old message named an
+    /// export whatever was really running, and someone told there is an export
+    /// they cannot see reasonably concludes the app is broken.
+    case busy(ExportWriterLease.Owner)
 
     public var errorDescription: String? {
         switch self {
-        case .exportAlreadyRunning:
-            "An export is already running."
+        case .busy(let owner):
+            "\(owner.activityDescription) Hozz will export as soon as it finishes."
         }
     }
 }
@@ -145,6 +150,13 @@ public actor HealthExportEngine {
     /// cannot spin forever. At the default page size this still allows tens of
     /// millions of records for a single type.
     public static let maximumQueriesPerType = 50_000
+
+    /// How long a manual export waits for the writer lease before giving up.
+    ///
+    /// Long enough to cover an ordinary sync pass, which is what usually holds
+    /// it, and short enough that the app is not left looking frozen if
+    /// something is genuinely stuck.
+    static let leaseWait = Duration.seconds(90)
 
     /// Coverage states that mean a type reached an empty page in this run.
     ///
@@ -236,15 +248,40 @@ public actor HealthExportEngine {
 
     public func export(
         format: HealthExportFormat,
+        waitingForWriter: @escaping @Sendable (ExportWriterLease.Owner) async -> Void = { _ in },
         progress: @escaping @Sendable (HealthExportProgress) async -> Void
     ) async throws -> HealthExportOutcome {
-        guard await lease.acquire() else {
-            throw HealthExportEngineError.exportAlreadyRunning
+        // Waits rather than refusing. An automatic sync holds this same lease,
+        // and one starts whenever the app is opened — so pressing Export a
+        // second later used to fail, with a message naming an export that was
+        // not running. Most of those waits are over in moments.
+        //
+        // The wait is announced before it starts, so the screen can say what
+        // is being waited for. Showing an export at 0% would be the same lie
+        // in a friendlier font.
+        if let holder = await lease.currentHolder {
+            await waitingForWriter(holder)
         }
-        defer {
-            Task { await lease.release() }
+        guard await lease.acquire(
+            for: .manualExport,
+            waitingUpTo: Self.leaseWait
+        ) else {
+            throw HealthExportEngineError.busy(
+                await lease.currentHolder ?? .manualExport
+            )
         }
-        return try await runExport(format: format, progress: progress)
+        // Released before returning rather than in a detached task. A `defer`
+        // that spawns a task hands the lease back at some unspecified later
+        // point, so an export could finish and still be holding it when the
+        // person pressed the button again.
+        do {
+            let outcome = try await runExport(format: format, progress: progress)
+            await lease.release()
+            return outcome
+        } catch {
+            await lease.release()
+            throw error
+        }
     }
 
     private func runExport(

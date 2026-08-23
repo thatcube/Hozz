@@ -524,21 +524,31 @@ final class ExportEngineTests: XCTestCase {
             lease: lease
         )
 
-        let acquired = await lease.acquire()
+        let acquired = await lease.acquire(for: .automaticSync)
         XCTAssertTrue(acquired, "The lease should start free.")
-        do {
-            _ = try await engine.export(format: .ndjson) { _ in }
-            XCTFail("A second writer must be refused.")
-        } catch HealthExportEngineError.exportAlreadyRunning {
-            // Expected.
-        }
 
+        // The export now waits for the writer rather than being refused, but
+        // the invariant is unchanged and is what this checks: it must not
+        // start while something else holds the lease.
+        let started = Date()
+        async let outcome = engine.export(format: .ndjson) { _ in }
+
+        try await Task.sleep(for: .milliseconds(150))
+        let runsWhileHeld = try await store.allRuns()
+        XCTAssertTrue(
+            runsWhileHeld.isEmpty,
+            "No second writer may open a run while the lease is held."
+        )
         await lease.release()
-        guard
-            case .completed = try await engine.export(format: .ndjson, progress: { _ in })
-        else {
+
+        guard case .completed = try await outcome else {
             return XCTFail("The export should run once the lease is free.")
         }
+        XCTAssertGreaterThan(
+            Date().timeIntervalSince(started),
+            0.1,
+            "It waited rather than barging in."
+        )
     }
 
     /// Publishing the archive and completing the run are one transaction, so

@@ -117,14 +117,13 @@ public actor HealthSyncEngine {
             return .idle
         }
         // The manual exporter shares this store, so only one may drain at once.
-        guard await lease.acquire() else {
+        // An automatic pass does not wait: it runs again soon anyway, and
+        // queueing behind a manual export would hold up the person watching.
+        guard await lease.acquire(for: .automaticSync) else {
             for destination in destinations {
                 try? await delivery.markWaitingForSystem(destination.id)
             }
             return .idle
-        }
-        defer {
-            Task { await lease.release() }
         }
 
         var deliveredRecords = 0
@@ -161,6 +160,10 @@ public actor HealthSyncEngine {
             }
         }
 
+        // Released here rather than in a detached task, so the lease is free
+        // the moment the pass is, and a manual export waiting on it starts
+        // immediately instead of at some unspecified later point.
+        await lease.release()
         return SyncOutcome(
             deliveredRecords: deliveredRecords,
             destinationCount: destinations.count,

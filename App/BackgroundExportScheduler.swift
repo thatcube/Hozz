@@ -140,8 +140,9 @@ enum BackgroundExportScheduler {
                 scheduleProcessing()
                 return false
             }
-        } catch HealthExportEngineError.exportAlreadyRunning {
-            // The foreground already owns this run.
+        } catch is HealthExportEngineError {
+            // Something in the foreground already owns the writer. It will
+            // finish the run, and this task has no user watching it.
             return true
         } catch {
             log.error("Background export stopped: \(error.localizedDescription, privacy: .public)")

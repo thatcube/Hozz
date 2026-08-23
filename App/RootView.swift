@@ -77,6 +77,11 @@ struct RootView: View {
                 exportFormat: model.exportFormat,
                 pauseAction: model.pause
             )
+        case .waitingForWriter(let owner):
+            ExportWaitingView(
+                owner: owner,
+                cancelAction: model.pause
+            )
         case .paused(let pause):
             ExportPausedView(
                 pause: pause,
@@ -819,6 +824,36 @@ private struct ExportReadyView: View {
 
     private var hasErrors: Bool {
         result.failedTypeCount > 0 || result.sampleEncodingErrorCount > 0
+    }
+}
+
+/// Shown while an export is queued behind whatever already holds the writer.
+///
+/// This screen exists because of a real report: someone opened Hozz, found it
+/// not running, pressed Export, and was told "an export is already running"
+/// with only a Try again button. Two things were wrong. The activity was named
+/// incorrectly — an automatic sync held the writer, not an export — and Try
+/// again was the only thing offered, which could not work until the sync had
+/// finished and gave no way to know when that would be.
+private struct ExportWaitingView: View {
+    let owner: ExportWriterLease.Owner
+    let cancelAction: () -> Void
+
+    var body: some View {
+        ContentUnavailableView {
+            Label("Waiting to start", systemImage: "clock.arrow.circlepath")
+        } description: {
+            Text(
+                """
+                \(owner.activityDescription) Your export will start as soon \
+                as it finishes.
+                """
+            )
+        } actions: {
+            Button("Cancel", action: cancelAction)
+                .buttonStyle(.bordered)
+        }
+        .navigationTitle("Hozz")
     }
 }
 

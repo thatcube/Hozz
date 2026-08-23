@@ -174,13 +174,17 @@ public actor HealthKitManualExporter {
 
     public func export(
         format: HealthExportFormat = .ndjson,
+        waitingForWriter: @escaping @Sendable (ExportWriterLease.Owner) async -> Void = { _ in },
         progress: @escaping @Sendable (HealthExportProgress) async -> Void
     ) async throws -> HealthExportOutcome {
         guard HKHealthStore.isHealthDataAvailable() else {
             throw HealthKitManualExporterError.healthDataUnavailable
         }
-        return try await engine(for: format)
-            .export(format: format, progress: progress)
+        return try await engine(for: format).export(
+            format: format,
+            waitingForWriter: waitingForWriter,
+            progress: progress
+        )
     }
 
     public func resumableRun() async throws -> ExportRunRecord? {
