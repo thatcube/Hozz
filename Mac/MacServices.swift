@@ -30,6 +30,13 @@ final class MacServices {
     private(set) var status: Status = .starting
     private(set) var summaries: [TypeSummary] = []
     private(set) var totalRecords = 0
+    /// Facts about the person — date of birth, blood type — rather than
+    /// measurements of them. Shown because they are the context that makes the
+    /// measurements interpretable.
+    private(set) var characteristics: [StoredCharacteristic] = []
+    /// Records stored without being understood, which means this Mac is behind
+    /// the phone. Nothing is lost, but it is worth being able to see.
+    private(set) var unhandled: [UnhandledSummary] = []
     private(set) var events: [ReceiverEvent] = []
     private(set) var devices: [KnownDevice] = []
     private(set) var lastReceivedAt: Date?
@@ -219,6 +226,8 @@ final class MacServices {
         do {
             summaries = try await store.summaries()
             totalRecords = try await store.totalRecordCount()
+            characteristics = try await store.characteristics()
+            unhandled = try await store.unhandledSummary()
             devices = try await store.devices()
             lastReceivedAt = devices.map(\.lastSeenAt).max()
         } catch {

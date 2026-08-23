@@ -13,7 +13,7 @@ struct DataView: View {
 
     var body: some View {
         Group {
-            if services.summaries.isEmpty {
+            if services.summaries.isEmpty && services.characteristics.isEmpty {
                 ContentUnavailableView {
                     Label("Nothing received yet", systemImage: "tray")
                 } description: {
@@ -57,15 +57,55 @@ struct DataView: View {
     }
 
     private var typeList: some View {
-        List(services.summaries, id: \.type, selection: $selected) { summary in
-            VStack(alignment: .leading, spacing: 3) {
-                Text(Self.readableName(summary.type))
-                    .font(.body.weight(.medium))
-                Text("\(summary.recordCount) records")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        List(selection: $selected) {
+            // Above the measurements, because they are what the measurements
+            // have to be read against: a resting heart rate of 48 means
+            // something different at 34 than at 70.
+            if !services.characteristics.isEmpty {
+                Section("About you") {
+                    ForEach(services.characteristics) { characteristic in
+                        HStack {
+                            Text(characteristic.displayName)
+                                .font(.body.weight(.medium))
+                            Spacer()
+                            Text(Self.readableValue(characteristic))
+                                .font(.callout)
+                                .foregroundStyle(
+                                    characteristic.isKnown ? .primary : .secondary
+                                )
+                        }
+                    }
+                }
             }
-            .tag(summary.type)
+
+            if !services.unhandled.isEmpty {
+                // Nothing is lost — these are on disk — but a receiver that is
+                // behind the phone should say so rather than look complete.
+                Section("Not yet understood") {
+                    ForEach(services.unhandled) { entry in
+                        VStack(alignment: .leading, spacing: 3) {
+                            Text("\(entry.count) × \(entry.kind)")
+                                .font(.body.weight(.medium))
+                            Text("Stored, but this Mac has no place for it yet. Update Hozz.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
+            }
+
+            Section("Measurements") {
+                ForEach(services.summaries, id: \.type) { summary in
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(Self.readableName(summary.type))
+                            .font(.body.weight(.medium))
+                        Text("\(summary.recordCount) records")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .tag(summary.type)
+                }
+            }
         }
         .onChange(of: selected) { _, _ in
             Task { await reload() }
@@ -192,6 +232,29 @@ struct DataView: View {
 
     /// HealthKit identifiers are unreadable in a list; this makes them scannable
     /// without inventing a name that hides which type it really is.
+    /// What to show beside a characteristic's name.
+    ///
+    /// Health distinguishes "the person has not set this" from "this could not
+    /// be read", and both are different from a value. Collapsing them all to a
+    /// blank would turn a known fact about the person — that they have not
+    /// recorded a blood type — into something indistinguishable from a bug.
+    static func readableValue(_ characteristic: StoredCharacteristic) -> String {
+        if let value = characteristic.value, characteristic.isKnown {
+            return value.replacingOccurrences(
+                of: #"([a-z0-9])([A-Z])"#,
+                with: "$1 $2",
+                options: .regularExpression
+            )
+        }
+        return switch characteristic.state {
+        case "notSet": "Not set"
+        case "unavailable": "Unavailable"
+        case "unrecognised": "Unrecognised value"
+        case "unreadable": "Could not be read"
+        default: "Unknown"
+        }
+    }
+
     static func readableName(_ identifier: String) -> String {
         var name = identifier
         for prefix in [
