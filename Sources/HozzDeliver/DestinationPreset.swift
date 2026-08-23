@@ -12,6 +12,7 @@ import Foundation
 public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
     case folder
     case homeAssistant
+    case influxDB
     case restAPI
     case mqtt
 
@@ -23,6 +24,8 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
             "Folder"
         case .homeAssistant:
             "Home Assistant"
+        case .influxDB:
+            "InfluxDB"
         case .restAPI:
             "Web address"
         case .mqtt:
@@ -37,6 +40,8 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
             "Syncs to your computer through iCloud, Dropbox, or any folder. No server needed."
         case .homeAssistant:
             "Sends metrics straight into Home Assistant as sensors."
+        case .influxDB:
+            "Writes line protocol straight into InfluxDB, ready to chart in Grafana."
         case .restAPI:
             "Posts to any endpoint you run."
         case .mqtt:
@@ -48,7 +53,7 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .folder:
             .folder
-        case .homeAssistant, .restAPI:
+        case .homeAssistant, .influxDB, .restAPI:
             .restAPI
         case .mqtt:
             .mqtt
@@ -61,6 +66,8 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
             "folder"
         case .homeAssistant:
             "home"
+        case .influxDB:
+            "database"
         case .restAPI:
             "api"
         case .mqtt:
@@ -78,6 +85,8 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .folder, .restAPI:
             .ndjson
+        case .influxDB:
+            .influx
         case .homeAssistant, .mqtt:
             // Both want data grouped by metric, and both already understand
             // this shape, so an existing dashboard or automation keeps working.
@@ -91,6 +100,8 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
             "My computer"
         case .homeAssistant:
             "Home Assistant"
+        case .influxDB:
+            "InfluxDB"
         case .restAPI:
             "My server"
         case .mqtt:
@@ -105,6 +116,8 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
             ""
         case .homeAssistant:
             "http://homeassistant.local:8123/api/webhook/hozz"
+        case .influxDB:
+            "http://influxdb.local:8086/api/v2/write?org=home&bucket=health&precision=ns"
         case .restAPI:
             "https://example.com/health"
         case .mqtt:
@@ -116,6 +129,8 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .homeAssistant:
             "Bearer <long-lived access token>"
+        case .influxDB:
+            "Token YOUR_INFLUXDB_API_TOKEN"
         case .restAPI:
             "Authorization header (optional)"
         case .mqtt:
@@ -141,6 +156,14 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
                 "Paste the address here, and put Bearer followed by the token in the field below.",
                 "Tap Send a test — Home Assistant will show the request arriving."
             ]
+        case .influxDB:
+            [
+                "For InfluxDB 2.x or 3.x, use /api/v2/write and add ?org=, ?bucket=, and ?precision= to the address.",
+                "For InfluxDB 1.8, use /write?db=yourdatabase instead.",
+                "Paste your API token below, written as Token followed by a space and the token itself.",
+                "Set the measurement name and timestamp precision under Details; the precision has to match the one in the address.",
+                "Tap Send a test — InfluxDB writes one point you can query straight away."
+            ]
         case .restAPI:
             [
                 "Point this at any endpoint that accepts a POST.",
@@ -163,8 +186,23 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
             nil
         case .homeAssistant, .restAPI:
             "Your phone has to be able to reach this address. On a home network that means being on the same Wi-Fi."
+        case .influxDB:
+            "InfluxDB keeps one point per measurement, tag set, and timestamp, so two samples of the same type from the same source at the same instant become one. Your phone also has to be able to reach this address."
         case .mqtt:
             "MQTT keeps no history, so a broker that is offline misses that batch. Hozz retries, but a folder is more forgiving."
+        }
+    }
+
+    /// Settings this preset starts with, beyond the address and the secret.
+    public var options: [String: String] {
+        switch self {
+        case .influxDB:
+            [
+                Destination.measurementKey: InfluxLineProtocol.defaultMeasurement,
+                Destination.precisionKey: InfluxLineProtocol.Precision.nanoseconds.rawValue
+            ]
+        case .folder, .homeAssistant, .restAPI, .mqtt:
+            [:]
         }
     }
 
@@ -174,7 +212,8 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
             kind: kind,
             format: format,
             cadence: .whenDataArrives,
-            authorizationHeader: "Authorization"
+            authorizationHeader: "Authorization",
+            options: options
         )
     }
 }

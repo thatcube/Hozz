@@ -278,7 +278,7 @@ public actor HealthSyncEngine {
 
         let payload = try DeliveryPayloadBuilder.build(
             records: records,
-            format: destination.format
+            destination: destination
         )
         let batch = DeliveryBatch(
             // The key is derived from the bytes being sent, so a retry of the
@@ -354,8 +354,9 @@ public actor HealthSyncEngine {
 enum DeliveryPayloadBuilder {
     static func build(
         records: [HealthChange],
-        format: DeliveryFormat
+        destination: Destination
     ) throws -> Data {
+        let format = destination.format
         let encoder = HealthSampleEncoder()
         var lines: [Data] = []
         lines.reserveCapacity(records.count)
@@ -398,8 +399,18 @@ enum DeliveryPayloadBuilder {
             return try csv(from: lines)
 
         case .metrics:
-            return try CompatiblePayloadBuilder.build(
-                records: lines.compactMap(CompatiblePayloadBuilder.record(from:))
+            let decoded = lines.compactMap(CompatiblePayloadBuilder.record(from:))
+            switch destination.payloadSchema {
+            case .hozz:
+                return try CompatiblePayloadBuilder.build(records: decoded)
+            case .healthAutoExport:
+                return try HealthAutoExportPayloadBuilder.build(records: decoded)
+            }
+
+        case .influx:
+            return InfluxLineProtocol.build(
+                records: lines.compactMap(CompatiblePayloadBuilder.record(from:)),
+                options: destination.influxOptions
             )
         }
     }

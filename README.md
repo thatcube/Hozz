@@ -21,7 +21,8 @@ Supported automatic destinations are:
 | This Mac | NDJSON batches to the Hozz Mac receiver over the local network, with token authentication. |
 | Folder | Batch files written through the Files picker to iCloud Drive, Dropbox, OneDrive, Google Drive, SMB, or on-device storage. |
 | Home Assistant | Metrics JSON to a webhook or REST endpoint. |
-| Web address | NDJSON, JSON, CSV, or Metrics JSON POSTs to an endpoint you run. |
+| InfluxDB | Line protocol written straight to `/api/v2/write` or 1.8's `/write`, with a configurable measurement and timestamp precision. |
+| Web address | NDJSON, JSON, CSV, Metrics JSON, or InfluxDB line protocol POSTs to an endpoint you run. |
 | MQTT | MQTT 3.1.1 publishes to `mqtt://` or `mqtts://`, using retained QoS 0 topics. |
 
 Background delivery is requested with `HKObserverQuery` and `enableBackgroundDelivery`, then coalesced into bounded sync passes. iOS still decides when background work runs, most Health types are capped at hourly delivery, Health cannot be read while the phone is locked, and force-quitting Hozz stops launches until the app is opened again. Hozz reports those states rather than calling them success.
@@ -66,7 +67,13 @@ archive, and the foot of every single note all say so and point at the formats
 that keep everything. Days are local days, and sleep is filed under the day it
 ended, because last night's sleep belongs to the morning you woke up.
 
-Automatic destinations use `DeliveryFormat`: NDJSON, JSON, CSV, or Metrics JSON. Metrics JSON groups points by metric name for Home Assistant, MQTT, and dashboards; deletions are carried alongside instead of silently dropped. Neither SQLite nor Markdown is offered there: a delivery is an append of new records to an endpoint or a folder, a database file is not appendable over HTTP, and a day's note rewritten from one batch would replace a full day with a fraction of it.
+Automatic destinations use `DeliveryFormat`: NDJSON, JSON, CSV, Metrics JSON, or InfluxDB line protocol. Metrics JSON groups points by metric name for Home Assistant, MQTT, and dashboards; deletions are carried alongside instead of silently dropped. Neither SQLite nor Markdown is offered there: a delivery is an append of new records to an endpoint or a folder, a database file is not appendable over HTTP, and a day's note rewritten from one batch would replace a full day with a fraction of it.
+
+**[`docs/delivery-schema.md`](docs/delivery-schema.md) documents every delivery format field by field**, with a worked example payload for each, the escaping rules, and the delivery headers — so something can be built against Hozz without reading the source.
+
+Line protocol exists because the alternative was making people run a translator. The usual self-hosted setup is Health data in InfluxDB charted in Grafana, and reaching it meant deploying a container whose entire job was turning an exporter's JSON into the format InfluxDB already wanted. It is deliberately not offered for folder destinations: the Mac app watches a folder for NDJSON, JSON, and CSV, so a folder writing line protocol would look like it was working while nothing was ingested.
+
+The Home Assistant, MQTT, and web address destinations also have an **opt-in** compatibility mode that emits Health Auto Export's published field names, for people arriving with automations and scripts already keyed to them. It matches what that format documents and says plainly what it does not: Hozz sends individual samples rather than rollups, so a heart rate point carries the same number in `Min`, `Avg`, and `Max`, and blood pressure stays split rather than guessing which two samples pair. Hozz's own schema remains the default and the recommended one.
 
 ## Health acquisition and durability
 
@@ -247,7 +254,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 294 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, export formats, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains COUNT_PLACEHOLDER tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, export formats, line protocol escaping, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

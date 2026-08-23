@@ -93,6 +93,12 @@ public enum DeliveryFormat: String, Codable, CaseIterable, Sendable {
     /// advertised in the interface: it is a reason this shape was chosen, not
     /// a feature to sell.
     case metrics
+    /// InfluxDB line protocol, which InfluxDB and Telegraf ingest directly.
+    ///
+    /// Self-hosters charting Health data in Grafana were deploying a container
+    /// whose only job was translating an exporter's JSON into this. Writing it
+    /// here removes that container from the diagram.
+    case influx
 
     public var displayName: String {
         switch self {
@@ -104,6 +110,8 @@ public enum DeliveryFormat: String, Codable, CaseIterable, Sendable {
             "CSV"
         case .metrics:
             "Metrics JSON"
+        case .influx:
+            "InfluxDB line protocol"
         }
     }
 
@@ -115,6 +123,8 @@ public enum DeliveryFormat: String, Codable, CaseIterable, Sendable {
             "json"
         case .csv:
             "csv"
+        case .influx:
+            "lp"
         }
     }
 
@@ -126,12 +136,64 @@ public enum DeliveryFormat: String, Codable, CaseIterable, Sendable {
             "application/json"
         case .csv:
             "text/csv"
+        case .influx:
+            // What InfluxDB's own write API expects.
+            "text/plain; charset=utf-8"
         }
     }
 
     /// Whether the format keeps every field Health returned.
     public var isLossless: Bool {
         self == .ndjson || self == .json
+    }
+
+    /// The formats worth offering for a destination of this kind.
+    ///
+    /// Line protocol is deliberately missing from folders. Hozz's own Mac app
+    /// watches a folder for `ndjson`, `json`, and `csv` batches and ignores
+    /// anything else, so a folder destination writing line protocol would
+    /// appear to be working while the Mac quietly ingested nothing. An endpoint
+    /// answers for itself, which is why it is offered there.
+    public static func available(for kind: DestinationKind) -> [DeliveryFormat] {
+        switch kind {
+        case .folder:
+            [.ndjson, .json, .csv, .metrics]
+        case .restAPI, .mqtt:
+            allCases
+        }
+    }
+}
+
+/// Which field names and shape a delivery uses.
+///
+/// Hozz's own schema is the default and the one that is documented. The
+/// alternative exists because the paid app most people are leaving has a
+/// published format, and their Home Assistant automations, MQTT subscribers,
+/// and scripts are all keyed to its field names. Making someone rewrite all of
+/// that to switch is a real reason not to switch.
+public enum PayloadSchema: String, Codable, CaseIterable, Sendable {
+    /// Hozz's documented schema.
+    case hozz
+    /// Health Auto Export's published field names, for pipelines already built
+    /// against them.
+    case healthAutoExport
+
+    public var displayName: String {
+        switch self {
+        case .hozz:
+            "Hozz"
+        case .healthAutoExport:
+            "Health Auto Export"
+        }
+    }
+
+    /// Whether this schema changes anything for the given format.
+    ///
+    /// Only the grouped-by-metric shape has a counterpart worth matching. The
+    /// record-per-line formats are Hozz's own and there is nothing to be
+    /// compatible with.
+    public static func applies(to format: DeliveryFormat) -> Bool {
+        format == .metrics
     }
 }
 
@@ -157,6 +219,14 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
     public var authorizationHeader: String
     /// Types the user chose to sync. Empty means everything Hozz can read.
     public var includedTypes: Set<HealthTypeKey>
+    /// Which field names the payload uses.
+    public var payloadSchema: PayloadSchema
+    /// Per-destination settings that are neither secrets nor HTTP headers —
+    /// the InfluxDB measurement name, for instance.
+    ///
+    /// Kept apart from ``headers`` because those really are sent as headers,
+    /// and a measurement name arriving as one would be noise at best.
+    public var options: [String: String]
     public var createdAt: Date
 
     public init(
@@ -171,6 +241,8 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
         headers: [String: String] = [:],
         authorizationHeader: String = "Authorization",
         includedTypes: Set<HealthTypeKey> = [],
+        payloadSchema: PayloadSchema = .hozz,
+        options: [String: String] = [:],
         createdAt: Date = .now
     ) {
         self.id = id
@@ -184,8 +256,61 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
         self.headers = headers
         self.authorizationHeader = authorizationHeader
         self.includedTypes = includedTypes
+        self.payloadSchema = payloadSchema
+        self.options = options
         self.createdAt = createdAt
     }
+
+    /// Decodes tolerantly, so a row written by an older build still loads.
+    ///
+    /// The synthesised decoder would throw on a payload missing a key added
+    /// later, and destinations are loaded with `try?`. Between those two facts,
+    /// adding one field would have silently emptied everybody's destination
+    /// list on upgrade — the delivery equivalent of losing records. Every field
+    /// is therefore optional on the way in and falls back to its default.
+    public init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(UUID.self, forKey: .id)
+        name = try container.decode(String.self, forKey: .name)
+        kind = try container.decode(DestinationKind.self, forKey: .kind)
+        format = try container.decodeIfPresent(DeliveryFormat.self, forKey: .format)
+            ?? .ndjson
+        cadence = try container.decodeIfPresent(SyncCadence.self, forKey: .cadence)
+            ?? .whenDataArrives
+        isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        folderBookmark = try container.decodeIfPresent(Data.self, forKey: .folderBookmark)
+        endpointURL = try container.decodeIfPresent(URL.self, forKey: .endpointURL)
+        headers = try container.decodeIfPresent([String: String].self, forKey: .headers)
+            ?? [:]
+        authorizationHeader = try container.decodeIfPresent(
+            String.self,
+            forKey: .authorizationHeader
+        ) ?? "Authorization"
+        includedTypes = try container.decodeIfPresent(
+            Set<HealthTypeKey>.self,
+            forKey: .includedTypes
+        ) ?? []
+        payloadSchema = try container.decodeIfPresent(
+            PayloadSchema.self,
+            forKey: .payloadSchema
+        ) ?? .hozz
+        options = try container.decodeIfPresent([String: String].self, forKey: .options)
+            ?? [:]
+        createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
+    }
+
+    /// The InfluxDB measurement and timestamp precision for this destination.
+    public var influxOptions: InfluxLineProtocol.Options {
+        InfluxLineProtocol.Options(
+            measurement: options[Destination.measurementKey]
+                ?? InfluxLineProtocol.defaultMeasurement,
+            precision: options[Destination.precisionKey]
+                .flatMap(InfluxLineProtocol.Precision.init(rawValue:)) ?? .nanoseconds
+        )
+    }
+
+    public static let measurementKey = "influxMeasurement"
+    public static let precisionKey = "influxPrecision"
 
     /// Keychain account name for this destination's secret.
     public var credentialKey: String {

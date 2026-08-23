@@ -27,6 +27,11 @@ public enum CompatiblePayloadBuilder {
         public let value: Double?
         public let unit: String?
         public let sourceName: String?
+        public let deviceName: String?
+        /// Workout length in seconds, as HealthKit reported it.
+        public let duration: Double?
+        /// `HKWorkoutActivityType` raw value, for workouts only.
+        public let activityType: Int?
         public let isDeletion: Bool
 
         public init(
@@ -38,6 +43,9 @@ public enum CompatiblePayloadBuilder {
             value: Double?,
             unit: String?,
             sourceName: String?,
+            deviceName: String? = nil,
+            duration: Double? = nil,
+            activityType: Int? = nil,
             isDeletion: Bool
         ) {
             self.identifier = identifier
@@ -48,7 +56,22 @@ public enum CompatiblePayloadBuilder {
             self.value = value
             self.unit = unit
             self.sourceName = sourceName
+            self.deviceName = deviceName
+            self.duration = duration
+            self.activityType = activityType
             self.isDeletion = isDeletion
+        }
+
+        /// The short name this record's type is published under.
+        public var metricName: String {
+            kind == "workout"
+                ? "workout"
+                : MetricNameMap.metricName(for: typeIdentifier)
+        }
+
+        /// The workout's activity, when Hozz has a name for it.
+        public var activityName: String? {
+            activityType.flatMap(WorkoutActivityNames.name(for:))
         }
     }
 
@@ -140,12 +163,8 @@ public enum CompatiblePayloadBuilder {
 
         let quantity = object["quantity"] as? [String: Any]
         let source = object["source"] as? [String: Any]
-        let value: Double? = switch quantity?["value"] ?? object["value"] {
-        case let number as Double: number
-        case let number as Int: Double(number)
-        case let number as NSNumber: number.doubleValue
-        default: nil
-        }
+        let device = object["device"] as? [String: Any]
+        let value = number(from: quantity?["value"] ?? object["value"])
 
         return Record(
             identifier: object["id"] as? String ?? "",
@@ -156,7 +175,19 @@ public enum CompatiblePayloadBuilder {
             value: value,
             unit: quantity?["unit"] as? String,
             sourceName: source?["name"] as? String,
+            deviceName: device?["name"] as? String,
+            duration: number(from: object["duration"]),
+            activityType: number(from: object["activityType"]).map(Int.init),
             isDeletion: kind == "deletion"
         )
+    }
+
+    private static func number(from value: Any?) -> Double? {
+        switch value {
+        case let number as Double: number
+        case let number as Int: Double(number)
+        case let number as NSNumber: number.doubleValue
+        default: nil
+        }
     }
 }
