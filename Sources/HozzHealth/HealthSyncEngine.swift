@@ -57,6 +57,17 @@ public actor HealthSyncEngine {
     /// Records gathered before a batch is handed over. Small enough to fit in
     /// the few seconds and few megabytes a background launch is given.
     public static let batchRecordLimit = 5_000
+
+    /// Bytes gathered before a batch is handed over.
+    ///
+    /// A count alone stopped being a bound once series types arrived. An
+    /// ordinary sample is a few hundred bytes, but one workout route or ECG
+    /// record carries five hundred points and is tens of kilobytes, so five
+    /// thousand of those would be hundreds of megabytes gathered in a launch
+    /// iOS gives a few seconds and a few megabytes. Cutting the pass short
+    /// costs nothing: each type's cursor is committed wherever it reached, and
+    /// the pass reports itself as interrupted so the rest follows next time.
+    public static let batchByteLimit = 4 * 1_024 * 1_024
     private static let pageSize = 500
 
     private let store: HozzStore
@@ -166,6 +177,7 @@ public actor HealthSyncEngine {
             .filter { dirtyTypes.isEmpty || dirtyTypes.contains($0) }
 
         var records: [HealthChange] = []
+        var recordBytes = 0
         var proposedAnchors: [HealthTypeKey: AnchorToken] = [:]
         var baseAnchors: [HealthTypeKey: AnchorToken?] = [:]
         var counts: [HealthTypeKey: Int] = [:]
@@ -173,7 +185,11 @@ public actor HealthSyncEngine {
         var waitingForUnlock = false
 
         for type in candidates {
-            if Task.isCancelled || records.count >= Self.batchRecordLimit {
+            if
+                Task.isCancelled
+                    || records.count >= Self.batchRecordLimit
+                    || recordBytes >= Self.batchByteLimit
+            {
                 interrupted = true
                 break
             }
@@ -181,9 +197,14 @@ public actor HealthSyncEngine {
             let base = try await store.committedAnchor(scope: scope, type: type)
             var anchor = base
             var collected: [HealthChange] = []
+            var collectedBytes = 0
 
             drain: while true {
-                if Task.isCancelled || records.count + collected.count >= Self.batchRecordLimit {
+                if
+                    Task.isCancelled
+                        || records.count + collected.count >= Self.batchRecordLimit
+                        || recordBytes + collectedBytes >= Self.batchByteLimit
+                {
                     interrupted = true
                     break drain
                 }
@@ -197,6 +218,9 @@ public actor HealthSyncEngine {
                         throw DrainError.nonAdvancingAnchor
                     }
                     collected.append(contentsOf: page.changes)
+                    collectedBytes += page.changes.reduce(0) {
+                        $0 + $1.approximateByteCount
+                    }
                     anchor = page.proposedAnchor
                     if page.changes.isEmpty {
                         break drain
@@ -224,6 +248,7 @@ public actor HealthSyncEngine {
 
             if !collected.isEmpty || anchor != base {
                 records.append(contentsOf: collected)
+                recordBytes += collectedBytes
                 proposedAnchors[type] = anchor
                 baseAnchors[type] = base
                 counts[type] = collected.count
