@@ -11,8 +11,27 @@ public struct ExportableHealthType: Sendable {
     }
 }
 
+/// A characteristic Hozz asks to read.
+///
+/// Characteristics are not sample types, so they cannot be carried by
+/// ``ExportableHealthType``. They are still requested in the same
+/// authorization call, because a characteristic Hozz never asked for could
+/// only ever come back refused.
+public struct AuthorizableCharacteristic: Sendable {
+    public let catalogEntry: HealthCatalogEntry
+    public let characteristicType: HKCharacteristicType
+
+    public init(
+        catalogEntry: HealthCatalogEntry,
+        characteristicType: HKCharacteristicType
+    ) {
+        self.catalogEntry = catalogEntry
+        self.characteristicType = characteristicType
+    }
+}
+
 public enum HealthKitTypeRegistry {
-    /// The families Hozz can read and encode losslessly today.
+    /// The families Hozz can read and encode as samples today.
     ///
     /// Correlations are deliberately absent. Including them in the standard
     /// authorization request crashes authorization, and querying a type that was
@@ -20,6 +39,10 @@ public enum HealthKitTypeRegistry {
     /// for them would be dishonest. Their constituent quantity and category
     /// samples are still exported individually; only the grouping edge is
     /// missing, and it is reported as unsupported.
+    ///
+    /// Characteristics are absent for a different reason: they are not samples
+    /// at all. They are read whole, once per export, by
+    /// ``HealthKitCharacteristicsReader`` and listed by ``characteristicTypes``.
     public static func exportableTypes(
         operatingSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
     ) -> [ExportableHealthType] {
@@ -62,12 +85,52 @@ public enum HealthKitTypeRegistry {
         }
     }
 
-    /// Every exportable type is requested. A type Hozz reads but never asks for
-    /// can only ever report an indeterminate result, so the two sets are kept
-    /// identical by construction.
+    /// The characteristics Hozz reads once per export.
+    ///
+    /// These are facts about the person — date of birth, biological sex, blood
+    /// type, skin type, wheelchair use, move mode — rather than measurements,
+    /// so they never appear in the sample stream. They are read whole through
+    /// ``HealthKitCharacteristicsReader``.
+    public static func characteristicTypes(
+        operatingSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+    ) -> [AuthorizableCharacteristic] {
+        HealthTypeCatalog.entries
+            .filter { $0.family == .characteristic }
+            .compactMap { entry -> AuthorizableCharacteristic? in
+                guard entry.introduced.isAvailable(on: operatingSystem) else {
+                    return nil
+                }
+                guard
+                    let type = HKObjectType.characteristicType(
+                        forIdentifier: HKCharacteristicTypeIdentifier(
+                            rawValue: entry.key.rawValue
+                        )
+                    )
+                else {
+                    return nil
+                }
+                return AuthorizableCharacteristic(
+                    catalogEntry: entry,
+                    characteristicType: type
+                )
+            }
+            .sorted { $0.catalogEntry.key < $1.catalogEntry.key }
+    }
+
+    /// Every type Hozz reads is requested. A type Hozz reads but never asks for
+    /// can only ever report an indeterminate result, so the read set is the
+    /// union of the sample types it drains and the characteristics it fetches,
+    /// by construction.
     public static func authorizationReadTypes(
         operatingSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
     ) -> Set<HKObjectType> {
-        Set(exportableTypes(operatingSystem: operatingSystem).map(\.sampleType))
+        var types = Set<HKObjectType>(
+            exportableTypes(operatingSystem: operatingSystem).map(\.sampleType)
+        )
+        types.formUnion(
+            characteristicTypes(operatingSystem: operatingSystem)
+                .map(\.characteristicType)
+        )
+        return types
     }
 }

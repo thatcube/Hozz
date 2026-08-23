@@ -6,7 +6,7 @@ Hozz is a free, open-source iPhone app with a companion Mac receiver. The iPhone
 
 There is no subscription, account, analytics, advertising, hosted relay, or default network destination. Nothing leaves the iPhone until you add a destination and confirm it.
 
-Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, and historical deletions. Correlations, routes, ECG, audiograms, series, characteristics, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
+Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, historical deletions, and the six Health characteristics. Correlations, routes, ECG, audiograms, series, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
 
 ## What works today
 
@@ -50,6 +50,26 @@ For a manual export, records are written to an open spool part and anchors are o
 Automatic sync uses the same anchor rule per destination. Each destination has its own cursor, so a failed destination cannot advance past data it did not accept, and one broken destination does not block a healthy one. Batches use stable content-derived identifiers and `Idempotency-Key` headers so a retry can be accepted safely.
 
 Apple does not let apps distinguish “the user denied this Health type” from “there is no matching data.” Hozz therefore reports authorization-scoped coverage and keeps denied-or-empty, unavailable, unsupported, and failed states visible.
+
+## Characteristics
+
+Date of birth, biological sex, blood type, Fitzpatrick skin type, wheelchair use, and activity move mode are not samples. They have no UUID, no dates, no source, and no anchor, so they cannot travel through the anchored-query path. Hozz reads them whole and writes one `characteristics` record per export attempt, ahead of the measurements.
+
+They are worth the separate path because they are what makes the rest interpretable. A resting heart rate of 48 reads differently depending on age and sex, and without them an assistant reading the export cannot answer “is this normal for me”.
+
+Each characteristic carries its own state rather than a blank:
+
+| State | Meaning |
+| --- | --- |
+| `known` | Health returned a value the person set. |
+| `notSet` | Health answered, and the person never entered one. An unknown fact, not a failure. |
+| `unrecognised` | Health returned a value this build has no name for. The raw number is kept, so the fact survives. |
+| `unavailable` | The characteristic does not exist on this OS, or Health is unavailable here. |
+| `unreadable` | Health refused or could not answer, with the coverage state and reason. |
+
+Unlike sample types, these four situations really are distinguishable: HealthKit throws a distinct authorization error when a characteristic was refused and a distinct no-data error when it was simply never set, so Hozz reports refusal and absence apart instead of flattening both.
+
+The record is written on every export attempt, including resumed ones, because the part holding an earlier copy may have been discarded unsealed. Each carries its own `readAt`. In a CSV export they are also flattened into `characteristics.csv`, one row per characteristic including the unset ones, while the lossless copy stays in `export-log.ndjson`.
 
 ## Mac receiver
 
@@ -150,7 +170,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 178 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 196 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

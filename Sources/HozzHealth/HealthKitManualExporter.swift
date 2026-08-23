@@ -46,6 +46,9 @@ public actor HealthKitManualExporter {
                 types: types
             ),
             types: types.map(\.catalogEntry.key),
+            characteristics: HealthKitCharacteristicsReader(
+                healthStore: healthStore
+            ),
             batchSize: batchSize
         )
     }

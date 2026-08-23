@@ -62,7 +62,11 @@ enum ExportTranscoder {
         "typeSummary",
         "typeError",
         "completion",
-        "sampleEncodingError"
+        "sampleEncodingError",
+        // Characteristics are the person, not a measurement, so they have no
+        // per-type grid to sit in. They are kept whole in the export log and
+        // also flattened into their own small file below.
+        "characteristics"
     ]
 
     /// Writes one CSV entry per data type, plus a deletions file and the run's
@@ -83,6 +87,7 @@ enum ExportTranscoder {
         var seenTypes: [String: Int] = [:]
         var deletions: [(id: String, type: String)] = []
         var runRecords: [Data] = []
+        var characteristicRows: [String] = []
 
         func closeEntry() throws {
             if currentType != nil {
@@ -103,6 +108,11 @@ enum ExportTranscoder {
 
             if runRecordKinds.contains(kind) {
                 runRecords.append(line)
+                if kind == "characteristics" {
+                    characteristicRows.append(
+                        contentsOf: characteristicCSVRows(from: object)
+                    )
+                }
                 continue
             }
             if kind == "deletion" {
@@ -146,6 +156,17 @@ enum ExportTranscoder {
             try archive.endEntry()
         }
 
+        if !characteristicRows.isEmpty {
+            try archive.beginEntry(name: "characteristics.csv")
+            try archive.write(
+                Data("readAt,type,state,value,rawValue,coverage,reason\n".utf8)
+            )
+            for row in characteristicRows {
+                try archive.write(Data((row + "\n").utf8))
+            }
+            try archive.endEntry()
+        }
+
         try archive.beginEntry(name: "export-log.ndjson")
         for record in runRecords {
             try archive.write(record)
@@ -180,6 +201,37 @@ enum ExportTranscoder {
     }
 
     // MARK: - CSV shaping
+
+    /// Flattens one characteristics record into one row per characteristic.
+    ///
+    /// Every characteristic is emitted, including the ones with no value, so a
+    /// spreadsheet shows "blood type: not set" rather than leaving the reader
+    /// to guess whether Hozz looked.
+    static func characteristicCSVRows(
+        from object: [String: Any]
+    ) -> [String] {
+        guard
+            let values = object["characteristics"] as? [String: Any]
+        else {
+            return []
+        }
+        let readAt = object["readAt"] as? String ?? ""
+
+        return values.keys.sorted().compactMap { type in
+            guard let entry = values[type] as? [String: Any] else {
+                return nil
+            }
+            return [
+                readAt,
+                type,
+                entry["state"] as? String ?? "",
+                entry["value"] as? String ?? "",
+                number(entry["rawValue"]),
+                entry["coverage"] as? String ?? "",
+                entry["reason"] as? String ?? ""
+            ].map(escape).joined(separator: ",")
+        }
+    }
 
     static func fileName(for type: String, occurrence: Int) -> String {
         var name = type
