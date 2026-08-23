@@ -1,4 +1,5 @@
 import HozzUI
+import HozzHealth
 import SwiftUI
 
 /// What Hozz is, what it promises, and where the code lives.
@@ -41,8 +42,14 @@ struct AboutView: View {
                 CoverageRow("Medication doses", available: true)
                 CoverageRow("Health characteristics", available: true)
                 CoverageRow("Historical deletions", available: true)
+                // Driven by the build rather than written down, so it stays
+                // true whichever build someone is holding.
                 CoverageRow(
-                    "Correlations, documents, and clinical records",
+                    "Health records",
+                    available: ClinicalRecordsSupport.isBuiltIn
+                )
+                CoverageRow(
+                    "Correlations and documents",
                     available: false
                 )
             }

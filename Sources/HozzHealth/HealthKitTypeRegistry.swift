@@ -44,7 +44,8 @@ public enum HealthKitTypeRegistry {
     /// at all. They are read whole, once per export, by
     /// ``HealthKitCharacteristicsReader`` and listed by ``characteristicTypes``.
     public static func exportableTypes(
-        operatingSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+        operatingSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion,
+        includingClinicalRecords: Bool = false
     ) -> [ExportableHealthType] {
         let generated = HealthTypeCatalog.entries.compactMap { entry -> ExportableHealthType? in
             guard entry.introduced.isAvailable(on: operatingSystem) else {
@@ -86,9 +87,16 @@ public enum HealthKitTypeRegistry {
                 default:
                     nil
                 }
+            case .clinical:
+                objectType = includingClinicalRecords
+                    ? HKObjectType.clinicalType(
+                        forIdentifier: HKClinicalTypeIdentifier(
+                            rawValue: entry.key.rawValue
+                        )
+                    )
+                    : nil
             case .correlation,
                  .characteristic,
-                 .clinical,
                  .document,
                  .scoredAssessment:
                 objectType = nil
@@ -97,7 +105,16 @@ public enum HealthKitTypeRegistry {
             guard let objectType else {
                 return nil
             }
-            guard !objectType.requiresPerObjectAuthorization() else {
+            // Per-object authorization is the filter that keeps types Hozz
+            // cannot honestly cover out of the offered set. Clinical records
+            // are the one family where it is expected rather than
+            // disqualifying: the person picks individual records, and partial
+            // access is the normal case. Every other family still has to pass,
+            // so lifting it here admits nothing else.
+            guard
+                !objectType.requiresPerObjectAuthorization()
+                    || entry.family == .clinical
+            else {
                 return nil
             }
             return ExportableHealthType(catalogEntry: entry, sampleType: objectType)
@@ -106,6 +123,25 @@ public enum HealthKitTypeRegistry {
         return generated.sorted {
             $0.catalogEntry.key.rawValue < $1.catalogEntry.key.rawValue
         }
+    }
+
+    /// The clinical record types, which are only offered when this build can
+    /// actually read them.
+    ///
+    /// They are requested in their own authorization call rather than with
+    /// everything else. Someone exporting step counts must never be asked for
+    /// their lab results as a side effect of that.
+    public static func clinicalTypes(
+        operatingSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
+    ) -> [ExportableHealthType] {
+        guard ClinicalRecordsSupport.isBuiltIn else {
+            return []
+        }
+        return exportableTypes(
+            operatingSystem: operatingSystem,
+            includingClinicalRecords: true
+        )
+        .filter { $0.catalogEntry.family == .clinical }
     }
 
     /// The characteristics Hozz reads once per export.
