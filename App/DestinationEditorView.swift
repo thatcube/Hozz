@@ -27,6 +27,9 @@ struct DestinationEditorView: View {
     @State private var isTesting = false
     @State private var includedTypes: Set<HealthTypeKey>
     @State private var isPickingTypes = false
+    @State private var measurement: String
+    @State private var precision: InfluxLineProtocol.Precision
+    @State private var payloadSchema: PayloadSchema
     @State private var discovered: [DiscoveredReceiver] = []
     @State private var isBrowsing = false
 
@@ -53,6 +56,14 @@ struct DestinationEditorView: View {
         _folderBookmark = State(initialValue: destination?.folderBookmark)
         _folderName = State(initialValue: destination?.folderBookmark.flatMap(Self.folderName))
         _includedTypes = State(initialValue: destination?.includedTypes ?? [])
+        let options = destination?.influxOptions
+            ?? InfluxLineProtocol.Options(
+                measurement: preset?.options[Destination.measurementKey]
+                    ?? InfluxLineProtocol.defaultMeasurement
+            )
+        _measurement = State(initialValue: options.measurement)
+        _precision = State(initialValue: options.precision)
+        _payloadSchema = State(initialValue: destination?.payloadSchema ?? .hozz)
     }
 
     var body: some View {
@@ -113,8 +124,17 @@ struct DestinationEditorView: View {
                     .textInputAutocapitalization(.words)
 
                 Picker("Format", selection: $format) {
-                    ForEach(DeliveryFormat.allCases, id: \.self) { format in
+                    ForEach(availableFormats, id: \.self) { format in
                         Text(format.displayName).tag(format)
+                    }
+                }
+                .onChange(of: kind) { _, newKind in
+                    // Not every format suits every kind, and leaving a stale
+                    // one selected would save a destination that writes bytes
+                    // its receiver quietly ignores.
+                    let available = DeliveryFormat.available(for: newKind)
+                    if !available.contains(format) {
+                        format = available.first ?? .ndjson
                     }
                 }
 
@@ -143,6 +163,14 @@ struct DestinationEditorView: View {
                 Text("Details")
             } footer: {
                 Text(formatExplanation)
+            }
+
+            if format == .influx {
+                influxSection
+            }
+
+            if PayloadSchema.applies(to: format), kind != .folder {
+                compatibilitySection
             }
 
             if let testResult {
@@ -216,6 +244,62 @@ struct DestinationEditorView: View {
                     includedTypes = selection
                 }
             }
+        }
+    }
+
+    private var availableFormats: [DeliveryFormat] {
+        DeliveryFormat.available(for: kind)
+    }
+
+    /// Everything InfluxDB needs that does not fit in the address.
+    private var influxSection: some View {
+        Section {
+            TextField("Measurement", text: $measurement)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+
+            Picker("Timestamp precision", selection: $precision) {
+                ForEach(InfluxLineProtocol.Precision.allCases, id: \.self) { precision in
+                    Text(precision.displayName).tag(precision)
+                }
+            }
+        } header: {
+            Text("InfluxDB")
+        } footer: {
+            Text(
+                "Every sample is written to this measurement, tagged with its "
+                + "type, source, device, and unit. The precision has to match "
+                + "the precision in the address: InfluxDB does not complain "
+                + "about a mismatch, it just files every point in the wrong "
+                + "decade. InfluxDB 2.x and 3.x expect /api/v2/write with org, "
+                + "bucket, and precision in the address and a Token "
+                + "authorization header; 1.8 expects /write?db=yourdatabase."
+            )
+        }
+    }
+
+    /// Matching another exporter's field names, for pipelines already built.
+    private var compatibilitySection: some View {
+        Section {
+            Picker("Field names", selection: $payloadSchema) {
+                ForEach(PayloadSchema.allCases, id: \.self) { schema in
+                    Text(schema.displayName).tag(schema)
+                }
+            }
+        } header: {
+            Text("Field names")
+        } footer: {
+            Text(
+                payloadSchema == .hozz
+                    ? "Hozz's own schema, which is what the documentation "
+                    + "describes and what to build anything new against."
+                    : "Sends the field names Health Auto Export publishes, so an "
+                    + "automation or dashboard already built for it keeps "
+                    + "working. Dates become local time in their format rather "
+                    + "than ISO 8601. Hozz sends individual samples rather than "
+                    + "summaries, so a heart rate point carries the same number "
+                    + "in Min, Avg, and Max."
+            )
         }
     }
 
@@ -326,6 +410,8 @@ struct DestinationEditorView: View {
             "A spreadsheet. Drops metadata and workout detail."
         case .metrics:
             "Grouped by metric, with the latest value for each. What Home Assistant, Grafana, and most dashboards expect."
+        case .influx:
+            "InfluxDB line protocol, written straight into InfluxDB or Telegraf. No translator in between."
         }
     }
 
@@ -388,8 +474,24 @@ struct DestinationEditorView: View {
             endpointURL: kind == .folder ? nil : URL(string: endpoint),
             headers: existing?.headers ?? [:],
             includedTypes: includedTypes,
+            payloadSchema: PayloadSchema.applies(to: format) ? payloadSchema : .hozz,
+            options: options,
             createdAt: existing?.createdAt ?? .now
         )
+    }
+
+    /// Settings that belong to the destination but are not headers or secrets.
+    ///
+    /// Anything already stored is kept, so switching format away from InfluxDB
+    /// and back does not lose a measurement name that was typed once.
+    private var options: [String: String] {
+        var options = existing?.options ?? [:]
+        let trimmed = measurement.trimmingCharacters(in: .whitespaces)
+        options[Destination.measurementKey] = trimmed.isEmpty
+            ? InfluxLineProtocol.defaultMeasurement
+            : trimmed
+        options[Destination.precisionKey] = precision.rawValue
+        return options
     }
 
     private func runTest() async {

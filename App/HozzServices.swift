@@ -112,15 +112,12 @@ extension DeliveryEngine {
     /// auth header, discovered days later when data never arrived. This turns
     /// that into an immediate, readable answer.
     func test(_ destination: Destination) async throws -> String {
-        let probe = Data(
-            #"{"kind":"hozzConnectionTest","schemaVersion":1}"#.utf8
-        )
         let batch = DeliveryBatch(
             id: UUID(),
             sequence: 0,
             createdAt: .now,
             recordCount: 0,
-            payload: destination.format == .ndjson ? probe + Data([0x0A]) : probe,
+            payload: DeliveryProbe.payload(for: destination),
             format: destination.format
         )
 

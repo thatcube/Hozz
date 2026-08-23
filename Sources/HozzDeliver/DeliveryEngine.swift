@@ -306,20 +306,12 @@ public actor DeliveryEngine {
         }
 
         Self.log.info("A destination moved address and was re-resolved.")
-        return Destination(
-            id: destination.id,
-            name: destination.name,
-            kind: destination.kind,
-            format: destination.format,
-            cadence: destination.cadence,
-            isEnabled: destination.isEnabled,
-            folderBookmark: destination.folderBookmark,
-            endpointURL: URL(string: working),
-            headers: destination.headers,
-            authorizationHeader: destination.authorizationHeader,
-            includedTypes: destination.includedTypes,
-            createdAt: destination.createdAt
-        )
+        // Rebuilt by mutation rather than field by field: a re-resolve that
+        // forgot to copy a field would silently reset it, and the user would
+        // have no way to tell that moving networks had changed their settings.
+        var repaired = destination
+        repaired.endpointURL = URL(string: working)
+        return repaired
     }
 
     public func deliverWithoutRecording(
