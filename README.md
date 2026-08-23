@@ -6,7 +6,7 @@ Hozz is a free, open-source iPhone app with a companion Mac receiver. The iPhone
 
 There is no subscription, account, analytics, advertising, hosted relay, or default network destination. Nothing leaves the iPhone until you add a destination and confirm it.
 
-Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, workout routes, historical deletions, and the six Health characteristics. Correlations, ECG, audiograms, other series, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
+Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, workout routes, electrocardiograms, audiograms, historical deletions, and the six Health characteristics. Correlations, other series, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
 
 ## What works today
 
@@ -98,27 +98,37 @@ Unlike sample types, these four situations really are distinguishable: HealthKit
 
 The record is written on every export attempt, including resumed ones, because the part holding an earlier copy may have been discarded unsealed. Each carries its own `readAt`. In a CSV export they are also flattened into `characteristics.csv`, one row per characteristic including the unset ones, while the lossless copy stays in `export-log.ndjson`.
 
-## Workout routes
+## Series types: routes and electrocardiograms
 
-A route is the GPS trace of an outdoor run or ride. It is one Health sample whose real content is elsewhere: the points arrive as a separate stream, and a long ride holds hundreds of thousands of them.
+A workout route and an electrocardiogram are the same shape of problem. Each is one Health sample whose real content is somewhere else: a route's GPS points and an ECG's voltage readings arrive as separate streams, and a long ride holds hundreds of thousands of points where a thirty-second ECG holds around fifteen thousand readings. Both go through one implementation, so the part that could lose or duplicate data is written and tested once.
 
-Routes are drained as their own anchored type rather than being fetched per workout. That is not a stylistic choice. A route is attached after its workout has already been saved, so a workout read before its route existed would never gain one — the route would be lost permanently, which is exactly what anchors exist to prevent.
-
-Each route is written as three kinds of record:
+Each sample is written as three kinds of record:
 
 | Kind | What it holds |
 | --- | --- |
-| `workoutRoute` | The route sample itself, plus the workout it belongs to. |
-| `workoutRouteLocations` | 500 points, addressed by their absolute offset in the route. |
-| `workoutRouteEnd` | The final point count, so a whole route is distinguishable from a truncated one. |
+| header | The sample itself — for a route, the workout it belongs to; for an ECG, its classification, average heart rate, sampling frequency, and symptoms status. |
+| elements | 500 points or readings, addressed by their absolute offset in the sample. |
+| end | The final element count, so a whole sample is distinguishable from a truncated one. |
 
-**Attaching a route to its workout.** HealthKit has no back-pointer from a route to its workout, so Hozz takes the workouts that overlap the route in time and asks each one whether this route is actually its own. Only a confirmed answer is written. Overlap alone would attach a ride to whatever else happened to be recorded at the same moment, so an unconfirmed route says `"state": "unresolved"` with a reason rather than naming a workout it guessed.
+**Streaming.** The cursor for a series type records which sample is half-written and how far into it Hozz has got, so a ride or a recording is never held in memory whole. The element stream stays open between pages, which keeps the ordinary path to a single read of each element; a relaunch has no stream to continue, so it re-opens the sample and skips what is already durable, paying that re-read once after an interruption rather than on every page.
 
-**Streaming.** The cursor for the route type records which route is half-written and how far into it Hozz has got, so a ride is never held in memory whole. The location stream stays open between pages, which keeps the ordinary path to a single read of each point; a relaunch has no stream to continue, so it re-opens the route and skips what is already durable, paying that re-read once after an interruption rather than on every page.
+Pages are split at fixed offsets rather than at wherever a pass happened to stop, and each page's identifier is derived from the sample and that offset. A replayed page is therefore identical to the page it replaces, so a receiver recognises it as the same record instead of storing it twice.
 
-Pages are split at fixed offsets rather than at wherever a pass happened to stop, and each page's identifier is derived from the route and that offset. A replayed page is therefore byte-identical to the page it replaces, so a receiver recognises it as the same record instead of storing it twice.
+**Routes** are drained as their own anchored type rather than fetched per workout. That is not a stylistic choice: a route is attached after its workout has already been saved, so a workout read before its route existed would never gain one, and the trace would be lost permanently.
 
-In a CSV export, routes become `WorkoutRoutes.csv` (one row per route) and `WorkoutRouteLocations.csv` (one row per point), because a route collapsed into a single cell would not be data any more.
+HealthKit has no back-pointer from a route to its workout, so Hozz takes the workouts that overlap the route in time and asks each one whether this route is actually its own. Only a confirmed answer is written. Overlap alone would attach a ride to whatever else happened to be recorded at the same moment, so an unconfirmed route says `"state": "unresolved"` with a reason rather than naming a workout it guessed.
+
+**Electrocardiograms** carry the reading that makes them interpretable — `sinusRhythm`, `atrialFibrillation`, one of the inconclusive results — alongside the raw enumeration value, so a classification from a later OS is still readable rather than becoming a gap. A reading the lead did not report is written as a gap rather than as zero volts, an absent average heart rate is left out rather than written as zero, and the number of readings Health said the recording holds is kept beside the number actually exported, so a short read is visible instead of looking complete.
+
+In a CSV export these become `WorkoutRoutes.csv`, `WorkoutRouteLocations.csv`, `Electrocardiograms.csv`, and `ElectrocardiogramVoltages.csv` — one row per sample and one row per element, because a recording collapsed into a single cell would not be data any more.
+
+## Audiograms
+
+A hearing test is not a series: its sensitivity readings sit on the sample itself, at most thirty of them, so it travels the ordinary anchored path.
+
+Two things a flat reading would throw away are kept. An ear with nothing recorded produces no reading at all, rather than a zero — 0 dBHL is perfect hearing, so writing it for an ear that was never measured would be a claim rather than a gap. And a reading Health marks as clamped is written with its bound, because a clamped 90 dBHL means "at least 90", not "90". Where the OS supports it, conduction type and whether the test was masked are carried too.
+
+In a CSV export a hearing test becomes `Audiograms.csv`, one row per ear reading.
 
 ## Mac receiver
 
@@ -227,7 +237,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 261 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, workout routes, export formats, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains COUNT_PLACEHOLDER tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, export formats, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

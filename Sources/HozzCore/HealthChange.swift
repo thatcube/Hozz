@@ -34,4 +34,20 @@ public enum HealthChange: Hashable, Sendable {
             deletion.type
         }
     }
+
+    /// Roughly what this change costs to hold, in bytes.
+    ///
+    /// Used to bound a batch by size rather than only by count. Most records
+    /// are a single sample of a few hundred bytes, but a series record carries
+    /// five hundred GPS points or voltage readings and is tens of kilobytes,
+    /// so counting alone stopped being a bound on memory.
+    public var approximateByteCount: Int {
+        switch self {
+        case .upsert(let object):
+            object.canonicalPayload.count
+        case .delete:
+            // A tombstone is a short line with an identifier and a type.
+            128
+        }
+    }
 }

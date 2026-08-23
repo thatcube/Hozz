@@ -44,6 +44,10 @@ public struct HealthSampleEncoder: Sendable {
                     "metadata": metadataObject(event.metadata ?? [:])
                 ] as [String: Any]
             } ?? []
+        case let audiogram as HKAudiogramSample:
+            object["kind"] = "audiogram"
+            object["sensitivityPoints"] = AudiogramEncoding
+                .sensitivityPoints(audiogram)
         case let correlation as HKCorrelation:
             object["kind"] = "correlation"
             object["members"] = correlation.objects.sorted {
