@@ -349,6 +349,94 @@ final class ExportSQLiteTests: XCTestCase {
         )
     }
 
+    /// The acquisition side emits one record holding every characteristic it
+    /// read, keyed by type. This is that exact shape: if it changes, this test
+    /// is where the two halves stop agreeing.
+    func testACombinedCharacteristicsRecordFansOutIntoRows() throws {
+        let (url, statistics) = try build([
+            [
+                "kind": "characteristics",
+                "schemaVersion": 1,
+                "catalogVersion": "2026.08.1",
+                "readAt": "2026-01-02T15:00:00.000Z",
+                "characteristics": [
+                    "HKCharacteristicTypeIdentifierBloodType": [
+                        "state": "read",
+                        "value": "APositive",
+                        "rawValue": 2
+                    ],
+                    "HKCharacteristicTypeIdentifierDateOfBirth": [
+                        "state": "read",
+                        "value": "1985-03-04"
+                    ],
+                    "HKCharacteristicTypeIdentifierBiologicalSex": [
+                        "state": "notSet",
+                        "coverage": "authorizationIndeterminate"
+                    ]
+                ]
+            ]
+        ])
+
+        XCTAssertEqual(statistics.characteristicRows, 3)
+
+        let database = try open(url)
+        defer { database.close() }
+
+        let rows = try database.query(
+            "SELECT type, state, value, read_at FROM characteristic ORDER BY type",
+            row: { ($0.text(0), $0.optionalText(1), $0.optionalText(2), $0.optionalText(3)) }
+        )
+        XCTAssertEqual(rows.count, 3)
+        XCTAssertEqual(rows[0].0, "HKCharacteristicTypeIdentifierBiologicalSex")
+        XCTAssertEqual(rows[0].1, "notSet")
+        XCTAssertNil(
+            rows[0].2,
+            "A characteristic that was never set has no value to invent."
+        )
+        XCTAssertEqual(rows[1].0, "HKCharacteristicTypeIdentifierBloodType")
+        XCTAssertEqual(rows[1].2, "APositive")
+        XCTAssertEqual(rows[1].3, "2026-01-02T15:00:00.000Z")
+        XCTAssertEqual(rows[2].2, "1985-03-04")
+
+        // The fan-out is a projection, so the record itself still survives.
+        let logged = try text(
+            database,
+            "SELECT raw FROM export_log WHERE kind = 'characteristics'"
+        )
+        let decoded = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: Data(logged.utf8))
+                as? [String: Any]
+        )
+        XCTAssertEqual(
+            (decoded["characteristics"] as? [String: Any])?.count,
+            3
+        )
+        XCTAssertEqual(decoded["catalogVersion"] as? String, "2026.08.1")
+    }
+
+    /// A single characteristic carrying its own type still works, so the table
+    /// does not depend on which shape the encoder settles on.
+    func testASingleCharacteristicRecordAlsoLands() throws {
+        let (url, statistics) = try build([
+            [
+                "kind": "characteristic",
+                "schemaVersion": 1,
+                "id": "c-1",
+                "type": "HKCharacteristicTypeIdentifierBloodType",
+                "state": "read",
+                "value": "ONegative"
+            ]
+        ])
+
+        XCTAssertEqual(statistics.characteristicRows, 1)
+        let database = try open(url)
+        defer { database.close() }
+        XCTAssertEqual(
+            try text(database, "SELECT value FROM characteristic"),
+            "ONegative"
+        )
+    }
+
     func testAnUnreadableLineIsKeptRatherThanSkipped() throws {
         let url = directory.url.appending(path: "broken.ndjson")
         var data = Data()

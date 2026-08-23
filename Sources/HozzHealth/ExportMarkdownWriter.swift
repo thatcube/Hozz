@@ -99,6 +99,14 @@ enum ExportMarkdownWriter {
                 }
                 continue
             }
+            if record.kind == "characteristic" || record.kind == "characteristics" {
+                // Date of birth and blood type are true of a person, not of a
+                // Tuesday. There is no day to file them under and no summary
+                // to make of them, so they travel in the export log instead of
+                // being counted as records that happened to lack a date.
+                runRecords.append(line)
+                continue
+            }
             if record.kind == "sampleEncodingError" {
                 // An object Health returned that Hozz could not encode. It has
                 // no values to summarise, so it travels in the export log and

@@ -300,17 +300,37 @@ enum ExportSQLiteWriter {
                     statistics.deletionRows += 1
                     pendingRows += 1
 
-                case "characteristic":
+                case "characteristic", "characteristics":
                     // Characteristics are not time series — one value that is
                     // true until it is not — so they get a table of their own
                     // rather than a `sample` row with every date column null.
-                    try characteristicStatement.run([
-                        text(record.type),
-                        text(characteristicValue(record)),
+                    //
+                    // Two shapes reach here. A single characteristic carries
+                    // its own `type`, and the acquisition side emits one
+                    // record holding every characteristic it read, keyed by
+                    // type. The second is fanned out into rows, because the
+                    // question someone asks is "what is my blood type", not
+                    // "what did the characteristics record say".
+                    let rows = characteristicRows(record)
+                    for row in rows {
+                        try characteristicStatement.run([
+                            text(row.type),
+                            text(row.state),
+                            text(row.value),
+                            text(row.readAt),
+                            .text(row.raw)
+                        ])
+                    }
+                    statistics.characteristicRows += rows.count
+                    // The whole record still goes to the log verbatim, so the
+                    // fan-out is a projection rather than a replacement.
+                    try logStatement.run([
+                        .integer(Int64(statistics.logRows)),
+                        .text(record.kind),
                         .text(rawText)
                     ])
-                    statistics.characteristicRows += 1
-                    pendingRows += 1
+                    statistics.logRows += 1
+                    pendingRows += rows.count + 1
 
                 case "sampleEncodingError":
                     try issueStatement.run([
@@ -547,9 +567,15 @@ enum ExportSQLiteWriter {
             PRIMARY KEY (id, type)
         );
 
+        -- Facts about the person rather than measurements of a moment: date
+        -- of birth, blood type, and the rest. `state` is here because Apple
+        -- cannot tell a characteristic you declined to share from one you
+        -- never filled in, so a row without a value says which it was.
         CREATE TABLE characteristic (
             type TEXT PRIMARY KEY,
+            state TEXT,
             value TEXT,
+            read_at TEXT,
             raw TEXT NOT NULL
         );
 
@@ -575,7 +601,8 @@ enum ExportSQLiteWriter {
             raw BLOB
         );
 
-        -- The run's own records, verbatim and in order.
+        -- Records that describe the run, or the person, rather than a moment
+        -- in time. Kept verbatim and in order.
         CREATE TABLE export_log (
             ordinal INTEGER PRIMARY KEY,
             kind TEXT NOT NULL,
@@ -702,9 +729,12 @@ enum ExportSQLiteWriter {
         """
 
     private static let characteristicInsert = """
-        INSERT INTO characteristic (type, value, raw) VALUES (?, ?, ?)
+        INSERT INTO characteristic (type, state, value, read_at, raw)
+        VALUES (?, ?, ?, ?, ?)
         ON CONFLICT (type) DO UPDATE SET
+            state = excluded.state,
             value = excluded.value,
+            read_at = excluded.read_at,
             raw = excluded.raw
         """
 
@@ -887,6 +917,70 @@ enum ExportSQLiteWriter {
             state.message = record.message
         }
         states[type] = state
+    }
+
+    /// A characteristic's plain value, and the state Health reported for it.
+    ///
+    /// The state matters as much as the value: Apple cannot distinguish a
+    /// characteristic you declined to share from one you never filled in, so a
+    /// row with no value says which of those it was rather than looking like
+    /// an empty field.
+    private struct CharacteristicRow {
+        let type: String
+        let state: String?
+        let value: String?
+        let readAt: String?
+        let raw: String
+    }
+
+    private static func characteristicRows(
+        _ record: ExportRecord
+    ) -> [CharacteristicRow] {
+        let readAt = record.object["readAt"] as? String
+
+        // The combined shape: one record, every characteristic keyed by type.
+        if let values = record.object["characteristics"] as? [String: Any] {
+            return values.keys.sorted().compactMap { type in
+                guard let entry = values[type] else {
+                    return nil
+                }
+                let object = entry as? [String: Any] ?? [:]
+                return CharacteristicRow(
+                    type: type,
+                    state: object["state"] as? String,
+                    value: plainValue(object["value"])
+                        ?? plainValue(object["rawValue"]),
+                    readAt: readAt,
+                    raw: ExportRecord.compactJSON(entry)
+                        ?? String(decoding: record.raw, as: UTF8.self)
+                )
+            }
+        }
+
+        // The single shape: one characteristic, carrying its own type.
+        guard let type = record.type else {
+            return []
+        }
+        return [
+            CharacteristicRow(
+                type: type,
+                state: record.object["state"] as? String,
+                value: characteristicValue(record),
+                readAt: readAt,
+                raw: String(decoding: record.raw, as: UTF8.self)
+            )
+        ]
+    }
+
+    private static func plainValue(_ value: Any?) -> String? {
+        switch value {
+        case let text as String:
+            text
+        case let bool as Bool:
+            bool ? "true" : "false"
+        default:
+            ExportRecord.number(value).map { ExportRecord.plain($0) }
+        }
     }
 
     /// A characteristic's plain value, whatever shape the encoder gave it.
