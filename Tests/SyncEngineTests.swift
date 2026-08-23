@@ -468,6 +468,269 @@ final class SyncEngineTests: XCTestCase {
         )
     }
 
+    // MARK: - Fair ordering
+
+    /// The failure this fixes: types were visited in catalogue order and the
+    /// budget was shared first-come, so a big type early in the list took the
+    /// whole pass and everything behind it got nothing at all.
+    ///
+    /// Stand hours sit 4th of 212 and step count 197th, so someone with years
+    /// of stand hours saw no step count for dozens of passes.
+    func testABigEarlyTypeNoLongerStarvesTheOnesBehindIt() async throws {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = Destination(
+            name: "Folder",
+            kind: .folder,
+            folderBookmark: Data("a".utf8)
+        )
+        try await delivery.save(destination)
+
+        let source = ScriptedHealthDataSource(
+            streams: [
+                // Far more than one pass can carry.
+                steps: (0..<20_000).map { sample("stand-\($0)", type: steps) },
+                heart: (0..<10).map { sample("heart-\($0)", type: heart) }
+            ]
+        )
+        let engine = makeEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps, heart]
+        )
+
+        _ = try await engine.sync()
+
+        let identifiers = await channel.sampleIDs(for: destination.id)
+        XCTAssertEqual(
+            identifiers.filter { $0.hasPrefix("heart-") }.count,
+            10,
+            "A small type behind a large one must not wait its turn to be seen."
+        )
+        XCTAssertGreaterThan(
+            identifiers.filter { $0.hasPrefix("stand-") }.count,
+            HealthSyncEngine.minimumFairShare,
+            "The large type must still make real progress, not just its share."
+        )
+    }
+
+    func testAFairShareLeavesRoomForEveryTypeToBeSeen() {
+        XCTAssertEqual(HealthSyncEngine.fairShare(candidateCount: 1), 5_000)
+        XCTAssertEqual(HealthSyncEngine.fairShare(candidateCount: 212), 50)
+        XCTAssertEqual(HealthSyncEngine.fairShare(candidateCount: 5), 500)
+        XCTAssertGreaterThanOrEqual(
+            HealthSyncEngine.fairShare(candidateCount: 212) * 100,
+            HealthSyncEngine.batchRecordLimit,
+            "A hundred types should fit inside one budget's worth of shares."
+        )
+    }
+
+    func testTheOrderRotatesSoNoTypeIsPermanentlyFirst() {
+        let types = (0..<5).map { HealthTypeKey("type-\($0)") }
+
+        let first = HealthSyncEngine.rotated(
+            types,
+            at: Date(timeIntervalSince1970: 0)
+        )
+        let later = HealthSyncEngine.rotated(
+            types,
+            at: Date(timeIntervalSince1970: 3_600 * 2)
+        )
+
+        XCTAssertEqual(Set(first), Set(types), "Rotation must not drop a type.")
+        XCTAssertEqual(first.count, types.count)
+        XCTAssertNotEqual(
+            first.first,
+            later.first,
+            "The remainder of a pass would otherwise always land on the same type."
+        )
+    }
+
+    /// Fairness is only worth having if it still loses nothing.
+    func testEverythingStillArrivesAcrossPassesWithoutDuplication() async throws {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = Destination(
+            name: "Folder",
+            kind: .folder,
+            folderBookmark: Data("a".utf8)
+        )
+        try await delivery.save(destination)
+
+        let source = ScriptedHealthDataSource(
+            streams: [
+                steps: (0..<6_000).map { sample("stand-\($0)", type: steps) },
+                heart: (0..<600).map { sample("heart-\($0)", type: heart) }
+            ]
+        )
+        let engine = makeEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps, heart]
+        )
+
+        var passes = 0
+        while passes < 30 {
+            let outcome = try await engine.sync(
+                now: Date(timeIntervalSinceNow: Double(passes) * 3_600)
+            )
+            passes += 1
+            if outcome.deliveredRecords == 0 {
+                break
+            }
+        }
+
+        let identifiers = await channel.sampleIDs(for: destination.id)
+        XCTAssertEqual(identifiers.count, 6_600, "No record may be sent twice.")
+        XCTAssertEqual(Set(identifiers).count, 6_600, "No record may be missed.")
+    }
+
+    /// A partially drained type has to pick up where it stopped rather than
+    /// starting over, which is the whole point of the cursor.
+    func testAPartiallyDrainedTypeResumesWhereItStopped() async throws {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = Destination(
+            name: "Folder",
+            kind: .folder,
+            folderBookmark: Data("a".utf8)
+        )
+        try await delivery.save(destination)
+
+        let source = ScriptedHealthDataSource(
+            streams: [steps: (0..<7_000).map { sample("s-\($0)", type: steps) }]
+        )
+        let engine = makeEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps]
+        )
+
+        _ = try await engine.sync()
+        let afterFirst = await channel.sampleIDs(for: destination.id)
+        XCTAssertEqual(afterFirst.count, HealthSyncEngine.batchRecordLimit)
+
+        _ = try await engine.sync(now: Date(timeIntervalSinceNow: 3_600))
+        let afterSecond = await channel.sampleIDs(for: destination.id)
+
+        XCTAssertEqual(afterSecond.count, 7_000)
+        XCTAssertEqual(
+            Set(afterSecond).count,
+            7_000,
+            "Resuming must not replay what the first pass already sent."
+        )
+    }
+
+    // MARK: - Honest coverage
+
+    /// The store used to record `anchorClosed` for a type the budget cut off
+    /// mid-drain, which asserted the type was caught up when fifteen thousand
+    /// records were still to come.
+    func testATypeCutOffByTheBudgetIsNotRecordedAsFinished() async throws {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = Destination(
+            name: "Folder",
+            kind: .folder,
+            folderBookmark: Data("a".utf8)
+        )
+        try await delivery.save(destination)
+
+        let source = ScriptedHealthDataSource(
+            streams: [steps: (0..<20_000).map { sample("s-\($0)", type: steps) }]
+        )
+        let engine = makeEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps]
+        )
+
+        _ = try await engine.sync()
+
+        let record = try await store.streamRecord(
+            scope: .destination(destination.id),
+            type: steps
+        )
+        XCTAssertEqual(record?.coverage, .draining)
+        XCTAssertNil(
+            record?.anchorClosedAt,
+            "A type with records still to come has not closed."
+        )
+        XCTAssertGreaterThan(record?.recordCount ?? 0, 0)
+    }
+
+    func testATypeThatRanOutIsRecordedAsClosed() async throws {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = Destination(
+            name: "Folder",
+            kind: .folder,
+            folderBookmark: Data("a".utf8)
+        )
+        try await delivery.save(destination)
+
+        let source = ScriptedHealthDataSource(
+            streams: [steps: (0..<10).map { sample("s-\($0)", type: steps) }]
+        )
+        let engine = makeEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps]
+        )
+
+        _ = try await engine.sync()
+
+        let record = try await store.streamRecord(
+            scope: .destination(destination.id),
+            type: steps
+        )
+        XCTAssertEqual(record?.coverage, .anchorClosed)
+        XCTAssertNotNil(record?.anchorClosedAt)
+    }
+
+    /// A type that produced nothing at all cannot be called covered: Health
+    /// does not let Hozz tell a denied type from an empty one.
+    func testATypeThatProducedNothingStaysIndeterminate() async throws {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = Destination(
+            name: "Folder",
+            kind: .folder,
+            folderBookmark: Data("a".utf8)
+        )
+        try await delivery.save(destination)
+
+        let source = ScriptedHealthDataSource(
+            streams: [steps: [sample("s-0", type: steps)], heart: []]
+        )
+        let engine = makeEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps, heart]
+        )
+
+        _ = try await engine.sync()
+
+        let record = try await store.streamRecord(
+            scope: .destination(destination.id),
+            type: heart
+        )
+        XCTAssertEqual(record?.coverage, .authorizationIndeterminate)
+        XCTAssertEqual(record?.recordCount, 0)
+    }
+
     /// A record whose payload is deliberately large, standing in for a workout
     /// route page or a block of ECG voltages.
     private func fat(

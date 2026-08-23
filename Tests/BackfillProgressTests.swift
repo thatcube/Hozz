@@ -114,17 +114,38 @@ final class BackfillProgressTests: XCTestCase {
             destinationID: destination.id,
             selected: [stand, heart, steps]
         )
+        // Since the drain gives every type a share before spending the
+        // remainder, all three are seen in the first pass rather than two of
+        // them waiting for the big one to finish.
         XCTAssertEqual(
             after.reached,
-            1,
-            "One type has been drained; the other two have not been looked at."
+            3,
+            "Every type should be seen in the first pass, not just the first one."
         )
         XCTAssertEqual(after.records, 5_000, "One pass is bounded at 5,000.")
+
+        // The point of the test still stands: being seen is not being
+        // finished, and the big type must not claim to be caught up.
+        let big = try await store.streamRecord(
+            scope: .destination(destination.id),
+            type: stand
+        )
+        XCTAssertEqual(big?.coverage, .draining)
+        XCTAssertNil(
+            big?.anchorClosedAt,
+            "Fifteen thousand records still to come is not a closed type."
+        )
+        let small = try await store.streamRecord(
+            scope: .destination(destination.id),
+            type: heart
+        )
+        XCTAssertEqual(small?.recordCount, 5)
     }
 
-    /// The count has to climb as the sweep works through the list, or it is
-    /// not progress.
-    func testReachedTypesClimbAsTheSweepWorksThroughTheList() async throws {
+    /// Progress has to be visible between passes, or it is not progress.
+    /// It shows in the record count rather than in the reached count, because
+    /// every type is now reached in the first pass.
+    func testProgressClimbsBetweenPasses() async throws {
         let store = try HozzStore(directory: directory.url.appending(path: "store"))
         let channel = AcceptingChannel()
         let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
@@ -166,13 +187,25 @@ final class BackfillProgressTests: XCTestCase {
             selected: [stand, heart, steps]
         )
 
-        XCTAssertEqual(first.reached, 1)
         XCTAssertEqual(
-            second.reached,
+            first.reached,
             3,
-            "Once the big type finishes, the queued ones are reached."
+            "Every type is reached in the first pass now that the budget is shared."
         )
-        XCTAssertGreaterThan(second.records, first.records)
+        XCTAssertEqual(second.reached, 3)
+        XCTAssertGreaterThan(
+            second.records,
+            first.records,
+            "Progress now shows in the record count rather than in types waiting their turn."
+        )
+
+        // The big type is only closed once it genuinely runs out.
+        let big = try await store.streamRecord(
+            scope: .destination(destination.id),
+            type: stand
+        )
+        XCTAssertEqual(big?.coverage, .anchorClosed)
+        XCTAssertNotNil(big?.anchorClosedAt)
     }
 
     /// A type Health answered for with nothing is a complete export of

@@ -137,13 +137,11 @@ final class SyncViewModel {
     /// A type counts as *reached* once a cursor has been committed for it,
     /// which is exactly what "Hozz has drained some of this type" means.
     ///
-    /// It deliberately does **not** claim a type is *finished*. In the sync
-    /// path a cursor is committed with `anchorClosed` whether the type ran out
-    /// of data or the pass ran out of budget, so that state cannot currently
-    /// tell "caught up" from "cut off halfway". Reporting it as complete would
-    /// be the same fabrication as a percentage, just better hidden. When the
-    /// drain records the difference, `typesReached` becomes `typesComplete`
-    /// and nothing else here has to change.
+    /// It deliberately does **not** claim a type is *finished*, though it now
+    /// could. The drain records the difference: a type cut off by the budget
+    /// commits as `draining` with no closure time, and only an empty page
+    /// closes a type. Counting `anchorClosedAt != nil` would therefore be an
+    /// honest `typesComplete`, and this is the only place that has to change.
     private static func backfillProgress(
         services: HozzServices,
         destinations: [Destination]

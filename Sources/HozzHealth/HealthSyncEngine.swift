@@ -70,6 +70,11 @@ public actor HealthSyncEngine {
     public static let batchByteLimit = 4 * 1_024 * 1_024
     private static let pageSize = 500
 
+    /// The smallest share a type gets before the pass moves on. Small enough
+    /// that a hundred types fit inside one budget, large enough that a type
+    /// with a handful of new records finishes in a single pass.
+    public static let minimumFairShare = 50
+
     private let store: HozzStore
     private let source: any HealthDataSource
     private let delivery: DeliveryEngine
@@ -166,111 +171,112 @@ public actor HealthSyncEngine {
     }
 
     /// Drains and delivers for one destination, using only its own cursor.
+    ///
+    /// Types are visited in two rounds. The first gives every type a small
+    /// share, so a person sees *something* from everything rather than nothing
+    /// until its turn comes round; the second spends whatever the shares left,
+    /// so a large backlog still drains at close to full speed.
+    ///
+    /// A single pass in catalogue order was the alternative, and it starved by
+    /// position: stand hours sit 4th and step count 197th, so someone with
+    /// years of stand hours saw no step count at all until the stand hours
+    /// finished — dozens of background passes later. It converged, but nobody
+    /// waits that long before deciding an app is broken.
     private func sync(
         destination: Destination,
         dirtyTypes: Set<HealthTypeKey>,
         now: Date
     ) async throws -> SyncOutcome {
         let scope = AnchorScope.destination(destination.id)
-        let candidates = allTypes
-            .filter { destination.includes($0) }
-            .filter { dirtyTypes.isEmpty || dirtyTypes.contains($0) }
+        let candidates = Self.rotated(
+            allTypes
+                .filter { destination.includes($0) }
+                .filter { dirtyTypes.isEmpty || dirtyTypes.contains($0) },
+            at: now
+        )
 
         var records: [HealthChange] = []
         var recordBytes = 0
-        var proposedAnchors: [HealthTypeKey: AnchorToken] = [:]
-        var baseAnchors: [HealthTypeKey: AnchorToken?] = [:]
-        var counts: [HealthTypeKey: Int] = [:]
+        var states: [HealthTypeKey: TypeState] = [:]
         var interrupted = false
         var waitingForUnlock = false
 
-        for type in candidates {
-            if
-                Task.isCancelled
-                    || records.count >= Self.batchRecordLimit
-                    || recordBytes >= Self.batchByteLimit
-            {
-                interrupted = true
-                break
-            }
+        let share = Self.fairShare(candidateCount: candidates.count)
 
-            let base = try await store.committedAnchor(scope: scope, type: type)
-            var anchor = base
-            var collected: [HealthChange] = []
-            var collectedBytes = 0
-
-            drain: while true {
-                if
-                    Task.isCancelled
-                        || records.count + collected.count >= Self.batchRecordLimit
-                        || recordBytes + collectedBytes >= Self.batchByteLimit
-                {
+        rounds: for round in 0..<2 {
+            for type in candidates {
+                if Task.isCancelled {
                     interrupted = true
-                    break drain
+                    break rounds
                 }
-                do {
-                    let page = try await source.changes(
-                        for: type,
-                        after: anchor,
-                        limit: Self.pageSize
-                    )
-                    if !page.changes.isEmpty, page.proposedAnchor == anchor {
-                        throw DrainError.nonAdvancingAnchor
-                    }
-                    collected.append(contentsOf: page.changes)
-                    collectedBytes += page.changes.reduce(0) {
-                        $0 + $1.approximateByteCount
-                    }
-                    anchor = page.proposedAnchor
-                    if page.changes.isEmpty {
-                        break drain
-                    }
-                } catch {
-                    let failure = HealthKitFailure.classify(
-                        error,
-                        typeIdentifier: type.rawValue
-                    )
-                    if failure.kind == .deviceLocked {
-                        // The ordinary background case, not a failure.
-                        waitingForUnlock = true
-                        interrupted = true
-                        break drain
-                    }
-                    try? await store.recordCoverage(
-                        scope: scope,
-                        type: type,
-                        coverage: failure.coverageState,
-                        failureReason: failure.underlyingDescription
-                    )
-                    break drain
+                guard
+                    records.count < Self.batchRecordLimit,
+                    recordBytes < Self.batchByteLimit
+                else {
+                    interrupted = true
+                    break rounds
                 }
-            }
 
-            if !collected.isEmpty || anchor != base {
-                records.append(contentsOf: collected)
-                recordBytes += collectedBytes
-                proposedAnchors[type] = anchor
-                baseAnchors[type] = base
-                counts[type] = collected.count
+                var state: TypeState
+                if let existing = states[type] {
+                    state = existing
+                } else {
+                    // Read once per pass, for the cursor and for how much this
+                    // type has ever produced. The second is what decides
+                    // whether an empty page means "caught up" or "nothing here".
+                    let stored = try await store.streamRecord(
+                        scope: scope,
+                        type: type
+                    )
+                    state = TypeState(
+                        base: stored?.committedAnchor,
+                        observedBefore: stored?.observedCount ?? 0,
+                        anchor: stored?.committedAnchor
+                    )
+                }
+                if state.isExhausted {
+                    continue
+                }
+
+                let allowance = round == 0
+                    ? min(share, Self.batchRecordLimit - records.count)
+                    : Self.batchRecordLimit - records.count
+                let result = try await drain(
+                    type: type,
+                    from: state.anchor,
+                    allowance: allowance,
+                    byteAllowance: Self.batchByteLimit - recordBytes,
+                    scope: scope
+                )
+
+                records.append(contentsOf: result.changes)
+                recordBytes += result.bytes
+                state.anchor = result.anchor
+                state.collected += result.changes.count
+                state.isExhausted = result.isExhausted
+                states[type] = state
+
+                interrupted = interrupted || result.wasInterrupted
+                if result.waitingForUnlock {
+                    waitingForUnlock = true
+                    interrupted = true
+                    break rounds
+                }
             }
-            if waitingForUnlock {
-                break
-            }
+        }
+
+        let touched = states.filter { _, state in
+            state.anchor != state.base || state.collected > 0
         }
 
         guard !records.isEmpty else {
             // Nothing new for this destination. Still commit any cursor that
             // moved without data, so an empty stream is not re-read forever.
-            try await commitAnchors(
-                proposedAnchors,
-                base: baseAnchors,
-                counts: counts,
-                scope: scope
-            )
+            try await commitAnchors(touched, scope: scope)
             return SyncOutcome(
                 deliveredRecords: 0,
                 destinationCount: 1,
-                typesDrained: proposedAnchors.count,
+                typesDrained: touched.count,
                 wasInterrupted: interrupted,
                 waitingForUnlock: waitingForUnlock
             )
@@ -302,47 +308,182 @@ public actor HealthSyncEngine {
             return SyncOutcome(
                 deliveredRecords: 0,
                 destinationCount: 1,
-                typesDrained: proposedAnchors.count,
+                typesDrained: touched.count,
                 wasInterrupted: true,
                 waitingForUnlock: waitingForUnlock
             )
         }
 
-        try await commitAnchors(
-            proposedAnchors,
-            base: baseAnchors,
-            counts: counts,
-            scope: scope
-        )
+        try await commitAnchors(touched, scope: scope)
 
         return SyncOutcome(
             deliveredRecords: records.count,
             destinationCount: 1,
-            typesDrained: proposedAnchors.count,
+            typesDrained: touched.count,
             wasInterrupted: interrupted,
             waitingForUnlock: waitingForUnlock
         )
     }
 
+    /// Where one type got to during this pass.
+    struct TypeState {
+        let base: AnchorToken?
+        /// How many objects this type had ever produced before the pass.
+        let observedBefore: Int
+        var anchor: AnchorToken?
+        var collected = 0
+        /// Set only when Health returned an empty page, which is the one
+        /// condition that means there is nothing more to read right now.
+        var isExhausted = false
+    }
+
+    private struct TypeDrain {
+        var changes: [HealthChange] = []
+        var bytes = 0
+        var anchor: AnchorToken?
+        var isExhausted = false
+        var wasInterrupted = false
+        var waitingForUnlock = false
+    }
+
+    /// Reads one type until its allowance runs out or Health runs dry.
+    ///
+    /// The page size is trimmed to the allowance, so a share of fifty really
+    /// costs fifty rather than a whole page — otherwise every type would take
+    /// a full page in the first round and the fair share would be fiction.
+    private func drain(
+        type: HealthTypeKey,
+        from start: AnchorToken?,
+        allowance: Int,
+        byteAllowance: Int,
+        scope: AnchorScope
+    ) async throws -> TypeDrain {
+        var result = TypeDrain(anchor: start)
+        guard allowance > 0, byteAllowance > 0 else {
+            result.wasInterrupted = true
+            return result
+        }
+
+        while true {
+            if Task.isCancelled {
+                result.wasInterrupted = true
+                return result
+            }
+            let remaining = allowance - result.changes.count
+            guard remaining > 0, result.bytes < byteAllowance else {
+                result.wasInterrupted = true
+                return result
+            }
+
+            do {
+                let page = try await source.changes(
+                    for: type,
+                    after: result.anchor,
+                    limit: min(Self.pageSize, remaining)
+                )
+                if !page.changes.isEmpty, page.proposedAnchor == result.anchor {
+                    throw DrainError.nonAdvancingAnchor
+                }
+                result.changes.append(contentsOf: page.changes)
+                result.bytes += page.changes.reduce(0) {
+                    $0 + $1.approximateByteCount
+                }
+                result.anchor = page.proposedAnchor
+                if page.changes.isEmpty {
+                    result.isExhausted = true
+                    return result
+                }
+            } catch {
+                let failure = HealthKitFailure.classify(
+                    error,
+                    typeIdentifier: type.rawValue
+                )
+                if failure.kind == .deviceLocked {
+                    // The ordinary background case, not a failure.
+                    result.waitingForUnlock = true
+                    result.wasInterrupted = true
+                    return result
+                }
+                try? await store.recordCoverage(
+                    scope: scope,
+                    type: type,
+                    coverage: failure.coverageState,
+                    failureReason: failure.underlyingDescription
+                )
+                result.wasInterrupted = true
+                return result
+            }
+        }
+    }
+
+    /// Rotates the order types are visited in, by the hour.
+    ///
+    /// The fair share already stops one type eating a whole pass, but the
+    /// second round spends the remainder from the top of the list, so without
+    /// this the same type would always get it. Deriving the offset from the
+    /// clock keeps it deterministic and needs nothing stored.
+    public static func rotated(_ types: [HealthTypeKey], at now: Date) -> [HealthTypeKey] {
+        guard types.count > 1 else {
+            return types
+        }
+        let slot = Int(now.timeIntervalSince1970 / 3_600)
+        let offset = ((slot % types.count) + types.count) % types.count
+        return Array(types[offset...] + types[..<offset])
+    }
+
+    /// Records each type may take before every other type has had a turn.
+    public static func fairShare(candidateCount: Int) -> Int {
+        guard candidateCount > 1 else {
+            return batchRecordLimit
+        }
+        return min(
+            pageSize,
+            max(minimumFairShare, batchRecordLimit / candidateCount)
+        )
+    }
+
+    /// Commits one cursor per type, saying honestly whether the type is caught
+    /// up or merely further along.
+    ///
+    /// This used to write `anchorClosed` for everything it committed, so a
+    /// type cut off by the budget with fifteen thousand records still to come
+    /// was recorded as closed. Nothing was lost — the next pass re-reads from
+    /// the anchor either way — but the store asserted something it could not
+    /// know, and a progress display had no way to tell "caught up" from "cut
+    /// off halfway".
+    ///
+    /// An empty page is the only evidence that a type is caught up, and a type
+    /// that has never produced anything stays indeterminate, because Health
+    /// does not let Hozz tell a denied type from an empty one.
     private func commitAnchors(
-        _ anchors: [HealthTypeKey: AnchorToken],
-        base: [HealthTypeKey: AnchorToken?],
-        counts: [HealthTypeKey: Int],
+        _ states: [HealthTypeKey: TypeState],
         scope: AnchorScope
     ) async throws {
-        guard !anchors.isEmpty else {
+        guard !states.isEmpty else {
             return
         }
-        let commits = anchors
-            .map { type, anchor in
-                PendingAnchorCommit(
+        let closedAt = Date.now
+        let commits = states
+            .compactMap { type, state -> PendingAnchorCommit? in
+                guard let anchor = state.anchor else {
+                    return nil
+                }
+                let observed = state.observedBefore + state.collected
+                let coverage: CoverageState = if !state.isExhausted {
+                    .draining
+                } else if observed == 0 {
+                    .authorizationIndeterminate
+                } else {
+                    .anchorClosed
+                }
+                return PendingAnchorCommit(
                     type: type,
-                    baseAnchor: base[type] ?? nil,
+                    baseAnchor: state.base,
                     anchor: anchor,
-                    coverage: .anchorClosed,
-                    addedRecordCount: counts[type] ?? 0,
-                    addedObservedCount: counts[type] ?? 0,
-                    anchorClosedAt: .now
+                    coverage: coverage,
+                    addedRecordCount: state.collected,
+                    addedObservedCount: state.collected,
+                    anchorClosedAt: state.isExhausted ? closedAt : nil
                 )
             }
             .sorted { $0.type < $1.type }
