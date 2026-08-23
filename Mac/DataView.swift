@@ -109,6 +109,25 @@ struct DataView: View {
                 }
             }
 
+            // A Mac holding one type is almost always a sweep still working
+            // through someone's history, not a broken export. Saying what has
+            // arrived, and how far back it reaches, is what stops that being
+            // read as "I have no heart data".
+            if !services.summaries.isEmpty {
+                Section("What has arrived") {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(coverageHeadline)
+                            .font(.body.weight(.medium))
+                        Text(
+                            "Your phone sends one type at a time, so anything not listed yet is still queued."
+                        )
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+            }
+
             Section("Measurements") {
                 ForEach(services.summaries, id: \.type) { summary in
                     VStack(alignment: .leading, spacing: 3) {
@@ -247,6 +266,26 @@ struct DataView: View {
 
     /// HealthKit identifiers are unreadable in a list; this makes them scannable
     /// without inventing a name that hides which type it really is.
+    /// Types received and how far back they reach.
+    ///
+    /// Deliberately not a fraction of anything: this computer cannot know how
+    /// many types the phone intends to send, still less how many records exist,
+    /// so a denominator here would be a guess dressed as a measurement.
+    private var coverageHeadline: String {
+        let count = services.summaries.count
+        var text = "\(count) health "
+        text += count == 1 ? "type" : "types"
+        text += " received"
+        if let oldest = services.summaries.compactMap(\.earliest).min() {
+            text += ", oldest reaching \(Self.day(oldest))"
+        }
+        return text + "."
+    }
+
+    private static func day(_ date: Date) -> String {
+        date.formatted(.iso8601.year().month().day().dateSeparator(.dash))
+    }
+
     /// What to show beside a characteristic's name.
     ///
     /// Health distinguishes "the person has not set this" from "this could not

@@ -32,6 +32,37 @@ final class SyncViewModel {
     private(set) var lastError: String?
     private(set) var lastSyncSummary: String?
     private(set) var isObserving = false
+    private(set) var backfill: BackfillProgress?
+
+    /// How far the first sweep through someone's history has got.
+    ///
+    /// A full history is drained a bounded batch at a time, type by type, so a
+    /// phone with years of data spends its early passes on whichever types come
+    /// first and has genuinely not looked at the rest yet. Someone seeing one
+    /// type arrive concludes the export is broken, or that they have no heart
+    /// data. Neither is true, and saying which types have been reached is the
+    /// difference between a working sync that looks broken and one that
+    /// explains itself.
+    ///
+    /// Deliberately no percentage. HealthKit will not say how many records a
+    /// type holds without reading all of them, so any fraction would be
+    /// invented — and a progress bar is a promise about time remaining, which
+    /// is the one thing that genuinely cannot be known here.
+    struct BackfillProgress: Equatable {
+        /// Types that have had at least one record drained and committed.
+        let typesReached: Int
+        /// Types this phone is set up to send.
+        let typesSelected: Int
+        let recordsDelivered: Int
+        /// Types Health answered for but had nothing in. Not a failure: an
+        /// empty type is a complete export of nothing.
+        let typesEmpty: Int
+        let typesFailed: Int
+
+        var isUnderway: Bool {
+            typesSelected > 0 && typesReached < typesSelected
+        }
+    }
 
     @ObservationIgnored private var services: HozzServices?
 
@@ -90,10 +121,75 @@ final class SyncViewModel {
                 )
             }
             summaries = built
+            backfill = try await Self.backfillProgress(
+                services: services,
+                destinations: destinations
+            )
             lastError = nil
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    /// Counts how far the sweep has reached, from state the store already
+    /// holds.
+    ///
+    /// A type counts as *reached* once a cursor has been committed for it,
+    /// which is exactly what "Hozz has drained some of this type" means.
+    ///
+    /// It deliberately does **not** claim a type is *finished*. In the sync
+    /// path a cursor is committed with `anchorClosed` whether the type ran out
+    /// of data or the pass ran out of budget, so that state cannot currently
+    /// tell "caught up" from "cut off halfway". Reporting it as complete would
+    /// be the same fabrication as a percentage, just better hidden. When the
+    /// drain records the difference, `typesReached` becomes `typesComplete`
+    /// and nothing else here has to change.
+    private static func backfillProgress(
+        services: HozzServices,
+        destinations: [Destination]
+    ) async throws -> BackfillProgress? {
+        let selected = destinations.reduce(into: Set<HealthTypeKey>()) {
+            $0.formUnion($1.includedTypes)
+        }
+        guard !selected.isEmpty else {
+            // Every type, rather than a chosen subset. Counting the catalog
+            // here would be wrong for someone who narrowed their selection.
+            return nil
+        }
+
+        var reached: Set<HealthTypeKey> = []
+        var empty: Set<HealthTypeKey> = []
+        var failed: Set<HealthTypeKey> = []
+        var records = 0
+
+        for destination in destinations {
+            let streams = try await services.store.streamRecords(
+                scope: .destination(destination.id)
+            )
+            for stream in streams where selected.contains(stream.type) {
+                records += stream.recordCount
+                if stream.recordCount > 0 {
+                    reached.insert(stream.type)
+                } else if stream.coverage == .authorizationIndeterminate {
+                    empty.insert(stream.type)
+                }
+                if stream.failureReason != nil {
+                    failed.insert(stream.type)
+                }
+            }
+        }
+
+        // A type that produced records is reached whatever else it also did.
+        empty.subtract(reached)
+        failed.subtract(reached)
+
+        return BackfillProgress(
+            typesReached: reached.count + empty.count,
+            typesSelected: selected.count,
+            recordsDelivered: records,
+            typesEmpty: empty.count,
+            typesFailed: failed.count
+        )
     }
 
     func save(_ destination: Destination, secret: String?) async {

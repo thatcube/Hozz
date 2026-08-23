@@ -16,6 +16,7 @@ struct SyncDashboardView: View {
     var body: some View {
         List {
             statusSection
+            backfillSection
 
             if model.hasDestinations {
                 Section("Destinations") {
@@ -86,6 +87,64 @@ struct SyncDashboardView: View {
         .refreshable {
             await model.load()
         }
+    }
+
+    /// Says which types have been reached, so a sweep still working through
+    /// someone's history reads as in progress rather than as a finished export
+    /// that is inexplicably missing almost everything.
+    @ViewBuilder
+    private var backfillSection: some View {
+        if let backfill = model.backfill, backfill.typesSelected > 0 {
+            Section("First sync through your history") {
+                Label {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(
+                            "\(backfill.typesReached) of \(backfill.typesSelected) health types reached"
+                        )
+                        .font(.body.weight(.medium))
+
+                        Text(backfillDetail(backfill))
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                } icon: {
+                    Image(
+                        systemName: backfill.isUnderway
+                            ? "arrow.triangle.2.circlepath"
+                            : "checkmark.circle"
+                    )
+                    .foregroundStyle(
+                        backfill.isUnderway ? HozzPalette.action : .green
+                    )
+                }
+            }
+        }
+    }
+
+    private func backfillDetail(
+        _ backfill: SyncViewModel.BackfillProgress
+    ) -> String {
+        var text = ""
+        if backfill.isUnderway {
+            // No percentage and no estimate: Health will not say how much a
+            // type holds without reading all of it, so both would be invented,
+            // and an invented estimate is a promise that gets broken.
+            text = "Hozz works through your types a batch at a time, so the "
+                + "ones not listed yet are queued rather than missing. "
+                + "\(backfill.recordsDelivered.formatted()) records sent so far."
+        } else {
+            text = "Every type you selected has been reached. "
+                + "\(backfill.recordsDelivered.formatted()) records sent so far."
+        }
+        if backfill.typesEmpty > 0 {
+            // An empty type is a complete export of nothing, not a problem.
+            text += " \(backfill.typesEmpty) had no data to send."
+        }
+        if backfill.typesFailed > 0 {
+            text += " \(backfill.typesFailed) could not be read."
+        }
+        return text
     }
 
     private var statusSection: some View {

@@ -12,6 +12,8 @@ Hozz is still early alpha. It currently exports quantity samples, category sampl
 
 The iPhone app has two paths: **Automatic** and **Export**.
 
+A first sync works through your history a bounded batch at a time, one type after another, so a phone with years of data can spend its early passes on a handful of types. The dashboard says how many types have been reached out of those selected, and the Mac says how many have arrived and how far back they reach. Neither shows a percentage or an estimated time: Health will not say how many records a type holds without reading all of them, so any fraction would be invented, and a progress bar is a promise about time remaining.
+
 Automatic export sends new Health records to destinations you configure. Destinations can be limited to selected Health types, turned off, set to run when data arrives, hourly, daily, or only manually, and tested before you trust them. The dashboard shows the last successful delivery, retry or attention states, and a one-tap **Sync now** action. Shortcuts expose **Sync Health Data** and **Check Health Sync Status**.
 
 Supported automatic destinations are:
@@ -263,7 +265,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 368 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, aggregate sample counts, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 372 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, aggregate sample counts, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 
