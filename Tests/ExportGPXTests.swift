@@ -829,6 +829,53 @@ final class ExportGPXTests: XCTestCase {
 
     // MARK: - The format itself
 
+    /// The bytes, not just the tree.
+    ///
+    /// Parsing proves the file is well-formed and correctly ordered, but a
+    /// declaration in the wrong place or a stray blank line is the sort of
+    /// thing a lenient parser forgives and a strict importer does not.
+    func testTheFileBeginsExactlyAsAGPXFileMust() throws {
+        let (entries, _) = try build(completeRoute())
+        let name = try XCTUnwrap(gpxNames(entries).first)
+        let text = String(decoding: try XCTUnwrap(entries[name]), as: UTF8.self)
+
+        let expected = """
+        <?xml version="1.0" encoding="UTF-8"?>
+        <gpx version="1.1" creator="Hozz"
+             xmlns="http://www.topografix.com/GPX/1/1"
+             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+             xmlns:hozz="https://thatcube.github.io/hozz/gpx/1"
+             xsi:schemaLocation="http://www.topografix.com/GPX/1/1 \
+        http://www.topografix.com/GPX/1/1/gpx.xsd">
+          <metadata>
+            <name>Running — 2026-08-22</name>
+            <desc>Running, 30m long, recorded by Apple Watch, exported by Hozz.</desc>
+            <time>2026-08-22T11:00:00.000Z</time>
+          </metadata>
+          <trk>
+            <name>Running — 2026-08-22</name>
+            <desc>Running, 30m long, recorded by Apple Watch, exported by Hozz.</desc>
+            <type>Running</type>
+            <trkseg>
+              <trkpt lat="51.5007" lon="-0.1246">
+                <ele>11.2</ele>
+                <time>2026-08-22T11:00:00.000Z</time>
+                <extensions>
+                    <hozz:speed>3.1</hozz:speed>
+                    <hozz:course>182</hozz:course>
+                    <hozz:horizontalAccuracy>4.1</hozz:horizontalAccuracy>
+                    <hozz:verticalAccuracy>3</hozz:verticalAccuracy>
+                </extensions>
+              </trkpt>
+
+        """
+        XCTAssertTrue(
+            text.hasPrefix(expected),
+            "The file starts:\n\(text.prefix(expected.count + 200))"
+        )
+        XCTAssertTrue(text.hasSuffix("    </trkseg>\n  </trk>\n</gpx>\n"), "Ends: \(text.suffix(80))")
+    }
+
     func testGPXIsOfferedAndDescribedAccurately() {
         XCTAssertTrue(HealthExportFormat.allCases.contains(.gpx))
         XCTAssertEqual(HealthExportFormat.gpx.fileExtension, "zip")
