@@ -614,7 +614,7 @@ enum ExportTranscoder {
     static func header(for kind: String) -> String {
         switch kind {
         case "quantity":
-            "id,type,startDate,endDate,value,unit,sourceName,sourceBundleId,sourceVersion,device,metadata"
+            "id,type,startDate,endDate,value,unit,count,sourceName,sourceBundleId,sourceVersion,device,metadata"
         case "category":
             "id,type,startDate,endDate,value,sourceName,sourceBundleId,sourceVersion,device,metadata"
         case "workout":
@@ -640,6 +640,9 @@ enum ExportTranscoder {
             let quantity = object["quantity"] as? [String: Any] ?? [:]
             fields.append(number(quantity["value"]))
             fields.append(quantity["unit"] as? String ?? "")
+            // A spreadsheet is where an aggregate is most likely to be read as
+            // a single measurement, so the count travels with it.
+            fields.append(number(quantity["count"]))
         case "category":
             fields.append(number(object["value"]))
         case "workout":
