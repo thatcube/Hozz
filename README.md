@@ -38,7 +38,8 @@ Manual exports are built from a canonical NDJSON spool. That spool is the durabl
 | CSV | `.zip` with one CSV per Health type, plus deletion and export-log files when needed | Opens in spreadsheets. Explicitly lossy: metadata and nested workout details do not fit a grid. |
 | JSON | `.zip` containing one JSON array | Convenient for smaller exports and tools that expect a single JSON value. |
 | SQLite | `.sqlite` database | Query it in Datasette, DuckDB, pandas, Grafana, or `sqlite3` with no import step. Not lossy: every row keeps its original record in `raw`. |
-| Raw NDJSON | `.ndjson` | Supported by the export engine for direct piping; the main picker exposes NDJSON, CSV, JSON, and SQLite. |
+| Markdown | `.zip` of one `YYYY-MM-DD.md` note per day | For Obsidian and journals, with YAML front matter Dataview can query. Explicitly lossy: a note keeps a day's totals, never the records behind them. |
+| Raw NDJSON | `.ndjson` | Supported by the export engine for direct piping; the main picker exposes NDJSON, CSV, JSON, SQLite, and Markdown. |
 
 The SQLite file is built for asking questions rather than for mirroring the
 JSON. Everything time-shaped except workouts goes into one wide `sample` table
@@ -56,7 +57,16 @@ offered without the lossy label CSV carries. `meta` records when the export ran,
 what it covered, and which time zone the `local_day` columns were bucketed in —
 a UTC day would file an evening workout under the following morning.
 
-Automatic destinations use `DeliveryFormat`: NDJSON, JSON, CSV, or Metrics JSON. Metrics JSON groups points by metric name for Home Assistant, MQTT, and dashboards; deletions are carried alongside instead of silently dropped. SQLite is deliberately not offered there: a delivery is an append of new records to an endpoint or a folder, and a database file is neither appendable over HTTP nor meaningful one batch at a time.
+The Markdown export is the opposite trade, made deliberately. Each note carries
+YAML front matter for Dataview — steps, sleep hours, workout minutes, resting
+heart rate — then the day in prose and small tables. It keeps a day's counts,
+totals and extremes and throws the records themselves away, along with metadata,
+sources, devices and sample identifiers, so the picker, a `README.md` in the
+archive, and the foot of every single note all say so and point at the formats
+that keep everything. Days are local days, and sleep is filed under the day it
+ended, because last night's sleep belongs to the morning you woke up.
+
+Automatic destinations use `DeliveryFormat`: NDJSON, JSON, CSV, or Metrics JSON. Metrics JSON groups points by metric name for Home Assistant, MQTT, and dashboards; deletions are carried alongside instead of silently dropped. Neither SQLite nor Markdown is offered there: a delivery is an append of new records to an endpoint or a folder, a database file is not appendable over HTTP, and a day's note rewritten from one batch would replace a full day with a fraction of it.
 
 ## Health acquisition and durability
 
@@ -167,7 +177,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 190 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 205 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

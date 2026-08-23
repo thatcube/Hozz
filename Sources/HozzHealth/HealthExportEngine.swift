@@ -750,7 +750,7 @@ public actor HealthExportEngine {
                 )
             }
 
-        case .csv, .json, .sqlite:
+        case .csv, .json, .markdown, .sqlite:
             // These read every record back, so the spool is inflated once to a
             // scratch file and streamed from there.
             let plainURL = spool.appending(
@@ -781,6 +781,21 @@ public actor HealthExportEngine {
                     try ExportTranscoder.writeCSV(
                         readingFrom: plainURL,
                         into: archive
+                    )
+                }
+
+            case .markdown:
+                return try inArchive(
+                    finalURL: finalURL,
+                    modifiedAt: run.startedAt
+                ) { archive in
+                    try ExportMarkdownWriter.write(
+                        readingFrom: plainURL,
+                        into: archive,
+                        metadata: ExportMarkdownWriter.Metadata(
+                            runID: run.id,
+                            startedAt: run.startedAt
+                        )
                     )
                 }
 

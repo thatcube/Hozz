@@ -147,6 +147,7 @@ private struct ExportSetupView: View {
                     Text("CSV").tag(HealthExportFormat.csv)
                     Text("JSON").tag(HealthExportFormat.json)
                     Text("SQLite").tag(HealthExportFormat.sqlite)
+                    Text("Markdown").tag(HealthExportFormat.markdown)
                 }
                 .disabled(resumable != nil)
 
@@ -205,6 +206,8 @@ private struct ExportSetupView: View {
             "One array. Easiest to read, heaviest to open when large."
         case .sqlite:
             "A database you can query. Keeps every record as it was written."
+        case .markdown:
+            "A note per day for Obsidian. Drops the records behind the totals."
         case .raw:
             "Uncompressed. Can be several gigabytes."
         }
@@ -220,6 +223,8 @@ private struct ExportSetupView: View {
             "curlybraces"
         case .sqlite:
             "cylinder.split.1x2"
+        case .markdown:
+            "calendar"
         case .raw:
             "doc.plaintext"
         }

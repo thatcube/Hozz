@@ -209,31 +209,25 @@ struct LocalDayFormatter {
 
     /// The `YYYY-MM-DD` day `date` fell on locally.
     mutating func day(for date: Date) -> String {
-        let local = date.timeIntervalSince1970
-            + Double(timeZone.secondsFromGMT(for: date))
-        let dayNumber = Int((local / 86_400).rounded(.down))
-        if let cached = cache[dayNumber] {
+        let number = dayNumber(for: date)
+        if let cached = cache[number] {
             return cached
         }
-        let text = Self.text(forDayNumber: dayNumber)
+        let text = Self.text(forDayNumber: number)
         // Bounded by the number of distinct days an export covers, which is
         // years of history at worst.
-        cache[dayNumber] = text
+        cache[number] = text
         return text
     }
 
-    /// Days since the Unix epoch for a `YYYY-MM-DD` string.
-    static func dayNumber(for text: String) -> Int? {
-        let parts = text.split(separator: "-")
-        guard
-            parts.count == 3,
-            let year = Int(parts[0]),
-            let month = Int(parts[1]),
-            let day = Int(parts[2])
-        else {
-            return nil
-        }
-        return daysFromCivil(year: year, month: month, day: day)
+    /// Days since the Unix epoch for the local day `date` fell on.
+    ///
+    /// The day *number* is the useful form when days are being grouped, since
+    /// it sorts and compares without touching a string.
+    func dayNumber(for date: Date) -> Int {
+        let local = date.timeIntervalSince1970
+            + Double(timeZone.secondsFromGMT(for: date))
+        return Int((local / 86_400).rounded(.down))
     }
 
     static func text(forDayNumber dayNumber: Int) -> String {
@@ -262,16 +256,5 @@ struct LocalDayFormatter {
         let day = dayOfYear - (153 * monthPrime + 2) / 5 + 1
         let month = monthPrime < 10 ? monthPrime + 3 : monthPrime - 9
         return (month <= 2 ? year + 1 : year, month, day)
-    }
-
-    /// The inverse, so a day string can be turned back into an instant.
-    static func daysFromCivil(year y: Int, month m: Int, day d: Int) -> Int {
-        let year = m <= 2 ? y - 1 : y
-        let era = (year >= 0 ? year : year - 399) / 400
-        let yearOfEra = year - era * 400
-        let dayOfYear = (153 * (m > 2 ? m - 3 : m + 9) + 2) / 5 + d - 1
-        let dayOfEra =
-            yearOfEra * 365 + yearOfEra / 4 - yearOfEra / 100 + dayOfYear
-        return era * 146_097 + dayOfEra - 719_468
     }
 }
