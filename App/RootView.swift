@@ -146,6 +146,7 @@ private struct ExportSetupView: View {
                     Text("NDJSON").tag(HealthExportFormat.ndjson)
                     Text("CSV").tag(HealthExportFormat.csv)
                     Text("JSON").tag(HealthExportFormat.json)
+                    Text("SQLite").tag(HealthExportFormat.sqlite)
                 }
                 .disabled(resumable != nil)
 
@@ -202,6 +203,8 @@ private struct ExportSetupView: View {
             "A spreadsheet per data type. Drops metadata and workout details."
         case .json:
             "One array. Easiest to read, heaviest to open when large."
+        case .sqlite:
+            "A database you can query. Keeps every record as it was written."
         case .raw:
             "Uncompressed. Can be several gigabytes."
         }
@@ -215,6 +218,8 @@ private struct ExportSetupView: View {
             "tablecells"
         case .json:
             "curlybraces"
+        case .sqlite:
+            "cylinder.split.1x2"
         case .raw:
             "doc.plaintext"
         }

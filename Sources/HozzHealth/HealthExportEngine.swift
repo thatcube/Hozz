@@ -729,18 +729,14 @@ public actor HealthExportEngine {
         let partURLs = parts.map { spool.appending(path: $0.fileName) }
         let baseName = "hozz-health-export-\(run.id.uuidString.lowercased())"
 
-        if format == .raw {
+        switch format {
+        case .raw:
             return try ExportPartJoiner.join(sourceURLs: partURLs, into: finalURL)
-        }
 
-        let archive = try ZipStreamWriter(
-            destinationURL: finalURL,
-            modifiedAt: run.startedAt
-        )
-        do {
-            switch format {
-            case .ndjson:
-                // The parts are already deflate-compressed, so this is a copy.
+        case .ndjson:
+            // The parts are already deflate-compressed, so this is a copy.
+            return try inArchive(finalURL: finalURL, modifiedAt: run.startedAt) {
+                archive in
                 try archive.addEntry(
                     name: "\(baseName).ndjson",
                     copying: parts.map { part in
@@ -752,32 +748,70 @@ public actor HealthExportEngine {
                         )
                     }
                 )
+            }
 
-            case .csv, .json:
-                // These have to read every record back, so the spool is first
-                // inflated to a scratch file and streamed from there.
-                let plainURL = spool.appending(
-                    path: "transcode-\(UUID().uuidString.lowercased()).ndjson"
+        case .csv, .json, .sqlite:
+            // These read every record back, so the spool is inflated once to a
+            // scratch file and streamed from there.
+            let plainURL = spool.appending(
+                path: "transcode-\(UUID().uuidString.lowercased()).ndjson"
+            )
+            defer { try? FileManager.default.removeItem(at: plainURL) }
+            try ExportPartInflater.inflate(partURLs: partURLs, into: plainURL)
+
+            switch format {
+            case .sqlite:
+                // A database is not a container of files, so it is built
+                // directly rather than placed inside an archive.
+                try ExportSQLiteWriter.write(
+                    readingFrom: plainURL,
+                    to: finalURL,
+                    metadata: ExportSQLiteWriter.Metadata(
+                        runID: run.id,
+                        startedAt: run.startedAt
+                    )
                 )
-                defer { try? FileManager.default.removeItem(at: plainURL) }
-                try ExportPartInflater.inflate(partURLs: partURLs, into: plainURL)
+                return try Self.byteCount(of: finalURL)
 
-                if format == .csv {
+            case .csv:
+                return try inArchive(
+                    finalURL: finalURL,
+                    modifiedAt: run.startedAt
+                ) { archive in
                     try ExportTranscoder.writeCSV(
                         readingFrom: plainURL,
                         into: archive
                     )
-                } else {
+                }
+
+            default:
+                return try inArchive(
+                    finalURL: finalURL,
+                    modifiedAt: run.startedAt
+                ) { archive in
                     try ExportTranscoder.writeJSON(
                         readingFrom: plainURL,
                         into: archive,
                         entryName: "\(baseName).json"
                     )
                 }
-
-            case .raw:
-                break
             }
+        }
+    }
+
+    /// Runs `body` against a new archive, abandoning it if anything throws so a
+    /// half-written file is never left where a finished one belongs.
+    private func inArchive(
+        finalURL: URL,
+        modifiedAt: Date,
+        _ body: (ZipStreamWriter) throws -> Void
+    ) throws -> UInt64 {
+        let archive = try ZipStreamWriter(
+            destinationURL: finalURL,
+            modifiedAt: modifiedAt
+        )
+        do {
+            try body(archive)
             return try archive.finish()
         } catch {
             archive.abandon()
