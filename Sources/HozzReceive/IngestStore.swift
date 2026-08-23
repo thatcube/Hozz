@@ -230,6 +230,35 @@ public actor IngestStore {
             return
         }
         try database.transaction {
+            // Before the schema below, not after, because that schema creates
+            // an index on `parser_version`. A receiver upgrading from version
+            // 3 already has `unhandled_record` without the column, so
+            // CREATE TABLE IF NOT EXISTS leaves it alone and the index then
+            // refers to a column that does not exist — which fails the whole
+            // transaction and leaves the database unopenable rather than
+            // merely unmigrated.
+            //
+            // An empty result means the table is absent, which is a fresh
+            // install: nothing to alter, and the schema below creates it with
+            // the column already present.
+            //
+            // The default of 0 is deliberately below every real parser
+            // version, so rows quarantined before promotion existed are all
+            // reconsidered exactly once.
+            let quarantineColumns = try database.query(
+                "PRAGMA table_info(unhandled_record)",
+                row: { $0.text(1) }
+            )
+            if !quarantineColumns.isEmpty,
+               !quarantineColumns.contains("parser_version") {
+                try database.execute(
+                    """
+                    ALTER TABLE unhandled_record
+                        ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+            }
+
             try database.execute(
                 """
                 CREATE TABLE IF NOT EXISTS sample (
@@ -496,23 +525,6 @@ public actor IngestStore {
                 );
                 """
             )
-
-            // A receiver upgrading from 3 already has the table without the
-            // column, so it is added rather than recreated. The default of 0
-            // is deliberately below every real parser version, so rows
-            // quarantined before promotion existed are all reconsidered once.
-            let columns = try database.query(
-                "PRAGMA table_info(unhandled_record)",
-                row: { $0.text(1) }
-            )
-            if !columns.contains("parser_version") {
-                try database.execute(
-                    """
-                    ALTER TABLE unhandled_record
-                        ADD COLUMN parser_version INTEGER NOT NULL DEFAULT 0
-                    """
-                )
-            }
 
             try database.execute("PRAGMA user_version = 7")
         }
