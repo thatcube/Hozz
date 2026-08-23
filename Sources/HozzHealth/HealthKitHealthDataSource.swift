@@ -30,7 +30,8 @@ public actor HealthKitHealthDataSource: HealthDataSource {
     private let healthStore: HKHealthStore
     private let encoder: HealthSampleEncoder
     private let typesByKey: [HealthTypeKey: ExportableHealthType]
-    private let routes: WorkoutRouteReader
+    private let routes: SeriesReader<HealthKitWorkoutRouteBackend>
+    private let electrocardiograms: SeriesReader<HealthKitElectrocardiogramBackend>
     private var encodingErrors: [HealthTypeKey: Int] = [:]
 
     public init(
@@ -40,8 +41,17 @@ public actor HealthKitHealthDataSource: HealthDataSource {
     ) {
         self.healthStore = healthStore
         self.encoder = encoder
-        self.routes = WorkoutRouteReader(
+        self.routes = SeriesReader(
+            shape: WorkoutRouteEncoding.shape,
             backend: HealthKitWorkoutRouteBackend(
+                healthStore: healthStore,
+                encoder: encoder
+            ),
+            encoder: encoder
+        )
+        self.electrocardiograms = SeriesReader(
+            shape: ElectrocardiogramEncoding.shape,
+            backend: HealthKitElectrocardiogramBackend(
                 healthStore: healthStore,
                 encoder: encoder
             ),
@@ -71,10 +81,20 @@ public actor HealthKitHealthDataSource: HealthDataSource {
             throw HealthKitSourceError.unsupportedType(type.rawValue)
         }
 
-        // A route's content is a separate stream, so it is paged by position
-        // inside the route rather than by HealthKit's anchor alone.
+        // A series sample's content is a separate stream, so it is paged by
+        // position inside the sample rather than by HealthKit's anchor alone.
         if exportable.catalogEntry.family == .series {
-            return try await routes.changes(after: anchor, limit: limit)
+            switch type.rawValue {
+            case WorkoutRouteEncoding.typeIdentifier:
+                return try await routes.changes(after: anchor, limit: limit)
+            case ElectrocardiogramEncoding.typeIdentifier:
+                return try await electrocardiograms.changes(
+                    after: anchor,
+                    limit: limit
+                )
+            default:
+                throw HealthKitSourceError.unsupportedType(type.rawValue)
+            }
         }
 
         let startAnchor = try HealthKitAnchorCoding.anchor(for: anchor)

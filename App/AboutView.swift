@@ -35,10 +35,11 @@ struct AboutView: View {
                 CoverageRow("Quantity and category samples", available: true)
                 CoverageRow("Basic workout records", available: true)
                 CoverageRow("Workout routes", available: true)
+                CoverageRow("Electrocardiograms", available: true)
                 CoverageRow("Health characteristics", available: true)
                 CoverageRow("Historical deletions", available: true)
                 CoverageRow(
-                    "Correlations, ECG, audiograms, documents, and clinical records",
+                    "Correlations, audiograms, documents, and clinical records",
                     available: false
                 )
             }

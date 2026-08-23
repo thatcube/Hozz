@@ -66,7 +66,8 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
             "HKDocumentTypeIdentifier",
             "HKScoredAssessmentTypeIdentifier",
             "HKWorkoutRouteTypeIdentifier",
-            "HKWorkoutTypeIdentifier"
+            "HKWorkoutTypeIdentifier",
+            "HKDataTypeIdentifier"
         ]
         for prefix in prefixes where name.hasPrefix(prefix) {
             name.removeFirst(prefix.count)
@@ -104,14 +105,21 @@ public enum HealthTypeCatalog {
                 family: .workout,
                 introduced: IOSVersion(major: 8, minor: 0)
             ),
-            // Not in the generated catalog because it is not a type identifier
-            // Apple lists with the others: a route is reached through
-            // `HKSeriesType.workoutRoute()`. It is anchored and drained like
-            // any other sample, and its locations are streamed separately.
+            // Not in the generated catalog because they are not type
+            // identifiers Apple lists with the others: a route is reached
+            // through `HKSeriesType.workoutRoute()` and an electrocardiogram
+            // through `HKObjectType.electrocardiogramType()`. Both are
+            // anchored and drained like any other sample, and their contents
+            // are streamed separately.
             HealthCatalogEntry(
                 identifier: "HKWorkoutRouteTypeIdentifier",
                 family: .series,
                 introduced: IOSVersion(major: 11, minor: 0)
+            ),
+            HealthCatalogEntry(
+                identifier: "HKDataTypeIdentifierElectrocardiogram",
+                family: .series,
+                introduced: IOSVersion(major: 14, minor: 0)
             )
         ]
 
