@@ -226,7 +226,7 @@ public actor IngestStore {
     private static func migrate(_ database: SQLiteDatabase) throws {
         let version = try database.query("PRAGMA user_version", row: { $0.integer(0) })
             .first ?? 0
-        guard version < 6 else {
+        guard version < 7 else {
             return
         }
         try database.transaction {
@@ -434,6 +434,54 @@ public actor IngestStore {
                 CREATE INDEX IF NOT EXISTS dose_medication
                     ON medication_dose (medication_name, start_date);
 
+                -- What Health computed about how a workout went. The workout
+                -- keeps its `sample` row as well — a workout's own number is
+                -- its duration — so it still appears in type lists and counts.
+                -- This holds the aggregates that row cannot.
+                CREATE TABLE IF NOT EXISTS workout_detail (
+                    id TEXT PRIMARY KEY,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT,
+                    activity_type INTEGER,
+                    duration_seconds REAL,
+                    source_name TEXT,
+                    received_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS workout_detail_start
+                    ON workout_detail (start_date);
+
+                -- One row per measured quantity per workout, rather than a
+                -- column per quantity: Health decides which statistics a
+                -- workout carries, and a fixed set of columns would silently
+                -- drop the ones this build had not thought of.
+                CREATE TABLE IF NOT EXISTS workout_statistic (
+                    workout_id TEXT NOT NULL,
+                    -- Empty for the workout as a whole; otherwise the leg.
+                    activity_id TEXT NOT NULL DEFAULT '',
+                    type TEXT NOT NULL,
+                    unit TEXT,
+                    sum REAL,
+                    average REAL,
+                    minimum REAL,
+                    maximum REAL,
+                    PRIMARY KEY (workout_id, activity_id, type)
+                );
+
+                -- A triathlon is one workout and three efforts, and an average
+                -- across all three describes none of them.
+                CREATE TABLE IF NOT EXISTS workout_activity (
+                    id TEXT PRIMARY KEY,
+                    workout_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    activity_type INTEGER,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT
+                );
+
+                CREATE INDEX IF NOT EXISTS workout_activity_workout
+                    ON workout_activity (workout_id, ordinal);
+
                 CREATE TABLE IF NOT EXISTS audiogram_point (
                     audiogram_id TEXT NOT NULL,
                     frequency REAL NOT NULL,
@@ -466,7 +514,7 @@ public actor IngestStore {
                 )
             }
 
-            try database.execute("PRAGMA user_version = 6")
+            try database.execute("PRAGMA user_version = 7")
         }
     }
 
@@ -757,6 +805,69 @@ public actor IngestStore {
             storedAudiograms += 1
         }
 
+
+        for workout in batch.workoutDetails {
+            try database.run(
+                """
+                INSERT INTO workout_detail
+                    (id, start_date, end_date, activity_type, duration_seconds,
+                     source_name, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    start_date = excluded.start_date,
+                    end_date = excluded.end_date,
+                    activity_type = excluded.activity_type,
+                    duration_seconds = excluded.duration_seconds,
+                    source_name = excluded.source_name
+                """,
+                [
+                    .text(workout.id),
+                    .text(Timestamps.text(from: workout.startDate)),
+                    workout.endDate.map { SQLiteValue.text(Timestamps.text(from: $0)) } ?? .null,
+                    workout.activityType.map { SQLiteValue.integer(Int64($0)) } ?? .null,
+                    workout.duration.map { SQLiteValue.real($0) } ?? .null,
+                    workout.sourceName.map { SQLiteValue.text($0) } ?? .null,
+                    .text(timestamp)
+                ]
+            )
+            try writeStatistics(
+                workout.statistics,
+                workoutID: workout.id,
+                activityID: "",
+                into: database
+            )
+
+            for (ordinal, activity) in workout.activities.enumerated() {
+                try database.run(
+                    """
+                    INSERT INTO workout_activity
+                        (id, workout_id, ordinal, activity_type, start_date, end_date)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (id) DO UPDATE SET
+                        workout_id = excluded.workout_id,
+                        ordinal = excluded.ordinal,
+                        activity_type = excluded.activity_type,
+                        start_date = excluded.start_date,
+                        end_date = excluded.end_date
+                    """,
+                    [
+                        .text(activity.id),
+                        .text(workout.id),
+                        .integer(Int64(ordinal)),
+                        .integer(Int64(activity.activityType)),
+                        .text(Timestamps.text(from: activity.startDate)),
+                        activity.endDate.map { SQLiteValue.text(Timestamps.text(from: $0)) } ?? .null
+                    ]
+                )
+                try writeStatistics(
+                    activity.statistics,
+                    workoutID: workout.id,
+                    activityID: activity.id,
+                    into: database
+                )
+            }
+        }
+
         for mood in batch.moodEntries {
             try database.run(
                 """
@@ -830,6 +941,40 @@ public actor IngestStore {
         _ = (storedElectrocardiograms, storedVoltagePages, storedAudiograms)
 
         return (stored, deleted, storedCharacteristics, storedUnhandled)
+    }
+
+
+    private static func writeStatistics(
+        _ statistics: [ReceivedWorkoutDetail.Statistic],
+        workoutID: String,
+        activityID: String,
+        into database: SQLiteDatabase
+    ) throws {
+        for statistic in statistics {
+            try database.run(
+                """
+                INSERT INTO workout_statistic
+                    (workout_id, activity_id, type, unit, sum, average, minimum, maximum)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (workout_id, activity_id, type) DO UPDATE SET
+                    unit = excluded.unit,
+                    sum = excluded.sum,
+                    average = excluded.average,
+                    minimum = excluded.minimum,
+                    maximum = excluded.maximum
+                """,
+                [
+                    .text(workoutID),
+                    .text(activityID),
+                    .text(statistic.type),
+                    .text(statistic.unit),
+                    statistic.sum.map { SQLiteValue.real($0) } ?? .null,
+                    statistic.average.map { SQLiteValue.real($0) } ?? .null,
+                    statistic.minimum.map { SQLiteValue.real($0) } ?? .null,
+                    statistic.maximum.map { SQLiteValue.real($0) } ?? .null
+                ]
+            )
+        }
     }
 
     private func isKnownBatch(_ key: String) throws -> Bool {
@@ -1426,6 +1571,111 @@ public actor IngestStore {
                 )
             }
             .sorted { $0.medication < $1.medication }
+    }
+
+
+    public struct StoredWorkoutStatistic: Hashable, Sendable {
+        public let type: String
+        public let unit: String?
+        public let sum: Double?
+        public let average: Double?
+        public let minimum: Double?
+        public let maximum: Double?
+    }
+
+    public struct StoredWorkoutActivity: Hashable, Sendable {
+        public let activityType: Int
+        public let startDate: Date
+        public let statistics: [StoredWorkoutStatistic]
+    }
+
+    public struct StoredWorkout: Hashable, Sendable {
+        public let id: String
+        public let startDate: Date
+        public let activityType: Int?
+        public let duration: Double?
+        public let sourceName: String?
+        public let statistics: [StoredWorkoutStatistic]
+        public let activities: [StoredWorkoutActivity]
+    }
+
+    private func statistics(
+        workoutID: String,
+        activityID: String
+    ) throws -> [StoredWorkoutStatistic] {
+        try database.query(
+            """
+            SELECT type, unit, sum, average, minimum, maximum
+              FROM workout_statistic
+             WHERE workout_id = ? AND activity_id = ?
+             ORDER BY type
+            """,
+            [.text(workoutID), .text(activityID)],
+            row: { row in
+                StoredWorkoutStatistic(
+                    type: row.text(0),
+                    unit: row.optionalText(1),
+                    sum: row.optionalReal(2),
+                    average: row.optionalReal(3),
+                    minimum: row.optionalReal(4),
+                    maximum: row.optionalReal(5)
+                )
+            }
+        )
+    }
+
+    /// Workouts with what Health computed about them, newest first.
+    public func workouts(
+        from start: Date? = nil,
+        limit: Int = 100
+    ) throws -> [StoredWorkout] {
+        var sql = """
+            SELECT id, start_date, activity_type, duration_seconds, source_name
+              FROM workout_detail
+            """
+        var parameters: [SQLiteValue] = []
+        if let start {
+            sql += " WHERE start_date >= ?"
+            parameters.append(.text(Timestamps.text(from: start)))
+        }
+        sql += " ORDER BY start_date DESC LIMIT ?"
+        parameters.append(.integer(Int64(limit)))
+
+        let rows = try database.query(sql, parameters) { row in
+            (
+                row.text(0),
+                Timestamps.date(from: row.text(1)) ?? .distantPast,
+                row.optionalInteger(2).map { Int($0) },
+                row.optionalReal(3),
+                row.optionalText(4)
+            )
+        }
+
+        return try rows.map { id, start, activityType, duration, source in
+            let legs = try database.query(
+                """
+                SELECT id, activity_type, start_date FROM workout_activity
+                 WHERE workout_id = ? ORDER BY ordinal
+                """,
+                [.text(id)],
+                row: { ($0.text(0), Int($0.integer(1)), $0.text(2)) }
+            )
+            return StoredWorkout(
+                id: id,
+                startDate: start,
+                activityType: activityType,
+                duration: duration,
+                sourceName: source,
+                statistics: try statistics(workoutID: id, activityID: ""),
+                activities: try legs.map { legID, type, legStart in
+                    StoredWorkoutActivity(
+                        activityType: type,
+                        startDate: Timestamps.date(from: legStart) ?? .distantPast,
+                        statistics: try statistics(workoutID: id, activityID: legID)
+                    )
+                }
+            )
+        }
     }
 
     /// Aggregates one type into time buckets.

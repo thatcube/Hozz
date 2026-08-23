@@ -85,6 +85,13 @@ knowing who *me* is the failure worth designing against.
 | `list_audiograms` | Hearing tests, with the threshold at each frequency for each ear. |
 | `list_mood_entries` | State of Mind entries with their classification, kind, labels and associations. |
 | `summarise_medication_adherence` | Dose events per medicine, counted by status. |
+| `list_workouts` | Workouts with what Health computed about each: heart rate, energy, distance, and each leg of a multi-sport workout separately. |
+
+A workout keeps its sample row too, with its **duration** as the value, so "how
+long do I work out" charts like anything else — dropping it would have hidden
+workouts from the type list altogether. What Health computed about how it went
+lives alongside. A figure Health did not compute is omitted rather than shown as
+zero, because a zero average heart rate reads as a measurement.
 
 Mood is also an ordinary chartable type: its valence lands in `sample` as a real
 value, so `aggregate_health_data`, `analyse_health_trend` and

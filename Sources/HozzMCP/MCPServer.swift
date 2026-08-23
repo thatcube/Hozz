@@ -137,6 +137,8 @@ public actor MCPServer {
             return try await moodEntries(arguments)
         case "summarise_medication_adherence":
             return try await medicationAdherence(arguments)
+        case "list_workouts":
+            return try await workouts(arguments)
         default:
             throw MCPError.unknownTool(name)
         }
@@ -500,6 +502,97 @@ public actor MCPServer {
         }
         return text
     }
+
+
+    private func workouts(_ arguments: [String: Any]) async throws -> String {
+        let days = min(max((arguments["days"] as? Int) ?? 90, 1), 3_650)
+        let limit = min((arguments["limit"] as? Int) ?? 50, 500)
+        let workouts = try await store.workouts(
+            from: Date.now.addingTimeInterval(-Double(days) * 86_400),
+            limit: limit
+        )
+        guard !workouts.isEmpty else {
+            return """
+                No workouts in the last \(days) days. If your phone has not \
+                finished its first sync they may not have arrived yet, rather \
+                than not existing.
+                """
+        }
+
+        var text = ""
+        for workout in workouts {
+            text += "\(Self.day(workout.startDate)) — "
+            text += Self.activityName(workout.activityType)
+            if let duration = workout.duration {
+                text += ", \(Int((duration / 60).rounded())) min"
+            }
+            if let source = workout.sourceName {
+                text += ", from \(source)"
+            }
+            text += "\n"
+
+            if workout.statistics.isEmpty {
+                // Health did not compute any, which is different from Hozz
+                // having failed to read them.
+                text += "  (Health recorded no statistics for this workout)\n"
+            }
+            for statistic in workout.statistics {
+                text += "  \(Self.describe(statistic))\n"
+            }
+
+            for (index, activity) in workout.activities.enumerated() {
+                text += "  Leg \(index + 1): "
+                text += Self.activityName(activity.activityType) + "\n"
+                for statistic in activity.statistics {
+                    text += "    \(Self.describe(statistic))\n"
+                }
+            }
+            text += "\n"
+        }
+        return text
+    }
+
+    /// One statistic, reporting only the figures Health actually computed.
+    ///
+    /// A missing average is left out rather than shown as zero: Health does
+    /// not compute every figure for every quantity, and a zero average heart
+    /// rate would read as a measurement.
+    private static func describe(
+        _ statistic: IngestStore.StoredWorkoutStatistic
+    ) -> String {
+        var parts: [String] = []
+        if let sum = statistic.sum {
+            parts.append("total \(number(sum))")
+        }
+        if let average = statistic.average {
+            parts.append("average \(number(average))")
+        }
+        if let minimum = statistic.minimum {
+            parts.append("min \(number(minimum))")
+        }
+        if let maximum = statistic.maximum {
+            parts.append("max \(number(maximum))")
+        }
+        let name = statistic.type
+            .replacingOccurrences(of: "HKQuantityTypeIdentifier", with: "")
+        let unit = statistic.unit.map { " \($0)" } ?? ""
+        return "\(name): \(parts.joined(separator: ", "))\(unit)"
+    }
+
+    private static func activityName(_ activityType: Int?) -> String {
+        guard let activityType else {
+            return "Workout"
+        }
+        return activityNames[activityType] ?? "Activity \(activityType)"
+    }
+
+    private static let activityNames: [Int: String] = [
+        13: "Cycling", 16: "Elliptical", 20: "Functional strength training",
+        24: "Hiking", 35: "Rowing", 37: "Running", 44: "Stair climbing",
+        46: "Swimming", 50: "Traditional strength training", 52: "Walking",
+        57: "Yoga", 63: "High intensity interval training",
+        82: "Swim bike run", 83: "Transition", 3_000: "Other"
+    ]
 
     // MARK: - ECG and hearing
 
@@ -1096,6 +1189,24 @@ enum Tools {
                 "type": "object",
                 "properties": [
                     "days": ["type": "integer", "description": "How far back to look. Defaults to 90."]
+                ] as [String: Any]
+            ]
+        ],
+        [
+            "name": "list_workouts",
+            "description": """
+                Workouts with what Health computed about each one: average, \
+                minimum and maximum heart rate, energy burned, distance, and \
+                whatever else it measured. A multi-sport workout also reports \
+                each leg separately, because an average across a swim, a ride \
+                and a run describes none of them. This is the tool for "how \
+                did that run go" and "what was my average heart rate on it".
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "days": ["type": "integer", "description": "How far back to look. Defaults to 90."],
+                    "limit": ["type": "integer", "description": "How many workouts. Defaults to 50."]
                 ] as [String: Any]
             ]
         ],

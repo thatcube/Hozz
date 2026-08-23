@@ -315,6 +315,7 @@ public struct ParsedBatch: Hashable, Sendable {
     public let audiograms: [ReceivedAudiogram]
     public let moodEntries: [ReceivedMoodEntry]
     public let medicationDoses: [ReceivedMedicationDose]
+    public let workoutDetails: [ReceivedWorkoutDetail]
     /// Records the receiver could not interpret. They are still stored, so this
     /// is a list of things to teach it about rather than a list of losses.
     public let unhandled: [UnhandledRecord]
@@ -331,6 +332,7 @@ public struct ParsedBatch: Hashable, Sendable {
             && audiograms.isEmpty
             && moodEntries.isEmpty
             && medicationDoses.isEmpty
+            && workoutDetails.isEmpty
             && unhandled.isEmpty
     }
 
@@ -343,6 +345,7 @@ public struct ParsedBatch: Hashable, Sendable {
         audiograms: [ReceivedAudiogram] = [],
         moodEntries: [ReceivedMoodEntry] = [],
         medicationDoses: [ReceivedMedicationDose] = [],
+        workoutDetails: [ReceivedWorkoutDetail] = [],
         unhandled: [UnhandledRecord] = [],
         unreadableCount: Int
     ) {
@@ -354,6 +357,7 @@ public struct ParsedBatch: Hashable, Sendable {
         self.audiograms = audiograms
         self.moodEntries = moodEntries
         self.medicationDoses = medicationDoses
+        self.workoutDetails = workoutDetails
         self.unhandled = unhandled
         self.unreadableCount = unreadableCount
     }
@@ -390,7 +394,8 @@ public enum BatchParser {
     /// - 2: characteristics, and quarantine instead of dropping.
     /// - 3: ECG readings, their voltage pages, and audiograms.
     /// - 4: State of Mind valence, and medication doses.
-    public static let parserVersion = 4
+    /// - 5: workout statistics and per-activity legs.
+    public static let parserVersion = 5
 
     public static func parse(_ payload: Data) throws -> ParsedBatch {
         let text = String(decoding: payload, as: UTF8.self)
@@ -479,6 +484,7 @@ public enum BatchParser {
             audiograms: batch.audiograms,
             moodEntries: batch.moodEntries,
             medicationDoses: batch.medicationDoses,
+            workoutDetails: batch.workoutDetails,
             unhandled: batch.unhandled + quarantined,
             unreadableCount: batch.unreadableCount + unreadable
         )
@@ -493,6 +499,7 @@ public enum BatchParser {
         var audiograms: [ReceivedAudiogram] = []
         var moodEntries: [ReceivedMoodEntry] = []
         var medicationDoses: [ReceivedMedicationDose] = []
+        var workoutDetails: [ReceivedWorkoutDetail] = []
         var unhandled: [UnhandledRecord] = []
         var unreadable = 0
 
@@ -560,6 +567,13 @@ public enum BatchParser {
                     medicationDoses.append(dose)
                     continue
                 }
+            case WorkoutDetailShape.kind:
+                // Not `continue`: the workout stays an ordinary sample row so
+                // it still appears in type lists and counts. This only adds
+                // what Health computed about how it went.
+                if let detail = WorkoutDetailShape.detail(in: object) {
+                    workoutDetails.append(detail)
+                }
             case ElectrocardiogramShape.headerKind:
                 if let ecg = ElectrocardiogramShape.reading(in: object) {
                     electrocardiograms.append(ecg)
@@ -611,6 +625,7 @@ public enum BatchParser {
             audiograms: audiograms,
             moodEntries: moodEntries,
             medicationDoses: medicationDoses,
+            workoutDetails: workoutDetails,
             unhandled: unhandled,
             unreadableCount: unreadable
         )
@@ -676,6 +691,16 @@ public enum BatchParser {
         if value == nil, let valence = numeric(object["valence"]) {
             value = valence
             unit = unit ?? "valence"
+        }
+        // A workout's own number is how long it lasted. It keeps its sample
+        // row — dropping it would hide workouts from the type list entirely —
+        // and a duration is a real, chartable quantity, so "how long do I work
+        // out" is answerable without anything bespoke. Everything Health
+        // computed about how it went lives in the workout tables.
+        if value == nil, object["kind"] as? String == "workout",
+           let duration = numeric(object["duration"]) {
+            value = duration
+            unit = unit ?? "sec"
         }
 
         var sourceName: String?
@@ -1239,5 +1264,158 @@ enum MoodAndMedicationShape {
 
     private static func names(in value: Any?) -> [String] {
         (value as? [[String: Any]])?.compactMap { $0["name"] as? String } ?? []
+    }
+}
+
+/// What Health computed about how a workout went.
+///
+/// Health carries these on the workout sample it already hands over, so they
+/// cost no extra query. Without them a workout is an activity type and a
+/// duration: you can tell a run happened and nothing about how it went.
+public struct ReceivedWorkoutDetail: Hashable, Sendable {
+    public struct Statistic: Hashable, Sendable {
+        public let type: String
+        public let unit: String
+        public let sum: Double?
+        public let average: Double?
+        public let minimum: Double?
+        public let maximum: Double?
+
+        public init(
+            type: String,
+            unit: String,
+            sum: Double?,
+            average: Double?,
+            minimum: Double?,
+            maximum: Double?
+        ) {
+            self.type = type
+            self.unit = unit
+            self.sum = sum
+            self.average = average
+            self.minimum = minimum
+            self.maximum = maximum
+        }
+    }
+
+    /// One leg of a multi-sport workout: a swim, then a ride, then a run.
+    public struct Activity: Hashable, Sendable {
+        public let id: String
+        public let activityType: Int
+        public let startDate: Date
+        public let endDate: Date?
+        public let statistics: [Statistic]
+
+        public init(
+            id: String,
+            activityType: Int,
+            startDate: Date,
+            endDate: Date?,
+            statistics: [Statistic]
+        ) {
+            self.id = id
+            self.activityType = activityType
+            self.startDate = startDate
+            self.endDate = endDate
+            self.statistics = statistics
+        }
+    }
+
+    public let id: String
+    public let startDate: Date
+    public let endDate: Date?
+    public let activityType: Int?
+    public let duration: Double?
+    public let sourceName: String?
+    public let statistics: [Statistic]
+    /// Empty for an ordinary workout. A triathlon is one workout and three
+    /// efforts, and an average across all three describes none of them.
+    public let activities: [Activity]
+
+    public init(
+        id: String,
+        startDate: Date,
+        endDate: Date?,
+        activityType: Int?,
+        duration: Double?,
+        sourceName: String?,
+        statistics: [Statistic],
+        activities: [Activity]
+    ) {
+        self.id = id
+        self.startDate = startDate
+        self.endDate = endDate
+        self.activityType = activityType
+        self.duration = duration
+        self.sourceName = sourceName
+        self.statistics = statistics
+        self.activities = activities
+    }
+}
+
+enum WorkoutDetailShape {
+    static let kind = "workout"
+
+    static func detail(in object: [String: Any]) -> ReceivedWorkoutDetail? {
+        guard
+            let id = object["id"] as? String,
+            let startText = object["startDate"] as? String,
+            let start = Timestamps.date(from: startText)
+        else {
+            return nil
+        }
+        let statistics = statistics(in: object["statistics"])
+        let activities = (object["activities"] as? [[String: Any]] ?? [])
+            .compactMap { activity -> ReceivedWorkoutDetail.Activity? in
+                guard
+                    let activityID = activity["id"] as? String,
+                    let activityStartText = activity["startDate"] as? String,
+                    let activityStart = Timestamps.date(from: activityStartText)
+                else {
+                    return nil
+                }
+                return ReceivedWorkoutDetail.Activity(
+                    id: activityID,
+                    activityType: BatchParser.numeric(activity["activityType"])
+                        .map { Int($0) } ?? 0,
+                    startDate: activityStart,
+                    endDate: (activity["endDate"] as? String)
+                        .flatMap(Timestamps.date(from:)),
+                    statistics: Self.statistics(in: activity["statistics"])
+                )
+            }
+
+        // A workout with neither statistics nor legs has nothing this table
+        // would hold that the sample row does not already carry.
+        guard !statistics.isEmpty || !activities.isEmpty else {
+            return nil
+        }
+
+        return ReceivedWorkoutDetail(
+            id: id,
+            startDate: start,
+            endDate: (object["endDate"] as? String).flatMap(Timestamps.date(from:)),
+            activityType: BatchParser.numeric(object["activityType"]).map { Int($0) },
+            duration: BatchParser.numeric(object["duration"]),
+            sourceName: (object["source"] as? [String: Any])?["name"] as? String,
+            statistics: statistics,
+            activities: activities
+        )
+    }
+
+    static func statistics(in value: Any?) -> [ReceivedWorkoutDetail.Statistic] {
+        (value as? [[String: Any]] ?? []).compactMap { entry in
+            guard let type = entry["type"] as? String else {
+                return nil
+            }
+            return ReceivedWorkoutDetail.Statistic(
+                type: type,
+                unit: entry["unit"] as? String ?? "",
+                sum: BatchParser.numeric(entry["sum"]),
+                average: BatchParser.numeric(entry["average"]),
+                minimum: BatchParser.numeric(entry["minimum"]),
+                maximum: BatchParser.numeric(entry["maximum"])
+            )
+        }
     }
 }
