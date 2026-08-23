@@ -215,6 +215,27 @@ Quantities stay optional. A dose nobody logged is absent rather than zero, becau
 
 In a CSV export doses become `MedicationDoses.csv`, one row per dose.
 
+## Health records (clinical records)
+
+Lab results, conditions, medications, immunisations and the rest, as FHIR resources from a connected provider.
+
+**These are not in the released build, and the code that would read them is compiled out.** Reading them needs `com.apple.developer.healthkit.access` carrying `health-records`, which Apple grants by application, and submitting a binary that carries it before approval is an automatic rejection. The entitlement array in `project.yml` therefore ships empty and the Swift flag that enables the code is undefined by default.
+
+Turning it on once approval lands takes two deliberate steps:
+
+1. Build with `HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS`, on the `xcodebuild` command line or in the gitignored `Local.xcconfig`. This changes no entitlement, so on its own it cannot cause a rejection — the code simply compiles and reports that the entitlement is missing.
+2. Change `com.apple.developer.healthkit.access` in `project.yml` from `[]` to `[health-records]`. This is the step with consequences, which is why it is a visible edit to a tracked file rather than a switch.
+
+Both build configurations are tested, so the flag cannot rot while it is switched off.
+
+When it is off — which is every released build today — the app says health records are **not available in this build**, and says explicitly that this is not a statement about whether you have any. Someone with a hospital connected to Health being told their records are empty would be the worst version of this feature.
+
+Three things about the data itself:
+
+- **Consent is per record.** Health asks which records to share, one by one, and Hozz cannot see what was withheld. Partial access is the normal case, not a failure, so nothing treats a small result as an error. It is asked for in its own prompt: someone exporting step counts is never asked for their lab results as a side effect.
+- **The FHIR resource is carried through as the provider sent it**, not reshaped into Hozz's vocabulary. A result's units, reference ranges and coding systems *are* the clinical meaning, and any projection would lose some of it while looking complete. A resource Hozz cannot parse is kept as bytes rather than dropped.
+- **A clinical record's identity is not its HealthKit UUID.** Apple states the UUID is not stable for these records and that source, resource type, and FHIR identifier should be used instead. Since every destination deduplicates on the identifier, keying on the UUID would file the same lab result again on every sync — a growing pile of identical results, which in a medical record is misleading rather than merely untidy. Hozz derives the identity from the three stable fields and keeps the UUID alongside, labelled, for tracing.
+
 ## Mac receiver
 
 The Mac app is a local receiver and browser for data the phone sends. It starts an `NWListener` HTTP receiver, advertises `_hozz._tcp`, normally listens on port **54330**, accepts `/pair` without a token, and requires the token for deliveries. It stores accepted batches in `hozz-received.sqlite` with schema version 6, idempotent batch records, deletions, characteristics, and per-device “last heard from” state.
@@ -320,7 +341,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 455 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 468 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

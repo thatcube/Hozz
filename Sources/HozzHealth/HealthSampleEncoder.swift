@@ -29,6 +29,16 @@ public struct HealthSampleEncoder: Sendable {
             return try serialize(object)
         }
 
+        // A clinical record does not go through the switch because its
+        // identity is not its UUID, so it cannot share the base object's `id`.
+        if let clinical = sample as? HKClinicalRecord {
+            ClinicalRecordEncoding.decorate(
+                &object,
+                record: Self.facts(for: clinical)
+            )
+            return try serialize(object)
+        }
+
         // Handled ahead of the switch for the same reason as State of Mind:
         // `HKMedicationDoseEvent` does not exist on this deployment target and
         // cannot appear in a case pattern.
@@ -117,6 +127,32 @@ public struct HealthSampleEncoder: Sendable {
         return try JSONSerialization.data(
             withJSONObject: object,
             options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+    }
+
+    /// Reads a clinical record where HealthKit handed it over.
+    static func facts(for record: HKClinicalRecord) -> ClinicalRecordFacts {
+        var fhir: FHIRResourceFacts?
+        if let resource = record.fhirResource {
+            var version: String?
+            if #available(iOS 14.0, *) {
+                version = resource.fhirVersion.stringRepresentation
+            }
+            fhir = FHIRResourceFacts(
+                resourceType: resource.resourceType.rawValue,
+                identifier: resource.identifier,
+                fhirVersion: version,
+                sourceURL: resource.sourceURL,
+                data: resource.data
+            )
+        }
+        return ClinicalRecordFacts(
+            healthKitID: record.uuid,
+            clinicalType: record.clinicalType.identifier,
+            displayName: record.displayName,
+            sourceBundleIdentifier: record.sourceRevision.source
+                .bundleIdentifier,
+            fhir: fhir
         )
     }
 

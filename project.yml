@@ -184,12 +184,30 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.Hozz
         TARGETED_DEVICE_FAMILY: "1,2"
+        # Clinical records are compiled out unless this is defined, and it is
+        # deliberately undefined here so nothing sets it by accident. To build
+        # with them, pass HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS on the
+        # xcodebuild command line or set it in the gitignored Local.xcconfig.
+        #
+        # This flag alone changes no entitlement, so it cannot cause an App
+        # Store rejection: the code compiles and reports honestly that the
+        # entitlement is missing. See the health-records note below for the
+        # step that does have consequences.
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) $(HOZZ_CLINICAL_FLAG)
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
     entitlements:
       path: App/Hozz.entitlements
       properties:
         com.apple.developer.healthkit: true
         com.apple.developer.healthkit.background-delivery: true
+        # Empty on purpose, and it must stay empty until Apple approves the
+        # application for health records. Submitting a binary that carries
+        # `health-records` before approval is an automatic rejection rather
+        # than a review note.
+        #
+        # Once approval lands, change this to:
+        #     com.apple.developer.healthkit.access: [health-records]
+        # and build with HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS.
         com.apple.developer.healthkit.access: []
         # The widget is a separate process with its own container, so it can
         # only read live sync state through this shared group.
@@ -211,6 +229,8 @@ targets:
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         ITSAppUsesNonExemptEncryption: false
         NSHealthShareUsageDescription: Hozz reads the Health data you select so you can export it to destinations you own.
+        # Read at a sensitive moment, so it says what happens and nothing more.
+        NSHealthClinicalHealthRecordsShareUsageDescription: Hozz exports the health records you choose to destinations you own. Nothing is uploaded to Hozz, and nobody but you receives them.
         # Required before Hozz may look for a receiver on the local network.
         NSLocalNetworkUsageDescription: Hozz looks for the Hozz app on your computer so you can send Health data to it without typing an address.
         # A computer on your own network has no public certificate, so it is

@@ -8,6 +8,7 @@ public enum HealthKitManualExporterError: Error, LocalizedError, Sendable {
     case healthDataUnavailable
     case cannotCreateExport
     case authorizationNotCompleted
+    case clinicalRecordsUnavailable
 
     public var errorDescription: String? {
         switch self {
@@ -17,6 +18,10 @@ public enum HealthKitManualExporterError: Error, LocalizedError, Sendable {
             "Hozz could not create the export file."
         case .authorizationNotCompleted:
             "Health access was not completed."
+        case .clinicalRecordsUnavailable:
+            ClinicalRecordsSupport.availability(
+                isHealthDataAvailable: true
+            ).explanation
         }
     }
 }
@@ -106,6 +111,53 @@ public actor HealthKitManualExporter {
                 toShare: nil,
                 read: readTypes
             ) { success, error in
+                if let error {
+                    continuation.resume(
+                        throwing: HealthKitFailure.classify(error)
+                    )
+                } else if success {
+                    continuation.resume()
+                } else {
+                    continuation.resume(
+                        throwing: HealthKitManualExporterError.authorizationNotCompleted
+                    )
+                }
+            }
+        }
+    }
+
+    /// The state of clinical records for this build and device.
+    public nonisolated var clinicalRecordsAvailability: ClinicalRecordsSupport.Availability {
+        ClinicalRecordsSupport.availability(
+            isHealthDataAvailable: HKHealthStore.isHealthDataAvailable()
+        )
+    }
+
+    /// Asks for clinical records, and only for clinical records.
+    ///
+    /// Deliberately a separate call from ``requestAuthorization()``. Health
+    /// presents one sheet per request, so folding these in would mean someone
+    /// exporting step counts is asked to hand over their lab results in the
+    /// same breath. This is only ever reached from an explicit choice.
+    ///
+    /// Per-object authorization means the person picks individual records.
+    /// Partial access is the normal outcome, not a failure, and Hozz cannot
+    /// see what was withheld — so nothing here treats a small result as wrong.
+    public func requestClinicalRecordAuthorization() async throws {
+        guard clinicalRecordsAvailability.canRead else {
+            throw HealthKitManualExporterError.clinicalRecordsUnavailable
+        }
+        let types = Set(
+            HealthKitTypeRegistry.clinicalTypes().map { $0.sampleType as HKObjectType }
+        )
+        guard !types.isEmpty else {
+            throw HealthKitManualExporterError.clinicalRecordsUnavailable
+        }
+
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            healthStore.requestAuthorization(toShare: nil, read: types) {
+                success, error in
                 if let error {
                     continuation.resume(
                         throwing: HealthKitFailure.classify(error)
