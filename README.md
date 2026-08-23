@@ -6,7 +6,7 @@ Hozz is a free, open-source iPhone app with a companion Mac receiver. The iPhone
 
 There is no subscription, account, analytics, advertising, hosted relay, or default network destination. Nothing leaves the iPhone until you add a destination and confirm it.
 
-Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, and historical deletions. Correlations, routes, ECG, audiograms, series, characteristics, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
+Hozz is still early alpha. It currently exports quantity samples, category samples, workout records, workout routes, historical deletions, and the six Health characteristics. Correlations, ECG, audiograms, other series, documents, scored assessments, and clinical records are catalogued or acknowledged where relevant, but not claimed as exported coverage.
 
 ## What works today
 
@@ -77,6 +77,48 @@ For a manual export, records are written to an open spool part and anchors are o
 Automatic sync uses the same anchor rule per destination. Each destination has its own cursor, so a failed destination cannot advance past data it did not accept, and one broken destination does not block a healthy one. Batches use stable content-derived identifiers and `Idempotency-Key` headers so a retry can be accepted safely.
 
 Apple does not let apps distinguish “the user denied this Health type” from “there is no matching data.” Hozz therefore reports authorization-scoped coverage and keeps denied-or-empty, unavailable, unsupported, and failed states visible.
+
+## Characteristics
+
+Date of birth, biological sex, blood type, Fitzpatrick skin type, wheelchair use, and activity move mode are not samples. They have no UUID, no dates, no source, and no anchor, so they cannot travel through the anchored-query path. Hozz reads them whole and writes one `characteristics` record per export attempt, ahead of the measurements.
+
+They are worth the separate path because they are what makes the rest interpretable. A resting heart rate of 48 reads differently depending on age and sex, and without them an assistant reading the export cannot answer “is this normal for me”.
+
+Each characteristic carries its own state rather than a blank:
+
+| State | Meaning |
+| --- | --- |
+| `known` | Health returned a value the person set. |
+| `notSet` | Health answered, and the person never entered one. An unknown fact, not a failure. |
+| `unrecognised` | Health returned a value this build has no name for. The raw number is kept, so the fact survives. |
+| `unavailable` | The characteristic does not exist on this OS, or Health is unavailable here. |
+| `unreadable` | Health refused or could not answer, with the coverage state and reason. |
+
+Unlike sample types, these four situations really are distinguishable: HealthKit throws a distinct authorization error when a characteristic was refused and a distinct no-data error when it was simply never set, so Hozz reports refusal and absence apart instead of flattening both.
+
+The record is written on every export attempt, including resumed ones, because the part holding an earlier copy may have been discarded unsealed. Each carries its own `readAt`. In a CSV export they are also flattened into `characteristics.csv`, one row per characteristic including the unset ones, while the lossless copy stays in `export-log.ndjson`.
+
+## Workout routes
+
+A route is the GPS trace of an outdoor run or ride. It is one Health sample whose real content is elsewhere: the points arrive as a separate stream, and a long ride holds hundreds of thousands of them.
+
+Routes are drained as their own anchored type rather than being fetched per workout. That is not a stylistic choice. A route is attached after its workout has already been saved, so a workout read before its route existed would never gain one — the route would be lost permanently, which is exactly what anchors exist to prevent.
+
+Each route is written as three kinds of record:
+
+| Kind | What it holds |
+| --- | --- |
+| `workoutRoute` | The route sample itself, plus the workout it belongs to. |
+| `workoutRouteLocations` | 500 points, addressed by their absolute offset in the route. |
+| `workoutRouteEnd` | The final point count, so a whole route is distinguishable from a truncated one. |
+
+**Attaching a route to its workout.** HealthKit has no back-pointer from a route to its workout, so Hozz takes the workouts that overlap the route in time and asks each one whether this route is actually its own. Only a confirmed answer is written. Overlap alone would attach a ride to whatever else happened to be recorded at the same moment, so an unconfirmed route says `"state": "unresolved"` with a reason rather than naming a workout it guessed.
+
+**Streaming.** The cursor for the route type records which route is half-written and how far into it Hozz has got, so a ride is never held in memory whole. The location stream stays open between pages, which keeps the ordinary path to a single read of each point; a relaunch has no stream to continue, so it re-opens the route and skips what is already durable, paying that re-read once after an interruption rather than on every page.
+
+Pages are split at fixed offsets rather than at wherever a pass happened to stop, and each page's identifier is derived from the route and that offset. A replayed page is therefore byte-identical to the page it replaces, so a receiver recognises it as the same record instead of storing it twice.
+
+In a CSV export, routes become `WorkoutRoutes.csv` (one row per route) and `WorkoutRouteLocations.csv` (one row per point), because a route collapsed into a single cell would not be data any more.
 
 ## Mac receiver
 
@@ -177,7 +219,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 206 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains COUNT_PLACEHOLDER tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, workout routes, export formats, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

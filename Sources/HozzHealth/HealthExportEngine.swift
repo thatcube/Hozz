@@ -159,6 +159,7 @@ public actor HealthExportEngine {
 
     private let store: HozzStore
     private let source: any HealthDataSource
+    private let characteristics: (any HealthCharacteristicsSource)?
     private let types: [HealthTypeKey]
     private let batchSize: Int
     private let lease: ExportWriterLease
@@ -168,6 +169,7 @@ public actor HealthExportEngine {
         store: HozzStore,
         source: any HealthDataSource,
         types: [HealthTypeKey],
+        characteristics: (any HealthCharacteristicsSource)? = nil,
         batchSize: Int = 1_000,
         lease: ExportWriterLease = .shared,
         sinkFactory: (
@@ -176,6 +178,7 @@ public actor HealthExportEngine {
     ) {
         self.store = store
         self.source = source
+        self.characteristics = characteristics
         self.types = types
         self.batchSize = batchSize
         self.lease = lease
@@ -266,6 +269,19 @@ public actor HealthExportEngine {
                 "attemptedTypes": types.count,
                 "catalogTypes": HealthTypeCatalog.entries.count
             ])
+        }
+
+        // Written on every attempt rather than only on the first. The part
+        // holding an earlier copy may have been discarded unsealed, and these
+        // few lines are the context that makes every measurement after them
+        // interpretable — a duplicate is cheap, a missing one is not. Each
+        // carries its own `readAt`, so the last is the current one.
+        if let characteristics {
+            try await sink.writeRecord(
+                HealthCharacteristicsRecord.make(
+                    from: await characteristics.characteristics()
+                )
+            )
         }
 
         do {

@@ -126,16 +126,26 @@ final class HealthKitBridgeTests: XCTestCase {
         XCTAssertEqual(checked, quantityEntries.count)
     }
 
-    func testEveryExportableTypeIsAlsoRequestedForReading() {
+    func testEveryTypeHozzReadsIsAlsoRequestedForReading() {
         let exportable = Set(
             HealthKitTypeRegistry.exportableTypes().map(\.sampleType)
+                .map { $0 as HKObjectType }
+        )
+        let characteristics = Set(
+            HealthKitTypeRegistry.characteristicTypes()
+                .map { $0.characteristicType as HKObjectType }
         )
         let requested = HealthKitTypeRegistry.authorizationReadTypes()
 
         XCTAssertEqual(
-            exportable,
+            exportable.union(characteristics),
             requested,
             "Reading a type Hozz never asked for can only ever look indeterminate."
+        )
+        XCTAssertGreaterThan(
+            requested.count,
+            exportable.count,
+            "Characteristics are read too, so the read set must be wider than the sample types."
         )
     }
 
