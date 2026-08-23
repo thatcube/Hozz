@@ -26,14 +26,57 @@ database; it has no code path that writes, changes, or deletes anything.
 The tool ships inside the Mac app:
 
 ```text
-Hozz.app/Contents/MacOS/hozz-mcp
+/Applications/Hozz.app/Contents/MacOS/hozz-mcp
 ```
 
 It has to be told where the received database is. The Mac app is sandboxed while
 your assistant launches `hozz-mcp` outside that sandbox, so a guessed path opens
 an empty directory and every tool truthfully reports no data. **Open the Mac
 app's Assistant tab and copy the configuration it generates** rather than typing
-one. It looks like this:
+one.
+
+### Let your assistant do it
+
+Every client keeps its MCP configuration somewhere different and in a slightly
+different shape, which is a tedious thing to document and an easy thing to get
+wrong. Your assistant already knows where its own configuration lives, so paste
+this to it instead:
+
+```text
+Please add a local MCP server called "hozz" to your own MCP configuration.
+
+It runs this command:
+  /Applications/Hozz.app/Contents/MacOS/hozz-mcp
+
+with these arguments:
+  --data-dir
+  /Users/YOUR_USERNAME/Library/Containers/com.thatcube.Hozz.mac/Data/Library/Application Support/Hozz/Received
+
+Replace YOUR_USERNAME with my actual username. That path is real and contains a
+space in "Application Support", so keep it as one argument rather than splitting
+it. It is a stdio server speaking JSON-RPC, not an HTTP one, so it needs no URL,
+port, or token.
+
+Write it into whichever configuration file you actually read, in whatever shape
+that file expects, and leave any servers already in there alone. Please back the
+file up first. Then tell me whether I need to restart you for it to load.
+
+You can check it works before I restart by running the command yourself with
+those arguments and sending it this on stdin:
+  {"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}
+  {"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+It should answer with thirteen tools. If it says there is no received data,
+Hozz has not synced to this Mac yet, which is a different problem from the
+configuration being wrong.
+```
+
+That works because the server needs so little: a path, an argument, and stdio.
+There is no account to create, no key to paste, and nothing to reach over a
+network.
+
+### Writing it by hand
+
+If you would rather do it yourself, the shape most clients want is:
 
 ```json
 {
@@ -49,8 +92,28 @@ one. It looks like this:
 }
 ```
 
+Some clients want extra keys alongside those — GitHub Copilot's CLI, for
+instance, keeps its servers in `~/.copilot/mcp-config.json` and expects
+`"type": "local"` and a `"tools"` list on each entry. Check what the other
+entries in your own file look like and match them; the `command` and `args` are
+the part that is always the same.
+
 `HOZZ_DATA_DIR` works instead of `--data-dir` if your client prefers an
 environment variable.
+
+### If it reports no data
+
+Two different problems look identical from the client:
+
+- **The path is wrong.** A sandboxed Mac app keeps its database inside its
+  container, and the path above is that container. Pointing at
+  `~/Library/Application Support/Hozz` instead finds nothing, because that is
+  where an unsandboxed build would have put it.
+- **Nothing has arrived yet.** Open Hozz on the Mac, connect your phone, and let
+  it sync at least once. The Mac's Data tab says how many types have arrived.
+
+The tools distinguish these where they can: a type with no records in your
+window says so, rather than claiming you have no such data.
 
 One thing worth understanding before you connect it: if you point a
 cloud-hosted assistant at this server, that assistant may upload whatever it
