@@ -176,10 +176,30 @@ public enum HealthKitTypeRegistry {
             .sorted { $0.catalogEntry.key < $1.catalogEntry.key }
     }
 
-    /// Every type Hozz reads is requested. A type Hozz reads but never asks for
-    /// can only ever report an indeterminate result, so the read set is the
-    /// union of the sample types it drains and the characteristics it fetches,
-    /// by construction.
+    /// A type that must never appear in an authorization request, however much
+    /// Hozz would like to read it.
+    ///
+    /// Medication doses are granted per medicine, in Health, under each one's
+    /// Data Sources & Access — there is no blanket permission to ask for. Asking
+    /// anyway does not return a refusal: HealthKit raises
+    /// `NSInvalidArgumentException`, "Authorization to read the following types
+    /// is disallowed", and the app is gone before it can report anything. So the
+    /// type is drained like any other and simply left out of the request, which
+    /// is the arrangement Health expects.
+    ///
+    /// `requiresPerObjectAuthorization()` does not catch this one, which is why
+    /// the guard in `exportableTypes()` lets it through.
+    static func isDisallowedInAuthorizationRequest(_ type: HKObjectType) -> Bool {
+        guard #available(iOS 26.0, *) else {
+            return false
+        }
+        return type == HKObjectType.medicationDoseEventType()
+    }
+
+    /// Every type Hozz reads is requested, except the ones Health refuses to be
+    /// asked about. A type Hozz reads but never asks for can only ever report an
+    /// indeterminate result, so the read set is the union of the sample types it
+    /// drains and the characteristics it fetches, minus those.
     public static func authorizationReadTypes(
         operatingSystem: OperatingSystemVersion = ProcessInfo.processInfo.operatingSystemVersion
     ) -> Set<HKObjectType> {
@@ -190,6 +210,7 @@ public enum HealthKitTypeRegistry {
             characteristicTypes(operatingSystem: operatingSystem)
                 .map(\.characteristicType)
         )
+        types = types.filter { !isDisallowedInAuthorizationRequest($0) }
         return types
     }
 }

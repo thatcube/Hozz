@@ -137,15 +137,58 @@ final class HealthKitBridgeTests: XCTestCase {
         )
         let requested = HealthKitTypeRegistry.authorizationReadTypes()
 
+        // Everything Hozz reads is asked for, except the types Health refuses
+        // to be asked about at all. Those are granted per object instead, and
+        // requesting one is fatal rather than merely refused.
+        let readable = exportable.union(characteristics).filter {
+            !HealthKitTypeRegistry.isDisallowedInAuthorizationRequest($0)
+        }
+
         XCTAssertEqual(
-            exportable.union(characteristics),
+            readable,
             requested,
             "Reading a type Hozz never asked for can only ever look indeterminate."
         )
         XCTAssertGreaterThan(
             requested.count,
-            exportable.count,
+            exportable.count - 1,
             "Characteristics are read too, so the read set must be wider than the sample types."
+        )
+    }
+
+    /// Asking for a per-object type kills the app rather than being refused.
+    ///
+    /// Medication doses are granted one medicine at a time, in Health, under
+    /// each one's Data Sources & Access. Including the type in an authorization
+    /// request does not come back denied — HealthKit raises
+    /// `NSInvalidArgumentException` and the process is gone:
+    ///
+    ///     Authorization to read the following types is disallowed:
+    ///     HKMedicationDoseEventTypeIdentifierMedicationDoseEvent
+    ///
+    /// The suite could not see this, because the fake source never builds a real
+    /// request; only pressing Export on a device did. This asserts the set that
+    /// would have been handed to HealthKit, which is the closest a test can get
+    /// without a real store.
+    func testATypeHealthRefusesToBeAskedAboutIsNeverRequested() throws {
+        guard #available(iOS 26.0, *) else {
+            throw XCTSkip("Medication doses need iOS 26.")
+        }
+        let doses = HKObjectType.medicationDoseEventType()
+        let requested = HealthKitTypeRegistry.authorizationReadTypes()
+
+        XCTAssertFalse(
+            requested.contains(doses),
+            "Requesting medication doses raises rather than being declined."
+        )
+
+        let drained = Set(
+            HealthKitTypeRegistry.exportableTypes().map(\.sampleType)
+                .map { $0 as HKObjectType }
+        )
+        XCTAssertTrue(
+            drained.contains(doses),
+            "Doses are still exported: Health grants them per medicine instead."
         )
     }
 
