@@ -105,9 +105,8 @@ final class ClinicalRecordTests: XCTestCase {
     /// Lifting the per-object filter for clinical records must not quietly
     /// admit anything else it was holding back.
     func testNothingElsePerObjectAuthorizedSlipsIntoTheOfferedSet() {
-        for exportable in HealthKitTypeRegistry.exportableTypes(
-            includingClinicalRecords: true
-        ) {
+        for exportable in HealthKitTypeRegistry.exportableTypes()
+            + HealthKitTypeRegistry.clinicalTypes() {
             guard exportable.sampleType.requiresPerObjectAuthorization() else {
                 continue
             }

@@ -25,6 +25,15 @@ settings:
     CURRENT_PROJECT_VERSION: "1"
     ENABLE_USER_SCRIPT_SANDBOXING: true
     SWIFT_EMIT_LOC_STRINGS: true
+    # Clinical records are compiled out unless this is defined. It lives at
+    # project level rather than on the app target because the code it gates is
+    # in the HozzHealth framework: set on the app alone, the flag compiled
+    # nothing differently and every "both configurations" test run was
+    # secretly the same build twice.
+    #
+    # To build with them: HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS on the
+    # xcodebuild command line, or in the gitignored Local.xcconfig.
+    SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) $(HOZZ_CLINICAL_FLAG)
 
 targetTemplates:
   HozzFramework:
@@ -184,16 +193,6 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.Hozz
         TARGETED_DEVICE_FAMILY: "1,2"
-        # Clinical records are compiled out unless this is defined, and it is
-        # deliberately undefined here so nothing sets it by accident. To build
-        # with them, pass HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS on the
-        # xcodebuild command line or set it in the gitignored Local.xcconfig.
-        #
-        # This flag alone changes no entitlement, so it cannot cause an App
-        # Store rejection: the code compiles and reports honestly that the
-        # entitlement is missing. See the health-records note below for the
-        # step that does have consequences.
-        SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) $(HOZZ_CLINICAL_FLAG)
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
     entitlements:
       path: App/Hozz.entitlements
