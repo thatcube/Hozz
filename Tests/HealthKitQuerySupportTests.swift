@@ -149,6 +149,119 @@ final class HealthKitQuerySupportTests: XCTestCase {
         }
     }
 
+    // MARK: - The call that actually crashed
+
+    /// Makes the real authorization request, with the real set, against a real
+    /// store — which is the call that killed the app on device.
+    ///
+    /// Health refuses to be *asked* about some types: medication doses are
+    /// granted one medicine at a time, so there is no blanket permission to
+    /// request, and asking anyway raises `NSInvalidArgumentException` rather
+    /// than returning a refusal. The app is gone before it can report
+    /// anything. `requiresPerObjectAuthorization()` does not flag that type,
+    /// so nothing in the guard caught it.
+    ///
+    /// Three things make this test worth having rather than a re-statement of
+    /// the fix, and each was checked rather than assumed:
+    ///
+    /// - The simulator raises exactly as the device did, same exception and
+    ///   same message naming the offending type.
+    /// - The raise is synchronous, so nothing here waits on a completion
+    ///   handler that a test host would never see answered.
+    /// - XCTest turns the exception into a failing test rather than taking the
+    ///   whole run down, so the failure is readable and the suite continues.
+    ///
+    /// The point is that it names no type. A denylist test can only assert the
+    /// one type somebody already found; this fails for the next one too.
+    func testTheRealAuthorizationRequestDoesNotRaise() throws {
+        try XCTSkipUnless(
+            HKHealthStore.isHealthDataAvailable(),
+            "Needs HealthKit."
+        )
+        let types = HealthKitTypeRegistry.authorizationReadTypes()
+        XCTAssertGreaterThan(types.count, 100)
+
+        // No assertion on the outcome: nobody can tap the sheet in a test, so
+        // the completion is not the subject. Surviving the call is.
+        HKHealthStore().requestAuthorization(toShare: nil, read: types) { _, _ in }
+    }
+
+    /// The clinical prompt is a second, separate request, so it needs the same
+    /// check. Empty when the feature is compiled out, which asks nothing and
+    /// is the honest thing to do with an empty set.
+    func testTheClinicalAuthorizationRequestDoesNotRaise() throws {
+        try XCTSkipUnless(
+            HKHealthStore.isHealthDataAvailable(),
+            "Needs HealthKit."
+        )
+        let store = HKHealthStore()
+        // The gate Apple's own header says to call before requesting
+        // authorization for any clinical type. Without it this test raises,
+        // which is exactly what it did when it was first written — and what
+        // the app would have done on the device.
+        try XCTSkipUnless(
+            store.supportsHealthRecords(),
+            "This build is not entitled for health records, so nothing may ask."
+        )
+        let types = Set(
+            HealthKitTypeRegistry.clinicalTypes().map { $0.sampleType as HKObjectType }
+        )
+        guard !types.isEmpty else {
+            XCTAssertFalse(ClinicalRecordsSupport.isBuiltIn)
+            return
+        }
+        store.requestAuthorization(toShare: nil, read: types) { _, _ in }
+    }
+
+    /// The guard that makes the clinical request safe, checked against the
+    /// same store the app would use.
+    ///
+    /// This is the second instance tonight of the same class of bug — asking
+    /// HealthKit about something it refuses to be asked about — and it was
+    /// found by running the request rather than by reading the code.
+    func testNothingAsksAboutClinicalTypesWithoutTheEntitlement() throws {
+        try XCTSkipUnless(
+            HKHealthStore.isHealthDataAvailable(),
+            "Needs HealthKit."
+        )
+        let store = HKHealthStore()
+        guard !store.supportsHealthRecords() else {
+            throw XCTSkip("This build is entitled, so there is nothing to refuse.")
+        }
+
+        let availability = ClinicalRecordsSupport.availability(
+            isHealthDataAvailable: true,
+            supportsHealthRecords: store.supportsHealthRecords()
+        )
+        XCTAssertFalse(
+            availability.canRead,
+            """
+            Without the entitlement, asking about a clinical type raises and \
+            the app dies. Availability must refuse before anything asks.
+            """
+        )
+    }
+
+    /// The type that caused it, held separately so the reason stays written
+    /// down even once the general test above is the thing protecting us.
+    func testDoseEventsAreDrainedButNeverRequested() throws {
+        guard #available(iOS 26.0, *) else {
+            throw XCTSkip("Medication doses need iOS 26.")
+        }
+        let doses = HKObjectType.medicationDoseEventType()
+
+        XCTAssertTrue(
+            HealthKitTypeRegistry.exportableTypes().contains {
+                $0.sampleType == doses
+            },
+            "Doses are still read: only asking about them is fatal."
+        )
+        XCTAssertFalse(
+            HealthKitTypeRegistry.authorizationReadTypes().contains(doses),
+            "Asking raises rather than being refused, so it must not be asked."
+        )
+    }
+
     /// The build flag has to actually change the build.
     ///
     /// It was set on the app target while the code it gates lives in the

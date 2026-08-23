@@ -19,9 +19,7 @@ public enum HealthKitManualExporterError: Error, LocalizedError, Sendable {
         case .authorizationNotCompleted:
             "Health access was not completed."
         case .clinicalRecordsUnavailable:
-            ClinicalRecordsSupport.availability(
-                isHealthDataAvailable: true
-            ).explanation
+            "Hozz cannot read health records on this iPhone."
         }
     }
 }
@@ -129,7 +127,8 @@ public actor HealthKitManualExporter {
     /// The state of clinical records for this build and device.
     public nonisolated var clinicalRecordsAvailability: ClinicalRecordsSupport.Availability {
         ClinicalRecordsSupport.availability(
-            isHealthDataAvailable: HKHealthStore.isHealthDataAvailable()
+            isHealthDataAvailable: HKHealthStore.isHealthDataAvailable(),
+            supportsHealthRecords: healthStore.supportsHealthRecords()
         )
     }
 

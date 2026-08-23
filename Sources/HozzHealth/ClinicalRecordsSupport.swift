@@ -32,6 +32,15 @@ public enum ClinicalRecordsSupport {
 
     /// Why clinical records are or are not readable right now.
     ///
+    /// The build flag and the entitlement are separate switches, and they have
+    /// to agree. A build with the flag on and the entitlement absent is not
+    /// merely useless: asking HealthKit about a clinical type without the
+    /// entitlement raises `NSInvalidArgumentException` and the app is gone
+    /// before it can report anything. Apple's answer is
+    /// `supportsHealthRecords`, which its own header says to call before
+    /// requesting authorization for any clinical type — and which this code
+    /// originally did not.
+    ///
     /// The distinction that matters is the last one. Someone with a hospital
     /// connected to Health, told their records are empty, would reasonably
     /// conclude Hozz had checked and found nothing. It has not checked.
@@ -40,6 +49,10 @@ public enum ClinicalRecordsSupport {
         case notInThisBuild
         /// Health itself is unavailable or restricted on this device.
         case healthDataUnavailable
+        /// The code is compiled in but this build is not entitled, or the
+        /// device does not support health records. Asking anyway would be
+        /// fatal, so nothing asks.
+        case unsupportedOnThisDevice
         /// Readable, once the person chooses which records to share.
         case availableWithPermission
 
@@ -54,20 +67,32 @@ public enum ClinicalRecordsSupport {
                 "This build of Hozz cannot read health records. It says nothing about whether you have any."
             case .healthDataUnavailable:
                 "Health data is unavailable on this device."
+            case .unsupportedOnThisDevice:
+                "This iPhone cannot share health records with Hozz. It says nothing about whether you have any."
             case .availableWithPermission:
                 "Health will ask which records to share. Hozz exports the ones you choose and cannot see the rest."
             }
         }
     }
 
+    /// - Parameter supportsHealthRecords: `HKHealthStore.supportsHealthRecords()`.
+    ///   Taken as a parameter rather than read here so the decision can be
+    ///   tested for a device that says no, which is every build without the
+    ///   entitlement.
     public static func availability(
-        isHealthDataAvailable: Bool
+        isHealthDataAvailable: Bool,
+        supportsHealthRecords: Bool
     ) -> Availability {
         guard isBuiltIn else {
             return .notInThisBuild
         }
         guard isHealthDataAvailable else {
             return .healthDataUnavailable
+        }
+        // The last gate before anything asks HealthKit about a clinical type.
+        // Asking when this is false does not fail, it raises.
+        guard supportsHealthRecords else {
+            return .unsupportedOnThisDevice
         }
         return .availableWithPermission
     }

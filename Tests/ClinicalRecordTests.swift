@@ -71,7 +71,8 @@ final class ClinicalRecordTests: XCTestCase {
 
     func testAnUnavailableBuildSaysSoRatherThanClaimingThereAreNoRecords() {
         let availability = ClinicalRecordsSupport.availability(
-            isHealthDataAvailable: true
+            isHealthDataAvailable: true,
+            supportsHealthRecords: true
         )
 
         #if HOZZ_CLINICAL_RECORDS
@@ -88,7 +89,8 @@ final class ClinicalRecordTests: XCTestCase {
 
     func testHealthBeingUnavailableIsADistinctStateFromTheBuild() {
         let unavailable = ClinicalRecordsSupport.availability(
-            isHealthDataAvailable: false
+            isHealthDataAvailable: false,
+            supportsHealthRecords: true
         )
 
         #if HOZZ_CLINICAL_RECORDS
@@ -100,6 +102,30 @@ final class ClinicalRecordTests: XCTestCase {
             "The build is the more fundamental reason and is reported first."
         )
         #endif
+    }
+
+    /// The two switches have to agree, and the failure when they do not is
+    /// fatal rather than merely unhelpful: asking HealthKit about a clinical
+    /// type without the entitlement raises, and the app is gone.
+    func testAnEntitledBuildOnAnUnsupportingDeviceRefusesToAsk() {
+        let availability = ClinicalRecordsSupport.availability(
+            isHealthDataAvailable: true,
+            supportsHealthRecords: false
+        )
+
+        #if HOZZ_CLINICAL_RECORDS
+        XCTAssertEqual(availability, .unsupportedOnThisDevice)
+        #else
+        XCTAssertEqual(availability, .notInThisBuild)
+        #endif
+        XCTAssertFalse(
+            availability.canRead,
+            "Nothing may ask HealthKit about a clinical type here."
+        )
+        XCTAssertTrue(
+            availability.explanation.contains("says nothing about whether you have any"),
+            "An unsupported device is not a statement about the person's records."
+        )
     }
 
     /// Lifting the per-object filter for clinical records must not quietly

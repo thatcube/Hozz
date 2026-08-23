@@ -109,6 +109,8 @@ Turning clinical records on takes two deliberate steps:
 
 Both build configurations are tested, and a test asserts the flag actually reaches the framework it gates — it was once set on the app target alone, where it compiled nothing differently, so every run claiming to cover both configurations was the same build twice.
 
+Nothing asks HealthKit about a clinical type unless `supportsHealthRecords()` says it may. Without the entitlement, asking does not fail — it raises, and the app is gone before it can report anything. The build flag and the entitlement are separate switches, so a build with one and not the other is a crash rather than a disabled feature, and that gate is what makes the mismatch harmless.
+
 Clinical records are read with `HKSampleQuery`, not the anchored drain. HealthKit does not support anchored queries for clinical types, so they are kept out of the drained list structurally rather than skipped inside it: a clinical type reaching that list is a query that cannot run, not a slow path.
 
 There is no cursor. A date window is the obvious substitute and is the one thing Hozz's design exists to avoid — Health accepts backdated records, and a provider import arrives in bulk carrying results dated months earlier, which a cursor set to "now" would skip silently. So every record is read every time, and the stable identity does the work: re-reading produces byte-identical records a receiver already holds. That is only sound because the volume is small, and if it stops being small the answer is still not a date cursor. When it is off — which is every default build today — the app says health records are **not available in this build**, and says explicitly that this is not a statement about whether you have any.
@@ -223,7 +225,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 506 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, unfinished-export recovery, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 512 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, unfinished-export recovery, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 
