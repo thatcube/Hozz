@@ -13,6 +13,8 @@ public enum HealthTypeFamily: String, Codable, CaseIterable, Sendable {
     /// A hearing test: not a single value, but a set of sensitivity readings
     /// carried on the sample itself.
     case audiogram
+    /// A mood entry: how someone felt, rather than a measurement of them.
+    case stateOfMind
     /// Samples whose real content is a stream attached to them rather than a
     /// value on them — a workout's route, for instance. They are read through
     /// the ordinary anchored path and then streamed in bounded pieces.
@@ -58,7 +60,17 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
         self.isDeprecated = isDeprecated
     }
 
+    /// Names the generic prefix-stripping would get wrong.
+    private static let displayNameOverrides: [String: String] = [
+        "HKWorkoutTypeIdentifier": "Workout",
+        "HKWorkoutRouteTypeIdentifier": "Workout Route",
+        "HKDataTypeStateOfMind": "State of Mind"
+    ]
+
     public var displayName: String {
+        if let override = Self.displayNameOverrides[key.rawValue] {
+            return override
+        }
         var name = key.rawValue
         let prefixes = [
             "HKQuantityTypeIdentifier",
@@ -77,11 +89,7 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
             break
         }
         if name.isEmpty {
-            return switch key.rawValue {
-            case "HKWorkoutTypeIdentifier": "Workout"
-            case "HKWorkoutRouteTypeIdentifier": "Workout Route"
-            default: key.rawValue
-            }
+            return key.rawValue
         }
 
         return name
@@ -128,6 +136,11 @@ public enum HealthTypeCatalog {
                 identifier: "HKDataTypeIdentifierAudiogram",
                 family: .audiogram,
                 introduced: IOSVersion(major: 13, minor: 0)
+            ),
+            HealthCatalogEntry(
+                identifier: "HKDataTypeStateOfMind",
+                family: .stateOfMind,
+                introduced: IOSVersion(major: 18, minor: 0)
             )
         ]
 

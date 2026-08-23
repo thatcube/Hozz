@@ -65,6 +65,12 @@ public enum HealthKitTypeRegistry {
                 objectType = HKObjectType.workoutType()
             case .audiogram:
                 objectType = HKObjectType.audiogramSampleType()
+            case .stateOfMind:
+                if #available(iOS 18.0, *) {
+                    objectType = HKObjectType.stateOfMindType()
+                } else {
+                    objectType = nil
+                }
             case .series:
                 objectType = switch entry.key.rawValue {
                 case WorkoutRouteEncoding.typeIdentifier:

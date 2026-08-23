@@ -62,6 +62,11 @@ struct ExportRecord {
             return Self.number(quantity["value"])
         case "category":
             return Self.number(object["value"])
+        case "stateOfMind":
+            // Valence is the number a mood entry can be charted on. It runs
+            // from -1 to 1 and zero is neutral, so it is returned as-is; a
+            // missing entry is a missing row, never a zero.
+            return Self.number(object["valence"])
         default:
             return nil
         }

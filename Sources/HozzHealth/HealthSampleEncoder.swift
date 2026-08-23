@@ -17,6 +17,17 @@ public struct HealthSampleEncoder: Sendable {
     ) throws -> Data {
         var object = baseObject(sample: sample)
 
+        // Handled ahead of the switch because `HKStateOfMind` only exists on
+        // iOS 18, and a `case let x as HKStateOfMind` would not compile against
+        // a deployment target that predates it.
+        if #available(iOS 18.0, *), let stateOfMind = sample as? HKStateOfMind {
+            object["kind"] = "stateOfMind"
+            object.merge(StateOfMindEncoding.object(for: stateOfMind)) {
+                current, _ in current
+            }
+            return try serialize(object)
+        }
+
         switch sample {
         case let quantity as HKQuantitySample:
             guard let unitString = catalogEntry.canonicalUnit else {
@@ -62,6 +73,10 @@ public struct HealthSampleEncoder: Sendable {
             object["kind"] = "sample"
         }
 
+        return try serialize(object)
+    }
+
+    private func serialize(_ object: [String: Any]) throws -> Data {
         guard JSONSerialization.isValidJSONObject(object) else {
             throw HealthSampleEncodingError.invalidJSONObject
         }
