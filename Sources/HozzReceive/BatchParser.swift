@@ -41,6 +41,69 @@ public struct HealthRecord: Hashable, Sendable {
     }
 }
 
+/// The shape the phone uses for characteristics, in one place.
+///
+/// The phone writes a single record holding every characteristic it read,
+/// keyed by type. Reading it here rather than inline keeps the two halves of
+/// the contract legible: if the encoder's shape changes, this is the file that
+/// has to change with it.
+enum HealthCharacteristicsShape {
+    static let kind = "characteristics"
+
+    static func characteristics(
+        in object: [String: Any]
+    ) -> [ReceivedCharacteristic] {
+        let readAt = (object["readAt"] as? String)
+            .flatMap(Timestamps.date(from:))
+
+        // The combined shape: one record, every characteristic keyed by type.
+        if let values = object["characteristics"] as? [String: Any] {
+            return values.keys.sorted().compactMap { type in
+                guard let entry = values[type] as? [String: Any] else {
+                    return nil
+                }
+                return characteristic(
+                    type: type,
+                    object: entry,
+                    readAt: readAt
+                )
+            }
+        }
+
+        // A single characteristic carrying its own type, so the receiver does
+        // not depend on which of the two shapes the phone settles on.
+        guard let type = object["type"] as? String else {
+            return []
+        }
+        return [characteristic(type: type, object: object, readAt: readAt)]
+    }
+
+    private static func characteristic(
+        type: String,
+        object: [String: Any],
+        readAt: Date?
+    ) -> ReceivedCharacteristic {
+        let raw = (try? JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )) ?? Data()
+
+        var value = object["value"] as? String
+        if value == nil, let number = BatchParser.numeric(object["value"]) {
+            value = String(number)
+        }
+
+        return ReceivedCharacteristic(
+            type: type,
+            state: object["state"] as? String,
+            value: value,
+            rawValue: BatchParser.numeric(object["rawValue"]).map { Int($0) },
+            readAt: readAt,
+            raw: raw
+        )
+    }
+}
+
 /// A sample the phone reports as removed from Health.
 ///
 /// Deletions matter as much as additions: Health is the user's record of their
@@ -61,24 +124,93 @@ public struct HealthDeletion: Hashable, Sendable {
 }
 
 /// Everything one delivered batch contained.
+/// One characteristic, as it arrived: a fact about the person rather than a
+/// measurement of them.
+///
+/// The phone deliberately does not shape these like samples — a characteristic
+/// has no identifier, no start date, and no source, and inventing them would
+/// make a standing fact look like a measurement taken at export time. The
+/// receiver therefore has to meet that shape rather than the other way round.
+public struct ReceivedCharacteristic: Hashable, Sendable {
+    public let type: String
+    /// What Health actually said: `known`, `notSet`, `unavailable`, and so on.
+    /// Kept because a blank value that means "declined to share" and one that
+    /// means "never filled in" are different facts.
+    public let state: String?
+    public let value: String?
+    public let rawValue: Int?
+    public let readAt: Date?
+    public let raw: Data
+
+    public init(
+        type: String,
+        state: String?,
+        value: String?,
+        rawValue: Int?,
+        readAt: Date?,
+        raw: Data
+    ) {
+        self.type = type
+        self.state = state
+        self.value = value
+        self.rawValue = rawValue
+        self.readAt = readAt
+        self.raw = raw
+    }
+}
+
+/// A record the receiver could not interpret, kept whole anyway.
+///
+/// Dropping one of these is the failure this type exists to prevent. A phone
+/// running a newer build can send a record shape this Mac has never heard of,
+/// and the only two honest options are to store it uninterpreted or to refuse
+/// the batch. Refusing wedges: the phone would resend the same bytes forever
+/// and every later record behind it would be blocked. So it is stored, and the
+/// count is surfaced where someone can see it.
+public struct UnhandledRecord: Hashable, Sendable {
+    /// A content hash, so the same record arriving twice is stored once.
+    public let fingerprint: String
+    public let kind: String?
+    public let reason: String
+    public let raw: Data
+
+    public init(fingerprint: String, kind: String?, reason: String, raw: Data) {
+        self.fingerprint = fingerprint
+        self.kind = kind
+        self.reason = reason
+        self.raw = raw
+    }
+}
+
 public struct ParsedBatch: Hashable, Sendable {
     public let records: [HealthRecord]
     public let deletions: [HealthDeletion]
+    public let characteristics: [ReceivedCharacteristic]
+    /// Records the receiver could not interpret. They are still stored, so this
+    /// is a list of things to teach it about rather than a list of losses.
+    public let unhandled: [UnhandledRecord]
     /// Lines that could not be parsed at all, kept only as a count so nothing
     /// about their contents is logged.
     public let unreadableCount: Int
 
     public var isEmpty: Bool {
-        records.isEmpty && deletions.isEmpty
+        records.isEmpty
+            && deletions.isEmpty
+            && characteristics.isEmpty
+            && unhandled.isEmpty
     }
 
     public init(
         records: [HealthRecord],
         deletions: [HealthDeletion],
+        characteristics: [ReceivedCharacteristic] = [],
+        unhandled: [UnhandledRecord] = [],
         unreadableCount: Int
     ) {
         self.records = records
         self.deletions = deletions
+        self.characteristics = characteristics
+        self.unhandled = unhandled
         self.unreadableCount = unreadableCount
     }
 }
@@ -149,6 +281,7 @@ public enum BatchParser {
 
     private static func parseLines(_ text: String) -> ParsedBatch {
         var objects: [[String: Any]] = []
+        var quarantined: [UnhandledRecord] = []
         var unreadable = 0
         for line in text.split(separator: "\n", omittingEmptySubsequences: true) {
             let candidate = line.trimmingCharacters(in: .whitespaces)
@@ -159,7 +292,20 @@ public enum BatchParser {
                 let data = candidate.data(using: .utf8),
                 let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else {
+                // Not JSON at all, so there is nothing to interpret — but the
+                // phone has already advanced its cursor past it, and dropping
+                // it would be the same permanent loss by a different route.
+                // The bytes are kept verbatim instead.
                 unreadable += 1
+                let raw = candidate.data(using: .utf8) ?? Data()
+                quarantined.append(
+                    UnhandledRecord(
+                        fingerprint: fingerprint(of: raw),
+                        kind: nil,
+                        reason: "This line was not readable as JSON.",
+                        raw: raw
+                    )
+                )
                 continue
             }
             objects.append(object)
@@ -168,6 +314,8 @@ public enum BatchParser {
         return ParsedBatch(
             records: batch.records,
             deletions: batch.deletions,
+            characteristics: batch.characteristics,
+            unhandled: batch.unhandled + quarantined,
             unreadableCount: batch.unreadableCount + unreadable
         )
     }
@@ -175,6 +323,8 @@ public enum BatchParser {
     private static func collect(_ objects: [[String: Any]]) -> ParsedBatch {
         var records: [HealthRecord] = []
         var deletions: [HealthDeletion] = []
+        var characteristics: [ReceivedCharacteristic] = []
+        var unhandled: [UnhandledRecord] = []
         var unreadable = 0
 
         for object in objects {
@@ -191,18 +341,87 @@ public enum BatchParser {
                 )
                 continue
             }
-            guard let record = record(from: object) else {
-                unreadable += 1
+
+            let kind = object["kind"] as? String
+
+            // Characteristics are the same failure in a new shape. They carry
+            // no id, no type, and no startDate — deliberately, because a blood
+            // type is not a measurement taken at export time — so the sample
+            // parser rejected every one of them, the batch still answered 200,
+            // and the phone never sent them again.
+            if kind == HealthCharacteristicsShape.kind || kind == "characteristic" {
+                let parsed = HealthCharacteristicsShape.characteristics(in: object)
+                if parsed.isEmpty {
+                    unhandled.append(
+                        unhandledRecord(
+                            object,
+                            kind: kind,
+                            reason: "A characteristics record with nothing in it."
+                        )
+                    )
+                } else {
+                    characteristics.append(contentsOf: parsed)
+                }
                 continue
             }
-            records.append(record)
+
+            if let record = record(from: object) {
+                records.append(record)
+                continue
+            }
+
+            // Anything else is kept rather than dropped. This is the branch
+            // that used to lose data, and it is deliberately the last one: a
+            // record shape added by a newer phone lands here and survives
+            // uninterpreted until this Mac learns about it.
+            unhandled.append(
+                unhandledRecord(
+                    object,
+                    kind: kind,
+                    reason: kind.map { "No place yet for a \($0) record." }
+                        ?? "A record with no kind, id, type, or start date."
+                )
+            )
         }
 
         return ParsedBatch(
             records: records,
             deletions: deletions,
+            characteristics: characteristics,
+            unhandled: unhandled,
             unreadableCount: unreadable
         )
+    }
+
+    private static func unhandledRecord(
+        _ object: [String: Any],
+        kind: String?,
+        reason: String
+    ) -> UnhandledRecord {
+        let raw = (try? JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )) ?? Data()
+        return UnhandledRecord(
+            fingerprint: fingerprint(of: raw),
+            kind: kind,
+            reason: reason,
+            raw: raw
+        )
+    }
+
+    /// A stable content hash, so a retried delivery stores one row rather than
+    /// a second copy of the same unhandled record.
+    static func fingerprint(of data: Data) -> String {
+        // FNV-1a over the canonical bytes. This is a de-duplication key, not a
+        // security boundary, so a short non-cryptographic hash is the right
+        // tool and avoids pulling in CryptoKit for it.
+        var hash: UInt64 = 0xcbf2_9ce4_8422_2325
+        for byte in data {
+            hash ^= UInt64(byte)
+            hash &*= 0x0000_0100_0000_01B3
+        }
+        return String(hash, radix: 16)
     }
 
     static func record(from object: [String: Any]) -> HealthRecord? {
@@ -419,7 +638,7 @@ public enum BatchParser {
         )
     }
 
-    private static func numeric(_ value: Any?) -> Double? {
+    static func numeric(_ value: Any?) -> Double? {
         switch value {
         case let number as Double: number
         case let number as Int: Double(number)

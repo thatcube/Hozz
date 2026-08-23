@@ -378,7 +378,14 @@ public actor HealthReceiver {
                 json: [
                     "stored": result.stored,
                     "deleted": result.deleted,
-                    "duplicate": result.duplicate
+                    "duplicate": result.duplicate,
+                    // Reported so the phone's answer describes what actually
+                    // happened. Characteristics and unhandled records are both
+                    // genuinely on disk, so 200 is honest; `unreadable` counts
+                    // lines that were not JSON and could not be stored at all.
+                    "characteristics": result.characteristics,
+                    "unhandled": result.unhandled,
+                    "unreadable": result.unreadable
                 ]
             )
         } catch {
