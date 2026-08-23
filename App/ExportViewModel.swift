@@ -27,6 +27,16 @@ final class ExportViewModel {
         let runID: UUID
         let recordCount: Int
         let startedAt: Date
+        /// Why this run cannot be continued by this build, if it cannot.
+        ///
+        /// A run in this state is still shown. Hiding it would leave someone
+        /// wondering where their unfinished export went, and offering to
+        /// continue it would promise something that fails on the tap.
+        var obstruction: String?
+
+        var canContinue: Bool {
+            obstruction == nil
+        }
     }
 
     enum State {
@@ -122,20 +132,21 @@ final class ExportViewModel {
                 // already saved. So the run's own format wins, and the
                 // disabled picker shows what will actually be produced.
                 //
-                // A format this build does not recognise cannot be continued
-                // at all, so it is not offered as resumable. Starting a new
-                // export discards it through the usual path, which is honest,
-                // rather than promising to continue and then not.
-                guard let format = HealthExportFormat(rawValue: run.format) else {
-                    state = .idle(resumable: nil)
-                    return
+                // A run this build cannot continue — an unknown format, or a
+                // part state that leaves its bytes undecidable — is still
+                // shown, with the reason. It used to vanish silently, which
+                // left someone's unfinished export simply gone with nothing
+                // said about it.
+                let obstruction = try await exporter.resumeObstruction(for: run)
+                if let format = HealthExportFormat(rawValue: run.format) {
+                    exportFormat = format
                 }
-                exportFormat = format
                 state = .idle(
                     resumable: ResumableSummary(
                         runID: run.id,
                         recordCount: run.recordCount,
-                        startedAt: run.startedAt
+                        startedAt: run.startedAt,
+                        obstruction: obstruction
                     )
                 )
                 BackgroundExportScheduler.scheduleProcessing()

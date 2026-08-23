@@ -188,6 +188,13 @@ public actor HealthKitManualExporter {
         try await storeBackedEngine().resumableRun()
     }
 
+    /// Why a run cannot be continued by this build, or `nil` if it can.
+    public func resumeObstruction(
+        for run: ExportRunRecord
+    ) async throws -> String? {
+        try await storeBackedEngine().resumeObstruction(for: run)
+    }
+
     public func discardRun(id: UUID) async throws {
         try await storeBackedEngine().discardRun(id: id)
     }

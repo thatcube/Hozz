@@ -588,6 +588,49 @@ public actor HozzStore {
         ).first
     }
 
+    /// The spool file names a run owns, without decoding anything else.
+    ///
+    /// Deleting a run's files never needs to know whether a part was sealed,
+    /// and asking would make discarding impossible in exactly the case where
+    /// discarding is the only way out — a run whose part state this build
+    /// cannot read. The escape hatch must not depend on the thing that is
+    /// broken.
+    public func partFileNames(runID: UUID) throws -> [String] {
+        try database.query(
+            """
+            SELECT file_name FROM export_part WHERE run_id = ? ORDER BY sequence;
+            """,
+            [.text(runID.uuidString.lowercased())]
+        ) { row in
+            row.text(0)
+        }
+    }
+
+    /// Part states stored for a run that this build does not recognise.
+    ///
+    /// A part's state is what says whether its bytes are durable, so a state
+    /// this build cannot read leaves the run genuinely undecidable rather than
+    /// merely awkward: treating the part as sealed could ship a half-written
+    /// one, and treating it as open could delete bytes an anchor has already
+    /// advanced past. Neither is recoverable, so the run cannot be continued —
+    /// and the point of asking separately is to find that out *before*
+    /// offering to continue it.
+    ///
+    /// Reads the raw strings rather than decoding, which is the only way to
+    /// ask the question without hitting the failure being detected.
+    public func unrecognisedPartStates(runID: UUID) throws -> [String] {
+        try database.query(
+            """
+            SELECT DISTINCT state FROM export_part WHERE run_id = ?;
+            """,
+            [.text(runID.uuidString.lowercased())]
+        ) { row in
+            row.text(0)
+        }
+        .filter { ExportPartState(rawValue: $0) == nil }
+        .sorted()
+    }
+
     public func parts(runID: UUID) throws -> [ExportPartRecord] {
         try database.query(
             """

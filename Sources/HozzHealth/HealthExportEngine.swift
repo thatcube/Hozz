@@ -199,11 +199,36 @@ public actor HealthExportEngine {
         try await store.resumableRun()
     }
 
+    /// Why a run cannot be continued by this build, or `nil` if it can.
+    ///
+    /// Offering to continue something that then fails is its own small way of
+    /// claiming success, and it is worse than saying so plainly: the person
+    /// taps a button that promises their records are safe and watches it fail
+    /// with no idea why or what to do next.
+    public func resumeObstruction(for run: ExportRunRecord) async throws -> String? {
+        guard HealthExportFormat(rawValue: run.format) != nil else {
+            return """
+                This unfinished export was written in a format this version of \
+                Hozz does not know. Discard it to start a new one.
+                """
+        }
+        guard try await store.unrecognisedPartStates(runID: run.id).isEmpty else {
+            return """
+                This unfinished export was written by a version of Hozz that \
+                understood something this one does not, so it cannot be \
+                continued safely. Discard it to start a new one.
+                """
+        }
+        return nil
+    }
+
     /// Discards a run and every artifact it owns.
     public func discardRun(id: UUID) async throws {
-        for part in try await store.parts(runID: id) {
+        // Names only. Decoding part states here would make a run impossible to
+        // discard in precisely the case where discarding is the only way out.
+        for fileName in try await store.partFileNames(runID: id) {
             try? FileManager.default.removeItem(
-                at: await store.spoolDirectory.appending(path: part.fileName)
+                at: await store.spoolDirectory.appending(path: fileName)
             )
         }
         try await store.deleteRun(id: id)
@@ -641,7 +666,13 @@ public actor HealthExportEngine {
         format: HealthExportFormat
     ) async throws -> (ExportRunRecord, Bool) {
         if let existing = try await store.resumableRun() {
-            if existing.format == format.rawValue {
+            // A run this build cannot continue would otherwise fail every
+            // export from now on, including a brand new one, because the
+            // stale run is found first every time. It is abandoned for the
+            // same reason a format mismatch is: its parts cannot be appended
+            // to, so keeping it only prevents the export the person asked for.
+            let isBlocked = try await resumeObstruction(for: existing) != nil
+            if existing.format == format.rawValue, !isBlocked {
                 try await store.updateRun(id: existing.id, state: .running)
                 return (existing, true)
             }

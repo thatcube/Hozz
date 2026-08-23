@@ -32,6 +32,8 @@ Background delivery is requested with `HKObserverQuery` and `enableBackgroundDel
 
 Manual export creates a full historical export you can save or share from the phone. It is resumable: pausing, backgrounding, expiration, a kill, or a reboot resumes from the last durable checkpoint instead of starting over.
 
+An unfinished export that this build cannot continue — one written by a later version whose stored words it does not recognise — is still shown, with the reason, and can be discarded. Hiding it would leave someone's export simply gone; offering to continue it would promise something that fails on the tap.
+
 ## Formats
 
 Manual exports are built from a canonical NDJSON spool. That spool is the durable format because it streams, survives interruption, and can be assembled without recompressing. Presentation formats are produced from it at the end.
@@ -217,7 +219,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 493 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 501 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, unfinished-export recovery, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

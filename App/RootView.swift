@@ -122,12 +122,22 @@ private struct ExportSetupView: View {
 
             if let resumable {
                 Section("Unfinished export") {
-                    Label(
-                        "\(resumable.recordCount.formatted()) records are already saved. Exporting continues from there.",
-                        systemImage: "arrow.clockwise"
-                    )
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    if let obstruction = resumable.obstruction {
+                        // Shown rather than hidden. An unfinished export that
+                        // disappears with nothing said is worse than one that
+                        // explains why it is stuck.
+                        Label(obstruction, systemImage: "exclamationmark.triangle")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    } else {
+                        Label(
+                            "\(resumable.recordCount.formatted()) records are already saved. Exporting continues from there.",
+                            systemImage: "arrow.clockwise"
+                        )
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                    }
 
                     Button("Discard unfinished export", role: .destructive) {
                         discardAction()
@@ -150,7 +160,9 @@ private struct ExportSetupView: View {
                     Text("Markdown").tag(HealthExportFormat.markdown)
                     Text("GPX").tag(HealthExportFormat.gpx)
                 }
-                .disabled(resumable != nil)
+                // The unfinished run dictates the format only while it can
+                // actually be continued.
+                .disabled(resumable?.canContinue == true)
 
                 Label(formatNote, systemImage: formatIcon)
                     .font(.footnote)
@@ -171,7 +183,7 @@ private struct ExportSetupView: View {
                     .foregroundStyle(.orange)
                 }
 
-                if resumable != nil {
+                if resumable?.canContinue == true {
                     // Changing format now would throw away everything the
                     // unfinished run has already sealed, so the choice belongs
                     // to that run until it finishes or is discarded.
@@ -278,7 +290,12 @@ private struct ExportSetupView: View {
         if isRequestingAccess {
             return "Waiting for Health access"
         }
-        return resumable == nil ? "Export now" : "Continue export"
+        guard let resumable else {
+            return "Export now"
+        }
+        // A run that cannot be continued starts a fresh one instead, so the
+        // button says what will actually happen.
+        return resumable.canContinue ? "Continue export" : "Export now"
     }
 }
 
