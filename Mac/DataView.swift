@@ -79,18 +79,33 @@ struct DataView: View {
             }
 
             if !services.unhandled.isEmpty {
-                // Nothing is lost — these are on disk — but a receiver that is
-                // behind the phone should say so rather than look complete.
-                Section("Not yet understood") {
+                // Held, not failed. These are on disk and will be read as soon
+                // as Hozz learns the shape, so the wording says waiting rather
+                // than error — a receiver behind the phone is a temporary
+                // state, and describing it as a loss would be wrong twice.
+                Section("Waiting to be understood") {
                     ForEach(services.unhandled) { entry in
                         VStack(alignment: .leading, spacing: 3) {
                             Text("\(entry.count) × \(entry.kind)")
                                 .font(.body.weight(.medium))
-                            Text("Stored, but this Mac has no place for it yet. Update Hozz.")
+                            Text("Kept safely. A future version of Hozz will read these automatically — nothing needs to be re-sent from your phone.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
                         }
                     }
+                }
+            }
+
+            if services.promotedRecords > 0 {
+                Section {
+                    Label(
+                        "\(services.promotedRecords) records that were waiting have now been read and added.",
+                        systemImage: "checkmark.circle"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 }
             }
 

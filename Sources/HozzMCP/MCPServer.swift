@@ -121,12 +121,133 @@ public actor MCPServer {
             return try await aggregate(arguments)
         case "list_health_samples":
             return try await samples(arguments)
+        case "list_electrocardiograms":
+            return try await electrocardiograms(arguments)
+        case "get_electrocardiogram_voltages":
+            return try await voltages(arguments)
+        case "list_audiograms":
+            return try await audiograms(arguments)
         default:
             throw MCPError.unknownTool(name)
         }
     }
 
     // MARK: - Tools
+
+    // MARK: - ECG and hearing
+
+    private func electrocardiograms(_ arguments: [String: Any]) async throws -> String {
+        let limit = min((arguments["limit"] as? Int) ?? 50, 500)
+        let readings = try await store.electrocardiograms(limit: limit)
+        guard !readings.isEmpty else {
+            return "No ECG readings have been received."
+        }
+
+        var text = "\(readings.count) ECG "
+        text += readings.count == 1 ? "reading" : "readings"
+        text += ".\n\nid, start, classification, symptoms, average bpm, waveform\n"
+        text += readings
+            .map { reading in
+                [
+                    reading.id,
+                    Timestamps.text(from: reading.startDate),
+                    reading.classification ?? "unclassified",
+                    reading.symptomsStatus ?? "unknown",
+                    reading.averageHeartRate.map(Self.number) ?? "",
+                    Self.waveformState(reading)
+                ].joined(separator: ", ")
+            }
+            .joined(separator: "\n")
+        return text
+    }
+
+    /// Says what is actually held, because "complete" and "still arriving" are
+    /// different claims and only one of them can be read as a whole recording.
+    private static func waveformState(
+        _ reading: IngestStore.StoredElectrocardiogram
+    ) -> String {
+        guard reading.heldVoltages > 0 else {
+            return "no waveform received"
+        }
+        if reading.isComplete {
+            return "complete (\(reading.heldVoltages) points)"
+        }
+        guard let expected = reading.expectedVoltages else {
+            return "\(reading.heldVoltages) points, completeness unknown"
+        }
+        return "incomplete (\(reading.heldVoltages) of \(expected) points)"
+    }
+
+    private func voltages(_ arguments: [String: Any]) async throws -> String {
+        guard let id = arguments["id"] as? String else {
+            throw MCPError.missingArgument("id")
+        }
+        let limit = min((arguments["limit"] as? Int) ?? 500, 20_000)
+        let waveform = try await store.voltages(forElectrocardiogram: id)
+
+        guard !waveform.points.isEmpty else {
+            // Distinguishing "no such reading" from "no waveform yet" matters:
+            // an assistant told only "empty" will report the reading missing.
+            let known = try await store.electrocardiograms(limit: 500)
+                .map(\.id)
+            if !known.contains(id) {
+                return "There is no ECG reading with id \(id)."
+            }
+            return "That reading has arrived but its waveform has not."
+        }
+
+        var text = waveform.isComplete
+            ? "Complete recording: \(waveform.points.count) points."
+            : "INCOMPLETE recording: \(waveform.points.count) points held"
+        if !waveform.isComplete {
+            text += waveform.expected.map { " of \($0) expected" } ?? ""
+            text += ". Do not read this as a whole trace."
+        }
+        text += "\n\nsecondsSinceStart, volts\n"
+
+        text += waveform.points.prefix(limit)
+            .map { point in
+                String(format: "%.4f, %.7f", point.secondsSinceStart, point.volts)
+            }
+            .joined(separator: "\n")
+
+        if waveform.points.count > limit {
+            text += "\n\n(Truncated at \(limit) of \(waveform.points.count) points.)"
+        }
+        return text
+    }
+
+    private func audiograms(_ arguments: [String: Any]) async throws -> String {
+        let limit = min((arguments["limit"] as? Int) ?? 20, 200)
+        let tests = try await store.audiograms(limit: limit)
+        guard !tests.isEmpty else {
+            return "No hearing tests have been received."
+        }
+
+        var text = ""
+        for test in tests {
+            text += "Hearing test \(Self.day(test.startDate))"
+            if let source = test.sourceName {
+                text += " from \(source)"
+            }
+            text += "\n"
+            if test.points.isEmpty {
+                text += "  (no thresholds recorded)\n\n"
+                continue
+            }
+            text += "  frequency, ear, threshold\n"
+            for point in test.points {
+                let value = point.sensitivity.map(Self.number) ?? "—"
+                // A clamped reading is a bound: the difference between "90 dB"
+                // and "at least 90 dB".
+                let threshold = point.clamped ? "at least \(value)" : value
+                text += "  \(Self.number(point.frequency)) Hz, \(point.ear), "
+                text += "\(threshold) \(point.unit ?? "")\n"
+            }
+            text += "\n"
+        }
+        return text
+    }
 
     private func listTypes() async throws -> String {
         let summaries = try await store.summaries()
@@ -151,8 +272,19 @@ public actor MCPServer {
         let summaries = try await store.summaries()
         let total = try await store.totalRecordCount()
         let characteristics = try await store.characteristics()
+        // Counted here rather than later, because "nothing received" has to be
+        // false the moment anything has been — an ECG is not an ordinary
+        // sample, and reporting an empty store while holding one is exactly
+        // the confidently wrong answer this tool exists to avoid.
+        let ecgCount = try await store.electrocardiograms(limit: 500).count
+        let audiogramCount = try await store.audiograms(limit: 200).count
 
-        guard !summaries.isEmpty || !characteristics.isEmpty else {
+        guard
+            !summaries.isEmpty
+                || !characteristics.isEmpty
+                || ecgCount > 0
+                || audiogramCount > 0
+        else {
             return "No Health data has been received yet."
         }
 
@@ -177,6 +309,11 @@ public actor MCPServer {
         }
 
         guard !summaries.isEmpty else {
+            if ecgCount > 0 || audiogramCount > 0 {
+                return text
+                    + "No ordinary measurements yet, but \(ecgCount) ECG "
+                    + "readings and \(audiogramCount) hearing tests have arrived."
+            }
             return text + "No measurements have been received yet."
         }
 
@@ -198,6 +335,19 @@ public actor MCPServer {
             text += " received in a form this version of Hozz cannot read yet ("
             text += unhandled.map(\.kind).joined(separator: ", ")
             text += "); they are stored but not queryable here."
+        }
+
+        // Named separately because they are not ordinary samples: saying
+        // "0 types" while holding 200 ECG readings would be false.
+        if ecgCount > 0 {
+            text += " \(ecgCount) ECG "
+            text += ecgCount == 1 ? "reading" : "readings"
+            text += " (list_electrocardiograms)."
+        }
+        if audiogramCount > 0 {
+            text += " \(audiogramCount) hearing "
+            text += audiogramCount == 1 ? "test" : "tests"
+            text += " (list_audiograms)."
         }
 
         let biggest = summaries.sorted { $0.recordCount > $1.recordCount }.prefix(10)
@@ -469,6 +619,67 @@ enum Tools {
                     ]
                 ],
                 "required": ["type"]
+            ]
+        ],
+        [
+            "name": "list_electrocardiograms",
+            "description": """
+                Every ECG reading, newest first, with what the Watch \
+                classified it as, the average heart rate, whether the person \
+                reported symptoms, and whether the full waveform has arrived. \
+                Use this for questions about ECGs; they are not ordinary \
+                samples and do not appear in list_health_samples.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "limit": [
+                        "type": "integer",
+                        "description": "How many readings to return. Defaults to 50."
+                    ]
+                ] as [String: Any]
+            ]
+        ],
+        [
+            "name": "get_electrocardiogram_voltages",
+            "description": """
+                The waveform of one ECG reading, as time/volt pairs. Says \
+                explicitly whether the recording is complete: a waveform \
+                assembled from pages that are still arriving is not the same \
+                as a whole one, and must not be read as though it were. Large: \
+                a thirty-second reading is roughly 15,000 points, so ask for a \
+                limit unless the whole trace is genuinely needed.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "id": [
+                        "type": "string",
+                        "description": "The reading's id, from list_electrocardiograms."
+                    ],
+                    "limit": [
+                        "type": "integer",
+                        "description": "How many points to return. Defaults to 500."
+                    ]
+                ] as [String: Any],
+                "required": ["id"]
+            ]
+        ],
+        [
+            "name": "list_audiograms",
+            "description": """
+                Hearing tests, newest first, with the threshold measured at \
+                each frequency for each ear. A clamped reading is reported as \
+                a bound rather than a measurement.
+                """,
+            "inputSchema": [
+                "type": "object",
+                "properties": [
+                    "limit": [
+                        "type": "integer",
+                        "description": "How many tests to return. Defaults to 20."
+                    ]
+                ] as [String: Any]
             ]
         ],
         [

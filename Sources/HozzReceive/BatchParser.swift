@@ -182,10 +182,137 @@ public struct UnhandledRecord: Hashable, Sendable {
     }
 }
 
+/// One ECG reading, as it arrived.
+public struct ReceivedElectrocardiogram: Hashable, Sendable {
+    public let id: String
+    public let startDate: Date
+    public let endDate: Date?
+    /// What the Watch concluded: `sinusRhythm`, `atrialFibrillation`, and so
+    /// on. The single most useful field on the record, and the one that was
+    /// invisible while these were stored as generic samples.
+    public let classification: String?
+    public let classificationRawValue: Int?
+    public let symptomsStatus: String?
+    public let averageHeartRate: Double?
+    public let samplingHertz: Double?
+    /// How many voltage measurements the Watch says this reading contains.
+    public let expectedVoltages: Int?
+    public let sourceName: String?
+    public let raw: Data
+
+    public init(
+        id: String,
+        startDate: Date,
+        endDate: Date?,
+        classification: String?,
+        classificationRawValue: Int?,
+        symptomsStatus: String?,
+        averageHeartRate: Double?,
+        samplingHertz: Double?,
+        expectedVoltages: Int?,
+        sourceName: String?,
+        raw: Data
+    ) {
+        self.id = id
+        self.startDate = startDate
+        self.endDate = endDate
+        self.classification = classification
+        self.classificationRawValue = classificationRawValue
+        self.symptomsStatus = symptomsStatus
+        self.averageHeartRate = averageHeartRate
+        self.samplingHertz = samplingHertz
+        self.expectedVoltages = expectedVoltages
+        self.sourceName = sourceName
+        self.raw = raw
+    }
+}
+
+/// One page of a voltage series.
+///
+/// Pages are addressed by absolute offset and may arrive out of order, twice,
+/// or not at all, so a page carries everything needed to place itself.
+public struct ReceivedVoltagePage: Hashable, Sendable {
+    public let sampleID: String
+    public let sequence: Int
+    public let offset: Int
+    public let count: Int
+    /// The points as delivered, kept verbatim.
+    public let points: Data
+
+    public init(
+        sampleID: String,
+        sequence: Int,
+        offset: Int,
+        count: Int,
+        points: Data
+    ) {
+        self.sampleID = sampleID
+        self.sequence = sequence
+        self.offset = offset
+        self.count = count
+        self.points = points
+    }
+}
+
+/// One hearing test.
+public struct ReceivedAudiogram: Hashable, Sendable {
+    public struct Point: Hashable, Sendable {
+        public let frequency: Double
+        public let ear: String
+        public let sensitivity: Double?
+        public let unit: String?
+        public let masked: Bool?
+        /// A clamped reading is a bound rather than a measurement.
+        public let clamped: Bool
+
+        public init(
+            frequency: Double,
+            ear: String,
+            sensitivity: Double?,
+            unit: String?,
+            masked: Bool?,
+            clamped: Bool
+        ) {
+            self.frequency = frequency
+            self.ear = ear
+            self.sensitivity = sensitivity
+            self.unit = unit
+            self.masked = masked
+            self.clamped = clamped
+        }
+    }
+
+    public let id: String
+    public let startDate: Date
+    public let endDate: Date?
+    public let sourceName: String?
+    public let points: [Point]
+    public let raw: Data
+
+    public init(
+        id: String,
+        startDate: Date,
+        endDate: Date?,
+        sourceName: String?,
+        points: [Point],
+        raw: Data
+    ) {
+        self.id = id
+        self.startDate = startDate
+        self.endDate = endDate
+        self.sourceName = sourceName
+        self.points = points
+        self.raw = raw
+    }
+}
+
 public struct ParsedBatch: Hashable, Sendable {
     public let records: [HealthRecord]
     public let deletions: [HealthDeletion]
     public let characteristics: [ReceivedCharacteristic]
+    public let electrocardiograms: [ReceivedElectrocardiogram]
+    public let voltagePages: [ReceivedVoltagePage]
+    public let audiograms: [ReceivedAudiogram]
     /// Records the receiver could not interpret. They are still stored, so this
     /// is a list of things to teach it about rather than a list of losses.
     public let unhandled: [UnhandledRecord]
@@ -197,6 +324,9 @@ public struct ParsedBatch: Hashable, Sendable {
         records.isEmpty
             && deletions.isEmpty
             && characteristics.isEmpty
+            && electrocardiograms.isEmpty
+            && voltagePages.isEmpty
+            && audiograms.isEmpty
             && unhandled.isEmpty
     }
 
@@ -204,12 +334,18 @@ public struct ParsedBatch: Hashable, Sendable {
         records: [HealthRecord],
         deletions: [HealthDeletion],
         characteristics: [ReceivedCharacteristic] = [],
+        electrocardiograms: [ReceivedElectrocardiogram] = [],
+        voltagePages: [ReceivedVoltagePage] = [],
+        audiograms: [ReceivedAudiogram] = [],
         unhandled: [UnhandledRecord] = [],
         unreadableCount: Int
     ) {
         self.records = records
         self.deletions = deletions
         self.characteristics = characteristics
+        self.electrocardiograms = electrocardiograms
+        self.voltagePages = voltagePages
+        self.audiograms = audiograms
         self.unhandled = unhandled
         self.unreadableCount = unreadableCount
     }
@@ -233,6 +369,20 @@ public enum BatchParseError: Error, LocalizedError, Sendable {
 /// destination at it. So the shape is detected rather than configured, because
 /// a mismatch that silently stores nothing is the worst possible outcome.
 public enum BatchParser {
+    /// How much this parser understands, bumped whenever it learns a new
+    /// record shape.
+    ///
+    /// Quarantined records remember the version that failed to read them, so
+    /// the promotion pass can reconsider exactly the rows a newer parser might
+    /// now handle and skip the rest. Without it, teaching the parser anything
+    /// would mean rescanning every quarantined record on every launch forever.
+    ///
+    /// Bump this in the same commit that teaches the parser a shape.
+    /// - 1: samples, deletions.
+    /// - 2: characteristics, and quarantine instead of dropping.
+    /// - 3: ECG readings, their voltage pages, and audiograms.
+    public static let parserVersion = 3
+
     public static func parse(_ payload: Data) throws -> ParsedBatch {
         let text = String(decoding: payload, as: UTF8.self)
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -315,6 +465,9 @@ public enum BatchParser {
             records: batch.records,
             deletions: batch.deletions,
             characteristics: batch.characteristics,
+            electrocardiograms: batch.electrocardiograms,
+            voltagePages: batch.voltagePages,
+            audiograms: batch.audiograms,
             unhandled: batch.unhandled + quarantined,
             unreadableCount: batch.unreadableCount + unreadable
         )
@@ -324,6 +477,9 @@ public enum BatchParser {
         var records: [HealthRecord] = []
         var deletions: [HealthDeletion] = []
         var characteristics: [ReceivedCharacteristic] = []
+        var electrocardiograms: [ReceivedElectrocardiogram] = []
+        var voltagePages: [ReceivedVoltagePage] = []
+        var audiograms: [ReceivedAudiogram] = []
         var unhandled: [UnhandledRecord] = []
         var unreadable = 0
 
@@ -365,6 +521,38 @@ public enum BatchParser {
                 continue
             }
 
+            // ECG readings, their voltage pages, and hearing tests all parse
+            // as generic samples — they carry ids and dates — which is why
+            // they were never lost. But a generic sample has one value, and
+            // these have none: an ECG's answer is its classification, a
+            // hearing test's is a curve. Stored generically, "how many ECGs do
+            // I have" counted the voltage pages as readings and the
+            // classification was invisible. So they are read properly here,
+            // before the generic path can claim them.
+            switch kind {
+            case ElectrocardiogramShape.headerKind:
+                if let ecg = ElectrocardiogramShape.reading(in: object) {
+                    electrocardiograms.append(ecg)
+                    continue
+                }
+            case ElectrocardiogramShape.elementKind:
+                if let page = ElectrocardiogramShape.page(in: object) {
+                    voltagePages.append(page)
+                    continue
+                }
+            case ElectrocardiogramShape.endKind:
+                // The end marker carries no data of its own; the header
+                // already says how many measurements to expect.
+                continue
+            case AudiogramShape.kind:
+                if let audiogram = AudiogramShape.audiogram(in: object) {
+                    audiograms.append(audiogram)
+                    continue
+                }
+            default:
+                break
+            }
+
             if let record = record(from: object) {
                 records.append(record)
                 continue
@@ -388,6 +576,9 @@ public enum BatchParser {
             records: records,
             deletions: deletions,
             characteristics: characteristics,
+            electrocardiograms: electrocardiograms,
+            voltagePages: voltagePages,
+            audiograms: audiograms,
             unhandled: unhandled,
             unreadableCount: unreadable
         )
@@ -718,5 +909,134 @@ enum CSV {
         }
         fields.append(current)
         return fields
+    }
+}
+
+/// The shape the phone uses for an ECG, in one place.
+///
+/// Kept beside the characteristics reader for the same reason: this is one
+/// half of a contract whose other half lives in the phone's encoder, and a
+/// change there has to be answerable by a change here.
+enum ElectrocardiogramShape {
+    static let headerKind = "electrocardiogram"
+    static let elementKind = "electrocardiogramVoltages"
+    static let endKind = "electrocardiogramEnd"
+
+    static func reading(in object: [String: Any]) -> ReceivedElectrocardiogram? {
+        guard
+            let id = object["id"] as? String,
+            let startText = object["startDate"] as? String,
+            let start = Timestamps.date(from: startText)
+        else {
+            return nil
+        }
+
+        let classification = object["classification"] as? [String: Any]
+        let symptoms = object["symptomsStatus"] as? [String: Any]
+
+        return ReceivedElectrocardiogram(
+            id: id,
+            startDate: start,
+            endDate: (object["endDate"] as? String).flatMap(Timestamps.date(from:)),
+            classification: classification?["name"] as? String,
+            classificationRawValue: BatchParser.numeric(classification?["rawValue"])
+                .map { Int($0) },
+            symptomsStatus: symptoms?["name"] as? String,
+            averageHeartRate: quantityValue(object["averageHeartRate"]),
+            samplingHertz: quantityValue(object["samplingFrequency"]),
+            expectedVoltages: BatchParser.numeric(object["numberOfVoltageMeasurements"])
+                .map { Int($0) },
+            sourceName: (object["source"] as? [String: Any])?["name"] as? String,
+            raw: canonical(object)
+        )
+    }
+
+    static func page(in object: [String: Any]) -> ReceivedVoltagePage? {
+        guard
+            let sample = object["sample"] as? String,
+            let sequence = BatchParser.numeric(object["sequence"]).map({ Int($0) }),
+            let offset = BatchParser.numeric(object["offset"]).map({ Int($0) }),
+            let points = object["voltages"] as? [[String: Any]]
+        else {
+            return nil
+        }
+        // `count` is what the page claims; the array is what it holds. The
+        // array wins, because it is the thing that will actually be read back.
+        return ReceivedVoltagePage(
+            sampleID: sample,
+            sequence: sequence,
+            offset: offset,
+            count: points.count,
+            points: (try? JSONSerialization.data(
+                withJSONObject: points,
+                options: [.sortedKeys, .withoutEscapingSlashes]
+            )) ?? Data()
+        )
+    }
+
+    private static func quantityValue(_ value: Any?) -> Double? {
+        guard let object = value as? [String: Any] else {
+            return BatchParser.numeric(value)
+        }
+        return BatchParser.numeric(object["value"])
+    }
+
+    static func canonical(_ object: [String: Any]) -> Data {
+        (try? JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )) ?? Data()
+    }
+}
+
+/// The shape the phone uses for a hearing test.
+enum AudiogramShape {
+    static let kind = "audiogram"
+
+    static func audiogram(in object: [String: Any]) -> ReceivedAudiogram? {
+        guard
+            let id = object["id"] as? String,
+            let startText = object["startDate"] as? String,
+            let start = Timestamps.date(from: startText)
+        else {
+            return nil
+        }
+
+        var points: [ReceivedAudiogram.Point] = []
+        for entry in object["sensitivityPoints"] as? [[String: Any]] ?? [] {
+            guard
+                let frequency = quantity(entry["frequency"])
+            else {
+                continue
+            }
+            for ear in entry["ears"] as? [[String: Any]] ?? [] {
+                points.append(
+                    ReceivedAudiogram.Point(
+                        frequency: frequency,
+                        ear: ear["ear"] as? String ?? "unknown",
+                        sensitivity: quantity(ear["sensitivity"]),
+                        unit: (ear["sensitivity"] as? [String: Any])?["unit"] as? String,
+                        masked: ear["masked"] as? Bool,
+                        clamped: ear["clampingRange"] != nil
+                    )
+                )
+            }
+        }
+
+        return ReceivedAudiogram(
+            id: id,
+            startDate: start,
+            endDate: (object["endDate"] as? String).flatMap(Timestamps.date(from:)),
+            sourceName: (object["source"] as? [String: Any])?["name"] as? String,
+            points: points,
+            raw: ElectrocardiogramShape.canonical(object)
+        )
+    }
+
+    private static func quantity(_ value: Any?) -> Double? {
+        guard let object = value as? [String: Any] else {
+            return BatchParser.numeric(value)
+        }
+        return BatchParser.numeric(object["value"])
     }
 }
