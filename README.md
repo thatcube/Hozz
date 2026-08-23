@@ -293,7 +293,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains COUNT_PLACEHOLDER tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, aggregate sample counts, fair-share acquisition, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 402 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, aggregate sample counts, fair-share acquisition, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 
