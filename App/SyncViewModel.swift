@@ -121,15 +121,21 @@ final class SyncViewModel {
 
             for destination in destinations {
                 let state = try await services.delivery.state(for: destination.id)
+                // A destination Hozz only half understands has never been
+                // delivered to, whatever the stored state says, so it is shown
+                // as needing attention rather than as idle or delivered.
+                let unsupported = destination.unsupportedDescription
                 built.append(
                     DestinationSummary(
                         destination: destination,
-                        state: state.flatMap { DeliveryState(rawValue: $0.state) } ?? .idle,
+                        state: unsupported != nil
+                            ? .needsAttention
+                            : state.flatMap { DeliveryState(rawValue: $0.state) } ?? .idle,
                         lastSuccessAt: state?.lastSuccessAt,
                         lastAttemptAt: state?.lastAttemptAt,
                         nextAttemptAt: state?.nextAttemptAt,
                         deliveredRecords: state?.deliveredRecords ?? 0,
-                        detail: state?.detail
+                        detail: unsupported ?? state?.detail
                     )
                 )
             }

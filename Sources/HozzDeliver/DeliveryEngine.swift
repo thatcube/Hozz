@@ -128,6 +128,13 @@ public actor DeliveryEngine {
             guard destination.isEnabled, destination.isConfigured else {
                 continue
             }
+            // A destination this build only half understands is never run, not
+            // even when the user asks. Delivering it would mean substituting a
+            // format, a schedule, or a precision they did not choose and
+            // reporting that as a success.
+            guard destination.isUsable else {
+                continue
+            }
             if ignoringCadence {
                 // An explicit "sync now" bypasses both the cadence and any
                 // backoff: the user is standing there asking for an answer.
@@ -174,6 +181,13 @@ public actor DeliveryEngine {
         to destination: Destination,
         now: Date = .now
     ) async throws -> DeliveryReceipt {
+        if let detail = destination.unsupportedDescription {
+            // Recorded rather than thrown quietly, so the dashboard shows the
+            // destination needing attention instead of it simply never
+            // delivering anything again.
+            try await recordUnusable(destination, detail: detail, now: now)
+            throw DeliveryError.unsupportedSettings(detail)
+        }
         guard let channel = channels[destination.kind] else {
             throw DeliveryError.notConfigured
         }
@@ -314,10 +328,47 @@ public actor DeliveryEngine {
         return repaired
     }
 
+    /// Parks a destination Hozz cannot safely use, with a reason to show.
+    private func recordUnusable(
+        _ destination: Destination,
+        detail: String,
+        now: Date
+    ) async throws {
+        let previous = try await store.deliveryState(for: destination.id)
+        try await store.saveDeliveryState(
+            DeliveryStateRecord(
+                destinationID: destination.id,
+                state: DeliveryState.needsAttention.rawValue,
+                lastAttemptAt: now,
+                lastSuccessAt: previous?.lastSuccessAt,
+                nextAttemptAt: nil,
+                consecutiveFailures: previous?.consecutiveFailures ?? 0,
+                pendingBatchID: previous?.pendingBatchID,
+                nextSequence: previous?.nextSequence ?? 0,
+                deliveredRecords: previous?.deliveredRecords ?? 0,
+                detail: detail
+            )
+        )
+        try await store.appendReceipt(
+            DeliveryReceiptRecord(
+                destinationID: destination.id,
+                attemptedAt: now,
+                recordCount: 0,
+                byteCount: 0,
+                state: DeliveryState.needsAttention.rawValue,
+                detail: detail,
+                artifactName: nil
+            )
+        )
+    }
+
     public func deliverWithoutRecording(
         _ batch: DeliveryBatch,
         to destination: Destination
     ) async throws -> DeliveryReceipt {
+        if let detail = destination.unsupportedDescription {
+            throw DeliveryError.unsupportedSettings(detail)
+        }
         guard let channel = channels[destination.kind] else {
             throw DeliveryError.notConfigured
         }

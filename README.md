@@ -166,6 +166,16 @@ Destination credentials are kept in the device Keychain with `ThisDeviceOnly` ac
 
 Logs and diagnostics must not include Health sample values, credentials, or secret destination details. Network errors record statuses and human-readable failure states, not response bodies that might echo data back.
 
+### A stored setting this build does not recognise
+
+A destination is stored as JSON and read back with a decoder that tolerates missing keys, because destinations are loaded with `try?` and a decoder that threw would have emptied someone's list on upgrade without saying anything. Missing keys were only half of it: `decodeIfPresent` returns nil for an absent key but *throws* for a value the enum does not know, so a destination written by a newer build — or by one whose vocabulary later changed — vanished just as silently.
+
+There were three ways to answer that, and two of them are worse than they look. Failing closed is what already nearly happened: the destination disappears and nothing is said. Falling back to a default is quieter still and worse, because Hozz would then send Health data to a real endpoint in a shape, on a schedule, or at a timestamp precision nobody chose, and report it as a success — and the first re-save would write that default over the user's actual setting, so the update that could have understood it would arrive too late.
+
+So Hozz keeps the record and refuses to use it. The unrecognised word is held as-is and written back out untouched, so a build that cannot read a setting cannot erode it either. The destination stays in the list, marked as needing attention, saying which setting and which value it did not understand. Nothing is delivered to it, not even when the user taps Sync now, and the connection test refuses rather than reporting a destination Hozz cannot use as working. Editing and saving is the escape hatch, and the editor says plainly that saving is also the moment the original setting is replaced.
+
+The tests for this are built from hand-written stored payloads rather than by encoding today's types, because a round trip can only ever contain values this build already understands — which is exactly the case that was never in doubt.
+
 ## Build and test
 
 Requirements:
@@ -207,7 +217,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 478 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 493 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

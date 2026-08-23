@@ -227,6 +227,13 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
     /// Kept apart from ``headers`` because those really are sent as headers,
     /// and a measurement name arriving as one would be noise at best.
     public var options: [String: String]
+    /// Settings that were persisted with a value this build does not recognise,
+    /// keyed by the field they came from and holding the original word.
+    ///
+    /// Not a key of its own on disk. It is derived when a stored destination is
+    /// read and consumed when one is written, which is what lets an unknown
+    /// setting survive a round trip through a build that cannot use it.
+    public private(set) var unsupportedSettings: [String: String] = [:]
     public var createdAt: Date
 
     public init(
@@ -268,15 +275,19 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
     /// adding one field would have silently emptied everybody's destination
     /// list on upgrade — the delivery equivalent of losing records. Every field
     /// is therefore optional on the way in and falls back to its default.
+    /// Declared rather than synthesised, so ``unsupportedSettings`` never
+    /// becomes a key of its own on disk. It is derived from the other fields
+    /// and writing it down would let it disagree with them.
+    private enum CodingKeys: String, CodingKey {
+        case id, name, kind, format, cadence, isEnabled, folderBookmark
+        case endpointURL, headers, authorizationHeader, includedTypes
+        case payloadSchema, options, createdAt
+    }
+
     public init(from decoder: any Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         id = try container.decode(UUID.self, forKey: .id)
         name = try container.decode(String.self, forKey: .name)
-        kind = try container.decode(DestinationKind.self, forKey: .kind)
-        format = try container.decodeIfPresent(DeliveryFormat.self, forKey: .format)
-            ?? .ndjson
-        cadence = try container.decodeIfPresent(SyncCadence.self, forKey: .cadence)
-            ?? .whenDataArrives
         isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
         folderBookmark = try container.decodeIfPresent(Data.self, forKey: .folderBookmark)
         endpointURL = try container.decodeIfPresent(URL.self, forKey: .endpointURL)
@@ -290,13 +301,139 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
             Set<HealthTypeKey>.self,
             forKey: .includedTypes
         ) ?? []
-        payloadSchema = try container.decodeIfPresent(
-            PayloadSchema.self,
-            forKey: .payloadSchema
-        ) ?? .hozz
         options = try container.decodeIfPresent([String: String].self, forKey: .options)
             ?? [:]
         createdAt = try container.decodeIfPresent(Date.self, forKey: .createdAt) ?? .now
+
+        // Every enum is read as text first. `decodeIfPresent` returns nil only
+        // for an absent or null key; a value the enum does not recognise
+        // *throws*, and destinations are loaded with `try?`, so one unknown
+        // word would have deleted the whole destination from the user's list
+        // with no error at all.
+        var unsupported: [String: String] = [:]
+        func value<T: RawRepresentable<String>>(
+            _ key: CodingKeys,
+            _ fallback: T
+        ) throws -> T {
+            guard let raw = try container.decodeIfPresent(String.self, forKey: key) else {
+                return fallback
+            }
+            guard let known = T(rawValue: raw) else {
+                // Kept, not guessed at. The raw word is written back out
+                // untouched by `encode(to:)`, so a build that does not
+                // understand this setting cannot destroy it either.
+                unsupported[key.stringValue] = raw
+                return fallback
+            }
+            return known
+        }
+
+        kind = try value(.kind, .folder)
+        format = try value(.format, .ndjson)
+        cadence = try value(.cadence, .whenDataArrives)
+        payloadSchema = try value(.payloadSchema, .hozz)
+
+        // The InfluxDB precision is not an enum on the way in — it is a string
+        // in `options` — so it cannot throw. It can do something worse:
+        // silently fall back to nanoseconds and file every point in the wrong
+        // decade, in a database that will not complain.
+        if let raw = options[Destination.precisionKey],
+           InfluxLineProtocol.Precision(rawValue: raw) == nil {
+            unsupported[Destination.precisionKey] = raw
+        }
+
+        unsupportedSettings = unsupported
+    }
+
+    /// Writes the original word back for anything this build did not recognise.
+    ///
+    /// This is the half that makes keeping the record mean something. Without
+    /// it, the first time anything re-saved the destination — a delivery
+    /// receipt, a folder bookmark refresh — the fallback would be written over
+    /// the user's real setting and their choice would be gone for good, with
+    /// the upgrade that could have understood it arriving too late.
+    public func encode(to encoder: any Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(isEnabled, forKey: .isEnabled)
+        try container.encodeIfPresent(folderBookmark, forKey: .folderBookmark)
+        try container.encodeIfPresent(endpointURL, forKey: .endpointURL)
+        try container.encode(headers, forKey: .headers)
+        try container.encode(authorizationHeader, forKey: .authorizationHeader)
+        try container.encode(includedTypes, forKey: .includedTypes)
+        try container.encode(options, forKey: .options)
+        try container.encode(createdAt, forKey: .createdAt)
+
+        try container.encode(
+            unsupportedSettings[CodingKeys.kind.stringValue] ?? kind.rawValue,
+            forKey: .kind
+        )
+        try container.encode(
+            unsupportedSettings[CodingKeys.format.stringValue] ?? format.rawValue,
+            forKey: .format
+        )
+        try container.encode(
+            unsupportedSettings[CodingKeys.cadence.stringValue] ?? cadence.rawValue,
+            forKey: .cadence
+        )
+        try container.encode(
+            unsupportedSettings[CodingKeys.payloadSchema.stringValue]
+                ?? payloadSchema.rawValue,
+            forKey: .payloadSchema
+        )
+    }
+
+    /// Whether Hozz understands this destination well enough to use it.
+    ///
+    /// A destination set up by a newer build, or by one whose vocabulary has
+    /// since changed, is kept and shown rather than deleted or quietly run with
+    /// substituted settings. Sending someone's Health data somewhere in a shape
+    /// they did not choose is not a smaller failure than losing the
+    /// destination; it is a larger one, because it looks like it worked.
+    public var isUsable: Bool {
+        unsupportedSettings.isEmpty
+    }
+
+    /// What to tell the user, when there is something to tell them.
+    public var unsupportedDescription: String? {
+        guard !unsupportedSettings.isEmpty else {
+            return nil
+        }
+        let described = unsupportedSettings
+            .sorted { $0.key < $1.key }
+            .map { "\(Destination.settingName(for: $0.key)) \u{201C}\($0.value)\u{201D}" }
+        let list: String
+        switch described.count {
+        case 1:
+            list = described[0]
+        case 2:
+            list = "\(described[0]) and \(described[1])"
+        default:
+            list = described.dropLast().joined(separator: ", ")
+                + ", and \(described[described.count - 1])"
+        }
+        return "This destination uses \(list), which this version of Hozz does "
+            + "not understand. Nothing has been sent to it, and the setting has "
+            + "been kept. Update Hozz, or edit the destination to choose a "
+            + "setting this version supports."
+    }
+
+    static func settingName(for key: String) -> String {
+        switch key {
+        case CodingKeys.kind.stringValue:
+            "a destination type"
+        case CodingKeys.format.stringValue:
+            "a format"
+        case CodingKeys.cadence.stringValue:
+            "a schedule"
+        case CodingKeys.payloadSchema.stringValue:
+            "a field-name scheme"
+        case Destination.precisionKey:
+            "a timestamp precision"
+        default:
+            "a setting"
+        }
     }
 
     /// The InfluxDB measurement and timestamp precision for this destination.
@@ -464,6 +601,8 @@ public struct DeliveryBatch: Sendable {
 
 public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
     case notConfigured
+    /// The stored destination uses a setting this build does not recognise.
+    case unsupportedSettings(String)
     case folderUnavailable
     case accessDenied
     case rejected(statusCode: Int, body: String?)
@@ -474,6 +613,8 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
         switch self {
         case .notConfigured:
             "This destination is not finished being set up."
+        case .unsupportedSettings(let detail):
+            detail
         case .folderUnavailable:
             "Hozz could not reach that folder. It may have been moved, renamed, or signed out."
         case .accessDenied:
@@ -496,7 +637,11 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
         case .rejected(let statusCode, _):
             // 408, 429, and 5xx are the server asking to be tried again.
             statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode)
-        case .notConfigured, .folderUnavailable, .accessDenied, .cancelled:
+        case .notConfigured, .folderUnavailable, .accessDenied, .cancelled,
+             .unsupportedSettings:
+            // Waiting does not teach this build a word it does not know. Only
+            // an update or an edit resolves it, so it is put in front of the
+            // user instead of retried on a timer forever.
             false
         }
     }

@@ -165,6 +165,27 @@ struct DestinationEditorView: View {
                 Text(formatExplanation)
             }
 
+            if let unsupported = existing?.unsupportedDescription {
+                Section {
+                    HozzLabel(.alertTriangle, size: 16) {
+                        Text(unsupported)
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+                    }
+                } header: {
+                    Text("Not understood by this version")
+                } footer: {
+                    // Saying this plainly matters: saving is the escape hatch,
+                    // and it is also the moment the original setting is
+                    // replaced. Someone should be able to decide to wait.
+                    Text(
+                        "Saving replaces that setting with the one chosen "
+                        + "above. If you would rather keep it until Hozz can "
+                        + "read it again, leave this screen without saving."
+                    )
+                }
+            }
+
             if format == .influx {
                 influxSection
             }
