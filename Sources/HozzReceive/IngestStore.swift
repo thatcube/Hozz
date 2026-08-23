@@ -226,7 +226,7 @@ public actor IngestStore {
     private static func migrate(_ database: SQLiteDatabase) throws {
         let version = try database.query("PRAGMA user_version", row: { $0.integer(0) })
             .first ?? 0
-        guard version < 4 else {
+        guard version < 5 else {
             return
         }
         try database.transaction {
@@ -329,6 +329,77 @@ public actor IngestStore {
                 -- on?", which on a healthy receiver matches nothing at all.
                 CREATE INDEX IF NOT EXISTS unhandled_parser_version
                     ON unhandled_record (parser_version);
+
+                -- One row per ECG reading.
+                --
+                -- These do not belong in `sample`. An ECG has no single value,
+                -- so it landed there with an empty one, and its voltage pages
+                -- landed beside it as more rows of the same type — which made
+                -- "how many ECGs do I have" answer 2 for one reading, and made
+                -- the classification, the thing a person actually wants to
+                -- know, invisible.
+                CREATE TABLE IF NOT EXISTS electrocardiogram (
+                    id TEXT PRIMARY KEY,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT,
+                    classification TEXT,
+                    classification_raw INTEGER,
+                    symptoms_status TEXT,
+                    average_heart_rate REAL,
+                    sampling_hz REAL,
+                    -- What the watch said it recorded. Compared against the
+                    -- pages actually held, so a partial waveform is never
+                    -- presented as a whole one.
+                    expected_voltages INTEGER,
+                    source_name TEXT,
+                    raw BLOB NOT NULL,
+                    received_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS ecg_start ON electrocardiogram (start_date);
+
+                -- Voltages arrive in fixed-offset pages that may be delivered
+                -- out of order, more than once, or not at all. Keyed by
+                -- sequence so a replayed page overwrites rather than
+                -- duplicates, and ordered by offset on read so arrival order
+                -- does not matter.
+                CREATE TABLE IF NOT EXISTS electrocardiogram_voltage_page (
+                    sample_id TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    offset INTEGER NOT NULL,
+                    point_count INTEGER NOT NULL,
+                    points BLOB NOT NULL,
+                    PRIMARY KEY (sample_id, sequence)
+                );
+
+                CREATE INDEX IF NOT EXISTS ecg_page_sample
+                    ON electrocardiogram_voltage_page (sample_id, offset);
+
+                -- A hearing test is a set of thresholds per frequency, not one
+                -- number, so it gets the same treatment for the same reason.
+                CREATE TABLE IF NOT EXISTS audiogram (
+                    id TEXT PRIMARY KEY,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT,
+                    source_name TEXT,
+                    raw BLOB NOT NULL,
+                    received_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS audiogram_start ON audiogram (start_date);
+
+                CREATE TABLE IF NOT EXISTS audiogram_point (
+                    audiogram_id TEXT NOT NULL,
+                    frequency REAL NOT NULL,
+                    ear TEXT NOT NULL,
+                    sensitivity REAL,
+                    unit TEXT,
+                    masked INTEGER,
+                    -- A clamped reading is a bound, not a measurement: the
+                    -- difference between "90 dB" and "at least 90 dB".
+                    clamped INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY (audiogram_id, frequency, ear)
+                );
                 """
             )
 
@@ -349,7 +420,7 @@ public actor IngestStore {
                 )
             }
 
-            try database.execute("PRAGMA user_version = 4")
+            try database.execute("PRAGMA user_version = 5")
         }
     }
 
@@ -416,6 +487,9 @@ public actor IngestStore {
         var deleted = 0
         var storedCharacteristics = 0
         var storedUnhandled = 0
+        var storedElectrocardiograms = 0
+        var storedVoltagePages = 0
+        var storedAudiograms = 0
 
         for record in batch.records {
             try database.run(
@@ -525,8 +599,118 @@ public actor IngestStore {
                     .integer(Int64(BatchParser.parserVersion))
                 ]
             )
-        storedUnhandled += 1
+            storedUnhandled += 1
         }
+
+        for ecg in batch.electrocardiograms {
+            try database.run(
+                """
+                INSERT INTO electrocardiogram
+                    (id, start_date, end_date, classification, classification_raw,
+                     symptoms_status, average_heart_rate, sampling_hz,
+                     expected_voltages, source_name, raw, received_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    start_date = excluded.start_date,
+                    end_date = excluded.end_date,
+                    classification = excluded.classification,
+                    classification_raw = excluded.classification_raw,
+                    symptoms_status = excluded.symptoms_status,
+                    average_heart_rate = excluded.average_heart_rate,
+                    sampling_hz = excluded.sampling_hz,
+                    expected_voltages = excluded.expected_voltages,
+                    source_name = excluded.source_name,
+                    raw = excluded.raw
+                """,
+                [
+                    .text(ecg.id),
+                    .text(Timestamps.text(from: ecg.startDate)),
+                    ecg.endDate.map { SQLiteValue.text(Timestamps.text(from: $0)) } ?? .null,
+                    ecg.classification.map { SQLiteValue.text($0) } ?? .null,
+                    ecg.classificationRawValue.map { SQLiteValue.integer(Int64($0)) } ?? .null,
+                    ecg.symptomsStatus.map { SQLiteValue.text($0) } ?? .null,
+                    ecg.averageHeartRate.map { SQLiteValue.real($0) } ?? .null,
+                    ecg.samplingHertz.map { SQLiteValue.real($0) } ?? .null,
+                    ecg.expectedVoltages.map { SQLiteValue.integer(Int64($0)) } ?? .null,
+                    ecg.sourceName.map { SQLiteValue.text($0) } ?? .null,
+                    .blob(ecg.raw),
+                    .text(timestamp)
+                ]
+            )
+            storedElectrocardiograms += 1
+        }
+
+        // Keyed by sequence, so a page replayed byte-for-byte overwrites
+        // itself rather than appearing twice in the waveform.
+        for page in batch.voltagePages {
+            try database.run(
+                """
+                INSERT INTO electrocardiogram_voltage_page
+                    (sample_id, sequence, offset, point_count, points)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT (sample_id, sequence) DO UPDATE SET
+                    offset = excluded.offset,
+                    point_count = excluded.point_count,
+                    points = excluded.points
+                """,
+                [
+                    .text(page.sampleID),
+                    .integer(Int64(page.sequence)),
+                    .integer(Int64(page.offset)),
+                    .integer(Int64(page.count)),
+                    .blob(page.points)
+                ]
+            )
+            storedVoltagePages += 1
+        }
+
+        for audiogram in batch.audiograms {
+            try database.run(
+                """
+                INSERT INTO audiogram
+                    (id, start_date, end_date, source_name, raw, received_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET
+                    start_date = excluded.start_date,
+                    end_date = excluded.end_date,
+                    source_name = excluded.source_name,
+                    raw = excluded.raw
+                """,
+                [
+                    .text(audiogram.id),
+                    .text(Timestamps.text(from: audiogram.startDate)),
+                    audiogram.endDate.map { SQLiteValue.text(Timestamps.text(from: $0)) } ?? .null,
+                    audiogram.sourceName.map { SQLiteValue.text($0) } ?? .null,
+                    .blob(audiogram.raw),
+                    .text(timestamp)
+                ]
+            )
+            for point in audiogram.points {
+                try database.run(
+                    """
+                    INSERT INTO audiogram_point
+                        (audiogram_id, frequency, ear, sensitivity, unit, masked, clamped)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT (audiogram_id, frequency, ear) DO UPDATE SET
+                        sensitivity = excluded.sensitivity,
+                        unit = excluded.unit,
+                        masked = excluded.masked,
+                        clamped = excluded.clamped
+                    """,
+                    [
+                        .text(audiogram.id),
+                        .real(point.frequency),
+                        .text(point.ear),
+                        point.sensitivity.map { SQLiteValue.real($0) } ?? .null,
+                        point.unit.map { SQLiteValue.text($0) } ?? .null,
+                        point.masked.map { SQLiteValue.integer($0 ? 1 : 0) } ?? .null,
+                        .integer(point.clamped ? 1 : 0)
+                    ]
+                )
+            }
+            storedAudiograms += 1
+        }
+        _ = (storedElectrocardiograms, storedVoltagePages, storedAudiograms)
 
         return (stored, deleted, storedCharacteristics, storedUnhandled)
     }
@@ -780,6 +964,244 @@ public actor IngestStore {
                 .integer(Int64(parserVersion))
             ]
         )
+    }
+
+    /// One ECG reading with its waveform's completeness stated plainly.
+    public struct StoredElectrocardiogram: Hashable, Sendable, Identifiable {
+        public let id: String
+        public let startDate: Date
+        public let classification: String?
+        public let symptomsStatus: String?
+        public let averageHeartRate: Double?
+        public let samplingHertz: Double?
+        public let expectedVoltages: Int?
+        public let heldVoltages: Int
+        public let sourceName: String?
+
+        public init(
+            id: String,
+            startDate: Date,
+            classification: String?,
+            symptomsStatus: String?,
+            averageHeartRate: Double?,
+            samplingHertz: Double?,
+            expectedVoltages: Int?,
+            heldVoltages: Int,
+            sourceName: String?
+        ) {
+            self.id = id
+            self.startDate = startDate
+            self.classification = classification
+            self.symptomsStatus = symptomsStatus
+            self.averageHeartRate = averageHeartRate
+            self.samplingHertz = samplingHertz
+            self.expectedVoltages = expectedVoltages
+            self.heldVoltages = heldVoltages
+            self.sourceName = sourceName
+        }
+
+        /// Whether every measurement the Watch recorded is actually here.
+        ///
+        /// A waveform assembled from pages that are still arriving is a
+        /// different thing from a complete recording, and showing one as the
+        /// other would be a clinical-looking lie. When the Watch did not say
+        /// how many to expect, this stays `false` rather than assuming.
+        public var isComplete: Bool {
+            guard let expectedVoltages, expectedVoltages > 0 else {
+                return false
+            }
+            return heldVoltages >= expectedVoltages
+        }
+    }
+
+    /// Every ECG reading, newest first.
+    public func electrocardiograms(limit: Int = 200) throws -> [StoredElectrocardiogram] {
+        try database.query(
+            """
+            SELECT e.id, e.start_date, e.classification, e.symptoms_status,
+                   e.average_heart_rate, e.sampling_hz, e.expected_voltages,
+                   COALESCE(SUM(p.point_count), 0), e.source_name
+              FROM electrocardiogram e
+              LEFT JOIN electrocardiogram_voltage_page p ON p.sample_id = e.id
+             GROUP BY e.id
+             ORDER BY e.start_date DESC
+             LIMIT ?
+            """,
+            [.integer(Int64(limit))],
+            row: { row in
+                StoredElectrocardiogram(
+                    id: row.text(0),
+                    startDate: Timestamps.date(from: row.text(1)) ?? .distantPast,
+                    classification: row.optionalText(2),
+                    symptomsStatus: row.optionalText(3),
+                    averageHeartRate: row.optionalReal(4),
+                    samplingHertz: row.optionalReal(5),
+                    expectedVoltages: row.optionalInteger(6).map { Int($0) },
+                    heldVoltages: Int(row.integer(7)),
+                    sourceName: row.optionalText(8)
+                )
+            }
+        )
+    }
+
+    /// A reading's waveform, reassembled from its pages.
+    ///
+    /// Pages may arrive out of order, more than once, or not at all, so they
+    /// are ordered by their absolute offset and gaps are reported rather than
+    /// closed up. A caller is told what is missing instead of being handed a
+    /// shorter waveform that looks whole.
+    public struct VoltagePoint: Hashable, Sendable {
+        public let secondsSinceStart: Double
+        public let volts: Double
+
+        public init(secondsSinceStart: Double, volts: Double) {
+            self.secondsSinceStart = secondsSinceStart
+            self.volts = volts
+        }
+    }
+
+    public struct Waveform: Hashable, Sendable {
+        public let points: [VoltagePoint]
+        /// Whether every measurement the Watch recorded is present and in one
+        /// unbroken run. A caller must not present an incomplete waveform as a
+        /// whole recording.
+        public let isComplete: Bool
+        public let expected: Int?
+
+        public init(points: [VoltagePoint], isComplete: Bool, expected: Int?) {
+            self.points = points
+            self.isComplete = isComplete
+            self.expected = expected
+        }
+    }
+
+    public func voltages(forElectrocardiogram id: String) throws -> Waveform {
+        let pages = try database.query(
+            """
+            SELECT offset, point_count, points
+              FROM electrocardiogram_voltage_page
+             WHERE sample_id = ?
+             ORDER BY offset
+            """,
+            [.text(id)],
+            row: { ($0.integer(0), $0.integer(1), $0.blob(2) ?? Data()) }
+        )
+
+        let expected = try database.query(
+            "SELECT expected_voltages FROM electrocardiogram WHERE id = ?",
+            [.text(id)],
+            row: { $0.optionalInteger(0).map { Int($0) } }
+        ).first ?? nil
+
+        var points: [VoltagePoint] = []
+        var nextOffset = 0
+        var contiguous = true
+        for (offset, _, data) in pages {
+            if Int(offset) != nextOffset {
+                // A page is missing between the last one and this. The points
+                // that did arrive are still returned; the gap is what makes
+                // this waveform incomplete.
+                contiguous = false
+            }
+            let decoded = (try? JSONSerialization.jsonObject(with: data))
+                as? [[String: Any]] ?? []
+            for entry in decoded {
+                guard
+                    let time = entry["timeSinceStart"] as? Double,
+                    let volts = entry["volts"] as? Double
+                else {
+                    continue
+                }
+                points.append(VoltagePoint(secondsSinceStart: time, volts: volts))
+            }
+            nextOffset = Int(offset) + decoded.count
+        }
+
+        return Waveform(
+            points: points,
+            isComplete: contiguous && expected.map { points.count >= $0 } == true,
+            expected: expected
+        )
+    }
+
+    /// One hearing test's thresholds.
+    public struct StoredAudiogramPoint: Hashable, Sendable {
+        public let frequency: Double
+        public let ear: String
+        public let sensitivity: Double?
+        public let unit: String?
+        public let clamped: Bool
+
+        public init(
+            frequency: Double,
+            ear: String,
+            sensitivity: Double?,
+            unit: String?,
+            clamped: Bool
+        ) {
+            self.frequency = frequency
+            self.ear = ear
+            self.sensitivity = sensitivity
+            self.unit = unit
+            self.clamped = clamped
+        }
+    }
+
+    public struct StoredAudiogram: Hashable, Sendable, Identifiable {
+        public let id: String
+        public let startDate: Date
+        public let sourceName: String?
+        public let points: [StoredAudiogramPoint]
+
+        public init(
+            id: String,
+            startDate: Date,
+            sourceName: String?,
+            points: [StoredAudiogramPoint]
+        ) {
+            self.id = id
+            self.startDate = startDate
+            self.sourceName = sourceName
+            self.points = points
+        }
+    }
+
+    public func audiograms(limit: Int = 100) throws -> [StoredAudiogram] {
+        let tests = try database.query(
+            """
+            SELECT id, start_date, source_name FROM audiogram
+             ORDER BY start_date DESC LIMIT ?
+            """,
+            [.integer(Int64(limit))],
+            row: { ($0.text(0), $0.text(1), $0.optionalText(2)) }
+        )
+
+        return try tests.map { id, start, source in
+            let points = try database.query(
+                """
+                SELECT frequency, ear, sensitivity, unit, clamped
+                  FROM audiogram_point
+                 WHERE audiogram_id = ?
+                 ORDER BY frequency, ear
+                """,
+                [.text(id)],
+                row: { row in
+                    StoredAudiogramPoint(
+                        frequency: row.real(0),
+                        ear: row.text(1),
+                        sensitivity: row.optionalReal(2),
+                        unit: row.optionalText(3),
+                        clamped: row.integer(4) == 1
+                    )
+                }
+            )
+            return StoredAudiogram(
+                id: id,
+                startDate: Timestamps.date(from: start) ?? .distantPast,
+                sourceName: source,
+                points: points
+            )
+        }
     }
 
     /// Aggregates one type into time buckets.

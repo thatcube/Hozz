@@ -87,6 +87,57 @@ final class ReceiverKindAuditTests: XCTestCase {
         return object
     }
 
+    /// ECG and hearing-test records, which the phone emits and which the
+    /// receiver reads into their own tables rather than into `sample`.
+    private func seriesRecords() -> [[String: Any]] {
+        [
+            [
+                "kind": "electrocardiogram", "schemaVersion": 1, "id": "ecg-1",
+                "type": "HKDataTypeIdentifierElectrocardiogram",
+                "startDate": "2026-01-02T15:00:00.000Z",
+                "endDate": "2026-01-02T15:00:30.000Z",
+                "classification": ["name": "sinusRhythm", "rawValue": 1],
+                "numberOfVoltageMeasurements": 1,
+                "source": ["name": "Apple Watch"]
+            ],
+            [
+                "kind": "electrocardiogramVoltages", "schemaVersion": 1,
+                "id": "ecg-1-v-0",
+                "type": "HKDataTypeIdentifierElectrocardiogram",
+                "sample": "ecg-1", "sequence": 0, "offset": 0, "count": 1,
+                "startDate": "2026-01-02T15:00:00.000Z",
+                "endDate": "2026-01-02T15:00:00.002Z",
+                "voltages": [["timeSinceStart": 0.0, "volts": 0.0001]]
+            ],
+            [
+                "kind": "electrocardiogramEnd", "schemaVersion": 1,
+                "id": "ecg-1-end",
+                "type": "HKDataTypeIdentifierElectrocardiogram",
+                "sample": "ecg-1", "voltages": 1,
+                "startDate": "2026-01-02T15:00:00.000Z",
+                "endDate": "2026-01-02T15:00:30.000Z"
+            ],
+            [
+                "kind": "audiogram", "schemaVersion": 1, "id": "audio-1",
+                "type": "HKDataTypeIdentifierAudiogram",
+                "startDate": "2026-02-01T10:00:00.000Z",
+                "endDate": "2026-02-01T10:05:00.000Z",
+                "source": ["name": "Mimi"],
+                "sensitivityPoints": [
+                    [
+                        "frequency": ["unit": "Hz", "value": 1_000.0],
+                        "ears": [
+                            [
+                                "ear": "left",
+                                "sensitivity": ["unit": "dBHL", "value": 15.0]
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ]
+    }
+
     /// The combined shape from `HealthCharacteristicsRecord`: no id, no type,
     /// no start date, one record holding every characteristic keyed by type.
     private func characteristicsRecord() -> [String: Any] {
@@ -115,21 +166,38 @@ final class ReceiverKindAuditTests: XCTestCase {
 
     // MARK: - The audit
 
+    /// Kinds the phone's encoder can actually produce today.
+    ///
+    /// This list is the audit's claim, so it only holds kinds something
+    /// upstream can really emit. `correlation` is deliberately not here: the
+    /// `HKCorrelation` branch in the encoder is unreachable, because
+    /// `encode(sample:)` is only called from anchored queries over
+    /// `typesByKey`, correlation types are never in it, and an anchored query
+    /// on a quantity or category type cannot return an `HKCorrelation`. The
+    /// receiver would handle one, which is worth keeping and is covered
+    /// separately below — but listing it here would make this test read as
+    /// proof of end-to-end coverage that does not exist.
+    private static let kindsThePhoneEmits = [
+        ("quantity", "HKQuantityTypeIdentifierStepCount"),
+        ("category", "HKCategoryTypeIdentifierSleepAnalysis"),
+        ("sample", "HKQuantityTypeIdentifierBodyMass"),
+        ("workout", "HKWorkoutTypeIdentifier"),
+        ("workoutRoute", "HKWorkoutRouteTypeIdentifier"),
+        ("workoutRouteLocations", "HKWorkoutRouteTypeIdentifier"),
+        ("workoutRouteEnd", "HKWorkoutRouteTypeIdentifier")
+    ]
+
     /// The one test that would have caught both bugs.
     func testEveryKindThePhoneEmitsIsStoredRatherThanDropped() async throws {
-        let sampleKinds = [
-            ("quantity", "HKQuantityTypeIdentifierStepCount"),
-            ("category", "HKCategoryTypeIdentifierSleepAnalysis"),
-            ("sample", "HKQuantityTypeIdentifierBodyMass"),
-            ("workout", "HKWorkoutTypeIdentifier"),
-            ("correlation", "HKCorrelationTypeIdentifierBloodPressure"),
-            ("workoutRoute", "HKWorkoutRouteTypeIdentifier"),
-            ("workoutRouteLocations", "HKWorkoutRouteTypeIdentifier"),
-            ("workoutRouteEnd", "HKWorkoutRouteTypeIdentifier")
-        ]
+        let sampleKinds = Self.kindsThePhoneEmits
 
         var objects = sampleKinds.map { sampleShaped(kind: $0.0, type: $0.1) }
         objects.append(characteristicsRecord())
+        // Emitted too, but deliberately not stored as generic samples: an ECG
+        // has no single value and its pages are not readings. They are audited
+        // in ReceiverSeriesTests, and named here so this list stays a complete
+        // account of what the phone can send.
+        objects.append(contentsOf: seriesRecords())
         objects.append([
             "kind": "deletion",
             "schemaVersion": 1,
@@ -149,6 +217,13 @@ final class ReceiverKindAuditTests: XCTestCase {
             """
         )
         XCTAssertEqual(batch.deletions.count, 1)
+        XCTAssertEqual(
+            batch.electrocardiograms.count,
+            1,
+            "An ECG is one reading, read into its own shape rather than sample."
+        )
+        XCTAssertEqual(batch.voltagePages.count, 1)
+        XCTAssertEqual(batch.audiograms.count, 1)
         XCTAssertEqual(
             batch.characteristics.count,
             3,
@@ -177,6 +252,28 @@ final class ReceiverKindAuditTests: XCTestCase {
                 "\(type) never reached the database."
             )
         }
+    }
+
+    /// The receiver accepts deliveries from anything a user points at it —
+    /// its own parser says so, and the Mac also watches a folder — so handling
+    /// a correlation is worth keeping even though Hozz's own phone app cannot
+    /// currently produce one. This is defensive coverage, not evidence that
+    /// correlations are exported.
+    func testACorrelationWouldBeStoredIfSomeProducerSentOne() async throws {
+        let batch = try BatchParser.parse(
+            try payload([
+                sampleShaped(
+                    kind: "correlation",
+                    type: "HKCorrelationTypeIdentifierBloodPressure"
+                )
+            ])
+        )
+        XCTAssertEqual(batch.records.first?.kind, "correlation")
+
+        let store = try makeStore()
+        let result = try await store.ingest(batch, idempotencyKey: "correlation-1")
+        XCTAssertEqual(result.stored, 1)
+        XCTAssertEqual(result.unhandled, 0)
     }
 
     /// The specific regression: this exact record used to be dropped whole.
@@ -443,7 +540,7 @@ final class ReceiverKindAuditTests: XCTestCase {
         defer { reopened.close() }
         XCTAssertEqual(
             try reopened.query("PRAGMA user_version", row: { $0.integer(0) }).first,
-            4
+            5
         )
     }
 

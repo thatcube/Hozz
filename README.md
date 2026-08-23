@@ -171,6 +171,9 @@ It speaks JSON-RPC 2.0 over stdio, advertises protocol version `2024-11-05`, ser
 - `summarise_health_data`
 - `aggregate_health_data`
 - `list_health_samples`
+- `list_electrocardiograms`
+- `get_electrocardiogram_voltages`
+- `list_audiograms`
 
 `summarise_health_data` also returns the person's own characteristics — age,
 biological sex, blood type — where they have been shared. That is deliberately
@@ -247,7 +250,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains NNN tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, export formats, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 309 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, export formats, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 
