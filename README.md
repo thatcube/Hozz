@@ -100,12 +100,12 @@ Matching by time range is therefore an approximation, and worth knowing you are 
 
 Clinical records are FHIR resources from a connected provider: lab results, conditions, clinical medications, immunisations, procedures, vital signs, coverage records, allergies, and notes.
 
-These are not in the default build, and the code that would read them is compiled out. Reading them requires Apple's explicit approval of the `com.apple.developer.healthkit.access` entitlement with `health-records`. The entitlement array in `project.yml` ships empty and the Swift flag that enables the code is undefined by default.
+These are not in the default build, and the code that would read them is compiled out. Reading them needs the `com.apple.developer.healthkit.access` entitlement with `health-records` — the "Clinical Health Records" checkbox on the HealthKit capability. There is no request form for it and no approval to wait for; App Review judges whether an app has a reason to hold these records when the app is submitted. The entitlement array in `project.yml` ships empty and the Swift flag that enables the code is undefined by default, so shipping them stays a deliberate decision rather than a default.
 
 Turning clinical records on takes two deliberate steps:
 
-1. Build with `HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS`, on the `xcodebuild` command line or in the gitignored `Local.xcconfig`. This changes no entitlement, so on its own it cannot cause a rejection — the code compiles and reports honestly that the entitlement is missing.
-2. Change `com.apple.developer.healthkit.access` in `project.yml` from `[]` to `[health-records]`. This is the step with consequences, which is why it is a visible edit to a tracked file rather than a switch.
+1. Build with `HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS`, on the `xcodebuild` command line or in the gitignored `Local.xcconfig`. This changes no entitlement — the code compiles and reports honestly that the entitlement is missing.
+2. Change `com.apple.developer.healthkit.access` in `project.yml` from `[]` to `[health-records]`. This is the step App Review sees, which is why it is a visible edit to a tracked file rather than a switch.
 
 Both build configurations are tested, so the flag cannot rot while it is switched off. When it is off — which is every default build today — the app says health records are **not available in this build**, and says explicitly that this is not a statement about whether you have any.
 

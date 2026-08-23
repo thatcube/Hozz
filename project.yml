@@ -200,12 +200,20 @@ targets:
       properties:
         com.apple.developer.healthkit: true
         com.apple.developer.healthkit.background-delivery: true
-        # Empty on purpose, and it must stay empty until Apple approves the
-        # application for health records. Submitting a binary that carries
-        # `health-records` before approval is an automatic rejection rather
-        # than a review note.
+        # Empty on purpose, but not because anyone has to approve it first.
+        # There is no request form for `health-records`: it is the "Clinical
+        # Health Records" checkbox on the HealthKit capability, and the
+        # judgement happens at App Review rather than beforehand. The one in
+        # the developer portal's capability list is Verifiable Health Records,
+        # which is SMART Health Cards for travel and workplace screening, and
+        # is a different entitlement Hozz does not want.
         #
-        # Once approval lands, change this to:
+        # It stays empty until shipping clinical records is a deliberate
+        # decision, because App Review does reject an app that asks for these
+        # without a clear reason to hold them, and Hozz has nothing to show
+        # for the entitlement until the feature is switched on.
+        #
+        # To turn it on, change this to:
         #     com.apple.developer.healthkit.access: [health-records]
         # and build with HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS.
         com.apple.developer.healthkit.access: []
