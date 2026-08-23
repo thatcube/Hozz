@@ -40,7 +40,8 @@ Manual exports are built from a canonical NDJSON spool. That spool is the durabl
 | JSON | `.zip` containing one JSON array | Convenient for smaller exports and tools that expect a single JSON value. |
 | SQLite | `.sqlite` database | Query it in Datasette, DuckDB, pandas, Grafana, or `sqlite3` with no import step. Not lossy: every row keeps its original record in `raw`. |
 | Markdown | `.zip` of one `YYYY-MM-DD.md` note per day | For Obsidian and journals, with YAML front matter Dataview can query. Explicitly lossy: a note keeps a day's totals, never the records behind them. |
-| Raw NDJSON | `.ndjson` | Supported by the export engine for direct piping; the main picker exposes NDJSON, CSV, JSON, SQLite, and Markdown. |
+| GPX | `.zip` of one GPX 1.1 track per workout with GPS | For maps, Strava-alikes, and anything that reads a track. Not a projection but a **filter**: it exports routes and nothing else. |
+| Raw NDJSON | `.ndjson` | Supported by the export engine for direct piping; the main picker exposes NDJSON, CSV, JSON, SQLite, Markdown, and GPX. |
 
 The SQLite file is built for asking questions rather than for mirroring the
 JSON. Everything time-shaped except workouts goes into one wide `sample` table
@@ -74,6 +75,29 @@ Automatic destinations use `DeliveryFormat`: NDJSON, JSON, CSV, Metrics JSON, or
 Line protocol exists because the alternative was making people run a translator. The usual self-hosted setup is Health data in InfluxDB charted in Grafana, and reaching it meant deploying a container whose entire job was turning an exporter's JSON into the format InfluxDB already wanted. It is deliberately not offered for folder destinations: the Mac app watches a folder for NDJSON, JSON, and CSV, so a folder writing line protocol would look like it was working while nothing was ingested.
 
 The Home Assistant, MQTT, and web address destinations also have an **opt-in** compatibility mode that emits Health Auto Export's published field names, for people arriving with automations and scripts already keyed to them. It matches what that format documents and says plainly what it does not: Hozz sends individual samples rather than rollups, so a heart rate point carries the same number in `Min`, `Avg`, and `Max`, and blood pressure stays split rather than guessing which two samples pair. Hozz's own schema remains the default and the recommended one.
+
+The GPX export is the odd one out, and the interface says so before it is
+chosen. Every other format takes everything in the export and keeps less of each
+record; this one takes almost nothing in the export and keeps all of what it
+takes. A GPX file is a track, with nowhere to put a heart rate or a body weight,
+so a workout recorded without GPS produces no file — a treadmill run has no
+route, and that is not an error. It exists because GPX is what every mapping and
+fitness tool reads, and a route delivered as JSON is of no use to someone moving
+their rides to something they host themselves.
+
+Routes arrive as pages at fixed absolute offsets, so a sync that was interrupted
+leaves a hole of a known size rather than a shorter list. That is what makes it
+possible to be honest about a gap instead of quietly closing it, and closing it
+is the real hazard: a GPX that joins the two sides of a missing page draws a
+straight line across a mile of city and looks completely correct. So a gap
+becomes a separate `<trkseg>` on each side — which is what a track segment means
+in GPX and what every renderer already honours — the track's `<desc>` says how
+many points are missing and where, and the archive's `README.md` lists every
+affected file. A route whose pages never arrived at all produces no file rather
+than an empty track, because an empty track is a claim that the ride had no
+points. Speed, course, and Core Location's accuracies have no element in base
+GPX and are published under Hozz's own namespace in `<extensions>` rather than
+invented as bare elements that would fail validation.
 
 ## Health acquisition and durability
 
@@ -254,7 +278,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 351 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, export formats, line protocol escaping, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 380 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, export formats, GPX track assembly, line protocol escaping, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

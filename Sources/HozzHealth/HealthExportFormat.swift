@@ -17,12 +17,20 @@ public enum HealthExportFormat: String, CaseIterable, Sendable {
     /// One SQLite database, ready to be queried. Not lossy: the typed columns
     /// are a projection for querying and every row keeps its original record.
     case sqlite
+    /// GPX 1.1 tracks, one file per workout that has GPS.
+    ///
+    /// Not a projection of the export like the others: it is a *filter*. A GPX
+    /// file holds a route and nothing else, so this exports only workouts with
+    /// a route and none of the rest of Health. It exists because GPX is what
+    /// every mapping and fitness tool reads, and a route delivered as JSON is
+    /// of no use to someone moving to a self-hosted Strava.
+    case gpx
     /// Uncompressed NDJSON, for piping straight into something else.
     case raw
 
     public var fileExtension: String {
         switch self {
-        case .ndjson, .csv, .json, .markdown:
+        case .ndjson, .csv, .json, .markdown, .gpx:
             "zip"
         case .sqlite:
             "sqlite"
@@ -34,7 +42,7 @@ public enum HealthExportFormat: String, CaseIterable, Sendable {
     /// The extension used for a run's individual, not-yet-assembled parts.
     var partFileExtension: String {
         switch self {
-        case .ndjson, .csv, .json, .markdown, .sqlite:
+        case .ndjson, .csv, .json, .markdown, .sqlite, .gpx:
             "deflate"
         case .raw:
             "ndjson"
@@ -47,17 +55,29 @@ public enum HealthExportFormat: String, CaseIterable, Sendable {
         switch self {
         case .ndjson:
             true
-        case .csv, .json, .markdown, .sqlite, .raw:
+        case .csv, .json, .markdown, .sqlite, .gpx, .raw:
             false
         }
     }
 
     /// Whether the format cannot carry everything the export holds.
     ///
-    /// Both of these are lossy on purpose — a grid and a daily note are for
-    /// reading, not for keeping — and both say so where the format is chosen.
+    /// All three are lossy on purpose — a grid and a daily note are for
+    /// reading rather than for keeping, and a GPX file is a route — and all
+    /// three say so where the format is chosen.
     public var isLossy: Bool {
-        self == .csv || self == .markdown
+        self == .csv || self == .markdown || self == .gpx
+    }
+
+    /// Whether the format exports only workouts that have a route.
+    ///
+    /// This is a different thing from being lossy, and worth its own name. The
+    /// others take everything in the export and keep less of each record; this
+    /// one takes almost nothing in the export and keeps all of what it takes.
+    /// Someone choosing it expecting a health export gets an archive that looks
+    /// broken, so the interface has to say which it is before they pick it.
+    public var coversRoutesOnly: Bool {
+        self == .gpx
     }
 
     public var displayName: String {
@@ -72,6 +92,8 @@ public enum HealthExportFormat: String, CaseIterable, Sendable {
             "Markdown"
         case .sqlite:
             "SQLite"
+        case .gpx:
+            "GPX"
         case .raw:
             "Raw NDJSON"
         }
