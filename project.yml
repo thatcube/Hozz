@@ -184,15 +184,16 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.Hozz
         TARGETED_DEVICE_FAMILY: "1,2"
-        # Clinical records are compiled out unless this is defined, and it is
-        # deliberately undefined here so nothing sets it by accident. To build
-        # with them, pass HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS on the
-        # xcodebuild command line or set it in the gitignored Local.xcconfig.
+        # Clinical records ship, so the flag that compiles them in is defined
+        # here rather than left to each machine. It was previously undefined
+        # and set through the gitignored Local.xcconfig, which kept the feature
+        # off by default while it was being built — but a setting only one
+        # machine holds is not a shipped feature, and fastlane and anyone
+        # cloning the repo would have quietly built without it.
         #
-        # This flag alone changes no entitlement, so it cannot cause an App
-        # Store rejection: the code compiles and reports honestly that the
-        # entitlement is missing. See the health-records note below for the
-        # step that does have consequences.
+        # HOZZ_CLINICAL_FLAG is still read, so a build can override it to
+        # compile clinical records back out without editing this file.
+        HOZZ_CLINICAL_FLAG: HOZZ_CLINICAL_RECORDS
         SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) $(HOZZ_CLINICAL_FLAG)
         ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME: AccentColor
     entitlements:
@@ -200,23 +201,25 @@ targets:
       properties:
         com.apple.developer.healthkit: true
         com.apple.developer.healthkit.background-delivery: true
-        # Empty on purpose, but not because anyone has to approve it first.
-        # There is no request form for `health-records`: it is the "Clinical
-        # Health Records" checkbox on the HealthKit capability, and the
-        # judgement happens at App Review rather than beforehand. The one in
-        # the developer portal's capability list is Verifiable Health Records,
-        # which is SMART Health Cards for travel and workplace screening, and
-        # is a different entitlement Hozz does not want.
+        # `health-records` gives read-only access to the FHIR resources a
+        # connected provider has put in Health: lab results, conditions,
+        # medications, immunisations. It is the "Clinical Health Records"
+        # checkbox on the HealthKit capability, written straight into the
+        # entitlements file — there is no request form and nothing to wait for.
+        # App Review makes the judgement when the app is submitted.
         #
-        # It stays empty until shipping clinical records is a deliberate
-        # decision, because App Review does reject an app that asks for these
-        # without a clear reason to hold them, and Hozz has nothing to show
-        # for the entitlement until the feature is switched on.
+        # Not to be confused with the Verifiable Health Records entitlement in
+        # the developer portal's capability list, which is SMART Health Cards
+        # for travel and workplace screening. That is a different key and Hozz
+        # does not want it.
         #
-        # To turn it on, change this to:
-        #     com.apple.developer.healthkit.access: [health-records]
-        # and build with HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS.
-        com.apple.developer.healthkit.access: []
+        # App Review does reject an app that asks for clinical records without
+        # a reason to hold them, so the reason has to be plain in the review
+        # notes: Hozz exports them, read-only, to a destination the user picked,
+        # behind a consent prompt of their own, and keeps the FHIR exactly as
+        # the provider wrote it.
+        com.apple.developer.healthkit.access: [health-records]
+        com.apple.developer.healthkit.access: [health-records]
         # The widget is a separate process with its own container, so it can
         # only read live sync state through this shared group.
         com.apple.security.application-groups:

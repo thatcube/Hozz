@@ -100,14 +100,11 @@ Matching by time range is therefore an approximation, and worth knowing you are 
 
 Clinical records are FHIR resources from a connected provider: lab results, conditions, clinical medications, immunisations, procedures, vital signs, coverage records, allergies, and notes.
 
-These are not in the default build, and the code that would read them is compiled out. Reading them needs the `com.apple.developer.healthkit.access` entitlement with `health-records` — the "Clinical Health Records" checkbox on the HealthKit capability. There is no request form for it and no approval to wait for; App Review judges whether an app has a reason to hold these records when the app is submitted. The entitlement array in `project.yml` ships empty and the Swift flag that enables the code is undefined by default, so shipping them stays a deliberate decision rather than a default.
+Clinical records ship. Reading them needs the `com.apple.developer.healthkit.access` entitlement with `health-records` — the "Clinical Health Records" checkbox on the HealthKit capability, written into the entitlements file. There is no request form for it and no approval to wait for; App Review judges whether an app has a reason to hold these records when the app is submitted. It is a different entitlement from Verifiable Health Records, which covers SMART Health Cards for travel and workplace screening, and which Hozz does not use.
 
-Turning clinical records on takes two deliberate steps:
+Hozz reads them, never writes them, and asks for them behind their own consent prompt rather than folding them into the main Health request — someone exporting step counts is never asked for their lab results as a side effect.
 
-1. Build with `HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS`, on the `xcodebuild` command line or in the gitignored `Local.xcconfig`. This changes no entitlement — the code compiles and reports honestly that the entitlement is missing.
-2. Change `com.apple.developer.healthkit.access` in `project.yml` from `[]` to `[health-records]`. This is the step App Review sees, which is why it is a visible edit to a tracked file rather than a switch.
-
-Both build configurations are tested, so the flag cannot rot while it is switched off. When it is off — which is every default build today — the app says health records are **not available in this build**, and says explicitly that this is not a statement about whether you have any.
+`HOZZ_CLINICAL_FLAG` still selects whether the code is compiled in, and defaults to on. Both build configurations are tested, so the branch that compiles them out cannot rot. In a build without them the app says health records are **not available in this build**, and says explicitly that this is not a statement about whether you have any.
 
 Three things about the data itself:
 
