@@ -15,7 +15,7 @@ public struct HealthSampleEncoder: Sendable {
         sample: HKSample,
         catalogEntry: HealthCatalogEntry
     ) throws -> Data {
-        var object = baseObject(sample: sample, catalogEntry: catalogEntry)
+        var object = baseObject(sample: sample)
 
         switch sample {
         case let quantity as HKQuantitySample:
@@ -102,10 +102,23 @@ public struct HealthSampleEncoder: Sendable {
         )
     }
 
-    private func baseObject(
-        sample: HKSample,
-        catalogEntry: HealthCatalogEntry
-    ) -> [String: Any] {
+    /// The fields every sample carries, without the type-specific ones.
+    ///
+    /// Used where a record has to be finished later — a workout route needs
+    /// queries of its own to find its workout — so the sample's own fields are
+    /// captured on HealthKit's queue and completed afterwards.
+    public func encodeBaseFields(sample: HKSample) throws -> Data {
+        let object = baseObject(sample: sample)
+        guard JSONSerialization.isValidJSONObject(object) else {
+            throw HealthSampleEncodingError.invalidJSONObject
+        }
+        return try JSONSerialization.data(
+            withJSONObject: object,
+            options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+    }
+
+    private func baseObject(sample: HKSample) -> [String: Any] {
         var object: [String: Any] = [
             "schemaVersion": 1,
             "id": sample.uuid.uuidString.lowercased(),

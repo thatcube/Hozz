@@ -30,6 +30,7 @@ public actor HealthKitHealthDataSource: HealthDataSource {
     private let healthStore: HKHealthStore
     private let encoder: HealthSampleEncoder
     private let typesByKey: [HealthTypeKey: ExportableHealthType]
+    private let routes: WorkoutRouteReader
     private var encodingErrors: [HealthTypeKey: Int] = [:]
 
     public init(
@@ -39,6 +40,13 @@ public actor HealthKitHealthDataSource: HealthDataSource {
     ) {
         self.healthStore = healthStore
         self.encoder = encoder
+        self.routes = WorkoutRouteReader(
+            backend: HealthKitWorkoutRouteBackend(
+                healthStore: healthStore,
+                encoder: encoder
+            ),
+            encoder: encoder
+        )
         self.typesByKey = Dictionary(
             types.map { ($0.catalogEntry.key, $0) },
             uniquingKeysWith: { first, _ in first }
@@ -61,6 +69,12 @@ public actor HealthKitHealthDataSource: HealthDataSource {
         }
         guard let exportable = typesByKey[type] else {
             throw HealthKitSourceError.unsupportedType(type.rawValue)
+        }
+
+        // A route's content is a separate stream, so it is paged by position
+        // inside the route rather than by HealthKit's anchor alone.
+        if exportable.catalogEntry.family == .series {
+            return try await routes.changes(after: anchor, limit: limit)
         }
 
         let startAnchor = try HealthKitAnchorCoding.anchor(for: anchor)

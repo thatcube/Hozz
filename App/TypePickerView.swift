@@ -148,6 +148,7 @@ private extension HealthTypeFamily {
         case .clinical: "Clinical"
         case .document: "Documents"
         case .scoredAssessment: "Assessments"
+        case .series: "Routes and series"
         }
     }
 }

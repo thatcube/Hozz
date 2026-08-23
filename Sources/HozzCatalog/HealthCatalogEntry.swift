@@ -10,6 +10,10 @@ public enum HealthTypeFamily: String, Codable, CaseIterable, Sendable {
     case document
     case scoredAssessment
     case workout
+    /// Samples whose real content is a stream attached to them rather than a
+    /// value on them — a workout's route, for instance. They are read through
+    /// the ordinary anchored path and then streamed in bounded pieces.
+    case series
 }
 
 public struct IOSVersion: Codable, Hashable, Sendable, Comparable {
@@ -61,6 +65,7 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
             "HKClinicalTypeIdentifier",
             "HKDocumentTypeIdentifier",
             "HKScoredAssessmentTypeIdentifier",
+            "HKWorkoutRouteTypeIdentifier",
             "HKWorkoutTypeIdentifier"
         ]
         for prefix in prefixes where name.hasPrefix(prefix) {
@@ -68,7 +73,11 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
             break
         }
         if name.isEmpty {
-            return family == .workout ? "Workout" : key.rawValue
+            return switch key.rawValue {
+            case "HKWorkoutTypeIdentifier": "Workout"
+            case "HKWorkoutRouteTypeIdentifier": "Workout Route"
+            default: key.rawValue
+            }
         }
 
         return name
@@ -94,6 +103,15 @@ public enum HealthTypeCatalog {
                 identifier: "HKWorkoutTypeIdentifier",
                 family: .workout,
                 introduced: IOSVersion(major: 8, minor: 0)
+            ),
+            // Not in the generated catalog because it is not a type identifier
+            // Apple lists with the others: a route is reached through
+            // `HKSeriesType.workoutRoute()`. It is anchored and drained like
+            // any other sample, and its locations are streamed separately.
+            HealthCatalogEntry(
+                identifier: "HKWorkoutRouteTypeIdentifier",
+                family: .series,
+                introduced: IOSVersion(major: 11, minor: 0)
             )
         ]
 
