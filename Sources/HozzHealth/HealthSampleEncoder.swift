@@ -67,6 +67,20 @@ public struct HealthSampleEncoder: Sendable {
             object["kind"] = "workout"
             object["activityType"] = workout.workoutActivityType.rawValue
             object["duration"] = workout.duration
+            WorkoutEncoding.decorate(
+                &object,
+                statistics: Self.statistics(from: workout.allStatistics),
+                segments: workout.workoutActivities.map { activity in
+                    WorkoutSegment(
+                        id: activity.uuid,
+                        activityType: activity.workoutConfiguration
+                            .activityType.rawValue,
+                        startDate: activity.startDate,
+                        endDate: activity.endDate,
+                        statistics: Self.statistics(from: activity.allStatistics)
+                    )
+                }
+            )
             object["events"] = workout.workoutEvents?.map { event in
                 [
                     "type": event.type.rawValue,
@@ -104,6 +118,35 @@ public struct HealthSampleEncoder: Sendable {
             withJSONObject: object,
             options: [.sortedKeys, .withoutEscapingSlashes]
         )
+    }
+
+    /// Turns Health's own workout aggregates into values.
+    ///
+    /// The unit comes from the catalogue, which is the same unit the type's
+    /// individual samples are written in, so a workout's average heart rate
+    /// and its heart rate samples can be compared without conversion. A type
+    /// the catalogue has no unit for is skipped rather than guessed at.
+    static func statistics(
+        from all: [HKQuantityType: HKStatistics]
+    ) -> [WorkoutStatistic] {
+        all.compactMap { quantityType, statistics in
+            guard
+                let unitString = HealthTypeCatalog
+                    .entriesByIdentifier[quantityType.identifier]?
+                    .canonicalUnit
+            else {
+                return nil
+            }
+            let unit = HKUnit(from: unitString)
+            return WorkoutStatistic(
+                type: quantityType.identifier,
+                unit: unitString,
+                sum: statistics.sumQuantity()?.doubleValue(for: unit),
+                average: statistics.averageQuantity()?.doubleValue(for: unit),
+                minimum: statistics.minimumQuantity()?.doubleValue(for: unit),
+                maximum: statistics.maximumQuantity()?.doubleValue(for: unit)
+            )
+        }
     }
 
     /// Shapes a quantity, saying plainly when the one number stands for many.

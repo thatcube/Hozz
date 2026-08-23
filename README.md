@@ -109,6 +109,16 @@ Unlike sample types, these four situations really are distinguishable: HealthKit
 
 The record is written on every export attempt, including resumed ones, because the part holding an earlier copy may have been discarded unsealed. Each carries its own `readAt`. In a CSV export they are also flattened into `characteristics.csv`, one row per characteristic including the unset ones, while the lossless copy stays in `export-log.ndjson`.
 
+## Workouts
+
+A workout used to export as an activity type and a duration: you could tell that a run happened, and nothing about how it went.
+
+Health computes its own aggregates for a workout and carries them on the sample, so they cost no extra query. Each is written with the unit that type's individual samples use, so a workout's average heart rate can be compared with the heart rate samples without converting anything. Only the aggregates Health actually offers are written — a discrete type like heart rate has an average, minimum, and maximum but no total; a cumulative one like energy has a total and none of the others — and an aggregate it does not offer is left out rather than written as zero.
+
+A workout made of several efforts, like a triathlon, also carries each leg with its own figures, because an average across all three describes none of them.
+
+These are **summaries of samples that are exported separately**, not copies of them. Every reading appears exactly once in an export, as itself; nothing here repeats one.
+
 ## Series types: routes and electrocardiograms
 
 A workout route and an electrocardiogram are the same shape of problem. Each is one Health sample whose real content is somewhere else: a route's GPS points and an ECG's voltage readings arrive as separate streams, and a long ride holds hundreds of thousands of points where a thirty-second ECG holds around fifteen thousand readings. Both go through one implementation, so the part that could lose or duplicate data is written and tested once.
@@ -279,7 +289,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 394 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medication doses, fair-share drain ordering, aggregate sample counts, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 402 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medication doses, workout statistics, fair-share drain ordering, aggregate sample counts, export formats, line protocol escaping, receiver ingestion, quarantine and promotion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

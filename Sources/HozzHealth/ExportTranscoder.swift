@@ -327,6 +327,44 @@ enum ExportTranscoder {
         try archive.endEntry()
     }
 
+    /// One aggregate out of a workout's statistics, blank when the workout
+    /// does not have it. A run has no swimming distance, and a blank says so
+    /// rather than claiming zero.
+    static func statistic(
+        _ statistics: [[String: Any]],
+        type: String,
+        field: String
+    ) -> String {
+        guard
+            let match = statistics.first(where: { $0["type"] as? String == type })
+        else {
+            return ""
+        }
+        return number(match[field])
+    }
+
+    /// Whichever distance the workout actually recorded. There is a separate
+    /// type per sport, and only one of them is ever present.
+    static func distance(_ statistics: [[String: Any]]) -> String {
+        for type in [
+            "HKQuantityTypeIdentifierDistanceWalkingRunning",
+            "HKQuantityTypeIdentifierDistanceCycling",
+            "HKQuantityTypeIdentifierDistanceSwimming",
+            "HKQuantityTypeIdentifierDistanceWheelchair",
+            "HKQuantityTypeIdentifierDistanceDownhillSnowSports",
+            "HKQuantityTypeIdentifierDistanceCrossCountrySkiing",
+            "HKQuantityTypeIdentifierDistancePaddleSports",
+            "HKQuantityTypeIdentifierDistanceRowing",
+            "HKQuantityTypeIdentifierDistanceSkatingSports"
+        ] {
+            let value = statistic(statistics, type: type, field: "sum")
+            if !value.isEmpty {
+                return value
+            }
+        }
+        return ""
+    }
+
     // MARK: - Medications
 
     static let medicationEntry = "MedicationDoses.csv"
@@ -669,7 +707,7 @@ enum ExportTranscoder {
         case "category":
             "id,type,startDate,endDate,value,sourceName,sourceBundleId,sourceVersion,device,metadata"
         case "workout":
-            "id,type,startDate,endDate,activityType,duration,sourceName,sourceBundleId,sourceVersion,device,metadata"
+            "id,type,startDate,endDate,activityType,duration,activeEnergyKcal,averageHeartRate,distanceMetres,activities,sourceName,sourceBundleId,sourceVersion,device,metadata"
         default:
             "id,type,startDate,endDate,sourceName,sourceBundleId,sourceVersion,device,metadata"
         }
@@ -699,6 +737,29 @@ enum ExportTranscoder {
         case "workout":
             fields.append(number(object["activityType"]))
             fields.append(number(object["duration"]))
+            // The three a spreadsheet is actually opened for. The rest stay in
+            // the lossless formats rather than becoming forty columns.
+            let statistics = object["statistics"] as? [[String: Any]] ?? []
+            fields.append(
+                statistic(
+                    statistics,
+                    type: "HKQuantityTypeIdentifierActiveEnergyBurned",
+                    field: "sum"
+                )
+            )
+            fields.append(
+                statistic(
+                    statistics,
+                    type: "HKQuantityTypeIdentifierHeartRate",
+                    field: "average"
+                )
+            )
+            fields.append(
+                distance(statistics)
+            )
+            fields.append(
+                String((object["activities"] as? [[String: Any]] ?? []).count)
+            )
         default:
             break
         }
