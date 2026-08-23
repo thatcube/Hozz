@@ -133,7 +133,15 @@ enum BackgroundExportScheduler {
                 return true
             }
 
-            switch try await exporter.export(format: format, progress: { _ in }) {
+            // Zero wait: this is the case the catch below already described,
+            // and queueing would spend a scarce background budget waiting for
+            // a foreground run that is going to finish the job anyway.
+            switch try await exporter.export(
+                format: format,
+                as: .backgroundExport,
+                waitingUpTo: .zero,
+                progress: { _ in }
+            ) {
             case .completed:
                 return true
             case .paused:

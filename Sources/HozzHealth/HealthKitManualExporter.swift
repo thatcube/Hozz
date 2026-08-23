@@ -174,6 +174,8 @@ public actor HealthKitManualExporter {
 
     public func export(
         format: HealthExportFormat = .ndjson,
+        as owner: ExportWriterLease.Owner = .manualExport,
+        waitingUpTo wait: Duration = HealthExportEngine.leaseWait,
         waitingForWriter: @escaping @Sendable (ExportWriterLease.Owner) async -> Void = { _ in },
         progress: @escaping @Sendable (HealthExportProgress) async -> Void
     ) async throws -> HealthExportOutcome {
@@ -182,6 +184,8 @@ public actor HealthKitManualExporter {
         }
         return try await engine(for: format).export(
             format: format,
+            as: owner,
+            waitingUpTo: wait,
             waitingForWriter: waitingForWriter,
             progress: progress
         )

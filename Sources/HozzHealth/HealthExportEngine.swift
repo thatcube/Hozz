@@ -156,7 +156,7 @@ public actor HealthExportEngine {
     /// Long enough to cover an ordinary sync pass, which is what usually holds
     /// it, and short enough that the app is not left looking frozen if
     /// something is genuinely stuck.
-    static let leaseWait = Duration.seconds(90)
+    public static let leaseWait = Duration.seconds(90)
 
     /// Coverage states that mean a type reached an empty page in this run.
     ///
@@ -248,6 +248,8 @@ public actor HealthExportEngine {
 
     public func export(
         format: HealthExportFormat,
+        as owner: ExportWriterLease.Owner = .manualExport,
+        waitingUpTo wait: Duration = HealthExportEngine.leaseWait,
         waitingForWriter: @escaping @Sendable (ExportWriterLease.Owner) async -> Void = { _ in },
         progress: @escaping @Sendable (HealthExportProgress) async -> Void
     ) async throws -> HealthExportOutcome {
@@ -259,13 +261,10 @@ public actor HealthExportEngine {
         // The wait is announced before it starts, so the screen can say what
         // is being waited for. Showing an export at 0% would be the same lie
         // in a friendlier font.
-        if let holder = await lease.currentHolder {
+        if wait > .zero, let holder = await lease.currentHolder {
             await waitingForWriter(holder)
         }
-        guard await lease.acquire(
-            for: .manualExport,
-            waitingUpTo: Self.leaseWait
-        ) else {
+        guard await lease.acquire(for: owner, waitingUpTo: wait) else {
             throw HealthExportEngineError.busy(
                 await lease.currentHolder ?? .manualExport
             )

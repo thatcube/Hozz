@@ -183,6 +183,27 @@ final class ExportLeaseTests: XCTestCase {
         )
     }
 
+    /// The background task has a scarce budget and no one watching it, and it
+    /// already means to defer to whatever holds the writer. Waiting would
+    /// spend that budget queueing for a run that is going to finish the job
+    /// anyway, so a zero wait must be refused at once rather than timed out.
+    func testAZeroWaitIsRefusedImmediatelyRatherThanQueueing() async throws {
+        let lease = ExportWriterLease()
+        let taken = await lease.acquire(for: .manualExport)
+        XCTAssertTrue(taken, "The lease should start free.")
+
+        let started = ContinuousClock.now
+        let queued = await lease.acquire(for: .backgroundExport, waitingUpTo: .zero)
+        let waited = ContinuousClock.now - started
+
+        XCTAssertFalse(queued, "A zero wait cannot succeed while it is held.")
+        XCTAssertLessThan(
+            waited,
+            .milliseconds(50),
+            "It queued instead of standing aside."
+        )
+    }
+
     // MARK: - Telling the person what they are waiting for
 
     /// The screen can only say "waiting for the automatic sync" if the engine

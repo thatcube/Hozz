@@ -30,6 +30,7 @@ public actor ExportWriterLease {
     public enum Owner: String, Sendable {
         case manualExport
         case automaticSync
+        case backgroundExport
 
         /// Written for the person waiting, not for a log.
         public var activityDescription: String {
@@ -38,6 +39,8 @@ public actor ExportWriterLease {
                 "An export is already running."
             case .automaticSync:
                 "Hozz is sending health data to your destinations."
+            case .backgroundExport:
+                "Hozz is finishing your last export in the background."
             }
         }
     }
@@ -78,6 +81,12 @@ public actor ExportWriterLease {
     ) async -> Bool {
         if acquire(for: owner) {
             return true
+        }
+        // A caller that will not wait should not pay for a timeout task, and
+        // the background task in particular means to stand aside at once
+        // rather than spend its budget queueing.
+        guard timeout > .zero else {
+            return false
         }
 
         let id = UUID()
