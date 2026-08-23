@@ -137,6 +137,12 @@ Two things a flat reading would throw away are kept. An ear with nothing recorde
 
 In a CSV export a hearing test becomes `Audiograms.csv`, one row per ear reading.
 
+## Quantity series
+
+HealthKit stores some readings — a workout's power, cadence, or speed — as a *series*: one sample whose quantity is an aggregate over `count` individual values, reachable only through `HKQuantitySeriesSampleQuery`.
+
+Hozz does not expand those series yet. What it does do is say so: every quantity record carries its `count`, and one standing for more than a single reading is marked `aggregatesSeries`. Without that, an average of three hundred readings is indistinguishable from one measurement, which understates nothing and overstates everything.
+
 ## State of Mind
 
 Mood entries logged in Health on iOS 18 and newer: a valence from -1 to 1, the classification Health derives from it, whether the entry was a momentary feeling or a whole day's mood, and the labels and life associations the person chose.
@@ -254,7 +260,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 351 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, export formats, line protocol escaping, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains COUNT_PLACEHOLDER tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, characteristics, series streaming for routes and ECG, audiograms, State of Mind, aggregate sample counts, export formats, line protocol escaping, receiver ingestion and quarantine, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

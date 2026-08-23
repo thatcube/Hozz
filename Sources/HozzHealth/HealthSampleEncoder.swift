@@ -35,11 +35,12 @@ public struct HealthSampleEncoder: Sendable {
             }
             let unit = HKUnit(from: unitString)
             object["kind"] = "quantity"
-            object["quantity"] = [
-                "unit": unitString,
-                "value": quantity.quantity.doubleValue(for: unit),
-                "description": quantity.quantity.description
-            ]
+            object["quantity"] = Self.quantityObject(
+                unit: unitString,
+                value: quantity.quantity.doubleValue(for: unit),
+                description: quantity.quantity.description,
+                count: quantity.count
+            )
         case let category as HKCategorySample:
             object["kind"] = "category"
             object["value"] = category.value
@@ -84,6 +85,36 @@ public struct HealthSampleEncoder: Sendable {
             withJSONObject: object,
             options: [.sortedKeys, .withoutEscapingSlashes]
         )
+    }
+
+    /// Shapes a quantity, saying plainly when the one number stands for many.
+    ///
+    /// HealthKit stores some readings — a workout's power or cadence, for
+    /// instance — as a *series*: one sample whose `quantity` is an aggregate
+    /// over `count` individual values that only `HKQuantitySeriesSampleQuery`
+    /// can reach. Written without that count, an average of three hundred
+    /// readings is indistinguishable from a single measurement, which is a
+    /// quiet way of overstating what Hozz actually knows.
+    ///
+    /// Hozz does not expand those series yet, so the honest thing is to say
+    /// the detail exists and is not here, rather than to let the aggregate
+    /// pass for a reading.
+    static func quantityObject(
+        unit: String,
+        value: Double,
+        description: String,
+        count: Int
+    ) -> [String: Any] {
+        var object: [String: Any] = [
+            "unit": unit,
+            "value": value,
+            "description": description,
+            "count": count
+        ]
+        if count > 1 {
+            object["aggregatesSeries"] = true
+        }
+        return object
     }
 
     public func encodeDeletion(id: UUID, typeIdentifier: String) throws -> Data {

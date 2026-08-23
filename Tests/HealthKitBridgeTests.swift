@@ -190,6 +190,41 @@ final class HealthKitBridgeTests: XCTestCase {
 
     // MARK: - Encoder
 
+    /// HealthKit stores some workout metrics as a series: one sample whose
+    /// quantity is an aggregate over many readings. Written without a count,
+    /// an average of three hundred readings looks exactly like one
+    /// measurement.
+    func testAnAggregateQuantitySaysHowManyReadingsItStandsFor() {
+        let object = HealthSampleEncoder.quantityObject(
+            unit: "count/min",
+            value: 142,
+            description: "142 count/min",
+            count: 300
+        )
+
+        XCTAssertEqual(object["count"] as? Int, 300)
+        XCTAssertEqual(
+            object["aggregatesSeries"] as? Bool,
+            true,
+            "One number standing for three hundred must not read as a single measurement."
+        )
+    }
+
+    func testASingleReadingIsNotLabelledAsAnAggregate() {
+        let object = HealthSampleEncoder.quantityObject(
+            unit: "count",
+            value: 412,
+            description: "412 count",
+            count: 1
+        )
+
+        XCTAssertEqual(object["count"] as? Int, 1)
+        XCTAssertNil(
+            object["aggregatesSeries"],
+            "A plain reading must not be dressed up as an aggregate either."
+        )
+    }
+
     func testEncodingFailuresAreRecordedRatherThanDropped() throws {
         let encoder = HealthSampleEncoder()
         let id = UUID()
