@@ -154,6 +154,18 @@ private struct ExportSetupView: View {
                 Label(formatNote, systemImage: formatIcon)
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+
+                if resumable != nil {
+                    // Changing format now would throw away everything the
+                    // unfinished run has already sealed, so the choice belongs
+                    // to that run until it finishes or is discarded.
+                    Label(
+                        "The unfinished export above set this format. Discard it to choose another.",
+                        systemImage: "lock"
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                }
             }
 
             Section("Current coverage") {

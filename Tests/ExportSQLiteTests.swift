@@ -791,6 +791,98 @@ final class ExportSQLiteTests: XCTestCase {
         XCTAssertEqual(identifiers.count, Set(identifiers).count)
     }
 
+    /// Continuing a run in a different format throws away every part it had
+    /// already sealed. That is correct — deflated NDJSON parts cannot be
+    /// appended to under a different assembly — but it is also why the format
+    /// of a resumable run is not the user's to change: the UI restores it from
+    /// the run rather than from whatever the picker happens to be showing, or
+    /// "Continue export" would silently start over.
+    func testResumingInADifferentFormatStartsOverRatherThanContinuing() async throws {
+        let store = try HozzStore(directory: directory.url.appending(path: "store"))
+        let source = ScriptedHealthDataSource(
+            streams: [
+                steps: (0..<4).map { index in
+                    change(
+                        quantity(
+                            id: "step-\(index)",
+                            type: steps.rawValue,
+                            start: "2026-01-02T15:00:00.000Z",
+                            value: Double(index)
+                        ),
+                        type: steps
+                    )
+                },
+                heartRate: (0..<4).map { index in
+                    change(
+                        quantity(
+                            id: "heart-\(index)",
+                            type: heartRate.rawValue,
+                            start: "2026-01-02T16:00:00.000Z",
+                            value: Double(60 + index),
+                            unit: "count/min"
+                        ),
+                        type: heartRate
+                    )
+                }
+            ]
+        )
+        let engine = HealthExportEngine(
+            store: store,
+            source: source,
+            types: [steps, heartRate],
+            batchSize: 2,
+            lease: ExportWriterLease()
+        )
+
+        let task = Task {
+            try await engine.export(format: .sqlite) { progress in
+                if progress.currentTypeState == .completed {
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+            }
+        }
+        guard case .paused(let pause) = try await task.value else {
+            return XCTFail("Cancelling mid-run must pause, not fail.")
+        }
+        let resumable = try await engine.resumableRun()
+        XCTAssertEqual(resumable?.id, pause.runID)
+        XCTAssertEqual(
+            resumable?.format,
+            HealthExportFormat.sqlite.rawValue,
+            "The run remembers the format it was started in."
+        )
+
+        guard
+            case .completed(let result) = try await engine.export(
+                format: .ndjson,
+                progress: { _ in }
+            )
+        else {
+            return XCTFail("The run should have completed.")
+        }
+
+        XCTAssertFalse(
+            result.wasResumed,
+            "A different format cannot continue the sealed parts, so this is a new run."
+        )
+        XCTAssertNotEqual(
+            result.runID,
+            pause.runID,
+            "The old run is discarded rather than silently mixed."
+        )
+
+        // Nothing is lost from Health itself: anchors are scoped to the run, so
+        // a discarded run replays from the beginning and the new artifact still
+        // holds every record.
+        let identifiers = try ExportArtifactReader.records(in: result.fileURL)
+            .compactMap { $0["id"] as? String }
+            .filter { $0.hasPrefix("step-") || $0.hasPrefix("heart-") }
+        XCTAssertEqual(
+            Set(identifiers),
+            Set((0..<4).map { "step-\($0)" } + (0..<4).map { "heart-\($0)" })
+        )
+    }
+
     // MARK: - Helpers
 
     private func change(

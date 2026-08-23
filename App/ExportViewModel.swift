@@ -111,6 +111,26 @@ final class ExportViewModel {
                 return
             }
             if let run = try await exporter.resumableRun() {
+                // The format the picker is showing is not necessarily the
+                // format this run was started in: it is in-memory state that
+                // resets to the default when the app is relaunched, which is
+                // precisely when a resumable run is most likely to be found.
+                //
+                // Continuing in a different format would discard every part
+                // already sealed and silently start again — while the button
+                // says "Continue export" and the screen says the records are
+                // already saved. So the run's own format wins, and the
+                // disabled picker shows what will actually be produced.
+                //
+                // A format this build does not recognise cannot be continued
+                // at all, so it is not offered as resumable. Starting a new
+                // export discards it through the usual path, which is honest,
+                // rather than promising to continue and then not.
+                guard let format = HealthExportFormat(rawValue: run.format) else {
+                    state = .idle(resumable: nil)
+                    return
+                }
+                exportFormat = format
                 state = .idle(
                     resumable: ResumableSummary(
                         runID: run.id,
