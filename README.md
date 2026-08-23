@@ -12,7 +12,7 @@ Hozz is still early alpha. It currently exports quantity samples, category sampl
 
 The iPhone app has two paths: **Automatic** and **Export**.
 
-A first sync works through your history a bounded batch at a time, one type after another, so a phone with years of data can spend its early passes on a handful of types. The dashboard says how many types have been reached out of those selected, and the Mac says how many have arrived and how far back they reach. Neither shows a percentage or an estimated time: Health will not say how many records a type holds without reading all of them, so any fraction would be invented, and a progress bar is a promise about time remaining.
+A first sync works through your history a bounded batch at a time, giving every type a share of each pass rather than draining one to exhaustion before starting the next. That ordering matters more than it sounds: taking types strictly in turn meant a phone with years of stand hours sent nothing else for days, which is a working sync that reads exactly like a broken one. The dashboard says how many types have been reached out of those selected, and the Mac says how many have arrived and how far back they reach. Neither shows a percentage or an estimated time: Health will not say how many records a type holds without reading all of them, so any fraction would be invented, and a progress bar is a promise about time remaining.
 
 Automatic export sends new Health records to destinations you configure. Destinations can be limited to selected Health types, turned off, set to run when data arrives, hourly, daily, or only manually, and tested before you trust them. The dashboard shows the last successful delivery, retry or attention states, and a one-tap **Sync now** action. Shortcuts expose **Sync Health Data** and **Check Health Sync Status**.
 
@@ -180,7 +180,7 @@ The Mac app also watches a folder for automatic batch files. Point the phone at 
 The Mac UI has four tabs:
 
 - **Connect** shows the receiver, folder watcher, token, and honest per-device status based on when data last arrived.
-- **Data** lists received Health types, charts numeric values by hour/day/week/month, and exports a type as CSV.
+- **Data** lists what has arrived and how far back it reaches, shows the person's own characteristics above the measurements, charts numeric values by hour/day/week/month, exports a type as CSV, and names anything received in a form this version cannot read yet.
 - **Assistant** shows the MCP configuration to copy into an assistant.
 - **Activity** lists recent accepted, duplicate, paired, test, and rejected deliveries without logging sample values.
 
@@ -194,7 +194,7 @@ The Mac app embeds a read-only MCP server at:
 Hozz.app/Contents/MacOS/hozz-mcp
 ```
 
-It speaks JSON-RPC 2.0 over stdio, advertises protocol version `2024-11-05`, server name `hozz`, version `1.0.0`, and exposes four tools:
+It speaks JSON-RPC 2.0 over stdio, advertises protocol version `2024-11-05`, server name `hozz`, version `1.0.0`, and exposes ten tools. They are documented in **[docs/mcp.md](docs/mcp.md)**, which covers what each one answers, a copy-pasteable client configuration, and what the analysis tools will and will not claim:
 
 - `list_health_types`
 - `summarise_health_data`
@@ -207,42 +207,23 @@ It speaks JSON-RPC 2.0 over stdio, advertises protocol version `2024-11-05`, ser
 - `compare_health_types`
 - `find_health_anomalies`
 
-The three analysis tools are built to be hard to overstate, because their output
-goes straight to a language model that will narrate a story around any number.
-A trend reports "no detectable change" when a flat line fits as well as a sloped
-one, and refuses below two weeks of days. A correlation puts its interval on an
-autocorrelation-adjusted sample size, since consecutive days are not independent
-evidence, and warns when both series are trending — two things that both drift
-correlate whether or not they are related. Anomalies use the median and median
-absolute deviation, and days with too few records are reported as *the device
-was not worn* rather than as low readings, because those two look identical to
-anything that ignores how much was recorded.
+Most Apple Health MCP servers read the bulk XML export, which is a snapshot: correct the day you make it and stale the next morning. Hozz queries a local database the phone keeps current in the background, so a question costs an indexed lookup rather than a re-parse of hundreds of megabytes. That is the main reason to choose it.
 
-`summarise_health_data` also returns the person's own characteristics — age,
-biological sex, blood type — where they have been shared. That is deliberately
-part of the overview rather than a tool of its own: an assistant that is not
-required to ask who "me" is will answer "is this normal for me" without ever
-having found out, and reference ranges depend on exactly those facts. A date of
-birth is reported with the age it implies, because age is what the ranges are
-keyed to.
+The three analysis tools are built to be hard to overstate, because their output goes straight to a language model that will narrate a story around any number. A trend reports "no detectable change" when a flat line fits as well as a sloped one, and refuses below two weeks of days. A correlation puts its interval on an autocorrelation-adjusted sample size, since consecutive days are not independent evidence, and warns when both series are trending. Anomalies use the median and median absolute deviation, and a day with too few records is reported as *the device was not worn* rather than as a low reading. **[docs/mcp.md](docs/mcp.md)** sets out exactly what each tool will and will not claim, and carries the client configuration to copy.
 
-The tool must be given the Mac app's received-data directory. The Mac app is sandboxed, while the assistant launches `hozz-mcp` outside that sandbox; if the path is guessed, the tool opens an empty directory. Open the Mac app's **Assistant** tab and copy the generated configuration. It has this shape:
+The tool must be given the Mac app's received-data directory, and the Mac app is sandboxed while the assistant launches `hozz-mcp` outside that sandbox — so a guessed path opens an empty directory and every tool truthfully reports no data. Open the Mac app's **Assistant** tab and copy the configuration it generates. The server can only read; it has no code path that writes. If you connect it to a cloud-hosted assistant, that assistant may upload whatever it reads. That is the assistant's behaviour, not Hozz's.
 
-```json
-{
-  "mcpServers": {
-    "hozz": {
-      "command": "/Applications/Hozz.app/Contents/MacOS/hozz-mcp",
-      "args": [
-        "--data-dir",
-        "/Users/you/Library/Containers/com.thatcube.Hozz.mac/Data/Library/Application Support/Hozz/Received"
-      ]
-    }
-  }
-}
-```
+## Why Hozz does not write back into Apple Health
 
-The same path can be passed as `HOZZ_DATA_DIR` instead of `--data-dir`. The server can only read the received database; it cannot change or delete data. If you connect it to a cloud-hosted assistant, that assistant may upload whatever it reads. That is the assistant's behaviour, not Hozz's.
+This gets asked, so: it is a decision, not an oversight, and not something waiting on time.
+
+Health permanently attributes every sample to the app that wrote it. Anything Hozz imported would be stamped as Hozz's data forever, so a heart rate your Watch recorded in 2019 and Hozz restored in 2027 would be indistinguishable from one Hozz invented. That destroys exactly the provenance an archive exists to preserve.
+
+HealthKit also has no upsert. There is no way to say "store this sample unless it is already there", so importing the same export twice silently doubles it, and there is no reliable way afterwards to tell the copies apart or remove only one. A tool whose whole argument is that it never loses or duplicates a record cannot ship an operation that duplicates records by design.
+
+And it could not be complete in any case: characteristics and clinical records cannot be written by an app at all, so even a perfect importer would restore some of your data and quietly skip the rest.
+
+Exporting somewhere you own has none of these problems. That is the direction Hozz works in.
 
 ## Storage, privacy, and security
 
