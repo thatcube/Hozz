@@ -251,6 +251,10 @@ struct DestinationEditorView: View {
         DeliveryFormat.available(for: kind)
     }
 
+    private var addressPrecision: InfluxLineProtocol.Precision? {
+        InfluxLineProtocol.declaredPrecision(in: URL(string: endpoint))
+    }
+
     /// Everything InfluxDB needs that does not fit in the address.
     private var influxSection: some View {
         Section {
@@ -261,6 +265,19 @@ struct DestinationEditorView: View {
             Picker("Timestamp precision", selection: $precision) {
                 ForEach(InfluxLineProtocol.Precision.allCases, id: \.self) { precision in
                     Text(precision.displayName).tag(precision)
+                }
+            }
+
+            if let declared = addressPrecision, declared != precision {
+                HozzLabel(.alertTriangle, size: 16) {
+                    Text(
+                        "The address says precision=\(declared.rawValue) but this "
+                        + "is set to \(precision.rawValue). InfluxDB will not "
+                        + "complain — it will file every point in the wrong "
+                        + "decade. Make them match."
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.orange)
                 }
             }
         } header: {
@@ -486,6 +503,11 @@ struct DestinationEditorView: View {
     /// and back does not lose a measurement name that was typed once.
     private var options: [String: String] {
         var options = existing?.options ?? [:]
+        guard format == .influx || options[Destination.measurementKey] != nil else {
+            // A folder has no measurement name, and stamping one on it would
+            // put settings in the record that mean nothing there.
+            return options
+        }
         let trimmed = measurement.trimmingCharacters(in: .whitespaces)
         options[Destination.measurementKey] = trimmed.isEmpty
             ? InfluxLineProtocol.defaultMeasurement

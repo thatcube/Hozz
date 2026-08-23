@@ -73,6 +73,26 @@ public enum InfluxLineProtocol {
 
     public static let defaultMeasurement = "health"
 
+    /// The precision declared in a write URL, when it declares one.
+    ///
+    /// InfluxDB does not report a mismatch between the precision in the
+    /// address and the precision of the timestamps it is sent. It just files
+    /// every point in the wrong decade, and the user finds out when a Grafana
+    /// panel is empty. Reading it back out of the address is what lets Hozz say
+    /// so before that happens.
+    public static func declaredPrecision(in url: URL?) -> Precision? {
+        guard
+            let url,
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else {
+            return nil
+        }
+        return components.queryItems?
+            .last { $0.name == "precision" }?
+            .value
+            .flatMap(Precision.init(rawValue:))
+    }
+
     /// Suffix for workouts, which carry a duration rather than a measurement.
     public static let workoutSuffix = "_workouts"
     /// Suffix for records that have no numeric value at all.

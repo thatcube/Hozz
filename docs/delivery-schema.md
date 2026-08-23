@@ -399,6 +399,10 @@ fractional digits out of the timestamp string rather than out of a parsed
 of resolution — enough to collapse two samples a millisecond apart onto
 timestamps that are not a millisecond apart.
 
+Because InfluxDB will not tell you about a mismatch, Hozz reads the `precision`
+parameter back out of the address and warns in the destination editor when it
+disagrees with the precision selected there.
+
 ### Escaping
 
 Hozz escapes exactly what InfluxDB requires, and no more:

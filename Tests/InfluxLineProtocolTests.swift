@@ -803,6 +803,37 @@ final class InfluxLineProtocolTests: XCTestCase {
         XCTAssertTrue(DeliveryFormat.available(for: .mqtt).contains(.influx))
     }
 
+    /// A precision in the address that disagrees with the one Hozz writes is
+    /// not an error InfluxDB reports. It accepts the write and files every
+    /// point in the wrong decade, so the disagreement has to be found here.
+    func testThePrecisionDeclaredInTheAddressIsReadBack() {
+        XCTAssertEqual(
+            InfluxLineProtocol.declaredPrecision(
+                in: URL(string: "http://h:8086/api/v2/write?org=a&bucket=b&precision=ms")
+            ),
+            .milliseconds
+        )
+        XCTAssertEqual(
+            InfluxLineProtocol.declaredPrecision(
+                in: URL(string: "http://h:8086/write?db=health&precision=s")
+            ),
+            .seconds
+        )
+        XCTAssertNil(
+            InfluxLineProtocol.declaredPrecision(
+                in: URL(string: "http://h:8086/api/v2/write?org=a&bucket=b")
+            ),
+            "No declaration is not a disagreement."
+        )
+        XCTAssertNil(
+            InfluxLineProtocol.declaredPrecision(
+                in: URL(string: "http://h:8086/api/v2/write?precision=fortnights")
+            ),
+            "A precision InfluxDB would not accept is not one to match."
+        )
+        XCTAssertNil(InfluxLineProtocol.declaredPrecision(in: nil))
+    }
+
     func testTheInfluxPresetIsReachableAndConfigured() {
         let destination = DestinationPreset.influxDB.makeDestination()
         XCTAssertEqual(destination.format, .influx)
