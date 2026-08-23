@@ -109,23 +109,6 @@ struct ExportRecord {
 
     var message: String? { object["message"] as? String }
 
-    /// A metadata value that was tagged by the encoder, unwrapped to plain text.
-    func metadataString(_ key: String) -> String? {
-        guard
-            let metadata = object["metadata"] as? [String: Any],
-            let tagged = metadata[key] as? [String: Any]
-        else {
-            return nil
-        }
-        if let text = tagged["value"] as? String {
-            return text
-        }
-        if let number = Self.number(tagged["value"]) {
-            return Self.plain(number)
-        }
-        return tagged["description"] as? String
-    }
-
     static func number(_ value: Any?) -> Double? {
         switch value {
         case let value as Double: value

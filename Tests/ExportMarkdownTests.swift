@@ -438,8 +438,47 @@ final class ExportMarkdownTests: XCTestCase {
         let log = try ExportArtifactReader.lines(
             in: try XCTUnwrap(entries["export-log.ndjson"])
         )
-        XCTAssertEqual(log.count, 2)
+        XCTAssertEqual(log.count, 3)
         XCTAssertEqual(log.first?["kind"] as? String, "manifest")
+        XCTAssertEqual(
+            log.first(where: { $0["kind"] as? String == "deletion" })?["id"] as? String,
+            "gone-1",
+            "A deletion has no day, so the record itself is what survives: \(log)"
+        )
+    }
+
+    /// An object Health returned that Hozz could not encode has no values to
+    /// summarise. It must be reported as that, not quietly filed as a record
+    /// that happened to have no date.
+    func testASampleHozzCouldNotEncodeIsReportedAsItself() throws {
+        let (entries, statistics) = try build([
+            quantity(type: steps, start: "2026-01-02T15:00:00.000Z", value: 400),
+            [
+                "kind": "sampleEncodingError",
+                "schemaVersion": 1,
+                "id": "broken-1",
+                "type": heartRate,
+                "message": "No canonical unit."
+            ]
+        ])
+
+        XCTAssertEqual(statistics.encodingIssues, 1)
+        XCTAssertEqual(statistics.undatedRecords, 0)
+
+        let readme = String(
+            decoding: try XCTUnwrap(entries["README.md"]),
+            as: UTF8.self
+        )
+        XCTAssertTrue(readme.contains("could not encode | 1"), readme)
+
+        let log = try ExportArtifactReader.lines(
+            in: try XCTUnwrap(entries["export-log.ndjson"])
+        )
+        XCTAssertEqual(
+            log.first?["id"] as? String,
+            "broken-1",
+            "The record itself travels with the archive: \(log)"
+        )
     }
 
     func testAnUnreadableLineIsCountedRatherThanIgnored() throws {

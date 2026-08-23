@@ -8,6 +8,10 @@ struct ExportMarkdownStatistics: Equatable {
     var samplesSummarised = 0
     var workoutsSummarised = 0
     var deletionsSeen = 0
+    /// Objects Health returned that Hozz could not encode. They carry no
+    /// values, so a summary has nothing to say about them beyond that they
+    /// happened.
+    var encodingIssues = 0
     var undatedRecords = 0
     var unreadableLines = 0
     /// Days the pass was holding a summary for. This grows with how much
@@ -95,10 +99,20 @@ enum ExportMarkdownWriter {
                 }
                 continue
             }
+            if record.kind == "sampleEncodingError" {
+                // An object Health returned that Hozz could not encode. It has
+                // no values to summarise, so it travels in the export log and
+                // is reported as itself rather than counted as a record that
+                // happened to have no date.
+                runRecords.append(line)
+                statistics.encodingIssues += 1
+                continue
+            }
             if record.kind == "deletion" {
                 // A deletion has no date, so there is no day to file it under.
                 // It is counted and reported rather than pretended away.
                 statistics.deletionsSeen += 1
+                runRecords.append(line)
                 continue
             }
 
@@ -422,6 +436,10 @@ enum ExportMarkdownWriter {
         if statistics.deletionsSeen > 0 {
             text += "| Deletions (no day to file them under) "
             text += "| \(grouped(Double(statistics.deletionsSeen))) |\n"
+        }
+        if statistics.encodingIssues > 0 {
+            text += "| Records Hozz could not encode | "
+            text += "\(grouped(Double(statistics.encodingIssues))) |\n"
         }
         if statistics.undatedRecords > 0 {
             text += "| Records without a date | "
