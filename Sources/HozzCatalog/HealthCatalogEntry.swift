@@ -70,7 +70,6 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
             "HKScoredAssessmentTypeIdentifier",
             "HKWorkoutRouteTypeIdentifier",
             "HKWorkoutTypeIdentifier",
-            "HKAudiogramTypeIdentifier",
             "HKDataTypeIdentifier"
         ]
         for prefix in prefixes where name.hasPrefix(prefix) {
@@ -81,7 +80,6 @@ public struct HealthCatalogEntry: Codable, Hashable, Sendable {
             return switch key.rawValue {
             case "HKWorkoutTypeIdentifier": "Workout"
             case "HKWorkoutRouteTypeIdentifier": "Workout Route"
-            case "HKAudiogramTypeIdentifier": "Audiogram"
             default: key.rawValue
             }
         }
@@ -127,7 +125,7 @@ public enum HealthTypeCatalog {
                 introduced: IOSVersion(major: 14, minor: 0)
             ),
             HealthCatalogEntry(
-                identifier: "HKAudiogramTypeIdentifier",
+                identifier: "HKDataTypeIdentifierAudiogram",
                 family: .audiogram,
                 introduced: IOSVersion(major: 13, minor: 0)
             )

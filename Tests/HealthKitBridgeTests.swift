@@ -149,6 +149,34 @@ final class HealthKitBridgeTests: XCTestCase {
         )
     }
 
+    /// Every catalogue key must be the string HealthKit itself reports.
+    ///
+    /// Most of the catalogue is generated, but a handful of types are added by
+    /// hand because Apple does not list them with the others, and a constant's
+    /// name is not always its value: `HKObjectType.audiogramSampleType()`
+    /// answers `HKDataTypeIdentifierAudiogram`, not `HKAudiogramTypeIdentifier`.
+    /// A key that disagrees with the sample it maps to writes records whose
+    /// `type` field does not match the cursor that produced them, which is the
+    /// sort of thing nobody notices until the data is read back.
+    func testEveryExportableKeyMatchesTheIdentifierHealthKitReports() {
+        for exportable in HealthKitTypeRegistry.exportableTypes() {
+            XCTAssertEqual(
+                exportable.catalogEntry.key.rawValue,
+                exportable.sampleType.identifier,
+                "\(exportable.catalogEntry.key.rawValue) is not what HealthKit calls this type."
+            )
+        }
+    }
+
+    func testEveryCharacteristicKeyMatchesTheIdentifierHealthKitReports() {
+        for characteristic in HealthKitTypeRegistry.characteristicTypes() {
+            XCTAssertEqual(
+                characteristic.catalogEntry.key.rawValue,
+                characteristic.characteristicType.identifier
+            )
+        }
+    }
+
     func testCorrelationTypesAreNotClaimedAsCovered() {
         let families = Set(
             HealthKitTypeRegistry.exportableTypes().map(\.catalogEntry.family)
