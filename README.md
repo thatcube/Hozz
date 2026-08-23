@@ -37,9 +37,26 @@ Manual exports are built from a canonical NDJSON spool. That spool is the durabl
 | NDJSON | `.zip` containing one `.ndjson` member | Default. One record per line, streamable, and lossless for the fields Hozz currently encodes. |
 | CSV | `.zip` with one CSV per Health type, plus deletion and export-log files when needed | Opens in spreadsheets. Explicitly lossy: metadata and nested workout details do not fit a grid. |
 | JSON | `.zip` containing one JSON array | Convenient for smaller exports and tools that expect a single JSON value. |
-| Raw NDJSON | `.ndjson` | Supported by the export engine for direct piping; the main picker currently exposes NDJSON, CSV, and JSON. |
+| SQLite | `.sqlite` database | Query it in Datasette, DuckDB, pandas, Grafana, or `sqlite3` with no import step. Not lossy: every row keeps its original record in `raw`. |
+| Raw NDJSON | `.ndjson` | Supported by the export engine for direct piping; the main picker exposes NDJSON, CSV, JSON, and SQLite. |
 
-Automatic destinations use `DeliveryFormat`: NDJSON, JSON, CSV, or Metrics JSON. Metrics JSON groups points by metric name for Home Assistant, MQTT, and dashboards; deletions are carried alongside instead of silently dropped.
+The SQLite file is built for asking questions rather than for mirroring the
+JSON. Everything time-shaped except workouts goes into one wide `sample` table
+with a `type` column, because the queries worth having — compare two types over
+the same period, show everything that happened last Tuesday — are cross-type,
+and a table per type turns them into a hundred-way union. Workouts, deletions
+and characteristics have genuinely different shapes and get their own tables, a
+`record` view puts the time-shaped ones back on one timeline, and a `daily` view
+covers the aggregate most questions start from. Indexes cover one type over a
+period, any type in a window, day-grouped totals, and filtering by source.
+
+Because every row also stores the untouched export line in `raw`, anything the
+columns leave out is still reachable with `json_extract`, which is why SQLite is
+offered without the lossy label CSV carries. `meta` records when the export ran,
+what it covered, and which time zone the `local_day` columns were bucketed in —
+a UTC day would file an evening workout under the following morning.
+
+Automatic destinations use `DeliveryFormat`: NDJSON, JSON, CSV, or Metrics JSON. Metrics JSON groups points by metric name for Home Assistant, MQTT, and dashboards; deletions are carried alongside instead of silently dropped. SQLite is deliberately not offered there: a delivery is an append of new records to an endpoint or a folder, and a database file is neither appendable over HTTP nor meaningful one batch at a time.
 
 ## Health acquisition and durability
 
@@ -150,7 +167,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 178 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 190 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, receiver ingestion, delivery, MCP, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 

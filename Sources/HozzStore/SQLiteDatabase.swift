@@ -103,6 +103,28 @@ public final class SQLiteDatabase {
         try step(statement, expectingRow: false)
     }
 
+    /// Compiles a statement once so it can be run many times.
+    ///
+    /// ``run(_:_:)`` compiles its SQL on every call, which is the right trade
+    /// for the handful of statements the app runs per operation and the wrong
+    /// one for a bulk load: an export can insert millions of rows, and parsing
+    /// the same `INSERT` a million times costs more than the inserts.
+    public func prepared(_ sql: String) throws -> SQLiteStatement {
+        guard let handle else {
+            throw SQLiteError.closed
+        }
+        var statement: OpaquePointer?
+        let status = sqlite3_prepare_v2(handle, sql, -1, &statement, nil)
+        guard status == SQLITE_OK, let statement else {
+            let message = String(cString: sqlite3_errmsg(handle))
+            if let statement {
+                sqlite3_finalize(statement)
+            }
+            throw SQLiteError.prepare(code: status, message: message, statement: sql)
+        }
+        return SQLiteStatement(statement: statement, database: handle)
+    }
+
     /// Runs a query and maps every row.
     public func query<Row>(
         _ sql: String,
@@ -181,35 +203,7 @@ public final class SQLiteDatabase {
         at index: Int32,
         to statement: OpaquePointer
     ) throws {
-        let status: Int32 = switch value {
-        case .null:
-            sqlite3_bind_null(statement, index)
-        case .integer(let integer):
-            sqlite3_bind_int64(statement, index, integer)
-        case .real(let real):
-            sqlite3_bind_double(statement, index, real)
-        case .text(let text):
-            sqlite3_bind_text(statement, index, text, -1, sqliteTransient)
-        case .blob(let data):
-            data.isEmpty
-                ? sqlite3_bind_zeroblob(statement, index, 0)
-                : data.withUnsafeBytes { bytes in
-                    sqlite3_bind_blob(
-                        statement,
-                        index,
-                        bytes.baseAddress,
-                        Int32(bytes.count),
-                        sqliteTransient
-                    )
-                }
-        }
-
-        guard status == SQLITE_OK else {
-            throw SQLiteError.bind(
-                code: status,
-                message: handle.map { String(cString: sqlite3_errmsg($0)) } ?? ""
-            )
-        }
+        try bindValue(value, at: index, to: statement, handle: handle)
     }
 
     @discardableResult
@@ -227,6 +221,95 @@ public final class SQLiteDatabase {
             throw SQLiteError.step(
                 code: status,
                 message: handle.map { String(cString: sqlite3_errmsg($0)) } ?? ""
+            )
+        }
+    }
+}
+
+private func bindValue(
+    _ value: SQLiteValue,
+    at index: Int32,
+    to statement: OpaquePointer,
+    handle: OpaquePointer?
+) throws {
+    let status: Int32 = switch value {
+    case .null:
+        sqlite3_bind_null(statement, index)
+    case .integer(let integer):
+        sqlite3_bind_int64(statement, index, integer)
+    case .real(let real):
+        sqlite3_bind_double(statement, index, real)
+    case .text(let text):
+        sqlite3_bind_text(statement, index, text, -1, sqliteTransient)
+    case .blob(let data):
+        data.isEmpty
+            ? sqlite3_bind_zeroblob(statement, index, 0)
+            : data.withUnsafeBytes { bytes in
+                sqlite3_bind_blob(
+                    statement,
+                    index,
+                    bytes.baseAddress,
+                    Int32(bytes.count),
+                    sqliteTransient
+                )
+            }
+    }
+
+    guard status == SQLITE_OK else {
+        throw SQLiteError.bind(
+            code: status,
+            message: handle.map { String(cString: sqlite3_errmsg($0)) } ?? ""
+        )
+    }
+}
+
+/// A statement compiled once and run many times.
+///
+/// Like ``SQLiteDatabase`` this is not `Sendable`; it belongs to whoever
+/// created it and is reset before each run, so a leftover binding from the
+/// previous row can never leak into the next one.
+public final class SQLiteStatement {
+    private var statement: OpaquePointer?
+    private let database: OpaquePointer?
+
+    init(statement: OpaquePointer, database: OpaquePointer?) {
+        self.statement = statement
+        self.database = database
+    }
+
+    deinit {
+        finalize()
+    }
+
+    public func finalize() {
+        guard let statement else {
+            return
+        }
+        sqlite3_finalize(statement)
+        self.statement = nil
+    }
+
+    /// Binds a fresh set of parameters and runs the statement to completion.
+    public func run(_ parameters: [SQLiteValue] = []) throws {
+        guard let statement else {
+            throw SQLiteError.closed
+        }
+        sqlite3_reset(statement)
+        sqlite3_clear_bindings(statement)
+        for (offset, parameter) in parameters.enumerated() {
+            try bindValue(
+                parameter,
+                at: Int32(offset + 1),
+                to: statement,
+                handle: database
+            )
+        }
+
+        let status = sqlite3_step(statement)
+        guard status == SQLITE_DONE || status == SQLITE_ROW else {
+            throw SQLiteError.step(
+                code: status,
+                message: database.map { String(cString: sqlite3_errmsg($0)) } ?? ""
             )
         }
     }
