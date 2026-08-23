@@ -14,6 +14,9 @@ final class ReceiverIntegrationTests: XCTestCase {
     private var store: IngestStore!
     private var receiver: HealthReceiver!
     private var port: UInt16!
+    /// Unique per test, and the thing that proves a response came from *this*
+    /// receiver rather than from whatever else happens to be on the port.
+    private var serviceName: String!
 
     private let token = "test-token-abc123"
 
@@ -25,10 +28,11 @@ final class ReceiverIntegrationTests: XCTestCase {
             withIntermediateDirectories: true
         )
         store = try IngestStore(directory: root.appending(path: "store"))
+        serviceName = "Hozz Test \(UUID().uuidString.prefix(6))"
         receiver = HealthReceiver(
             store: store,
             token: token,
-            serviceName: "Hozz Test \(UUID().uuidString.prefix(6))"
+            serviceName: serviceName
         )
         // Port zero, not the real one. These tests do not care which port they
         // get, and binding the fixed 54330 means two test runs on one machine
@@ -37,12 +41,60 @@ final class ReceiverIntegrationTests: XCTestCase {
         // port it actually bound, so everything downstream still works.
         await receiver.start(port: 0)
         port = try await waitForPort()
+        try await waitUntilThisReceiverAnswers()
     }
 
     override func tearDown() async throws {
         await receiver?.stop()
         await store?.close()
         try? FileManager.default.removeItem(at: root)
+    }
+
+    /// Confirms the port is answering *and* that the thing answering is this
+    /// test's own receiver.
+    ///
+    /// Binding port zero takes any free loopback port, and loopback is shared
+    /// with the host — so on a machine running several test bundles at once,
+    /// a port can be handed out, released, and reused while a client is still
+    /// pointed at it. A stray reply from somebody else's server then fails a
+    /// test with a status the receiver cannot even produce: it has no 404 in
+    /// it anywhere, only 200, 400, 401, 403, 405 and 500.
+    ///
+    /// The receiver names itself on GET precisely so a caller can tell which
+    /// computer answered, and the name here is unique per test, so this turns
+    /// "something answered" into "the right something answered". A foreign
+    /// reply now fails with a message that says so rather than looking like a
+    /// receiver bug.
+    private func waitUntilThisReceiverAnswers() async throws {
+        var lastSeen = "nothing answered"
+        for _ in 0..<100 {
+            var request = URLRequest(
+                url: URL(string: "http://127.0.0.1:\(port!)/")!
+            )
+            request.httpMethod = "GET"
+            if
+                let (data, response) = try? await URLSession.shared.data(for: request),
+                let status = (response as? HTTPURLResponse)?.statusCode
+            {
+                let json = (try? JSONSerialization.jsonObject(with: data))
+                    as? [String: Any]
+                if
+                    status == 200,
+                    json?["service"] as? String == "hozz-receiver",
+                    json?["name"] as? String == serviceName
+                {
+                    return
+                }
+                lastSeen = "status \(status) from \(json?["name"] as? String ?? "an unknown server")"
+            }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw XCTSkip(
+            """
+            Port \(port!) is not this test's receiver: \(lastSeen). Another \
+            process on this machine's loopback claimed it.
+            """
+        )
     }
 
     private func waitForPort() async throws -> UInt16 {
