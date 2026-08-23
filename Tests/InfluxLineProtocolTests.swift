@@ -1,5 +1,6 @@
 import Foundation
 @testable import HozzDeliver
+import HozzStore
 import XCTest
 
 /// A strict reader for InfluxDB line protocol.
@@ -247,6 +248,27 @@ struct ParsedLine {
             index += 1
         }
         return result
+    }
+}
+
+/// Rejects a whole write when any line is malformed, as InfluxDB does.
+private struct LineProtocolValidatingChannel: DeliveryChannel {
+    func deliver(
+        _ batch: DeliveryBatch,
+        to destination: Destination
+    ) async throws -> DeliveryReceipt {
+        let text = String(decoding: batch.payload, as: UTF8.self)
+        let lines = text.split(separator: "\n", omittingEmptySubsequences: true)
+        guard !lines.isEmpty, lines.allSatisfy({ ParsedLine.parse(String($0)) != nil }) else {
+            throw DeliveryError.rejected(statusCode: 400, body: nil)
+        }
+        return DeliveryReceipt(
+            destinationID: destination.id,
+            attemptedAt: .now,
+            recordCount: batch.recordCount,
+            byteCount: UInt64(batch.payload.count),
+            state: .delivered
+        )
     }
 }
 
@@ -597,6 +619,133 @@ final class InfluxLineProtocolTests: XCTestCase {
                 "InfluxDB would reject this line and lose the whole batch: \(line)"
             )
         }
+    }
+
+    /// The examples in `docs/delivery-schema.md`, asserted verbatim.
+    ///
+    /// Documentation that describes what the code used to do is worse than no
+    /// documentation, because someone builds against it.
+    func testTheDocumentedExamplesAreWhatIsActuallyWritten() {
+        let records = [
+            sample(
+                source: "Apple Watch",
+                device: "Apple Watch",
+                start: "2026-08-22T21:10:46.500Z"
+            ),
+            sample(
+                type: "HKCategoryTypeIdentifierSleepAnalysis",
+                kind: "category",
+                value: 3,
+                unit: nil,
+                source: "Apple Watch",
+                start: "2026-08-22T22:00:00.000Z",
+                end: "2026-08-22T22:30:00.000Z"
+            ),
+            sample(
+                type: "HKWorkoutTypeIdentifier",
+                kind: "workout",
+                value: nil,
+                unit: nil,
+                source: "Apple Watch",
+                start: "2026-08-22T07:00:00.000Z",
+                end: "2026-08-22T07:30:00.000Z",
+                identifier: "7b21c0de-0000-4000-8000-000000000001",
+                duration: 1_800,
+                activityType: 37
+            ),
+            sample(
+                type: "HKQuantityTypeIdentifierStepCount",
+                value: nil,
+                unit: nil,
+                source: nil,
+                start: "",
+                end: "",
+                identifier: "9c40c0de-0000-4000-8000-000000000002",
+                isDeletion: true
+            )
+        ]
+
+        XCTAssertEqual(
+            lines(records),
+            [
+                #"health,type=heart_rate,source=Apple\ Watch,device=Apple\ Watch,unit=count/min value=62.5 1787433046500000000"#,
+                #"health,type=sleep_analysis,source=Apple\ Watch value=3.0,duration=1800.0 1787436000000000000"#,
+                #"health_workouts,type=workout,activity=Running,source=Apple\ Watch duration=1800.0,id="7b21c0de-0000-4000-8000-000000000001" 1787382000000000000"#,
+                "health_deletions,type=step_count,id=9c40c0de-0000-4000-8000-000000000002 deleted=true"
+            ]
+        )
+    }
+
+    // MARK: - The seam
+
+    /// A destination that rejects a batch must never look like a success.
+    ///
+    /// This is the failure worth guarding: two correct pieces of work either
+    /// side of a boundary, and nobody owning the join, so records go missing in
+    /// transit while the interface says everything is fine. The channel here
+    /// validates line protocol the way InfluxDB does — reject the whole write
+    /// if any line is malformed — and the engine has to record that as
+    /// something needing attention, not as a delivery.
+    func testAnUnacceptablePayloadIsNeverRecordedAsDelivered() async throws {
+        let directory = try TemporaryDirectory()
+        let store = try HozzStore(directory: directory.url.appending(path: "store"))
+        let channel = LineProtocolValidatingChannel()
+        let engine = DeliveryEngine(store: store, channels: [.restAPI: channel])
+        var destination = DestinationPreset.influxDB.makeDestination()
+        destination.endpointURL = URL(string: "http://influx.local:8086/api/v2/write")
+        try await engine.save(destination)
+
+        let malformed = DeliveryBatch(
+            id: UUID(),
+            sequence: 0,
+            createdAt: .now,
+            recordCount: 1,
+            payload: Data("health,type=heart_rate value=\n".utf8),
+            format: .influx
+        )
+        _ = try? await engine.deliver(malformed, to: destination)
+
+        let state = try await engine.state(for: destination.id)
+        XCTAssertNotEqual(state?.state, DeliveryState.delivered.rawValue)
+        XCTAssertEqual(state?.deliveredRecords, 0, "Nothing arrived, so nothing counts.")
+        let receipts = try await engine.receipts(for: destination.id)
+        XCTAssertNotNil(receipts.first?.detail, "The user has to be told why.")
+    }
+
+    /// The other half of the same seam: what Hozz actually produces has to get
+    /// through that same validation.
+    func testWhatHozzProducesPassesTheValidationThatRejectedTheMalformedBatch() async throws {
+        let directory = try TemporaryDirectory()
+        let store = try HozzStore(directory: directory.url.appending(path: "store"))
+        let channel = LineProtocolValidatingChannel()
+        let engine = DeliveryEngine(store: store, channels: [.restAPI: channel])
+        var destination = DestinationPreset.influxDB.makeDestination()
+        destination.endpointURL = URL(string: "http://influx.local:8086/api/v2/write")
+        try await engine.save(destination)
+
+        let payload = InfluxLineProtocol.build(
+            records: [
+                sample(source: "Watch, Series 9 = \"Ultra\"\\"),
+                sample(value: .nan),
+                sample(kind: "workout", value: nil, unit: nil, duration: 60, activityType: 37),
+                sample(value: nil, unit: nil, identifier: "deleted", isDeletion: true)
+            ],
+            options: destination.influxOptions
+        )
+        let batch = DeliveryBatch(
+            id: DeliveryBatch.identifier(for: payload),
+            sequence: 0,
+            createdAt: .now,
+            recordCount: 4,
+            payload: payload,
+            format: .influx
+        )
+
+        _ = try await engine.deliver(batch, to: destination)
+
+        let state = try await engine.state(for: destination.id)
+        XCTAssertEqual(state?.state, DeliveryState.delivered.rawValue)
+        XCTAssertEqual(state?.deliveredRecords, 4)
     }
 
     func testTheSameRecordsAlwaysProduceTheSameBytes() {
