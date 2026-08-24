@@ -312,16 +312,26 @@ final class MacServices {
             archiveSpan = try? await store.archiveSpan()
         }
 
+        // Cleared first, for the reason `loadDetail` clears: this load is
+        // sixty-odd range joins over 147,330 rows, and until it finishes the
+        // cards would caption the *new* range over the *old* range's numbers —
+        // including `domainCaption`, which makes a specific factual claim about
+        // how many of them reach it.
+        overview = [:]
+
         // Always the whole archive, whatever range the metrics are showing:
         // this chart's job is to put the sweep's shape on screen, and a
-        // seven-day window of it would show nothing at all.
-        let wholeArchive = TimeBucketPlan.forRange(
-            .all,
-            now: .now,
-            earliest: archiveSpan?.earliest,
-            calendar: calendar
-        )
-        archiveDensity = (try? await store.archiveDensity(plan: wholeArchive)) ?? []
+        // seven-day window of it would show nothing at all. Loaded once rather
+        // than on every range change, since it cannot depend on the range.
+        if archiveDensity.isEmpty {
+            let wholeArchive = TimeBucketPlan.forRange(
+                .all,
+                now: .now,
+                earliest: archiveSpan?.earliest,
+                calendar: calendar
+            )
+            archiveDensity = (try? await store.archiveDensity(plan: wholeArchive)) ?? []
+        }
 
         let plan = plan(for: range)
         var loaded: [HealthDomain: [IngestStore.MetricSnapshot]] = [:]
@@ -397,6 +407,9 @@ final class MacServices {
             return
         }
         let plan = plan(for: range)
+        // Cleared for the same reason the others are: a stale line under a new
+        // range's axis is a chart of something the caption does not describe.
+        comparison = []
         var lines: [ComparisonSeries] = []
         for type in comparisonTypes {
             guard let series = try? await store.series(type: type, plan: plan),

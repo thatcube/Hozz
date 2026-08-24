@@ -257,22 +257,22 @@ struct WorkoutDetailView: View {
                 if let energy = statistic("HKQuantityTypeIdentifierActiveEnergyBurned") {
                     StatTile(
                         label: "Active energy",
-                        value: WorkoutFormat.value(energy.sum, unit: energy.unit),
-                        unit: WorkoutFormat.unitLabel(energy.unit)
+                        value: WorkoutFormat.value(energy.sum, of: energy),
+                        unit: WorkoutFormat.label(energy.sum, of: energy)
                     )
                 }
-                if let distance = distanceStatistic {
+                if let distance = totalDistance {
                     StatTile(
-                        label: "Distance",
-                        value: WorkoutFormat.value(distance.sum, unit: distance.unit),
-                        unit: WorkoutFormat.unitLabel(distance.unit)
+                        label: distanceLabel,
+                        value: distance.unit.format(distance.metres),
+                        unit: distance.unit.label
                     )
                 }
                 if let heart = statistic("HKQuantityTypeIdentifierHeartRate") {
                     StatTile(
                         label: "Heart rate",
-                        value: WorkoutFormat.heartRate(heart.average),
-                        unit: "bpm",
+                        value: WorkoutFormat.value(heart.average, of: heart),
+                        unit: WorkoutFormat.label(heart.average, of: heart),
                         caption: heartRangeCaption(heart)
                     )
                 }
@@ -280,17 +280,54 @@ struct WorkoutDetailView: View {
         }
     }
 
-    /// The low and high the watch actually recorded, in beats per minute.
+    /// The low and high the watch actually recorded.
     ///
-    /// Health stores a pulse in `count/s`, so these are converted rather than
-    /// printed: a minimum of 0.88 is not a heart rate anybody recognises.
+    /// Converted rather than printed: Health stores a pulse in `count/s`, so a
+    /// minimum of 0.88 is not a heart rate anybody recognises.
     private func heartRangeCaption(
         _ statistic: IngestStore.StoredWorkoutStatistic
     ) -> String? {
         guard let low = statistic.minimum, let high = statistic.maximum else {
             return nil
         }
-        return "\(WorkoutFormat.heartRate(low))–\(WorkoutFormat.heartRate(high)) range"
+        let unit = WorkoutFormat.unit(for: statistic, magnitude: high)
+        return "\(unit.format(low))–\(unit.format(high)) range"
+    }
+
+    /// Every distance in this workout added together.
+    ///
+    /// A triathlon's parent workout carries `DistanceSwimming`,
+    /// `DistanceCycling` and `DistanceWalkingRunning` as three separate rows.
+    /// Taking the first of them — which, ordered by type, is the bike — put
+    /// "Distance 42.20 km" at the top of a workout that covered 51.5, two cards
+    /// above a Legs section whose whole subtitle is that a figure standing for
+    /// one leg describes none of them.
+    ///
+    /// They are all cumulative and all in metres, so a sum is the real total.
+    private var totalDistance: (metres: Double, unit: DisplayUnit)? {
+        let parts = workout.statistics.filter {
+            $0.type.contains("Distance") && $0.unit == "m"
+        }
+        let metres = parts.compactMap(\.sum).reduce(0, +)
+        guard !parts.isEmpty, metres > 0 else {
+            return nil
+        }
+        let measure = HealthMeasure.measure(
+            for: parts[0].type,
+            storedUnit: "m"
+        )
+        return (metres, measure.displayUnit(forMagnitude: metres))
+    }
+
+    /// Named for what it actually is, so a combined figure is never read as
+    /// one discipline's.
+    private var distanceLabel: String {
+        let kinds = Set(
+            workout.statistics
+                .filter { $0.type.contains("Distance") && $0.unit == "m" }
+                .map(\.type)
+        )
+        return kinds.count > 1 ? "Distance (all legs)" : "Distance"
     }
 
     private var legsCard: some View {
@@ -373,9 +410,6 @@ struct WorkoutDetailView: View {
         workout.statistics.first { $0.type == type }
     }
 
-    private var distanceStatistic: IngestStore.StoredWorkoutStatistic? {
-        workout.statistics.first { $0.type.contains("Distance") }
-    }
 }
 
 /// Naming and drawing a workout by its HealthKit activity number.
@@ -416,6 +450,15 @@ enum WorkoutActivity {
 }
 
 /// Formatting for workout statistics, which arrive in Health's own units.
+///
+/// Everything about a value's unit is deferred to ``HealthMeasure``, which is
+/// the app's one table of what a type is stored in and how it should be read.
+/// An earlier version of this file kept a second, smaller table keyed on the
+/// unit string alone, and it was wrong in exactly the ways a duplicate table
+/// gets wrong: `m` is the canonical unit of running stride length and
+/// underwater depth as well as of nine distance types, so a 1.14 m stride
+/// printed as `0.00 km`; and `count/s` is the canonical unit of respiratory
+/// rate as well as heart rate, so a breathing rate was labelled `bpm`.
 enum WorkoutFormat {
     static func duration(_ seconds: Double?) -> String {
         guard let seconds, seconds > 0 else { return "—" }
@@ -428,36 +471,30 @@ enum WorkoutFormat {
         return "\(minutes)m \(total % 60)s"
     }
 
-    /// A pulse arrives per second and is read per minute.
-    static func heartRate(_ perSecond: Double?) -> String {
-        guard let perSecond else { return "—" }
-        return (perSecond * 60).formatted(.number.precision(.fractionLength(0)))
+    /// How this statistic's type should be read.
+    static func unit(
+        for statistic: IngestStore.StoredWorkoutStatistic,
+        magnitude: Double
+    ) -> DisplayUnit {
+        HealthMeasure
+            .measure(for: statistic.type, storedUnit: statistic.unit)
+            .displayUnit(forMagnitude: magnitude)
     }
 
-    static func unitLabel(_ unit: String?) -> String {
-        switch unit {
-        case "m": "km"
-        case "count/s": "bpm"
-        case "%": "%"
-        case .some(let other): other
-        case nil: ""
-        }
-    }
-
-    static func value(_ value: Double?, unit: String?) -> String {
+    /// A statistic's own value, with the unit it is actually in.
+    static func value(
+        _ value: Double?,
+        of statistic: IngestStore.StoredWorkoutStatistic
+    ) -> String {
         guard let value else { return "—" }
-        switch unit {
-        case "m":
-            return (value / 1000).formatted(.number.precision(.fractionLength(2)))
-        case "count/s":
-            return heartRate(value)
-        case "%":
-            return (value * 100).formatted(.number.precision(.fractionLength(1)))
-        case "kcal":
-            return value.formatted(.number.precision(.fractionLength(0)))
-        default:
-            return value.formatted(.number.precision(.fractionLength(1)))
-        }
+        return unit(for: statistic, magnitude: value).format(value)
+    }
+
+    static func label(
+        _ value: Double?,
+        of statistic: IngestStore.StoredWorkoutStatistic
+    ) -> String {
+        unit(for: statistic, magnitude: value ?? 0).label
     }
 
     /// The statistic Health actually computed, whichever it is.
@@ -465,20 +502,25 @@ enum WorkoutFormat {
     /// A sum and an average are different facts, so whichever the row carries
     /// is what gets shown — never one relabelled as the other.
     static func full(_ statistic: IngestStore.StoredWorkoutStatistic) -> String {
-        let label = unitLabel(statistic.unit)
         if let sum = statistic.sum {
-            return "\(value(sum, unit: statistic.unit)) \(label)".trimmed
+            return unit(for: statistic, magnitude: sum).formatted(sum)
         }
         guard let average = statistic.average else {
             return "—"
         }
-        var text = "avg \(value(average, unit: statistic.unit)) \(label)".trimmed
+        let display = unit(for: statistic, magnitude: average)
+        var text = "avg \(display.formatted(average))"
         if let low = statistic.minimum, let high = statistic.maximum {
-            text += " (\(value(low, unit: statistic.unit))–\(value(high, unit: statistic.unit)))"
+            text += " (\(display.format(low))–\(display.format(high)))"
         }
         return text
     }
 
+    /// The same, short enough for a leg's summary line.
+    ///
+    /// Carries its unit. Without one a 1,200 m swim leg read "Distance 1.20"
+    /// beside a run leg reading "Distance 5.00", with nothing on screen to say
+    /// that the first had been divided by a thousand and the second had not.
     static func short(_ statistic: IngestStore.StoredWorkoutStatistic) -> String {
         let measure = HealthMeasure.measure(
             for: statistic.type,
@@ -488,13 +530,11 @@ enum WorkoutFormat {
             .split(separator: " ")
             .first
             .map(String.init) ?? measure.displayName
-        if let sum = statistic.sum {
-            return "\(name) \(value(sum, unit: statistic.unit))"
+        guard let value = statistic.sum ?? statistic.average else {
+            return name
         }
-        if let average = statistic.average {
-            return "\(name) \(value(average, unit: statistic.unit))"
-        }
-        return name
+        let display = measure.displayUnit(forMagnitude: value)
+        return "\(name) \(display.formatted(value))"
     }
 }
 
