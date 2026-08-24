@@ -587,6 +587,51 @@ final class PrimeStoreTests: XCTestCase {
         XCTAssertEqual(prime?.state, .covered)
     }
 
+    /// The two lengths are two facts, and the store has to keep them apart.
+    ///
+    /// Everything in this table is a `REAL` beside another `REAL`, so a mapper
+    /// reading the wrong column, or an `apply` binding one length into the
+    /// other's slot, changes no type and raises nothing. Only reading them back
+    /// as *different* values can tell.
+    func testTheTwoLearnedLengthsSurviveSeparately() async throws {
+        let store = try makeStore()
+        let record = try await seed(store)
+
+        try await store.commit(
+            [],
+            prime: [
+                PendingPrimeCommit(
+                    type: steps,
+                    baseFrontier: record.frontier,
+                    baseCoveredThrough: record.coveredThrough,
+                    frontier: record.frontier.addingTimeInterval(-7 * 86_400),
+                    coveredThrough: record.coveredThrough,
+                    chunkSeconds: 7 * 86_400,
+                    topUpSeconds: 60,
+                    addedRecordCount: 350,
+                    state: .priming
+                )
+            ],
+            scope: scope
+        )
+
+        let stored = try await store.primeRecord(scope: scope, type: steps)
+        XCTAssertEqual(
+            stored?.chunkSeconds,
+            7 * 86_400,
+            "The backfill's week must not come back as the top-up's minute."
+        )
+        XCTAssertEqual(stored?.topUpSeconds, 60)
+        // Read alongside them, because a column that slipped by one would take
+        // these with it and nothing else in the row would notice.
+        XCTAssertEqual(stored?.deliveredCount, 350)
+        XCTAssertEqual(stored?.state, .priming)
+        XCTAssertEqual(
+            stored?.frontier,
+            record.frontier.addingTimeInterval(-7 * 86_400)
+        )
+    }
+
     func testARestartPointsTheWalkAtAFreshWindow() async throws {
         let store = try makeStore()
         let record = try await seed(store)

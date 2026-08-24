@@ -787,6 +787,73 @@ final class PrimeSyncTests: XCTestCase {
         )
     }
 
+    /// A minute the top-up had to shrink to must not shrink the backfill too.
+    ///
+    /// The two walks learn how long a chunk should be from what they read, and
+    /// they read different stretches. Shared, a busy afternoon would drag the
+    /// backfill down to sixty-second chunks of a quiet 2023, which it would
+    /// then spend four or five queries climbing back out of — on every pass,
+    /// indefinitely.
+    func testABusyLeadingEdgeDoesNotShrinkTheBackfillsChunks() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = try await makeDestination(delivery)
+        let scope = AnchorScope.destination(destination.id)
+
+        let dated = ScriptedDatedHealthDataSource(samples: [steps: denseHistory()])
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            sweep: ScriptedHealthDataSource(streams: [steps: []]),
+            dated: dated
+        )
+
+        // A first pass, which only backfills — the leading edge is not yet
+        // stale enough to be worth a query — and which cannot finish, so the
+        // type is still priming when the edge goes bad.
+        await pass(engine, at: now)
+        let midway = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
+        XCTAssertEqual(midway.state, .priming)
+        XCTAssertGreaterThan(
+            midway.chunkSeconds,
+            PrimePlan.minimumChunk,
+            "The backfill settled on a useful length over quiet months."
+        )
+
+        // The next three reads are the top-up's — it runs first, and narrows
+        // twice before giving up — and every one of them overflows.
+        let afterFirstPass = await dated.queryCount(for: steps)
+        await dated.setFaults(
+            Dictionary(
+                uniqueKeysWithValues: (afterFirstPass + 1...afterFirstPass + 3)
+                    .map { ($0, ScriptedDatedFault.truncate) }
+            ),
+            for: steps
+        )
+        await pass(engine, at: now.addingTimeInterval(PrimePlan.topUpInterval + 60))
+
+        let after = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
+        XCTAssertEqual(
+            after.topUpSeconds,
+            PrimePlan.minimumChunk,
+            "The top-up narrowed as far as it will go and stopped."
+        )
+        XCTAssertGreaterThanOrEqual(
+            after.chunkSeconds,
+            midway.chunkSeconds,
+            """
+            The months are as quiet as they were an hour ago. Nothing the \
+            leading edge did is evidence about them.
+            """
+        )
+        XCTAssertGreaterThan(after.deliveredCount, midway.deliveredCount)
+    }
+
     /// A busy few minutes at the leading edge says nothing about the months
     /// behind it, and must not be recorded as though it did.
     func testDensityAtTheLeadingEdgeDoesNotUndoAFinishedBackfill() async throws {
