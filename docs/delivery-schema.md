@@ -72,6 +72,7 @@ protocol are projections of it. Every record has these fields:
 | `deletion` | — | A tombstone. Carries only `kind`, `id`, `type`, `schemaVersion`. |
 | `sampleEncodingError` | `message` | A sample Hozz could not encode, written in its place so the batch never silently omits it. |
 | `sample` | — | An `HKSample` subclass this build has no specific handling for. |
+| `typeCoverage` | `state`, `complete`, `deliveredCount`, `primedFrom`, `primedThrough`, `observedAt` | Not a measurement: how completely Hozz has read one type. See below. |
 
 ### `quantity`
 
@@ -210,8 +211,68 @@ negative numbers that look like measurements. `workoutRouteEnd` carries the
 final `locations` count, so a complete route is distinguishable from a truncated
 one.
 
-## NDJSON
+### `typeCoverage`
 
+How completely Hozz has read one type. Not a measurement, and never to be
+stored as one: it carries no `id` and no `startDate`, deliberately, because it
+describes a type rather than a moment.
+
+```json
+{
+  "kind": "typeCoverage",
+  "type": "HKQuantityTypeIdentifierStepCount",
+  "state": "anchorClosed",
+  "complete": true,
+  "deliveredCount": 147330,
+  "observedAt": "2026-03-04T05:06:07.500Z"
+}
+```
+
+This exists because a receiver cannot work it out. Hozz reads Health through
+`HKAnchoredObjectQuery`, which returns samples in the order Health *stored*
+them, not the order they happened. So for a type whose sweep is unfinished,
+what has arrived is an arbitrary subset by date: the newest record delivered is
+the newest record *delivered*, and says nothing about the newest record that
+exists. A receiver shown only the records will read the first as the second —
+one did, and told someone who wears a watch daily that they had not walked in
+three years.
+
+| Field | Meaning |
+| --- | --- |
+| `state` | Hozz's own word for how this type is being read. `draining`, `anchorClosed`, `authorizationIndeterminate`, `limitedAuthorizationWindow`, `deviceLockedDeferred`, `tombstoneGapSuspected`, `unsupported`, `unverifiedOnDevice`, `unknown`. |
+| `complete` | `true` only when `state` is `anchorClosed`. **The one field that licenses presenting a date as the person's own most recent.** |
+| `deliveredCount` | Records sent for this type so far, as Hozz counts them. Informational. Do not compare it against your own count to decide completeness; the two can differ legitimately. |
+| `primedFrom`, `primedThrough` | A stretch filled by a dated query rather than the sweep, so everything in it is present. Both are achievements, never intentions. Absent when there is no such stretch. |
+| `observedAt` | When Hozz observed all of the above — that is, when this coverage last *changed*, not when it was last confirmed. Use it to decide whether an arriving report is newer than one you hold; deliveries can be retried and a folder of exports can be read in any order. |
+
+There is deliberately **no "swept through &lt;date&gt;" field**. That number
+would be easy to compute and would look authoritative, and the sweep's ordering
+cannot support it.
+
+Two things a report does not claim, both worth knowing before writing a
+sentence about one:
+
+- `anchorClosed` after a stream that never returned an object is reported as
+  `authorizationIndeterminate` instead, because HealthKit answers identically
+  for a type you have no records of and one Hozz was never granted. Treating it
+  as complete would present a type nobody has permission to read as a type the
+  person genuinely has nothing for.
+- A primed window means every *sample* Health holds in it is present. A dated
+  read has no tombstone channel, so deletions arrive only through the sweep,
+  and the expanded readings inside a high-frequency series sample are not part
+  of a prime — only the sample itself.
+
+Absence of a report is not evidence of completeness. A receiver that has never
+been told anything about a type knows nothing about it, which is a third state
+and not a quieter version of either of the other two.
+
+Reports are attached to every lossless batch, so any batch brings a receiver
+fully up to date; a batch carrying nothing else is delivered when coverage
+changes and nothing new was read. They are omitted from CSV, Metrics JSON and
+line protocol, which have no shape that could carry one without it arriving as
+a row of blanks or as a metric named after a type.
+
+## NDJSON
 Default. One record per line, `\n` terminated, `application/x-ndjson`. Lossless.
 
 ```

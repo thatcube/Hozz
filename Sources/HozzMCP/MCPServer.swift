@@ -320,10 +320,40 @@ public actor MCPServer {
                 tool can chart. Use list_health_samples to see them.
                 """
         }
-        return """
-            \(type) has \(summary.recordCount) records, but none in the last \
-            \(days) days. Widen the window to reach them.
-            """
+        // "None in the last N days" is a sentence about the person if the type
+        // has been read to the end, and a sentence about the transfer if it
+        // has not. They are opposite answers to "have I stopped doing this",
+        // and this used to give the first one in both cases.
+        let standing = TypeCoverageStanding(
+            report: try? await store.coverage(for: type)
+        )
+        switch standing {
+        case .complete:
+            return """
+                \(type) has \(summary.recordCount) records, but none in the \
+                last \(days) days. Your phone has finished reading this type, \
+                so the gap is genuine rather than a sync still in progress. \
+                Widen the window to reach the records that are here.
+                """
+        case .incomplete:
+            return """
+                \(type) has \(summary.recordCount) records on this Mac, none \
+                of them in the last \(days) days — but this type has not been \
+                fully read yet, so that is a fact about what has arrived and \
+                not about the person. \(Self.coverageGuidance)
+                """
+        case .untold:
+            // Not "has not been fully read": nobody said that. Claiming it
+            // would invent an incompleteness, which is the same failure as
+            // inventing a completeness, pointed the other way.
+            return """
+                \(type) has \(summary.recordCount) records on this Mac, none \
+                of them in the last \(days) days. This Mac has not been told \
+                whether your phone has finished reading this type, so it \
+                cannot say whether that is a gap in your history or a gap in \
+                what has arrived. \(Self.coverageGuidance)
+                """
+        }
     }
 
     private func analyseTrend(_ arguments: [String: Any]) async throws -> String {
@@ -825,16 +855,50 @@ public actor MCPServer {
                 add this computer as a destination, then sync.
                 """
         }
+        let coverage = (try? await store.coverage()) ?? [:]
         let lines = summaries.map { summary in
+            let standing = TypeCoverageStanding(report: coverage[summary.type])
             let range = [summary.earliest, summary.latest]
                 .compactMap { $0 }
                 .map(Self.day)
-            let span = range.count == 2 ? " (\(range[0]) to \(range[1]))" : ""
+            // A span presented plainly is a claim about the person's records.
+            // For a type still being swept it is a claim about which records
+            // happened to arrive, and both ends of it can move outward later,
+            // so it is labelled as what it is.
+            let span = range.count == 2
+                ? (standing.licensesLatestDate
+                    ? " (\(range[0]) to \(range[1]))"
+                    : " (received so far: \(range[0]) to \(range[1]))")
+                : ""
             let unit = summary.unit.map { " \($0)" } ?? ""
-            return "- \(summary.type): \(summary.recordCount) records\(unit)\(span)"
+            let note = standing.qualifier.map { " — \($0)" } ?? ""
+            return "- \(summary.type): \(summary.recordCount) records\(unit)\(span)\(note)"
         }
-        return "Health types available:\n" + lines.joined(separator: "\n")
+        return """
+            Health types available:
+            \(lines.joined(separator: "\n"))
+
+            \(Self.coverageGuidance)
+            """
     }
+
+    /// What an assistant has to know before it reads a date off any of this.
+    ///
+    /// Stated once, in the two tools an assistant calls to orient itself,
+    /// rather than repeated on every row. Without it a model does exactly what
+    /// the dashboard did: takes the newest record held as the newest record
+    /// that exists, and tells someone who wears a watch daily that they
+    /// stopped walking three years ago.
+    static let coverageGuidance = """
+        On completeness: a type with a note beside it has either not been \
+        fully read yet, or has not been reported on at all. The phone sends \
+        records in the order Health stored them rather than in date order, so \
+        for those types the newest record here is the newest that has \
+        *arrived* and says nothing about the newest that exists. Do not report \
+        it as the person's most recent, and do not infer that they stopped \
+        doing something. A type with no note has been read to the end and its \
+        dates can be taken at face value.
+        """
 
     private func summarise(_ arguments: [String: Any]) async throws -> String {
         let summaries = try await store.summaries()
@@ -887,9 +951,46 @@ public actor MCPServer {
 
         let earliest = summaries.compactMap(\.earliest).min()
         let latest = summaries.compactMap(\.latest).max()
+        let coverage = (try? await store.coverage()) ?? [:]
+        let standings = summaries.map {
+            TypeCoverageStanding(report: coverage[$0.type])
+        }
+        // Three counts, not two. "We were told this is unfinished" and "we
+        // were told nothing" are different facts, and folding the second into
+        // the first states an incompleteness nobody reported — which is the
+        // mirror image of the bug this whole change exists to fix. A Mac
+        // updated ahead of the phone sits entirely in the second state.
+        let unfinished = standings.count { standing in
+            if case .incomplete = standing { return true }
+            return false
+        }
+        let untold = standings.count { $0 == .untold }
         text += "\(total) records across \(summaries.count) types."
         if let earliest, let latest {
-            text += " Covering \(Self.day(earliest)) to \(Self.day(latest))."
+            // "Covering X to Y" is a claim that everything between the two is
+            // here. Unless every type has been read to the end it is not: what
+            // has arrived for an unfinished type is an arbitrary subset by
+            // date, so the outer dates are the edges of the arrivals rather
+            // than the edges of a filled range.
+            text += unfinished + untold == 0
+                ? " Covering \(Self.day(earliest)) to \(Self.day(latest))."
+                : " Records received so far run from \(Self.day(earliest)) to "
+                    + "\(Self.day(latest)), which is not the same as covering "
+                    + "that range."
+        }
+        if unfinished > 0 {
+            text += " \(unfinished) of \(summaries.count) "
+            text += unfinished == 1 ? "type has" : "types have"
+            text += " not been fully read yet (list_types says which)."
+        }
+        if untold > 0 {
+            text += " This Mac has not been told how completely \(untold) "
+            text += untold == 1 ? "type was" : "types were"
+            text += " read — usually a phone that has not synced since it "
+            text += "learned to say so. That is not evidence either way."
+        }
+        if unfinished + untold > 0 {
+            text += " " + Self.coverageGuidance
         }
 
         // A receiver holding records it could not interpret is not the same as

@@ -46,6 +46,15 @@ extension HealthSyncEngine {
         var bytes = 0
         /// Frontier advances, held back until the destination accepts the batch.
         var commits: [PendingPrimeCommit] = []
+        /// The stretch each type has genuinely had delivered, as this batch
+        /// will leave it.
+        ///
+        /// Built from what is about to be committed rather than from the store,
+        /// for the same reason the coverage beside it is: the commit and the
+        /// report travel in the same batch, so a window that widened is told to
+        /// the receiver in the same breath as the records that widened it. Read
+        /// from the store instead, every window would arrive one delivery late.
+        var windows: [HealthTypeKey: CoverageReporter.PrimedWindow] = [:]
         /// Whether any type still has window left to walk after this pass.
         var remains = false
         var wasInterrupted = false
@@ -87,8 +96,25 @@ extension HealthSyncEngine {
             )
         }
 
-        let pending = try await store.primeRecords(scope: scope)
+        let known = try await store.primeRecords(scope: scope)
             .filter { eligible.contains($0.type) }
+        // Every type with a stretch to report, not only the ones this pass will
+        // touch. A type whose backfill finished last week still holds its
+        // months, and leaving it out would retract a true claim.
+        for record in known {
+            guard
+                let covered = record.coveredWindow,
+                let window = CoverageReporter.PrimedWindow(
+                    from: covered.from,
+                    through: covered.through
+                )
+            else {
+                continue
+            }
+            round.windows[record.type] = window
+        }
+
+        let pending = known
             // A stalled type is skipped whole. Its density is what stopped the
             // backfill, and the same density is waiting at the leading edge.
             .filter { $0.state != .stalled }
@@ -161,6 +187,12 @@ extension HealthSyncEngine {
                 round.commits.append(commit)
                 if commit.state != .priming {
                     owingBackfill.remove(commit.type)
+                }
+                if let window = CoverageReporter.PrimedWindow(
+                    from: commit.frontier,
+                    through: commit.coveredThrough
+                ) {
+                    round.windows[commit.type] = window
                 }
             }
             if walk.waitingForUnlock {

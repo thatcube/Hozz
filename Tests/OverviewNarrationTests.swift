@@ -98,11 +98,23 @@ final class OverviewNarrationTests: XCTestCase {
         )
     }
 
+    /// A row from the range asked for still says how much of it is there —
+    /// and, since nothing has said this type is finished, that the figure may
+    /// not be all of it. Before the phone sent its coverage there was no
+    /// honest way to write the second half of that sentence.
     func testACurrentRowSaysCoverageWithoutSayingWhenItArrived() {
         let row = Self.snapshot(daysWithData: 11, dayCount: 30, isFromEarlierWindow: false)
-        XCTAssertEqual(row.rowCaption(monthName: Self.month), "total · 11/30 days")
+        XCTAssertEqual(
+            row.rowCaption(monthName: Self.month),
+            "may be incomplete · total · 11/30 days"
+        )
+        XCTAssertFalse(row.rowCaption(monthName: Self.month).contains("received to"))
     }
 
+    /// A row with nothing in the window still names a month, and that month is
+    /// still a claim. Nothing has said this type is finished, so it is
+    /// described as the newest thing that arrived rather than the last there
+    /// was — `CoverageNarrationTests` pins both halves of that.
     func testARowWithNoValuesSaysSoRatherThanReportingZero() {
         let row = Self.snapshot(
             daysWithData: 0,
@@ -110,7 +122,10 @@ final class OverviewNarrationTests: XCTestCase {
             headline: nil,
             isFromEarlierWindow: true
         )
-        XCTAssertEqual(row.rowCaption(monthName: Self.month), "Nothing yet · last Dec 2022")
+        XCTAssertEqual(
+            row.rowCaption(monthName: Self.month),
+            "Nothing yet · received to Dec 2022"
+        )
     }
 
     func testARowWithNoValuesAndNoHistoryDoesNotInventADate() {

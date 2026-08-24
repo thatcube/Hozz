@@ -32,7 +32,7 @@ final class SchemaMigrationTests: XCTestCase {
     }
 
     /// The current schema. Every historical fixture must reach this.
-    private static let currentVersion: Int64 = 8
+    private static let currentVersion: Int64 = 9
 
     // MARK: - The historical schemas, as they actually were
 

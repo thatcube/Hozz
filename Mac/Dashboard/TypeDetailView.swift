@@ -58,12 +58,35 @@ struct TypeDetailView: View {
                 Text(spanCaption(series))
                     .font(.callout)
                     .foregroundStyle(HozzPalette.inkSoft)
+                // Said on every visit rather than only when a range comes up
+                // empty. The state that produced the original bug — a type
+                // years behind, charting happily — never opens an empty range
+                // at all, so an explanation that appears only there is an
+                // explanation that never appears when it is needed.
+                Text(
+                    OverviewNarration.completeness(
+                        services.standing(for: type),
+                        latest: services.summaries
+                            .first { $0.type == type }?.latest,
+                        day: Self.day
+                    )
+                )
+                .font(.caption)
+                .foregroundStyle(HozzPalette.inkMuted)
+                .fixedSize(horizontal: false, vertical: true)
             }
             Spacer()
             RangePicker(range: $range)
         }
     }
 
+    /// How much is held and over what stretch — described as what arrived
+    /// unless the phone has said the type is finished.
+    ///
+    /// "2019 – 2023" reads as the span of the person's records. For a type
+    /// still being swept it is the span of the *arrivals*, and the two are not
+    /// the same thing: an anchored sweep returns samples in the order Health
+    /// stored them, so both ends of that range can move outward later.
     private func spanCaption(_ series: TypeSeries) -> String {
         guard let summary = services.summaries.first(where: { $0.type == type }) else {
             return ""
@@ -71,7 +94,10 @@ struct TypeDetailView: View {
         var text = summary.recordCount.formatted(.number)
         text += summary.recordCount == 1 ? " record" : " records"
         if let earliest = summary.earliest, let latest = summary.latest {
-            text += " · \(Self.day(earliest)) – \(Self.day(latest))"
+            let held = services.standing(for: type).licensesLatestDate
+                ? ""
+                : "received so far, "
+            text += " · \(held)\(Self.day(earliest)) – \(Self.day(latest))"
         }
         if series.hasAggregatedSamples {
             // Worth saying: one row standing for hundreds of readings is why
@@ -283,10 +309,19 @@ struct TypeDetailView: View {
                 .foregroundStyle(HozzPalette.ink)
             if let summary = services.summaries.first(where: { $0.type == type }),
                let latest = summary.latest {
+                // This used to explain the sweep whether or not the sweep was
+                // still running: "your phone sends one type at a time, so the
+                // newest days often arrive last" was shown for a finished type
+                // too, where it is simply not true and quietly suggests more is
+                // coming when nothing is. The phone now says which it is.
                 Text(
                     "This type does have \(summary.recordCount.formatted(.number)) records, "
-                        + "the most recent from \(Self.day(latest)). Your phone sends one type at "
-                        + "a time, so the newest days often arrive last."
+                        + "the most recent from \(Self.day(latest)). "
+                        + OverviewNarration.completeness(
+                            services.standing(for: type),
+                            latest: nil,
+                            day: Self.day
+                        )
                 )
                 .font(.caption)
                 .foregroundStyle(HozzPalette.inkMuted)

@@ -21,6 +21,31 @@ private actor PrimeRecordingChannel: DeliveryChannel {
         failing.remove(destinationID)
     }
 
+    /// The last coverage line sent for one type, as the bytes that actually
+    /// went out. Kept as bytes rather than decoded here so what crosses back is
+    /// exactly what crossed the wire.
+    func coverageLine(
+        for destinationID: UUID,
+        type: HealthTypeKey
+    ) -> Data? {
+        payloads[destinationID, default: []]
+            .flatMap { payload in
+                String(decoding: payload, as: UTF8.self)
+                    .split(separator: "\n")
+                    .map { Data($0.utf8) }
+            }
+            .last { line in
+                guard
+                    let object = try? JSONSerialization.jsonObject(with: line)
+                        as? [String: Any]
+                else {
+                    return false
+                }
+                return (object["kind"] as? String) == "typeCoverage"
+                    && (object["type"] as? String) == type.rawValue
+            }
+    }
+
     /// Every sample name this destination has been sent, repeats included.
     func sampleNames(for destinationID: UUID) -> [String] {
         payloads[destinationID, default: []].flatMap { payload in
@@ -1275,6 +1300,71 @@ final class PrimeSyncTests: XCTestCase {
             Everything in the new window must have arrived a second time. \
             Anything that did not was claimed on the strength of the first \
             walk, which the restart had already thrown away.
+            """
+        )
+    }
+
+    // MARK: - The gap, on the wire
+
+    /// The whole point, end to end: a receiver is told the held data has two
+    /// regions and a hole between them.
+    ///
+    /// Everything before this test checks the phone's own record. This checks
+    /// the bytes, because a fact the phone knows and never says is the state
+    /// the coverage report was built to end.
+    func testAReceiverIsToldWhichMonthsAreActuallyHeld() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = try await makeDestination(delivery)
+
+        // A sweep with years still to go, which is the state that makes a
+        // primed window worth reporting at all.
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            sweep: ScriptedHealthDataSource(
+                streams: [
+                    steps: (0..<20_000).map { change("s\($0)", type: steps, at: now) }
+                ]
+            ),
+            dated: ScriptedDatedHealthDataSource(samples: [steps: history()])
+        )
+
+        for index in 0..<4 {
+            await pass(engine, at: now.addingTimeInterval(Double(index) * 600))
+        }
+
+        let sent = await channel.coverageLine(for: destination.id, type: steps)
+        let report = try XCTUnwrap(
+            try JSONSerialization.jsonObject(with: try XCTUnwrap(sent))
+                as? [String: Any]
+        )
+
+        XCTAssertEqual(
+            report["complete"] as? Bool,
+            false,
+            "Twenty thousand records still to sweep is not a complete type."
+        )
+        let from = try XCTUnwrap(
+            (report["primedFrom"] as? String).flatMap(Timestamps.date(from:))
+        )
+        let through = try XCTUnwrap(
+            (report["primedThrough"] as? String).flatMap(Timestamps.date(from:))
+        )
+        XCTAssertEqual(
+            from,
+            now.addingTimeInterval(-90 * 86_400),
+            "The window's oldest end is where the backfill actually reached."
+        )
+        XCTAssertGreaterThanOrEqual(through, now)
+        XCTAssertLessThan(
+            from,
+            through,
+            """
+            An incomplete sweep with a real window is data with a hole in the \
+            middle of it, and a receiver that cannot see both ends cannot know \
+            the hole is there.
             """
         )
     }

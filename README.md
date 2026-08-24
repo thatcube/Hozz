@@ -184,7 +184,11 @@ Exporting somewhere you own has none of these problems. That is the direction Ho
 
 On the phone, Hozz stores cursors, coverage state, destination configuration, delivery receipts, and bounded spool artifacts. It does not keep a permanent local mirror of Health history by default. Health-derived files are protected with complete-unless-open file protection and excluded from device backups, including SQLite side files and spool files.
 
-Destination credentials are kept in the device Keychain with `ThisDeviceOnly` accessibility and are not synchronised. The Mac receiver token is different: it is intentionally shared through the user's own iCloud Keychain access group so a phone and Mac signed into the same Apple ID can find each other without a manual token copy. If that entitlement or iCloud path is unavailable, the app falls back to pairing over the local network.
+Destination secrets are kept in the device Keychain with `kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly`, and are not synchronised. Both halves of that constant matter: `ThisDeviceOnly` keeps the secret off every other device, and `AfterFirstUnlock` is what lets a background sync read it while the phone is locked. Note the word *secrets* rather than credentials — a destination's non-secret settings, an MQTT username among them, are stored with the rest of its configuration and are not in the Keychain.
+
+The Mac receiver token is deliberately different, and uses two mechanisms that are easy to conflate. `kSecAttrSynchronizable` is what carries it through the user's own iCloud Keychain, so a phone and Mac signed into the same Apple ID pair without anyone copying a token by hand; a shared **access group** is a separate thing, and is what stops other applications reading it. Naming one while describing the other is wrong in a way that reads as if it were right. If the entitlement or the iCloud path is unavailable, the app falls back to pairing over the local network.
+
+On the Mac there is no per-file protection class. The receiver's database is excluded from backups, and beyond that it rests on FileVault like anything else on the disk.
 
 Logs and diagnostics must not include Health sample values, credentials, or secret destination details. Network errors record statuses and human-readable failure states, not response bodies that might echo data back.
 
@@ -239,7 +243,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 931 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, the export writer lease, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, the recent-first prime and its separation from the anchors, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, unfinished-export recovery, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 1,004 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, the export writer lease, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, the recent-first prime and its separation from the anchors, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, unfinished-export recovery, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 
