@@ -199,8 +199,8 @@ enum DashboardMetrics {
             icon: .bed,
             fractionDigits: 1,
             note: """
-            A night counts towards the day you woke up. Overlapping records \
-            are counted once.
+            Sleep starting at 6pm or later counts towards the next day. \
+            Overlapping records are counted once.
             """
         ),
         DashboardMetric(
@@ -311,6 +311,18 @@ enum SleepAttribution {
     /// two bars and halving both. Six in the evening is the boundary Health
     /// itself presents sleep on, and it puts a whole night — and an afternoon
     /// nap — where a person would look for it.
+    ///
+    /// It is not free of oddities, and the caption is worded around them. An
+    /// evening nap from 19:00 to 20:00 is filed under the *next* day even
+    /// though nobody woke then, and someone asleep by 17:30 has their night
+    /// filed under the day it started. Both follow from deciding on the start
+    /// alone. Deciding on the *end* instead would fix those two and break a
+    /// commoner case: dozing 22:00–23:00 and then sleeping 23:30–07:00 would
+    /// split one night across two days rather than reporting eight and a half
+    /// hours for it. No rule is right everywhere, so the screen states the
+    /// mechanism — "sleep that starts after 6pm counts towards the next day" —
+    /// which is true in every case, rather than a friendlier summary that is
+    /// true only in most.
     ///
     /// This rule is stated on screen, not only here: `DashboardMetrics.sleep`
     /// carries a note the detail view prints under the chart. A filing rule a

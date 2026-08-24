@@ -856,6 +856,68 @@ final class PhoneDashboardTests: XCTestCase {
 
     /// Time in bed is not time asleep, and reporting it as such is the most
     /// common way a sleep figure flatters someone.
+    /// The awkward case, pinned deliberately rather than left undiscovered.
+    ///
+    /// Deciding on the start alone means an evening nap is filed under the
+    /// following day, though nobody woke then. That is a consequence of the
+    /// rule and not a defect in it — deciding on the end instead would split a
+    /// night that began with dozing on the sofa across two days — but it is
+    /// why the caption states the mechanism rather than saying sleep counts
+    /// towards the day you woke up, which this case would make false.
+    func testAnEveningNapIsFiledUnderTheFollowingDay() {
+        let calendar = calendar(newYork)
+        let nap = DateInterval(
+            start: date(2025, 6, 12, 19, zone: newYork),
+            end: date(2025, 6, 12, 20, zone: newYork)
+        )
+
+        let readings = SleepAttribution.readings(from: [nap], calendar: calendar)
+        XCTAssertEqual(readings.count, 1)
+        XCTAssertEqual(
+            readings[0].start,
+            date(2025, 6, 13, zone: newYork),
+            "Nineteen hundred is after the boundary, so it counts towards the 13th."
+        )
+        XCTAssertEqual(readings[0].value, 1, accuracy: 0.000_1)
+    }
+
+    /// The mirror of the case above: someone asleep before the boundary has
+    /// the night filed under the day it began, not the day they woke.
+    func testANightBegunBeforeTheBoundaryIsFiledUnderTheDayItStarted() {
+        let calendar = calendar(newYork)
+        let night = DateInterval(
+            start: date(2025, 6, 12, 17, 30, zone: newYork),
+            end: date(2025, 6, 13, 6, 0, zone: newYork)
+        )
+
+        let readings = SleepAttribution.readings(from: [night], calendar: calendar)
+        XCTAssertEqual(
+            readings[0].start,
+            date(2025, 6, 12, zone: newYork),
+            "Half past five is before the boundary, so it counts towards the 12th."
+        )
+        // 17:30 to 06:00 is twelve and a half hours.
+        XCTAssertEqual(readings[0].value, 12.5, accuracy: 0.000_1)
+    }
+
+    /// The caption says "at 6pm or later", so the instant itself has to fall on
+    /// the later side. One second earlier must not.
+    func testTheBoundaryInstantItselfCountsTowardsTheNextDay() {
+        let calendar = calendar(newYork)
+
+        let atSix = SleepAttribution.day(
+            forSleepStartingAt: date(2025, 6, 12, 18, 0, zone: newYork),
+            calendar: calendar
+        )
+        let justBefore = SleepAttribution.day(
+            forSleepStartingAt: date(2025, 6, 12, 17, 59, zone: newYork),
+            calendar: calendar
+        )
+
+        XCTAssertEqual(atSix, date(2025, 6, 13, zone: newYork), "Six exactly is 'or later'.")
+        XCTAssertEqual(justBefore, date(2025, 6, 12, zone: newYork), "A minute before is not.")
+    }
+
     func testTimeInBedAndTimeAwakeAreNotCountedAsSleep() {
         XCTAssertFalse(
             HealthMetricReader.isAsleep(HKCategoryValueSleepAnalysis.inBed.rawValue)
