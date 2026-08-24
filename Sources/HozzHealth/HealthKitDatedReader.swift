@@ -117,7 +117,17 @@ extension HealthKitHealthDataSource: DatedHealthDataSource {
                     key: key,
                     catalogEntry: catalogEntry,
                     encoder: encoder,
-                    medications: medications
+                    medications: medications,
+                    // A dated read delivers a series sample's aggregate and not
+                    // the readings behind it: paging those needs a position
+                    // inside the sample, and a date range has nowhere to carry
+                    // one. `encoded.seriesSamples` is therefore deliberately
+                    // dropped here rather than queued — and because it is, the
+                    // records must not carry the mark that says the readings
+                    // travelled with them. The sweep still delivers them, and
+                    // the receiver upserts on `(id, type)`, so the same record
+                    // arriving later with its readings replaces this one.
+                    expandsSeries: false
                 )
                 continuation.resume(
                     returning: DatedHealthChanges(changes: encoded.changes)

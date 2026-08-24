@@ -405,3 +405,71 @@ private actor AcceptingChannel: DeliveryChannel {
         )
     }
 }
+
+/// What a pass tells somebody watching it.
+///
+/// "Up to date" is a claim about their whole history, and it is the easiest
+/// sentence in the app to make untrue: a pass that read an empty stretch of the
+/// last few months and sent nothing has not finished anything.
+@MainActor
+final class SyncSummaryTests: XCTestCase {
+    private func outcome(
+        delivered: Int,
+        primed: Int = 0,
+        primingRemains: Bool = false,
+        waitingForUnlock: Bool = false
+    ) -> SyncOutcome {
+        SyncOutcome(
+            deliveredRecords: delivered,
+            destinationCount: 1,
+            typesDrained: 1,
+            wasInterrupted: false,
+            waitingForUnlock: waitingForUnlock,
+            primedRecords: primed,
+            primingRemains: primingRemains
+        )
+    }
+
+    func testAQuietPassWhileStillFetchingDoesNotClaimToBeFinished() {
+        let summary = SyncViewModel.describe(
+            outcome(delivered: 0, primingRemains: true)
+        )
+
+        XCTAssertFalse(
+            summary.contains("up to date"),
+            """
+            Telling somebody their history has arrived at the exact moment it \
+            has not is the whole failure this app is trying to avoid.
+            """
+        )
+        XCTAssertTrue(summary.contains("Still fetching"))
+    }
+
+    func testAQuietPassWithNothingLeftToFetchMaySaySo() {
+        XCTAssertEqual(
+            SyncViewModel.describe(outcome(delivered: 0)),
+            "Everything was already up to date."
+        )
+    }
+
+    func testAPassSaysHowMuchOfWhatItSentWasRecentHistory() {
+        XCTAssertEqual(
+            SyncViewModel.describe(outcome(delivered: 1_200, primed: 900)),
+            "Sent 1,200 records. 900 from recent months."
+        )
+        XCTAssertEqual(
+            SyncViewModel.describe(outcome(delivered: 40)),
+            "Sent 40 records.",
+            "With no dated records there is nothing to single out."
+        )
+    }
+
+    func testALockedPhoneIsSaidToBeLockedRatherThanIdle() {
+        XCTAssertEqual(
+            SyncViewModel.describe(
+                outcome(delivered: 0, primingRemains: true, waitingForUnlock: true)
+            ),
+            "Waiting for this iPhone to be unlocked."
+        )
+    }
+}

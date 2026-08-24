@@ -104,6 +104,15 @@ public actor HealthSyncEngine {
     /// backlog moving every single pass.
     static let primeRecordCeiling = batchRecordLimit * 3 / 4
 
+    /// The most of one pass's *bytes* the dated prime may take.
+    ///
+    /// The same reservation as the record ceiling, and for the same reason. A
+    /// prime allowed to run right up to the byte limit would start a chunk at
+    /// one byte below it and overshoot by a whole chunk, leaving the sweep's
+    /// own guard tripped before it read anything. The prime finishes either
+    /// way; the sweep would simply have lost that pass.
+    static let primeByteCeiling = batchByteLimit * 3 / 4
+
     /// The most dated queries one type may spend in a single pass.
     ///
     /// A sparse type crosses its whole window in a handful of chunks because
@@ -508,6 +517,30 @@ public actor HealthSyncEngine {
                 result.wasInterrupted = true
                 return result
             }
+        }
+    }
+
+    /// Points every destination's prime at a fresh window and walks it again.
+    ///
+    /// The one thing somebody might genuinely want to ask for by hand. Health
+    /// authorization can be widened in Settings long after Hozz first ran, and
+    /// a prime that already covered its window has no way to notice: it
+    /// finished, correctly, over the types it was allowed to see.
+    ///
+    /// Cheap to be wrong about. Re-reading delivers records the destination
+    /// already holds, and the receiver upserts on `(id, type)`, so asking twice
+    /// costs bytes rather than duplicates — while the cursors return to the new
+    /// starting instant first, so nothing is claimed while it is being re-read.
+    public func restartPrime(now: Date = .now) async throws {
+        let window = PrimePlan.window(endingAt: now, span: primeSpan)
+        for destination in try await delivery.destinations() {
+            try await store.restartPrime(
+                scope: .destination(destination.id),
+                windowStart: window.start,
+                startedAt: window.end,
+                chunkSeconds: PrimePlan.initialChunk,
+                at: now
+            )
         }
     }
 

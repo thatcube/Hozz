@@ -139,7 +139,7 @@ extension HealthSyncEngine {
             guard
                 round.changes.count + PrimePlan.chunkCapacity
                     <= Self.primeRecordCeiling,
-                round.bytes < Self.batchByteLimit
+                round.bytes < Self.primeByteCeiling
             else {
                 round.wasInterrupted = true
                 break
@@ -150,7 +150,7 @@ extension HealthSyncEngine {
                 scope: scope,
                 source: datedSource,
                 allowance: Self.primeRecordCeiling - round.changes.count,
-                byteAllowance: Self.batchByteLimit - round.bytes,
+                byteAllowance: Self.primeByteCeiling - round.bytes,
                 now: now
             )
 

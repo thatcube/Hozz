@@ -422,12 +422,29 @@ final class PrimeSyncTests: XCTestCase {
             dated: dated
         )
 
-        // Killed on the second read of the first pass, and again on the second
-        // read of the pass after that.
+        // Two different ways of being cut off, on two different passes. The
+        // fake counts queries across the whole run, so the second index is
+        // reached on a later pass, and the test asserts below that both were
+        // actually reached — an index past the end of a run is a fault that
+        // silently never happens, and a resilience test that was never tested.
         await dated.setFaults([2: .cancelTask], for: steps)
         await pass(engine, at: now)
-        await dated.setFaults([4: .cancelTask], for: steps)
+        let afterFirst = await dated.queryCount(for: steps)
+        XCTAssertGreaterThanOrEqual(
+            afterFirst,
+            2,
+            "The cancellation fault must actually have been reached."
+        )
+
+        await dated.setFaults([afterFirst + 1: .fail], for: steps)
         await pass(engine, at: now.addingTimeInterval(600))
+        let afterSecond = await dated.queryCount(for: steps)
+        XCTAssertGreaterThan(
+            afterSecond,
+            afterFirst,
+            "The failing fault must actually have been reached."
+        )
+
         await dated.setFaults([:], for: steps)
         for index in 2..<10 {
             await pass(engine, at: now.addingTimeInterval(Double(index) * 600))
@@ -437,7 +454,7 @@ final class PrimeSyncTests: XCTestCase {
         XCTAssertEqual(
             names,
             namesInWindow,
-            "Being killed twice must cost time, not records."
+            "Being cut off twice, two different ways, must cost time not records."
         )
 
         let record = try await store.primeRecord(
@@ -883,8 +900,100 @@ final class PrimeSyncTests: XCTestCase {
         )
     }
 
-    // MARK: - The gap the prime creates
+    // MARK: - Asking again
 
+    /// Asking again re-reads the months, and stops claiming them first.
+    func testAskingAgainWalksTheRecentMonthsFromNothing() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = try await makeDestination(delivery)
+        let scope = AnchorScope.destination(destination.id)
+
+        let dated = ScriptedDatedHealthDataSource(samples: [steps: history()])
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            sweep: ScriptedHealthDataSource(streams: [steps: []]),
+            dated: dated
+        )
+
+        for index in 0..<6 {
+            await pass(engine, at: now.addingTimeInterval(Double(index) * 600))
+        }
+        let covered = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
+        XCTAssertEqual(covered.state, .covered)
+
+        // Somebody widens Health authorization in Settings, and a type Hozz was
+        // never allowed to see turns up. A finished prime has no way to notice:
+        // it finished, correctly, over what it was allowed to read.
+        let restartedAt = now.addingTimeInterval(7 * 600)
+        try await engine.restartPrime(now: restartedAt)
+
+        let reset = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
+        XCTAssertNil(
+            reset.coveredWindow,
+            """
+            The claim has to go before the re-read starts. Keeping it would \
+            assert coverage of months the app has just decided to check again.
+            """
+        )
+        XCTAssertEqual(reset.state, .priming)
+        XCTAssertEqual(reset.deliveredCount, 0)
+
+        for index in 7..<16 {
+            await pass(engine, at: now.addingTimeInterval(Double(index) * 600))
+        }
+
+        let after = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
+        XCTAssertEqual(after.state, .covered)
+
+        // The window moved with the restart, so what the second walk owes is
+        // worked out from the new starting instant, not the old one.
+        let secondWindow = Set(
+            history()
+                .filter {
+                    $0.start >= restartedAt.addingTimeInterval(-90 * 86_400)
+                        && $0.start < restartedAt
+                }
+                .compactMap(name(of:))
+        )
+        let firstWindow = namesInWindow
+
+        let delivered = await channel.sampleNames(for: destination.id)
+        XCTAssertEqual(
+            Set(delivered),
+            firstWindow.union(secondWindow),
+            "Between them the two walks owe exactly the two windows."
+        )
+
+        // The point of the test: these months were read *again*, not merely
+        // still remembered from the first time. A repeat is what re-reading
+        // looks like from the destination's side, and it is harmless — the
+        // receiver stores each record under its own identifier.
+        let repeats = Set(
+            delivered.filter { name in
+                delivered.filter { $0 == name }.count > 1
+            }
+        )
+        XCTAssertEqual(
+            repeats,
+            secondWindow,
+            """
+            Everything in the new window must have arrived a second time. \
+            Anything that did not was claimed on the strength of the first \
+            walk, which the restart had already thrown away.
+            """
+        )
+    }
+
+    // MARK: - The gap the prime creates
     /// Priming leaves recent data and swept data with a hole between them, and
     /// the store has to be able to say so. A surface that cannot see the hole
     /// shows the recent past and reads as complete while years are missing.

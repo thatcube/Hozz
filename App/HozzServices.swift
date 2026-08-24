@@ -113,6 +113,14 @@ struct SyncCoordinator: Sendable {
     func sync(force: Bool = false) async throws -> SyncOutcome {
         try await engine.sync(ignoringCadence: force)
     }
+
+    /// Walks the recent months again for every destination.
+    ///
+    /// The pass that follows does the work; this only moves the cursors back,
+    /// so the app stops claiming the stretch before it starts re-reading it.
+    func primeAgain() async throws {
+        try await engine.restartPrime()
+    }
 }
 
 extension DeliveryEngine {

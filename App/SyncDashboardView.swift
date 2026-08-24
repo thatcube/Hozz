@@ -45,10 +45,28 @@ struct SyncDashboardView: View {
                 } label: {
                     HozzLabel("Add a destination", icon: .folderPlus)
                 }
+                if model.hasDestinations {
+                    Button {
+                        Task { await model.fetchRecentMonthsAgain() }
+                    } label: {
+                        HozzLabel("Fetch recent months again", icon: .refresh)
+                    }
+                    .disabled(model.isSyncing)
+                }
             } footer: {
                 Text(
                     "A destination is a folder or a web address you control. "
                     + "Hozz has no default and sends nothing until you add one."
+                    + (
+                        model.hasDestinations
+                            ? "\n\nHozz reads the last few months by date as "
+                            + "soon as a destination exists, then keeps working "
+                            + "backwards through everything older. Fetch them "
+                            + "again if you have given Hozz access to more "
+                            + "health types since then; anything already sent "
+                            + "is simply replaced."
+                            : ""
+                    )
                 )
             }
 

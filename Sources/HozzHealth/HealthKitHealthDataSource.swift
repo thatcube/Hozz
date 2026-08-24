@@ -199,12 +199,16 @@ public actor HealthKitHealthDataSource: HealthDataSource {
     ///
     /// `nonisolated` because it touches nothing but its arguments, which lets
     /// it run inside a HealthKit completion handler without hopping actors.
+    /// - Parameter expandsSeries: Whether the caller is going to deliver the
+    ///   readings behind a series sample. Only the anchored sweep can, so only
+    ///   it may have its records claim so.
     nonisolated static func encode(
         samples: [HKSample],
         key: HealthTypeKey,
         catalogEntry: HealthCatalogEntry,
         encoder: HealthSampleEncoder,
-        medications: [AnyHashable: MedicationConceptFacts]
+        medications: [AnyHashable: MedicationConceptFacts],
+        expandsSeries: Bool = true
     ) -> Encoded {
         var result = Encoded()
         result.changes.reserveCapacity(samples.count)
@@ -214,7 +218,8 @@ public actor HealthKitHealthDataSource: HealthDataSource {
                 let payload = try encoder.encode(
                     sample: sample,
                     catalogEntry: catalogEntry,
-                    medications: medications
+                    medications: medications,
+                    expandsSeries: expandsSeries
                 )
                 result.changes.append(
                     .upsert(
