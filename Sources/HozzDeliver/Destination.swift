@@ -221,6 +221,10 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
     public var includedTypes: Set<HealthTypeKey>
     /// Which field names the payload uses.
     public var payloadSchema: PayloadSchema
+    /// How far back this destination is willing to be sent.
+    ///
+    /// A delivery filter, not an acquisition cursor. See ``DeliveryWindow``.
+    public var deliveryWindow: DeliveryWindow
     /// Per-destination settings that are neither secrets nor HTTP headers —
     /// the InfluxDB measurement name, for instance.
     ///
@@ -249,6 +253,7 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
         authorizationHeader: String = "Authorization",
         includedTypes: Set<HealthTypeKey> = [],
         payloadSchema: PayloadSchema = .hozz,
+        deliveryWindow: DeliveryWindow = .sinceLastDelivery,
         options: [String: String] = [:],
         createdAt: Date = .now
     ) {
@@ -264,6 +269,7 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
         self.authorizationHeader = authorizationHeader
         self.includedTypes = includedTypes
         self.payloadSchema = payloadSchema
+        self.deliveryWindow = deliveryWindow
         self.options = options
         self.createdAt = createdAt
     }
@@ -281,7 +287,7 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, name, kind, format, cadence, isEnabled, folderBookmark
         case endpointURL, headers, authorizationHeader, includedTypes
-        case payloadSchema, options, createdAt
+        case payloadSchema, deliveryWindow, options, createdAt
     }
 
     public init(from decoder: any Decoder) throws {
@@ -332,6 +338,11 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
         format = try value(.format, .ndjson)
         cadence = try value(.cadence, .whenDataArrives)
         payloadSchema = try value(.payloadSchema, .hozz)
+        // The fallback is the unbounded window on purpose. If this build cannot
+        // read the window that was chosen, the destination is parked as
+        // unusable anyway — but should that ever change, the setting that
+        // cannot leave a record out is the safer thing to be wrong about.
+        deliveryWindow = try value(.deliveryWindow, .sinceLastDelivery)
 
         // The InfluxDB precision is not an enum on the way in — it is a string
         // in `options` — so it cannot throw. It can do something worse:
@@ -382,6 +393,11 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
                 ?? payloadSchema.rawValue,
             forKey: .payloadSchema
         )
+        try container.encode(
+            unsupportedSettings[CodingKeys.deliveryWindow.stringValue]
+                ?? deliveryWindow.rawValue,
+            forKey: .deliveryWindow
+        )
     }
 
     /// Whether Hozz understands this destination well enough to use it.
@@ -429,6 +445,8 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
             "a schedule"
         case CodingKeys.payloadSchema.stringValue:
             "a field-name scheme"
+        case CodingKeys.deliveryWindow.stringValue:
+            "a limit on how far back to send"
         case Destination.precisionKey:
             "a timestamp precision"
         default:
@@ -448,6 +466,101 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
 
     public static let measurementKey = "influxMeasurement"
     public static let precisionKey = "influxPrecision"
+    public static let timeoutKey = "requestTimeout"
+    /// Set while this destination is owed a replay of its whole history.
+    ///
+    /// Widening a delivery window has to do two things — write the new window,
+    /// and clear the cursors so the readings the narrower one skipped are read
+    /// again — and they are two separate writes to two separate tables. If the
+    /// second never happens, because the process was killed or the write failed,
+    /// nothing afterwards can tell: the destination already holds the wider
+    /// window, so comparing old against new says no replay is due, and the
+    /// readings are lost for good.
+    ///
+    /// The marker is written *with* the new window, in the same record, before
+    /// the cursors are touched. Whatever happens next, the fact that a replay is
+    /// owed is on disk, and it is acted on and cleared the next time the engine
+    /// loads or saves. Clearing cursors twice does nothing, so acting on it more
+    /// often than necessary is harmless; acting on it less often is the failure
+    /// this exists to prevent.
+    public static let pendingReplayKey = "pendingReplay"
+    public static let maxRequestBytesKey = "maxRequestBytes"
+    /// The concrete date a bounded delivery window resolved to.
+    ///
+    /// Written when the user chooses the window and then left alone, so the
+    /// starting point stops moving. A date worked out afresh at delivery time
+    /// creeps forward between the moment a reading was read and the moment it is
+    /// sent, and everything it creeps past is excluded permanently while the
+    /// delivery is reported as complete — which throws away every night's sleep,
+    /// every night, on a destination set to start from today.
+    public static let windowFloorKey = "windowFloor"
+
+    /// The starting point actually in force for this destination.
+    ///
+    /// Unbounded when the window is ``DeliveryWindow/sinceLastDelivery``, and
+    /// also when a bounded window has no resolved date yet — because admitting
+    /// too much costs a duplicate a receiver can recognise, and admitting too
+    /// little costs a reading nobody sees again.
+    public var deliveryFloor: DeliveryFloor {
+        guard deliveryWindow.isBounded else {
+            return .unbounded
+        }
+        return DeliveryFloor(
+            date: options[Destination.windowFloorKey]
+                .flatMap(InfluxLineProtocol.date(from:))
+        )
+    }
+
+    /// The largest body this destination should be sent in one request, or nil
+    /// to send each batch whole however large it is.
+    ///
+    /// The limit that bites in practice is a server's, not a phone's: an nginx
+    /// in front of somebody's home API refuses a body over one megabyte by
+    /// default and takes the whole batch down with it. Splitting is off unless
+    /// asked for, because it changes how many requests an already-working
+    /// destination receives, and a setup that works should keep working
+    /// untouched across an update.
+    public var maxRequestBytes: Int? {
+        guard
+            let raw = options[Destination.maxRequestBytesKey],
+            let bytes = Int(raw),
+            bytes >= RequestSize.minimum
+        else {
+            return nil
+        }
+        return bytes
+    }
+
+    /// Whether this destination still owes its history a replay.
+    public var isReplayPending: Bool {
+        options[Destination.pendingReplayKey] != nil
+    }
+
+    /// How long to wait for a destination to answer before giving up.
+    ///
+    /// A fixed timeout strands the people this app is for. A Raspberry Pi
+    /// running Home Assistant on an SD card can take minutes to accept a large
+    /// batch, and `URLSession`'s default of sixty seconds turns that into a
+    /// permanent, unexplained failure. Equally, a phone waiting an hour on a
+    /// server that is switched off is a phone spending battery on nothing, so
+    /// the choice belongs to the person who knows which of the two they have.
+    ///
+    /// Stored as a string in ``options`` rather than as a number, because that
+    /// is the only shape `options` has. An unreadable or out-of-range value
+    /// falls back to the default rather than being treated as unsupported: a
+    /// timeout cannot silently change the *meaning* of what is delivered, only
+    /// how long Hozz waits, so parking the destination over it would cost the
+    /// user their data to protect them from nothing.
+    public var requestTimeout: TimeInterval {
+        guard
+            let raw = options[Destination.timeoutKey],
+            let seconds = TimeInterval(raw),
+            RequestTimeout.range.contains(seconds)
+        else {
+            return RequestTimeout.default
+        }
+        return seconds
+    }
 
     /// Keychain account name for this destination's secret.
     public var credentialKey: String {
@@ -603,6 +716,25 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
     case notConfigured
     /// The stored destination uses a setting this build does not recognise.
     case unsupportedSettings(String)
+    /// A delivery window was set, but this build could not take the encoded
+    /// batch apart to apply it.
+    ///
+    /// Delivering the batch whole would have sent readings the user asked to
+    /// exclude, which is the failure that looks like a success.
+    case windowNotApplicable
+    /// A batch split across several requests stopped partway.
+    ///
+    /// Its own case rather than the underlying failure, because the two are not
+    /// the same fact and the difference is the one the user needs. "The server
+    /// refused the data" and "the server took the first two of five and then
+    /// refused" call for different things to be checked, and nothing else in
+    /// the system can reconstruct the second from the first.
+    ///
+    /// Nothing is recorded as delivered either way: the acquisition cursor does
+    /// not move, and the whole batch is sent again from the first part. The
+    /// parts that did land carry the same bytes and therefore the same
+    /// idempotency key, so a receiver that honours it stores them once.
+    case incompleteBatch(accepted: Int, total: Int, detail: String, isTransient: Bool)
     case folderUnavailable
     case accessDenied
     case rejected(statusCode: Int, body: String?)
@@ -615,6 +747,15 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
             "This destination is not finished being set up."
         case .unsupportedSettings(let detail):
             detail
+        case .windowNotApplicable:
+            "Hozz could not tell how old the readings in this batch were, so "
+                + "it sent nothing rather than send readings you asked it to "
+                + "leave out."
+        case .incompleteBatch(let accepted, let total, let detail, _):
+            "This batch was sent in \(total) requests and the destination "
+                + "accepted \(accepted) of them before stopping. \(detail) "
+                + "Nothing has been counted as delivered, and the whole batch "
+                + "will be sent again from the beginning."
         case .folderUnavailable:
             "Hozz could not reach that folder. It may have been moved, renamed, or signed out."
         case .accessDenied:
@@ -637,8 +778,12 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
         case .rejected(let statusCode, _):
             // 408, 429, and 5xx are the server asking to be tried again.
             statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode)
+        case .incompleteBatch(_, _, _, let isTransient):
+            // Carried through from whatever stopped it. A split delivery that
+            // failed on a 500 deserves the same patience as an unsplit one.
+            isTransient
         case .notConfigured, .folderUnavailable, .accessDenied, .cancelled,
-             .unsupportedSettings:
+             .unsupportedSettings, .windowNotApplicable:
             // Waiting does not teach this build a word it does not know. Only
             // an update or an edit resolves it, so it is put in front of the
             // user instead of retried on a timer forever.
