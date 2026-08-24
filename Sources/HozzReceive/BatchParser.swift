@@ -318,6 +318,14 @@ public struct ParsedBatch: Hashable, Sendable {
     public let moodEntries: [ReceivedMoodEntry]
     public let medicationDoses: [ReceivedMedicationDose]
     public let workoutDetails: [ReceivedWorkoutDetail]
+    /// What the phone says about how completely it has read each type.
+    ///
+    /// Not a measurement, and deliberately not counted as one anywhere: a
+    /// batch that carries nothing but these has still told the receiver
+    /// something it could not otherwise know, and a receiver that answered
+    /// "nothing arrived" to it would leave the phone resending the same fact
+    /// forever.
+    public let coverageReports: [TypeCoverageReport]
     /// Records the receiver could not interpret. They are still stored, so this
     /// is a list of things to teach it about rather than a list of losses.
     public let unhandled: [UnhandledRecord]
@@ -337,6 +345,7 @@ public struct ParsedBatch: Hashable, Sendable {
             && moodEntries.isEmpty
             && medicationDoses.isEmpty
             && workoutDetails.isEmpty
+            && coverageReports.isEmpty
             && unhandled.isEmpty
     }
 
@@ -352,6 +361,7 @@ public struct ParsedBatch: Hashable, Sendable {
         moodEntries: [ReceivedMoodEntry] = [],
         medicationDoses: [ReceivedMedicationDose] = [],
         workoutDetails: [ReceivedWorkoutDetail] = [],
+        coverageReports: [TypeCoverageReport] = [],
         unhandled: [UnhandledRecord] = [],
         unreadableCount: Int
     ) {
@@ -366,6 +376,7 @@ public struct ParsedBatch: Hashable, Sendable {
         self.moodEntries = moodEntries
         self.medicationDoses = medicationDoses
         self.workoutDetails = workoutDetails
+        self.coverageReports = coverageReports
         self.unhandled = unhandled
         self.unreadableCount = unreadableCount
     }
@@ -479,7 +490,8 @@ public enum BatchParser {
     /// - 4: State of Mind valence, and medication doses.
     /// - 5: workout statistics and per-activity legs.
     /// - 6: the readings behind a quantity aggregate, and their end markers.
-    public static let parserVersion = 6
+    /// - 7: per-type coverage reports.
+    public static let parserVersion = 7
 
     public static func parse(_ payload: Data) throws -> ParsedBatch {
         let text = String(decoding: payload, as: UTF8.self)
@@ -571,6 +583,7 @@ public enum BatchParser {
             moodEntries: batch.moodEntries,
             medicationDoses: batch.medicationDoses,
             workoutDetails: batch.workoutDetails,
+            coverageReports: batch.coverageReports,
             unhandled: batch.unhandled + quarantined,
             unreadableCount: batch.unreadableCount + unreadable
         )
@@ -588,6 +601,7 @@ public enum BatchParser {
         var moodEntries: [ReceivedMoodEntry] = []
         var medicationDoses: [ReceivedMedicationDose] = []
         var workoutDetails: [ReceivedWorkoutDetail] = []
+        var coverageReports: [TypeCoverageReport] = []
         var unhandled: [UnhandledRecord] = []
         var unreadable = 0
 
@@ -638,6 +652,23 @@ public enum BatchParser {
             // classification was invisible. So they are read properly here,
             // before the generic path can claim them.
             switch kind {
+            case TypeCoverageShape.kind:
+                // A statement about the reading of a type rather than a
+                // reading of one, so it never becomes a sample row: given an
+                // id and a date it does not have, it would appear on a chart
+                // as a measurement of the person.
+                if let report = TypeCoverageShape.report(in: object) {
+                    coverageReports.append(report)
+                } else {
+                    unhandled.append(
+                        unhandledRecord(
+                            object,
+                            kind: kind,
+                            reason: "A coverage report without the type or the moment it describes."
+                        )
+                    )
+                }
+                continue
             case MoodAndMedicationShape.moodKind:
                 // Deliberately not `continue`: a mood entry is one reading
                 // with one number, so it also becomes an ordinary sample row
@@ -752,6 +783,7 @@ public enum BatchParser {
             moodEntries: moodEntries,
             medicationDoses: medicationDoses,
             workoutDetails: workoutDetails,
+            coverageReports: coverageReports,
             unhandled: unhandled,
             unreadableCount: unreadable
         )

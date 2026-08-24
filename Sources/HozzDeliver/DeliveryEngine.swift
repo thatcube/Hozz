@@ -200,6 +200,75 @@ public actor DeliveryEngine {
         try await store.receipts(for: destinationID, limit: limit)
     }
 
+    /// Remembers which per-type coverage this destination has been told.
+    ///
+    /// Called only after a delivery is accepted, so a refused batch leaves the
+    /// coverage still owed and it is offered again next pass. Deliberately not
+    /// routed through ``save(_:now:)``: that method interprets a changed
+    /// delivery window as a request to replay history, and this is bookkeeping
+    /// about what has already been sent rather than a change the user made.
+    public func recordCoverageDigest(
+        _ digest: String,
+        for destinationID: UUID
+    ) async throws {
+        try await loadIfNeeded()
+        guard var destination = cache[destinationID] else {
+            return
+        }
+        guard destination.options[Destination.coverageDigestKey] != digest else {
+            return
+        }
+        destination.options[Destination.coverageDigestKey] = digest
+        try await write(destination)
+    }
+
+    /// When this destination's current coverage was observed.
+    ///
+    /// Returns the moment already recorded when the coverage has not changed,
+    /// so a batch rebuilt after a refusal is byte-for-byte the batch that was
+    /// refused — which is what lets the receiver recognise the retry rather
+    /// than storing it twice. A changed set is dated to now and written down
+    /// immediately, *before* anything is delivered, because an observation is
+    /// not a claim about what a destination received.
+    ///
+    /// Failing to write the moment is not worth failing the pass over: the
+    /// worst case is one batch that a retry cannot reproduce exactly, which is
+    /// where this started rather than something worse.
+    public func coverageObservation(
+        digest: String,
+        now: Date = .now,
+        for destinationID: UUID
+    ) async -> Date {
+        guard
+            let destination = try? await loadedDestination(destinationID)
+        else {
+            return now
+        }
+        let observation = CoverageReporter.observation(
+            matching: digest,
+            storedDigest: destination.observedCoverageDigest,
+            storedMoment: destination.observedCoverageMoment,
+            now: now
+        )
+        guard observation.isNew else {
+            return observation.moment
+        }
+
+        var updated = destination
+        updated.options[Destination.coverageObservedDigestKey] = digest
+        updated.options[Destination.coverageObservedAtKey] = Date.ISO8601FormatStyle(
+            includingFractionalSeconds: true,
+            timeZone: .gmt
+        ).format(observation.moment)
+        try? await write(updated)
+        return observation.moment
+    }
+
+    private func loadedDestination(_ id: UUID) async throws -> Destination? {
+        try await loadIfNeeded()
+        return cache[id]
+    }
+
     /// Destinations that are enabled, configured, and due to run.
     public func dueDestinations(
         now: Date = .now,

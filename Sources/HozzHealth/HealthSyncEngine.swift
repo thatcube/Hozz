@@ -271,11 +271,58 @@ public actor HealthSyncEngine {
         let touched = states.filter { _, state in
             state.anchor != state.base || state.collected > 0
         }
+        // A type whose sweep ran dry without producing anything is committed
+        // too, even though its cursor did not move. Health returns the same
+        // anchor for an empty page, so without this a type that finished
+        // exactly on a budget boundary stayed recorded as `draining` for good
+        // — and the receiver would have been told, truthfully by the letter
+        // and falsely in effect, that it is still waiting for records that do
+        // not exist.
+        let committable = states.filter { _, state in
+            state.anchor != state.base || state.collected > 0 || state.isExhausted
+        }
 
-        guard !records.isEmpty else {
+        // Built from what this pass is about to commit rather than from the
+        // store, so a completion travels in the same batch as the records that
+        // completed it. Reading the store here would report the previous
+        // pass's coverage, and a type that finishes and is then never touched
+        // again would never be reported finished at all.
+        //
+        // Stamped with the moment the coverage was *observed* rather than the
+        // moment this pass ran, so an identical retry rebuilds identical bytes
+        // and keeps the batch identity a receiver recognises it by. The digest
+        // ignores timestamps, so it can be taken before the moment is known.
+        let held = try await store.streamRecords(scope: scope)
+        let passCoverage = Self.passCoverage(for: committable)
+        let digest = CoverageReporter.digest(
+            of: CoverageReporter.reports(
+                from: held,
+                pass: passCoverage,
+                observedAt: now
+            )
+        )
+        let observedAt = await delivery.coverageObservation(
+            digest: digest,
+            now: now,
+            for: destination.id
+        )
+        let coverage = CoverageReporter.reports(
+            from: held,
+            pass: passCoverage,
+            // Empty until the dated reader lands. Everything downstream — the
+            // wire shape, the receiver's table, and every sentence built on it
+            // — already carries a primed window, so switching it on is one
+            // dictionary built here rather than a change that has to travel.
+            primedWindows: [:],
+            observedAt: observedAt
+        )
+        let coverageIsNews = destination.format.carriesCoverage
+            && digest != destination.reportedCoverageDigest
+
+        guard !records.isEmpty || coverageIsNews else {
             // Nothing new for this destination. Still commit any cursor that
             // moved without data, so an empty stream is not re-read forever.
-            try await commitAnchors(touched, scope: scope)
+            try await commitAnchors(committable, scope: scope)
             return SyncOutcome(
                 deliveredRecords: 0,
                 destinationCount: 1,
@@ -287,6 +334,7 @@ public actor HealthSyncEngine {
 
         let payload = try DeliveryPayloadBuilder.build(
             records: records,
+            coverage: destination.format.carriesCoverage ? coverage : [],
             destination: destination
         )
         let batch = DeliveryBatch(
@@ -317,7 +365,12 @@ public actor HealthSyncEngine {
             )
         }
 
-        try await commitAnchors(touched, scope: scope)
+        try await commitAnchors(committable, scope: scope)
+        if coverageIsNews {
+            // After the batch was accepted, so a refusal leaves the coverage
+            // still owed rather than recorded as told.
+            try? await delivery.recordCoverageDigest(digest, for: destination.id)
+        }
 
         return SyncOutcome(
             deliveredRecords: records.count,
@@ -326,6 +379,40 @@ public actor HealthSyncEngine {
             wasInterrupted: interrupted,
             waitingForUnlock: waitingForUnlock
         )
+    }
+
+    /// What this destination should be told about how completely each type has
+    /// been read.
+    ///
+    /// The store's records supply every type that has ever delivered anything;
+    /// this pass overrides the ones it visited, using exactly the coverage
+    /// ``commitAnchors`` is about to write, so the wire and the store cannot
+    /// disagree about the same type in the same moment.
+    static func passCoverage(
+        for states: [HealthTypeKey: TypeState]
+    ) -> [HealthTypeKey: CoverageReporter.PassCoverage] {
+        var pass: [HealthTypeKey: CoverageReporter.PassCoverage] = [:]
+        for (type, state) in states {
+            pass[type] = CoverageReporter.PassCoverage(
+                state: coverageState(for: state),
+                deliveredCount: state.observedBefore + state.collected
+            )
+        }
+        return pass
+    }
+
+    /// The one place that decides what a pass's reading of a type amounts to.
+    ///
+    /// An empty page is the only evidence that a type is caught up, and a type
+    /// that has never produced anything stays indeterminate, because Health
+    /// does not let Hozz tell a denied type from an empty one.
+    static func coverageState(for state: TypeState) -> CoverageState {
+        guard state.isExhausted else {
+            return .draining
+        }
+        return state.observedBefore + state.collected == 0
+            ? .authorizationIndeterminate
+            : .anchorClosed
     }
 
     /// Where one type got to during this pass.
@@ -462,9 +549,9 @@ public actor HealthSyncEngine {
     /// know, and a progress display had no way to tell "caught up" from "cut
     /// off halfway".
     ///
-    /// An empty page is the only evidence that a type is caught up, and a type
-    /// that has never produced anything stays indeterminate, because Health
-    /// does not let Hozz tell a denied type from an empty one.
+    /// The judgement itself lives in ``coverageState(for:)``, which the batch
+    /// on the wire uses too: the receiver is told exactly what the store is
+    /// about to record, in the same breath, or neither happens.
     private func commitAnchors(
         _ states: [HealthTypeKey: TypeState],
         scope: AnchorScope
@@ -478,19 +565,11 @@ public actor HealthSyncEngine {
                 guard let anchor = state.anchor else {
                     return nil
                 }
-                let observed = state.observedBefore + state.collected
-                let coverage: CoverageState = if !state.isExhausted {
-                    .draining
-                } else if observed == 0 {
-                    .authorizationIndeterminate
-                } else {
-                    .anchorClosed
-                }
                 return PendingAnchorCommit(
                     type: type,
                     baseAnchor: state.base,
                     anchor: anchor,
-                    coverage: coverage,
+                    coverage: Self.coverageState(for: state),
                     addedRecordCount: state.collected,
                     addedObservedCount: state.collected,
                     anchorClosedAt: state.isExhausted ? closedAt : nil
@@ -518,8 +597,15 @@ enum DeliveryPayloadBuilder {
     /// together with the numbers it is the average of.
     ///
     /// The lossless formats carry everything, unchanged.
+    ///
+    /// - Parameter coverage: what the phone knows about how completely each
+    ///   type has been read. Written as ordinary lines beside the records,
+    ///   because a receiver that has to be configured to expect a second
+    ///   channel is a receiver that will not be, and coverage that only some
+    ///   deliveries carry is worse than none.
     static func build(
         records: [HealthChange],
+        coverage: [TypeCoverageReport] = [],
         destination: Destination
     ) throws -> Data {
         let format = destination.format
@@ -540,6 +626,15 @@ enum DeliveryPayloadBuilder {
                 )
             }
         }
+
+        // Appended after the records, so a receiver applying the batch in order
+        // stores the samples before it is told what they amount to. The other
+        // order would briefly assert a type complete while the last of it was
+        // still being written, inside a transaction nobody can see into.
+        let coverageLines = format.carriesCoverage
+            ? CoverageReporter.lines(for: coverage)
+            : []
+        lines.append(contentsOf: coverageLines)
 
         switch format {
         case .ndjson:

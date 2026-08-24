@@ -66,7 +66,11 @@ public enum PayloadUnits {
             else {
                 return record
             }
-            return PayloadDivision.Record(date: record.date, content: .line(converted))
+            return PayloadDivision.Record(
+                date: record.date,
+                isMeasurement: record.isMeasurement,
+                content: .line(converted)
+            )
         }
         return division.recompose(rewritten)
     }
@@ -146,7 +150,11 @@ public enum PayloadUnits {
             fields[valueColumn] = format(converted)
             fields[unitColumn] = target
             let line = Data(fields.map(escape).joined(separator: ",").utf8)
-            return PayloadDivision.Record(date: record.date, content: .line(line))
+            return PayloadDivision.Record(
+                date: record.date,
+                isMeasurement: record.isMeasurement,
+                content: .line(line)
+            )
         }
         return division.recompose(rewritten)
     }

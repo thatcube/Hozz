@@ -324,6 +324,90 @@ public actor IngestStore {
     private static func migrate(_ database: SQLiteDatabase) throws {
         let version = try database.query("PRAGMA user_version", row: { $0.integer(0) })
             .first ?? 0
+        try migrateToEight(database, from: version)
+        try migrateToNine(database, from: version)
+    }
+
+    /// The table that holds what the phone says about its own reading.
+    ///
+    /// Deliberately a step of its own rather than another line inside the
+    /// block above. That block moves rows, and a step that only creates an
+    /// empty table has no business sharing a transaction with one that can
+    /// fail on a large archive — an interruption there would roll this back
+    /// too, forever, on exactly the databases most worth protecting.
+    ///
+    /// Nothing here reads a row, allocates per record, or depends on the size
+    /// of the archive, so an interruption costs one repeated `CREATE TABLE IF
+    /// NOT EXISTS` and nothing else. The version is stamped last, inside the
+    /// same transaction, so the two can never disagree.
+    private static func migrateToNine(
+        _ database: SQLiteDatabase,
+        from version: Int64
+    ) throws {
+        guard version < 9 else {
+            return
+        }
+        try database.transaction {
+            try database.execute(
+                """
+                -- What the phone has told this Mac about how completely it has
+                -- read each type.
+                --
+                -- The row this table exists to prevent: "Step Count · as of
+                -- Jan 2023", shown to someone who wears a watch daily. An
+                -- anchored sweep returns samples in the order Health stored
+                -- them, not the order they happened, so the newest record
+                -- received from an unfinished type says nothing whatever about
+                -- the newest record that exists. The receiver was never told
+                -- which types were finished, so it could not tell a person who
+                -- stopped walking from a sweep that had not got there yet, and
+                -- it picked the reading that sounded like an answer.
+                --
+                -- Keyed by type, because this is a standing fact about a type
+                -- rather than a measurement of a moment: a later report
+                -- replaces an earlier one instead of accumulating beside it.
+                CREATE TABLE IF NOT EXISTS type_coverage (
+                    type TEXT PRIMARY KEY,
+                    -- The phone's own word: draining, anchorClosed,
+                    -- authorizationIndeterminate, and the rest. Kept verbatim
+                    -- rather than reduced to a flag, because "the sweep is
+                    -- still running" and "Health would not say whether this
+                    -- type is empty or denied" are different facts and only
+                    -- one of them is about the person.
+                    --
+                    -- The wire carries a `complete` flag beside this word, and
+                    -- it is deliberately not kept. It is a second copy of
+                    -- something derived from the state, and the derivation has
+                    -- to win: a phone that said `draining` and `complete: true`
+                    -- is contradicting itself, and the reading that does not
+                    -- licence a date is the only safe one. A stored copy that
+                    -- must never be trusted over the column beside it is a trap
+                    -- for whoever reads this table next.
+                    state TEXT NOT NULL,
+                    delivered_count INTEGER,
+                    -- A stretch filled by a dated query, which unlike the
+                    -- sweep is a genuine density claim. Between it and the
+                    -- sweep's progress there is a hole, and a surface that
+                    -- does not know about these two columns cannot know the
+                    -- hole is there.
+                    primed_from TEXT,
+                    primed_through TEXT,
+                    -- When the phone observed all of the above. Deliveries can
+                    -- be retried and can arrive out of order, so this is what
+                    -- decides whether an arriving report is news or an echo.
+                    observed_at TEXT NOT NULL,
+                    received_at TEXT NOT NULL
+                );
+                """
+            )
+            try database.execute("PRAGMA user_version = 9")
+        }
+    }
+
+    private static func migrateToEight(
+        _ database: SQLiteDatabase,
+        from version: Int64
+    ) throws {
         guard version < 8 else {
             return
         }
@@ -1253,12 +1337,59 @@ public actor IngestStore {
             storedAudiograms
         )
 
+        for report in batch.coverageReports {
+            try write(report, at: timestamp, into: database)
+        }
+
         return (
             stored,
             deleted,
             storedCharacteristics,
             storedUnhandled,
             storedQuantitySeriesPages
+        )
+    }
+
+    /// Records what the phone says about one type, unless it has already said
+    /// something more recent.
+    ///
+    /// The guard is `observed_at`, not the state. A delivery can be retried,
+    /// and a folder of exported files can be dropped on the receiver in any
+    /// order, so an older report can genuinely arrive after a newer one — and
+    /// applying it would walk a finished type back to "still draining", or
+    /// worse, walk an unfinished one forward. Coverage is allowed to move in
+    /// either direction, because it genuinely does: widening a destination's
+    /// date range replays its history and a closed sweep opens again. What is
+    /// not allowed is for the older of two statements to win.
+    static func write(
+        _ report: TypeCoverageReport,
+        at timestamp: String,
+        into database: SQLiteDatabase
+    ) throws {
+        try database.run(
+            """
+            INSERT INTO type_coverage
+                (type, state, delivered_count, primed_from,
+                 primed_through, observed_at, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (type) DO UPDATE SET
+                state = excluded.state,
+                delivered_count = excluded.delivered_count,
+                primed_from = excluded.primed_from,
+                primed_through = excluded.primed_through,
+                observed_at = excluded.observed_at,
+                received_at = excluded.received_at
+            WHERE excluded.observed_at >= type_coverage.observed_at
+            """,
+            [
+                .text(report.type),
+                .text(report.state.rawValue),
+                report.deliveredCount.map { SQLiteValue.integer(Int64($0)) } ?? .null,
+                report.primedFrom.map { SQLiteValue.text(Timestamps.text(from: $0)) } ?? .null,
+                report.primedThrough.map { SQLiteValue.text(Timestamps.text(from: $0)) } ?? .null,
+                .text(Timestamps.text(from: report.observedAt)),
+                .text(timestamp)
+            ]
         )
     }
 
@@ -1627,6 +1758,7 @@ public actor IngestStore {
             || !batch.moodEntries.isEmpty
             || !batch.medicationDoses.isEmpty
             || !batch.workoutDetails.isEmpty
+            || !batch.coverageReports.isEmpty
     }
 
     /// Places a record in quarantine directly, for tests that need to stand in

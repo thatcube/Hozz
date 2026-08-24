@@ -1,4 +1,5 @@
 import Foundation
+import HozzCore
 import HozzDeliver
 import HozzMCP
 import HozzReceive
@@ -29,6 +30,12 @@ final class MacServices {
 
     private(set) var status: Status = .starting
     private(set) var summaries: [TypeSummary] = []
+    /// What the phone has said about how completely each type has been read.
+    ///
+    /// Held beside the summaries because every screen that shows a date needs
+    /// to ask the same question of it, and a screen that forgets to ask goes
+    /// back to inferring the answer from whichever records happened to arrive.
+    private(set) var coverage: [String: TypeCoverageReport] = [:]
     private(set) var totalRecords = 0
     /// Facts about the person — date of birth, blood type — rather than
     /// measurements of them. Shown because they are the context that makes the
@@ -254,6 +261,7 @@ final class MacServices {
         }
         do {
             summaries = try await store.summaries()
+            coverage = (try? await store.coverage()) ?? [:]
             totalRecords = try await store.totalRecordCount()
             characteristics = try await store.characteristics()
             unhandled = try await store.unhandledSummary()
@@ -380,8 +388,12 @@ final class MacServices {
             }
     }
 
-    func toggleComparison(_ type: String, limit: Int) {
-        if let index = comparisonTypes.firstIndex(of: type) {
+    /// What is known about how completely one type has been read.
+    func standing(for type: String) -> TypeCoverageStanding {
+        TypeCoverageStanding(report: coverage[type])
+    }
+
+    func toggleComparison(_ type: String, limit: Int) {        if let index = comparisonTypes.firstIndex(of: type) {
             comparisonTypes.remove(at: index)
         } else if comparisonTypes.count < limit {
             comparisonTypes.append(type)

@@ -1,4 +1,5 @@
 import Foundation
+import HozzCore
 
 /// Takes an encoded payload apart into the records it carries, and puts any
 /// subset of them back together in the same format.
@@ -25,6 +26,17 @@ public enum PayloadDivision {
         /// An undated record is never excluded by a window, because "no date"
         /// is not evidence of being outside one.
         public let date: Date?
+        /// Whether this is a measurement, as opposed to a statement about the
+        /// export itself.
+        ///
+        /// A coverage report is undated on purpose — it describes a type
+        /// rather than a moment — so a delivery window admits it, correctly.
+        /// What it must not do is be counted as a reading: a pass that
+        /// delivered nothing but coverage to a windowed destination would
+        /// otherwise report a couple of hundred records delivered. That is the
+        /// same mistake as counting a series reading page as a reading, which
+        /// this file already carries scars from.
+        public let isMeasurement: Bool
         let content: Content
 
         /// Roughly what this record adds to a payload, separator included.
@@ -45,8 +57,7 @@ public enum PayloadDivision {
             }
         }
 
-        enum Content: Sendable {
-            /// A whole line, exactly as the builder wrote it.
+        enum Content: Sendable {            /// A whole line, exactly as the builder wrote it.
             case line(Data)
             /// One point inside a Metrics JSON metric, held as the bytes of its
             /// own JSON object, alongside the bytes of the metric it belongs to
@@ -127,7 +138,11 @@ public enum PayloadDivision {
             return Division(
                 format: format,
                 records: lines.map {
-                    Record(date: canonicalDate(of: $0), content: .line($0))
+                    Record(
+                        date: canonicalDate(of: $0),
+                        isMeasurement: !isCoverageLine($0),
+                        content: .line($0)
+                    )
                 },
                 header: nil
             )
@@ -141,6 +156,7 @@ public enum PayloadDivision {
                 records: lines.map { line in
                     Record(
                         date: influxDate(of: Data(line), precision: influxPrecision),
+                        isMeasurement: true,
                         content: .line(Data(line))
                     )
                 },
@@ -365,6 +381,22 @@ public enum PayloadDivision {
         return lines
     }
 
+    /// Whether a line is a statement about the export rather than a reading.
+    ///
+    /// Read from the bytes rather than tracked alongside them, because a
+    /// payload arriving here has already been through a channel and a retry,
+    /// and anything carried beside the bytes is a second thing that can be
+    /// wrong about them.
+    private static func isCoverageLine(_ line: Data) -> Bool {
+        guard
+            let object = try? JSONSerialization.jsonObject(with: line)
+                as? [String: Any]
+        else {
+            return false
+        }
+        return (object["kind"] as? String) == TypeCoverageShape.kind
+    }
+
     private static func canonicalDate(of line: Data) -> Date? {
         guard
             let object = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
@@ -392,7 +424,7 @@ public enum PayloadDivision {
         return Division(
             format: .csv,
             records: rows.map { row in
-                Record(date: csvDate(of: row), content: .line(row))
+                Record(date: csvDate(of: row), isMeasurement: true, content: .line(row))
             },
             header: headerData
         )
@@ -567,6 +599,7 @@ public enum PayloadDivision {
                 records.append(
                     Record(
                         date: metricPointDate(point, style: dateStyle),
+                        isMeasurement: true,
                         content: .metricPoint(
                             name: name,
                             metric: envelopeBytes,
@@ -584,6 +617,7 @@ public enum PayloadDivision {
             records.append(
                 Record(
                     date: dateStyle.date(from: text),
+                    isMeasurement: true,
                     content: .metricWorkout(bytes)
                 )
             )
@@ -596,6 +630,7 @@ public enum PayloadDivision {
             records.append(
                 Record(
                     date: dateStyle.date(from: text),
+                    isMeasurement: true,
                     content: .metricDeletion(bytes)
                 )
             )

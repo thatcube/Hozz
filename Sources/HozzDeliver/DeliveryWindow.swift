@@ -270,7 +270,13 @@ extension DeliveryWindow {
                 id: DeliveryBatch.identifier(for: payload),
                 sequence: batch.sequence,
                 createdAt: batch.createdAt,
-                recordCount: kept.count,
+                // Only the readings. A coverage report is undated, so a window
+                // admits it — correctly, since it describes a type rather than
+                // a moment — but a backfill pass that delivered nothing inside
+                // the window would otherwise report a couple of hundred
+                // records delivered and put that in front of the user as a
+                // receipt.
+                recordCount: kept.count { $0.isMeasurement },
                 payload: payload,
                 format: batch.format
             ),
