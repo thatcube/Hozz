@@ -72,3 +72,19 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
 `tools/mac-build.sh` builds the Mac app. The README covers signing, the App
 Group the widget needs, and two macOS networking traps that are invisible from
 the code and cost days each.
+
+Do not believe a red build until you have regenerated the project and used a
+derived data path of your own. Two of the three "broken build" scares in one
+night were the tooling rather than the code, and both looked exactly like a
+genuine regression:
+
+- The `.xcodeproj` is generated and gitignored, so changing branch brings in
+  source files it does not know about. That surfaces as `cannot find type in
+  scope` across a module you never touched — 26 errors in `HozzDeliver` on one
+  occasion — and reads as a broken `main`. Run `xcodegen generate` after any
+  branch change, and after adding a file of your own.
+- DerivedData shared between two checkouts of the same project mixes a stale
+  app binary with a freshly built framework, which fails at launch as
+  `dyld: Symbol not found` for a symbol that does exist. Pass
+  `-derivedDataPath` somewhere of your own, and use a simulator nothing else
+  is installing to.

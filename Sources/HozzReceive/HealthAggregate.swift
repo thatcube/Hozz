@@ -108,11 +108,7 @@ extension IngestStore {
             WITH b(idx, lo, hi) AS (VALUES \(values))
             SELECT b.idx, SUM(s.value), AVG(s.value),
                    MIN(s.value), MAX(s.value), COUNT(*),
-                   SUM(\(counted)),
-                   SUM(CASE WHEN \(counted) = 1 THEN
-                            MAX(0.0, (julianday(s.end_date)
-                                      - julianday(s.start_date)) * 86400.0)
-                       ELSE 0 END)
+                   SUM(\(counted))
               FROM b JOIN sample s
                 ON s.type = ?
                AND s.start_date >= b.lo
@@ -136,10 +132,16 @@ extension IngestStore {
                 minimum: row.real(3),
                 maximum: row.real(4),
                 count: Int(row.integer(5)),
-                counted: Int(row.optionalReal(6) ?? 0),
-                duration: row.optionalReal(7) ?? 0
+                counted: Int(row.optionalReal(6) ?? 0)
             )
         }
+
+        // Time covered, not durations added. Only a duration measure needs it,
+        // and those types are inherently low-volume — a handful of records a
+        // night — so the rows are read rather than summed in SQL.
+        let unioned = measure.kind == .duration
+            ? try unionedSeconds(type: type, measure: measure, plan: plan)
+            : [:]
 
         let starts = Dictionary(
             uniqueKeysWithValues: plan.columns.map { ($0.index, $0.start) }
@@ -155,12 +157,12 @@ extension IngestStore {
             let meaningful: Double = switch measure.kind {
             case .total: row.sum
             case .average: row.average
-            // Rounded to the millisecond. `julianday` arithmetic carries a
-            // few microseconds of floating-point noise, which is invisible in
-            // seconds and turns "120" minutes into "120.00" the moment anyone
-            // formats it — a number that looks like it was measured to a
-            // precision nobody has.
-            case .duration: (row.duration * 1000).rounded() / 1000
+            // Rounded to the millisecond. Floating-point arithmetic over
+            // instants carries a few microseconds of noise, which is invisible
+            // in seconds and turns "120" minutes into "120.00" the moment
+            // anyone formats it — a number that looks measured to a precision
+            // nobody has.
+            case .duration: ((unioned[row.index] ?? 0) * 1000).rounded() / 1000
             case .occurrences: Double(row.counted)
             }
             return AggregateBucket(

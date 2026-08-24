@@ -553,6 +553,132 @@ final class MCPArgumentTests: XCTestCase {
         XCTAssertFalse(body.contains("average"), body)
     }
 
+    // MARK: - One night counted once
+
+    /// Two devices describing one night report that night once.
+    ///
+    /// A watch and a phone each write a record for the same stretch. Adding
+    /// their durations reports sixteen hours of sleep, which reads as an
+    /// unusually good night rather than as an error — the worst way for a
+    /// number to be wrong.
+    func testANightRecordedTwiceIsNotCountedTwice() async throws {
+        let store = try await store([
+            sleep("watch", from: try local(2026, 8, 17, 23), hours: 8, value: 3),
+            sleep("phone", from: try local(2026, 8, 17, 23), hours: 8, value: 1)
+        ])
+
+        let body = try text(
+            await call(store, "aggregate_health_data", [
+                "type": "HKCategoryTypeIdentifierSleepAnalysis",
+                "bucket": "day"
+            ])
+        )
+
+        XCTAssertTrue(
+            body.contains("2026-08-17, 480, 2"),
+            "eight hours from two records of the same night:\n\(body)"
+        )
+        XCTAssertFalse(body.contains("960"), "that would be counting it twice")
+        XCTAssertTrue(
+            body.contains("merged rather than added"),
+            "the reply should say how overlaps are handled:\n\(body)"
+        )
+    }
+
+    /// Partly overlapping records cover the union, not the sum and not one.
+    func testPartlyOverlappingRecordsCoverTheirUnion() async throws {
+        let store = try await store([
+            // 23:00–03:00 and 01:00–07:00 overlap by two hours.
+            sleep("a", from: try local(2026, 8, 17, 23), hours: 4, value: 3),
+            sleep("b", from: try local(2026, 8, 18, 1), hours: 6, value: 4)
+        ])
+
+        let body = try text(
+            await call(store, "aggregate_health_data", [
+                "type": "HKCategoryTypeIdentifierSleepAnalysis",
+                "bucket": "day"
+            ])
+        )
+
+        // 23:00 to 07:00 is eight hours. The second record starts after
+        // midnight, so it belongs to the 18th — the same attribution the
+        // Markdown export uses — and each day's own union is taken.
+        XCTAssertTrue(body.contains("2026-08-17, 240"), body)
+        XCTAssertTrue(body.contains("2026-08-18, 360"), body)
+    }
+
+    /// Records that do not overlap still add up.
+    func testSeparateStretchesStillAdd() async throws {
+        let store = try await store([
+            sleep("first", from: try local(2026, 8, 17, 1), hours: 2, value: 3),
+            sleep("nap", from: try local(2026, 8, 17, 14), hours: 1, value: 3)
+        ])
+
+        let body = try text(
+            await call(store, "aggregate_health_data", [
+                "type": "HKCategoryTypeIdentifierSleepAnalysis",
+                "bucket": "day"
+            ])
+        )
+        XCTAssertTrue(
+            body.contains("2026-08-17, 180, 2"),
+            "two hours and one hour, apart, is three:\n\(body)"
+        )
+    }
+
+    /// Touching stretches are one stretch, not two with a gap.
+    func testTouchingStretchesAreOneStretch() async throws {
+        let store = try await store([
+            sleep("core", from: try local(2026, 8, 17, 1), hours: 2, value: 3),
+            sleep("rem", from: try local(2026, 8, 17, 3), hours: 1, value: 5)
+        ])
+
+        let body = try text(
+            await call(store, "aggregate_health_data", [
+                "type": "HKCategoryTypeIdentifierSleepAnalysis",
+                "bucket": "day"
+            ])
+        )
+        XCTAssertTrue(body.contains("2026-08-17, 180, 2"), body)
+    }
+
+    /// Awake time inside a night is still not sleep, even when it overlaps.
+    func testAwakeStretchesAreNotUnionedIntoSleep() async throws {
+        let store = try await store([
+            sleep("asleep", from: try local(2026, 8, 17, 1), hours: 4, value: 3),
+            // An hour awake in the middle of it.
+            sleep("awake", from: try local(2026, 8, 17, 2), hours: 1, value: 2)
+        ])
+
+        let body = try text(
+            await call(store, "aggregate_health_data", [
+                "type": "HKCategoryTypeIdentifierSleepAnalysis",
+                "bucket": "day"
+            ])
+        )
+        XCTAssertTrue(
+            body.contains("2026-08-17, 240, 2"),
+            "four hours staged asleep; the awake record adds nothing:\n\(body)"
+        )
+    }
+
+    private func sleep(
+        _ id: String,
+        from start: Date,
+        hours: Double,
+        value: Int
+    ) -> [String: Any] {
+        [
+            "kind": "category", "id": id,
+            "type": "HKCategoryTypeIdentifierSleepAnalysis",
+            "startDate": Timestamps.text(from: start),
+            "endDate": Timestamps.text(
+                from: start.addingTimeInterval(hours * 3600)
+            ),
+            "value": value
+        ]
+    }
+
     // MARK: - The classification the tools share
 
     /// Types the hand-kept list had drifted past are totalled, not averaged.

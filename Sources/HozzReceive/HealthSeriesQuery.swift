@@ -208,6 +208,12 @@ extension IngestStore {
             uniqueKeysWithValues: fetched.map { ($0.index, $0) }
         )
 
+        // The same union the MCP tool and the Markdown export use, so three
+        // surfaces cannot disagree about how long somebody slept.
+        let unioned = measure.kind == .duration
+            ? try unionedSeconds(type: type, measure: measure, plan: plan)
+            : [:]
+
         let columns = plan.columns.map { column in
             let row = rows[column.index]
             return SeriesColumn(
@@ -224,7 +230,7 @@ extension IngestStore {
                 readingCount: row?.readings ?? 0,
                 daysWithData: row?.days ?? 0,
                 dayCount: column.dayCount(in: plan.calendar),
-                durationSeconds: (((row?.duration ?? 0) * 1000).rounded()) / 1000
+                durationSeconds: (((unioned[column.index] ?? 0) * 1000).rounded()) / 1000
             )
         }
 
