@@ -214,6 +214,7 @@ public actor HozzStore {
                         frontier REAL NOT NULL,
                         covered_through REAL NOT NULL,
                         chunk_seconds REAL NOT NULL,
+                        top_up_seconds REAL NOT NULL,
                         delivered_count INTEGER NOT NULL DEFAULT 0,
                         state TEXT NOT NULL,
                         failure_reason TEXT,
@@ -441,7 +442,8 @@ public actor HozzStore {
         try database.query(
             """
             SELECT type_key, window_start, started_at, frontier, covered_through,
-                   chunk_seconds, delivered_count, state, failure_reason, updated_at
+                   chunk_seconds, top_up_seconds, delivered_count, state,
+                   failure_reason, updated_at
             FROM prime_state
             WHERE scope = ? AND type_key = ?;
             """,
@@ -454,7 +456,8 @@ public actor HozzStore {
         try database.query(
             """
             SELECT type_key, window_start, started_at, frontier, covered_through,
-                   chunk_seconds, delivered_count, state, failure_reason, updated_at
+                   chunk_seconds, top_up_seconds, delivered_count, state,
+                   failure_reason, updated_at
             FROM prime_state
             WHERE scope = ?
             ORDER BY type_key;
@@ -491,10 +494,10 @@ public actor HozzStore {
             """
             INSERT INTO prime_state (
                 scope, type_key, window_start, started_at, frontier,
-                covered_through, chunk_seconds, delivered_count, state,
-                failure_reason, updated_at
+                covered_through, chunk_seconds, top_up_seconds, delivered_count,
+                state, failure_reason, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?)
             ON CONFLICT(scope, type_key) DO NOTHING;
             """,
             [
@@ -504,6 +507,7 @@ public actor HozzStore {
                 .real(startedAt.timeIntervalSince1970),
                 .real(startedAt.timeIntervalSince1970),
                 .real(startedAt.timeIntervalSince1970),
+                .real(chunkSeconds),
                 .real(chunkSeconds),
                 .text(
                     windowStart < startedAt
@@ -568,8 +572,9 @@ public actor HozzStore {
             """
             UPDATE prime_state
             SET window_start = ?, started_at = ?, frontier = ?,
-                covered_through = ?, chunk_seconds = ?, delivered_count = 0,
-                state = ?, failure_reason = NULL, updated_at = ?
+                covered_through = ?, chunk_seconds = ?, top_up_seconds = ?,
+                delivered_count = 0, state = ?, failure_reason = NULL,
+                updated_at = ?
             WHERE scope = ?;
             """,
             [
@@ -577,6 +582,7 @@ public actor HozzStore {
                 .real(startedAt.timeIntervalSince1970),
                 .real(startedAt.timeIntervalSince1970),
                 .real(startedAt.timeIntervalSince1970),
+                .real(chunkSeconds),
                 .real(chunkSeconds),
                 .text(
                     windowStart < startedAt
@@ -628,14 +634,15 @@ public actor HozzStore {
             """
             UPDATE prime_state
             SET frontier = ?, covered_through = ?, chunk_seconds = ?,
-                delivered_count = delivered_count + ?, state = ?,
-                failure_reason = ?, updated_at = ?
+                top_up_seconds = ?, delivered_count = delivered_count + ?,
+                state = ?, failure_reason = ?, updated_at = ?
             WHERE scope = ? AND type_key = ?;
             """,
             [
                 .real(commit.frontier.timeIntervalSince1970),
                 .real(commit.coveredThrough.timeIntervalSince1970),
                 .real(commit.chunkSeconds),
+                .real(commit.topUpSeconds),
                 .integer(Int64(commit.addedRecordCount)),
                 .text(commit.state.rawValue),
                 commit.failureReason.map(SQLiteValue.text) ?? .null,
@@ -650,9 +657,9 @@ public actor HozzStore {
         guard let type = HealthTypeKey(rawValue: row.text(0)) else {
             throw HozzStoreError.corruptStoredValue("empty prime type key")
         }
-        guard let state = PrimeState(rawValue: row.text(7)) else {
+        guard let state = PrimeState(rawValue: row.text(8)) else {
             throw HozzStoreError.corruptStoredValue(
-                "unknown prime state \(row.text(7))"
+                "unknown prime state \(row.text(8))"
             )
         }
 
@@ -663,10 +670,11 @@ public actor HozzStore {
             frontier: Date(timeIntervalSince1970: row.real(3)),
             coveredThrough: Date(timeIntervalSince1970: row.real(4)),
             chunkSeconds: row.real(5),
-            deliveredCount: Int(row.integer(6)),
+            topUpSeconds: row.real(6),
+            deliveredCount: Int(row.integer(7)),
             state: state,
-            failureReason: row.optionalText(8),
-            updatedAt: Date(timeIntervalSince1970: row.real(9))
+            failureReason: row.optionalText(9),
+            updatedAt: Date(timeIntervalSince1970: row.real(10))
         )
     }
 

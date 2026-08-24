@@ -382,11 +382,15 @@ final class SyncViewModel {
             return "Waiting for this iPhone to be unlocked."
         }
         if outcome.deliveredRecords == 0 {
-            // "Up to date" is a claim, and it is only available while nothing
-            // is still being fetched. A pass that sent nothing because it spent
-            // its time reading an empty stretch of the last few months has not
-            // finished; saying otherwise would tell somebody their history had
-            // arrived at the exact moment it had not.
+            // "Up to date" is a claim about somebody's whole history, and it is
+            // the easiest sentence here to make untrue. It is available only
+            // when a pass both sent nothing *and* got all the way through:
+            // a pass that was cut short, or whose destination refused it, has
+            // established nothing at all, and one still fetching the recent
+            // months has established that it is not finished.
+            if outcome.wasInterrupted {
+                return "Hozz did not get through this sync. It will pick up where it left off."
+            }
             return outcome.primingRemains
                 ? "Nothing new to send. Still fetching your recent history."
                 : "Everything was already up to date."

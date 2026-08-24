@@ -1081,6 +1081,44 @@ final class PrimeSyncTests: XCTestCase {
         XCTAssertEqual(record?.state, .covered)
     }
 
+    /// Two destinations are two lots of priming, and the pass has to add them
+    /// up rather than report whichever it looked at last.
+    func testAPassAddsUpThePrimingItDidForEveryDestination() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let first = try await makeDestination(delivery, name: "First")
+        let second = try await makeDestination(delivery, name: "Second")
+
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            sweep: ScriptedHealthDataSource(streams: [steps: []]),
+            dated: ScriptedDatedHealthDataSource(samples: [steps: history()])
+        )
+
+        let passOutcome = await pass(engine, at: now)
+        let outcome = try XCTUnwrap(passOutcome)
+
+        // Each destination has its own cursor and receives the window in full,
+        // so the pass sent the window twice — a hundred and eighty records to
+        // each of them, worked out from the fixture rather than read back.
+        XCTAssertEqual(
+            outcome.primedRecords,
+            2 * namesInWindow.count,
+            """
+            A pass that reported one destination's priming, or the larger of \
+            the two, would still look plausible and would still be wrong.
+            """
+        )
+        XCTAssertEqual(outcome.primedRecords, outcome.deliveredRecords)
+
+        for destination in [first, second] {
+            let names = await channel.sampleNames(for: destination.id)
+            XCTAssertEqual(Set(names), namesInWindow)
+        }
+    }
+
     // MARK: - Asking again
 
     /// Asking again re-reads the months, and stops claiming them first.

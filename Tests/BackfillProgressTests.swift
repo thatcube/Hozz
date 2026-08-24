@@ -464,6 +464,28 @@ final class SyncSummaryTests: XCTestCase {
         )
     }
 
+    /// A pass that failed has established nothing, least of all completeness.
+    ///
+    /// Every destination throwing looks from the outside exactly like a quiet
+    /// pass — no records, nothing outstanding — and the sentence that fits a
+    /// quiet pass is the strongest claim in the app.
+    func testAPassThatWasCutShortDoesNotClaimToHaveFinished() {
+        let cutShort = SyncOutcome(
+            deliveredRecords: 0,
+            destinationCount: 1,
+            typesDrained: 0,
+            wasInterrupted: true,
+            waitingForUnlock: false
+        )
+
+        let summary = SyncViewModel.describe(cutShort)
+        XCTAssertFalse(
+            summary.contains("up to date"),
+            "Nothing was established, so nothing may be claimed."
+        )
+        XCTAssertTrue(summary.contains("did not get through"))
+    }
+
     func testALockedPhoneIsSaidToBeLockedRatherThanIdle() {
         XCTAssertEqual(
             SyncViewModel.describe(

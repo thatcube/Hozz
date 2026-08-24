@@ -205,6 +205,12 @@ public actor HealthSyncEngine {
             } catch {
                 Self.log.error("A destination could not be synced this pass.")
                 interrupted = true
+                // A destination that could not be evaluated is not a
+                // destination that is finished. Leaving this alone would let a
+                // pass where everything failed report nothing outstanding,
+                // which reads downstream as "up to date" — a claim made on the
+                // strength of never having looked.
+                primingRemains = true
                 continue
             }
             deliveredRecords += result.deliveredRecords

@@ -132,8 +132,16 @@ public struct PrimeRecord: Equatable, Sendable {
     public let frontier: Date
     /// The newest instant delivered. Walks up towards now.
     public let coveredThrough: Date
-    /// The chunk length that suited this type's density last time.
+    /// The chunk length the backfill found suited this type last time.
     public let chunkSeconds: TimeInterval
+    /// The chunk length the top-up found suited this type last time.
+    ///
+    /// Kept apart from the backfill's, because the two walks are measuring
+    /// different things. A type can be quiet for months and busy this
+    /// afternoon, or the reverse, and one shared number means each walk hands
+    /// the other an estimate of a stretch it never read — which is then spent,
+    /// several queries at a time, discovering it was wrong.
+    public let topUpSeconds: TimeInterval
     /// Records this prime has handed over, as the phone counts them.
     public let deliveredCount: Int
     public let state: PrimeState
@@ -147,6 +155,7 @@ public struct PrimeRecord: Equatable, Sendable {
         frontier: Date,
         coveredThrough: Date,
         chunkSeconds: TimeInterval,
+        topUpSeconds: TimeInterval,
         deliveredCount: Int,
         state: PrimeState,
         failureReason: String? = nil,
@@ -158,6 +167,7 @@ public struct PrimeRecord: Equatable, Sendable {
         self.frontier = frontier
         self.coveredThrough = coveredThrough
         self.chunkSeconds = chunkSeconds
+        self.topUpSeconds = topUpSeconds
         self.deliveredCount = deliveredCount
         self.state = state
         self.failureReason = failureReason
@@ -203,6 +213,7 @@ public struct PendingPrimeCommit: Equatable, Sendable {
     public let frontier: Date
     public let coveredThrough: Date
     public let chunkSeconds: TimeInterval
+    public let topUpSeconds: TimeInterval
     public let addedRecordCount: Int
     public let state: PrimeState
     public let failureReason: String?
@@ -214,6 +225,7 @@ public struct PendingPrimeCommit: Equatable, Sendable {
         frontier: Date,
         coveredThrough: Date,
         chunkSeconds: TimeInterval,
+        topUpSeconds: TimeInterval,
         addedRecordCount: Int,
         state: PrimeState,
         failureReason: String? = nil
@@ -224,6 +236,7 @@ public struct PendingPrimeCommit: Equatable, Sendable {
         self.frontier = frontier
         self.coveredThrough = coveredThrough
         self.chunkSeconds = chunkSeconds
+        self.topUpSeconds = topUpSeconds
         self.addedRecordCount = addedRecordCount
         self.state = state
         self.failureReason = failureReason

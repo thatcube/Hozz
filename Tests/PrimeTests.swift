@@ -402,6 +402,7 @@ final class PrimeStoreTests: XCTestCase {
                     frontier: moved,
                     coveredThrough: first.coveredThrough,
                     chunkSeconds: 86_400,
+                    topUpSeconds: 86_400,
                     addedRecordCount: 12,
                     state: .priming
                 )
@@ -444,6 +445,7 @@ final class PrimeStoreTests: XCTestCase {
                     frontier: moved,
                     coveredThrough: record.coveredThrough,
                     chunkSeconds: 86_400,
+                    topUpSeconds: 86_400,
                     addedRecordCount: 4,
                     state: .priming
                 )
@@ -462,6 +464,7 @@ final class PrimeStoreTests: XCTestCase {
                         frontier: moved.addingTimeInterval(86_400),
                         coveredThrough: record.coveredThrough,
                         chunkSeconds: 86_400,
+                        topUpSeconds: 86_400,
                         addedRecordCount: 0,
                         state: .priming
                     )
@@ -497,6 +500,7 @@ final class PrimeStoreTests: XCTestCase {
                         frontier: record.frontier.addingTimeInterval(-86_400),
                         coveredThrough: record.coveredThrough,
                         chunkSeconds: 86_400,
+                        topUpSeconds: 86_400,
                         addedRecordCount: 3,
                         state: .priming
                     )
@@ -523,6 +527,7 @@ final class PrimeStoreTests: XCTestCase {
                         frontier: start,
                         coveredThrough: startedAt,
                         chunkSeconds: 86_400,
+                        topUpSeconds: 86_400,
                         addedRecordCount: 1,
                         state: .covered
                     )
@@ -560,6 +565,7 @@ final class PrimeStoreTests: XCTestCase {
                     frontier: start,
                     coveredThrough: record.coveredThrough,
                     chunkSeconds: 86_400,
+                    topUpSeconds: 86_400,
                     addedRecordCount: 20,
                     state: .covered
                 )
@@ -594,6 +600,7 @@ final class PrimeStoreTests: XCTestCase {
                     frontier: start,
                     coveredThrough: record.coveredThrough,
                     chunkSeconds: 86_400,
+                    topUpSeconds: 86_400,
                     addedRecordCount: 30,
                     state: .covered
                 )

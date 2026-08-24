@@ -228,7 +228,13 @@ extension HealthSyncEngine {
         var walk = PrimeWalk()
         var frontier = record.frontier
         var coveredThrough = record.coveredThrough
-        var seconds = record.chunkSeconds
+        // One length per walk. They measure different stretches of the same
+        // type — this afternoon and some months ago — and a type can easily be
+        // quiet in one and busy in the other. Shared, each walk hands the other
+        // an estimate of a stretch it never read, which the other then spends
+        // several queries disproving, on every pass, indefinitely.
+        var backfillSeconds = record.chunkSeconds
+        var topUpSeconds = record.topUpSeconds
         var state = record.state
         var failureReason: String?
         var queries = 0
@@ -282,8 +288,8 @@ extension HealthSyncEngine {
                 && queries < Self.primeQueriesPerType
         }
 
-        /// Handles a chunk that came back over capacity. Returns false when the
-        /// walk cannot narrow any further and has to stop.
+        /// A shorter length to try after a chunk came back over capacity, or
+        /// nil when the walk is already asking for the shortest it will.
         ///
         /// Narrows from the chunk's *actual* length rather than the length that
         /// was asked for, because those differ whenever a chunk was clipped by
@@ -292,28 +298,28 @@ extension HealthSyncEngine {
         /// answer. A sparse type that had settled near the longest chunk and
         /// then meets a busy five minutes would spend nine reads of its budget
         /// discovering the same thing nine times.
-        func narrow(_ chunk: Range<Date>) -> Bool {
+        func narrowed(
+            _ chunk: Range<Date>,
+            from seconds: TimeInterval
+        ) -> TimeInterval? {
             let asked = chunk.upperBound.timeIntervalSince(chunk.lowerBound)
             let effective = min(seconds, asked)
-            if PrimePlan.isAtMinimum(effective) {
-                // A minute of one type overflowing a five-hundred record bite
-                // is not something the dated reader can page through without
-                // either dropping records or holding more than a background
-                // launch is given. It stops and says so. The sweep still
-                // reaches every one of these records, so this costs speed
-                // rather than data — and a stalled prime keeps claiming
-                // exactly the stretch it had already delivered.
-                failureReason =
-                    "More records than one read can hold in the shortest window Hozz will ask for."
-                Self.primeLog.notice(
-                    "A type is too dense for a dated read at the shortest window."
-                )
-                seconds = PrimePlan.minimumChunk
-                return false
+            guard !PrimePlan.isAtMinimum(effective) else {
+                return nil
             }
-            seconds = PrimePlan.narrowed(effective)
-            return true
+            return PrimePlan.narrowed(effective)
         }
+
+        /// What a walk says when it cannot narrow any further.
+        ///
+        /// A minute of one type overflowing a five-hundred record bite is not
+        /// something the dated reader can page through without either dropping
+        /// records or holding more than a background launch is given. It stops
+        /// and says so. The sweep still reaches every one of these records, so
+        /// this costs speed rather than data — and it keeps claiming exactly
+        /// the stretch it had already delivered.
+        let tooDense =
+            "More records than one read can hold in the shortest window Hozz will ask for."
 
         // The leading edge, walked upwards so a half-finished top-up still
         // abuts what is already covered and can be recorded as it goes.
@@ -340,7 +346,7 @@ extension HealthSyncEngine {
                 let chunk = PrimePlan.topUp(
                     coveredThrough: coveredThrough,
                     ceiling: now,
-                    seconds: seconds
+                    seconds: topUpSeconds
                 )
             else {
                 break topUp
@@ -363,26 +369,33 @@ extension HealthSyncEngine {
                 break topUp
             }
             if batch.isTruncated {
-                if narrow(chunk) {
+                if let shorter = narrowed(chunk, from: topUpSeconds) {
+                    topUpSeconds = shorter
                     continue topUp
                 }
                 // Deliberately does *not* mark the record stalled. A stall is a
                 // statement about the backfill — the months this prime set out
                 // to fetch — and a busy few minutes at the leading edge is not
                 // evidence about them. Marking it here would freeze the record
-                // out of every future pass, abandon a backfill that may be
-                // half done, and make `isCovered` start reporting false about a
-                // backfill that genuinely finished. The narrowed length is
-                // committed below, so the next pass rediscovers this in one
-                // query rather than nine.
+                // out of every future pass, abandon a backfill that may be half
+                // done, and make `isCovered` start reporting false about a
+                // backfill that genuinely finished.
+                topUpSeconds = PrimePlan.minimumChunk
+                failureReason = tooDense
+                Self.primeLog.notice(
+                    "A type is too dense for a dated read at the shortest window."
+                )
                 break topUp
             }
 
             walk.changes.append(contentsOf: batch.changes)
             walk.bytes += batch.changes.reduce(0) { $0 + $1.approximateByteCount }
             coveredThrough = chunk.upperBound
-            if PrimePlan.isFullLength(chunk, seconds: seconds) {
-                seconds = PrimePlan.resized(seconds, after: batch.changes.count)
+            if PrimePlan.isFullLength(chunk, seconds: topUpSeconds) {
+                topUpSeconds = PrimePlan.resized(
+                    topUpSeconds,
+                    after: batch.changes.count
+                )
             }
         }
 
@@ -400,7 +413,7 @@ extension HealthSyncEngine {
                 let chunk = PrimePlan.chunk(
                     frontier: frontier,
                     windowStart: record.windowStart,
-                    seconds: seconds
+                    seconds: backfillSeconds
                 )
             else {
                 state = .covered
@@ -424,10 +437,16 @@ extension HealthSyncEngine {
                 break backfill
             }
             if batch.isTruncated {
-                if narrow(chunk) {
+                if let shorter = narrowed(chunk, from: backfillSeconds) {
+                    backfillSeconds = shorter
                     continue backfill
                 }
+                backfillSeconds = PrimePlan.minimumChunk
                 state = .stalled
+                failureReason = tooDense
+                Self.primeLog.notice(
+                    "A type is too dense for a dated read at the shortest window."
+                )
                 break backfill
             }
 
@@ -438,8 +457,15 @@ extension HealthSyncEngine {
             // that ordering is the whole resumability story, and reversing it
             // would claim a stretch that a failed delivery never carried.
             frontier = chunk.lowerBound
-            if PrimePlan.isFullLength(chunk, seconds: seconds) {
-                seconds = PrimePlan.resized(seconds, after: batch.changes.count)
+            // The months read fine, whatever the leading edge was doing. A
+            // reason left over from the top-up would sit beside a state that
+            // describes the backfill and read as a verdict on it.
+            failureReason = nil
+            if PrimePlan.isFullLength(chunk, seconds: backfillSeconds) {
+                backfillSeconds = PrimePlan.resized(
+                    backfillSeconds,
+                    after: batch.changes.count
+                )
             }
 
             if frontier <= record.windowStart {
@@ -467,7 +493,8 @@ extension HealthSyncEngine {
         guard
             Self.moved(frontier, coveredThrough, record)
                 || state != record.state
-                || seconds != record.chunkSeconds
+                || backfillSeconds != record.chunkSeconds
+                || topUpSeconds != record.topUpSeconds
         else {
             return walk
         }
@@ -477,7 +504,8 @@ extension HealthSyncEngine {
             baseCoveredThrough: record.coveredThrough,
             frontier: frontier,
             coveredThrough: coveredThrough,
-            chunkSeconds: seconds,
+            chunkSeconds: backfillSeconds,
+            topUpSeconds: topUpSeconds,
             addedRecordCount: walk.changes.count,
             state: state,
             failureReason: failureReason
