@@ -6,6 +6,11 @@ public enum HozzStoreError: Error, LocalizedError, Equatable, Sendable {
     /// committed value. Retrying work must never skip a page, so the write is
     /// rejected rather than applied.
     case staleBaseAnchor(type: String)
+    /// A prime advance was computed from a frontier that is no longer stored,
+    /// or would move one the wrong way through time.
+    case stalePrimeFrontier(type: String)
+    /// A prime advance arrived for a type that has no window to advance.
+    case unknownPrime(type: String)
     case unknownRun(UUID)
     case unknownPart(runID: UUID, sequence: Int)
     case partNotOpen(runID: UUID, sequence: Int)
@@ -16,6 +21,10 @@ public enum HozzStoreError: Error, LocalizedError, Equatable, Sendable {
         switch self {
         case .staleBaseAnchor(let type):
             "Hozz refused to advance the cursor for \(type) because it changed underneath the drain."
+        case .stalePrimeFrontier(let type):
+            "Hozz refused to move the recent-history frontier for \(type) because it changed underneath the walk."
+        case .unknownPrime(let type):
+            "Hozz has no recent-history window recorded for \(type)."
         case .unknownRun(let id):
             "Export run \(id.uuidString) is not in the store."
         case .unknownPart(let runID, let sequence):
@@ -183,6 +192,38 @@ public actor HozzStore {
                 try database.execute("PRAGMA user_version = 2;")
             }
         }
+
+        if version < 3 {
+            try database.transaction {
+                // A separate table, not extra columns on `stream_state`, and
+                // that separation is the feature's central safety property
+                // rather than a filing preference. An anchor is the sweep's
+                // promise that it has seen every record Health handed it; a
+                // prime frontier is a dated claim about a window. Sharing a row
+                // would put both under one `UPDATE`, and one careless statement
+                // would advance an anchor past records nothing ever read —
+                // permanently, silently, and in the direction that loses data.
+                // Two tables make that particular mistake impossible to write.
+                try database.execute(
+                    """
+                    CREATE TABLE prime_state (
+                        scope TEXT NOT NULL,
+                        type_key TEXT NOT NULL,
+                        window_start REAL NOT NULL,
+                        window_end REAL NOT NULL,
+                        frontier REAL NOT NULL,
+                        chunk_seconds REAL NOT NULL,
+                        delivered_count INTEGER NOT NULL DEFAULT 0,
+                        state TEXT NOT NULL,
+                        failure_reason TEXT,
+                        updated_at REAL NOT NULL,
+                        PRIMARY KEY (scope, type_key)
+                    );
+                    """
+                )
+                try database.execute("PRAGMA user_version = 3;")
+            }
+        }
     }
 
     public func schemaVersion() throws -> Int {
@@ -239,12 +280,35 @@ public actor HozzStore {
         scope: AnchorScope,
         at date: Date = .now
     ) throws {
-        guard !commits.isEmpty else {
+        try commit(commits, prime: [], scope: scope, at: date)
+    }
+
+    /// Applies anchor advances and prime frontier advances in one transaction.
+    ///
+    /// One batch of delivered records can carry both, because a pass drains the
+    /// sweep and walks the prime into the same payload. Committing them
+    /// separately would be two chances to be interrupted between them, and the
+    /// window between the two writes is exactly where a phone gets killed.
+    ///
+    /// Sharing a transaction is *not* sharing a cursor. The two kinds of commit
+    /// are applied by different statements against different tables, and a
+    /// prime commit carries no anchor at all, so there is no arrangement of
+    /// these arguments that moves an anchor on a prime's behalf.
+    public func commit(
+        _ commits: [PendingAnchorCommit],
+        prime primeCommits: [PendingPrimeCommit],
+        scope: AnchorScope,
+        at date: Date = .now
+    ) throws {
+        guard !commits.isEmpty || !primeCommits.isEmpty else {
             return
         }
 
         try database.transaction {
             for commit in commits {
+                try apply(commit, scope: scope, at: date)
+            }
+            for commit in primeCommits {
                 try apply(commit, scope: scope, at: date)
             }
         }
@@ -327,10 +391,22 @@ public actor HozzStore {
     }
 
     public func deleteStreamState(scope: AnchorScope) throws {
-        try database.run(
-            "DELETE FROM stream_state WHERE scope = ?;",
-            [.text(scope.rawValue)]
-        )
+        try database.transaction {
+            try database.run(
+                "DELETE FROM stream_state WHERE scope = ?;",
+                [.text(scope.rawValue)]
+            )
+            // The prime goes with it, and this is a correctness requirement
+            // rather than tidiness. This is called when a destination is about
+            // to replay its history from nothing. A prime frontier left behind
+            // would go on asserting that a window had been delivered to a
+            // destination that has just been told it holds none of it — a
+            // density claim about data that is no longer there.
+            try database.run(
+                "DELETE FROM prime_state WHERE scope = ?;",
+                [.text(scope.rawValue)]
+            )
+        }
     }
 
     private static func streamRecord(_ row: SQLiteRow) throws -> StreamRecord {
@@ -352,6 +428,233 @@ public actor HozzStore {
             anchorClosedAt: row.optionalReal(5).map(Date.init(timeIntervalSince1970:)),
             failureReason: row.optionalText(6),
             updatedAt: Date(timeIntervalSince1970: row.real(7))
+        )
+    }
+
+    // MARK: - Prime state
+
+    public func primeRecord(
+        scope: AnchorScope,
+        type: HealthTypeKey
+    ) throws -> PrimeRecord? {
+        try database.query(
+            """
+            SELECT type_key, window_start, window_end, frontier, chunk_seconds,
+                   delivered_count, state, failure_reason, updated_at
+            FROM prime_state
+            WHERE scope = ? AND type_key = ?;
+            """,
+            [.text(scope.rawValue), .text(type.rawValue)],
+            row: Self.primeRecord
+        ).first
+    }
+
+    public func primeRecords(scope: AnchorScope) throws -> [PrimeRecord] {
+        try database.query(
+            """
+            SELECT type_key, window_start, window_end, frontier, chunk_seconds,
+                   delivered_count, state, failure_reason, updated_at
+            FROM prime_state
+            WHERE scope = ?
+            ORDER BY type_key;
+            """,
+            [.text(scope.rawValue)],
+            row: Self.primeRecord
+        )
+    }
+
+    /// Starts a prime for a type that has never had one, and returns whatever
+    /// is stored either way.
+    ///
+    /// Deliberately does nothing when a row already exists, even a finished
+    /// one. Seeding runs on every pass, so an eager version would restart the
+    /// walk each time a pass began and the frontier would never reach the start
+    /// of the window. Restarting is a separate, explicit act.
+    @discardableResult
+    public func beginPrime(
+        scope: AnchorScope,
+        type: HealthTypeKey,
+        windowStart: Date,
+        windowEnd: Date,
+        chunkSeconds: TimeInterval,
+        at date: Date = .now
+    ) throws -> PrimeRecord {
+        if let existing = try primeRecord(scope: scope, type: type) {
+            return existing
+        }
+        // The frontier starts at the window's end, meaning nothing has been
+        // covered. It is the same value a completed prime would have if the
+        // window were empty, which is why `coveredWindow` treats the two
+        // identically: neither licenses a claim.
+        try database.run(
+            """
+            INSERT INTO prime_state (
+                scope, type_key, window_start, window_end, frontier,
+                chunk_seconds, delivered_count, state, failure_reason, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?)
+            ON CONFLICT(scope, type_key) DO NOTHING;
+            """,
+            [
+                .text(scope.rawValue),
+                .text(type.rawValue),
+                .real(windowStart.timeIntervalSince1970),
+                .real(windowEnd.timeIntervalSince1970),
+                .real(windowEnd.timeIntervalSince1970),
+                .real(chunkSeconds),
+                .text(
+                    windowStart < windowEnd
+                        ? PrimeState.priming.rawValue
+                        : PrimeState.covered.rawValue
+                ),
+                .real(date.timeIntervalSince1970)
+            ]
+        )
+        guard let record = try primeRecord(scope: scope, type: type) else {
+            throw HozzStoreError.corruptStoredValue(
+                "prime row vanished after being written for \(type.rawValue)"
+            )
+        }
+        return record
+    }
+
+    /// Records that a prime cannot continue, without moving its frontier.
+    ///
+    /// Separate from a commit because a stall is discovered while *reading*,
+    /// before anything has been delivered, and a pass whose delivery then fails
+    /// must still remember why the walk stopped. Nothing here touches the
+    /// frontier, so a stalled prime keeps claiming exactly what it had already
+    /// delivered and not one second more.
+    public func recordPrimeState(
+        scope: AnchorScope,
+        type: HealthTypeKey,
+        state: PrimeState,
+        failureReason: String? = nil,
+        at date: Date = .now
+    ) throws {
+        try database.run(
+            """
+            UPDATE prime_state
+            SET state = ?, failure_reason = ?, updated_at = ?
+            WHERE scope = ? AND type_key = ?;
+            """,
+            [
+                .text(state.rawValue),
+                failureReason.map(SQLiteValue.text) ?? .null,
+                .real(date.timeIntervalSince1970),
+                .text(scope.rawValue),
+                .text(type.rawValue)
+            ]
+        )
+    }
+
+    /// Points every prime in a scope at a fresh window and walks it again.
+    ///
+    /// The frontier returns to the new window's end, so the app immediately
+    /// stops claiming a window it is about to re-read. Re-reading delivers
+    /// records the destination already has, which the receiver upserts, so the
+    /// cost of asking for this twice is bytes rather than duplicates.
+    public func restartPrime(
+        scope: AnchorScope,
+        windowStart: Date,
+        windowEnd: Date,
+        chunkSeconds: TimeInterval,
+        at date: Date = .now
+    ) throws {
+        try database.run(
+            """
+            UPDATE prime_state
+            SET window_start = ?, window_end = ?, frontier = ?,
+                chunk_seconds = ?, delivered_count = 0, state = ?,
+                failure_reason = NULL, updated_at = ?
+            WHERE scope = ?;
+            """,
+            [
+                .real(windowStart.timeIntervalSince1970),
+                .real(windowEnd.timeIntervalSince1970),
+                .real(windowEnd.timeIntervalSince1970),
+                .real(chunkSeconds),
+                .text(
+                    windowStart < windowEnd
+                        ? PrimeState.priming.rawValue
+                        : PrimeState.covered.rawValue
+                ),
+                .real(date.timeIntervalSince1970),
+                .text(scope.rawValue)
+            ]
+        )
+    }
+
+    public func deletePrimeState(scope: AnchorScope) throws {
+        try database.run(
+            "DELETE FROM prime_state WHERE scope = ?;",
+            [.text(scope.rawValue)]
+        )
+    }
+
+    private func apply(
+        _ commit: PendingPrimeCommit,
+        scope: AnchorScope,
+        at date: Date
+    ) throws {
+        guard let existing = try primeRecord(scope: scope, type: commit.type) else {
+            throw HozzStoreError.unknownPrime(type: commit.type.rawValue)
+        }
+        // The same rule the anchors follow, for the same reason: an advance
+        // computed from a frontier that has since moved describes a chunk
+        // somebody else may already have handled, and applying it would leave
+        // the frontier below data nothing read.
+        guard existing.frontier == commit.baseFrontier else {
+            throw HozzStoreError.stalePrimeFrontier(type: commit.type.rawValue)
+        }
+        // A frontier only ever moves backwards through time, towards the start
+        // of the window. Forwards would abandon a stretch already delivered
+        // while still claiming it.
+        guard commit.frontier <= existing.frontier else {
+            throw HozzStoreError.stalePrimeFrontier(type: commit.type.rawValue)
+        }
+
+        try database.run(
+            """
+            UPDATE prime_state
+            SET frontier = ?, chunk_seconds = ?,
+                delivered_count = delivered_count + ?, state = ?,
+                failure_reason = ?, updated_at = ?
+            WHERE scope = ? AND type_key = ?;
+            """,
+            [
+                .real(commit.frontier.timeIntervalSince1970),
+                .real(commit.chunkSeconds),
+                .integer(Int64(commit.addedRecordCount)),
+                .text(commit.state.rawValue),
+                commit.failureReason.map(SQLiteValue.text) ?? .null,
+                .real(date.timeIntervalSince1970),
+                .text(scope.rawValue),
+                .text(commit.type.rawValue)
+            ]
+        )
+    }
+
+    private static func primeRecord(_ row: SQLiteRow) throws -> PrimeRecord {
+        guard let type = HealthTypeKey(rawValue: row.text(0)) else {
+            throw HozzStoreError.corruptStoredValue("empty prime type key")
+        }
+        guard let state = PrimeState(rawValue: row.text(6)) else {
+            throw HozzStoreError.corruptStoredValue(
+                "unknown prime state \(row.text(6))"
+            )
+        }
+
+        return PrimeRecord(
+            type: type,
+            windowStart: Date(timeIntervalSince1970: row.real(1)),
+            windowEnd: Date(timeIntervalSince1970: row.real(2)),
+            frontier: Date(timeIntervalSince1970: row.real(3)),
+            chunkSeconds: row.real(4),
+            deliveredCount: Int(row.integer(5)),
+            state: state,
+            failureReason: row.optionalText(7),
+            updatedAt: Date(timeIntervalSince1970: row.real(8))
         )
     }
 

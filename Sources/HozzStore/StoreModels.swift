@@ -82,6 +82,127 @@ public struct StreamRecord: Equatable, Sendable {
     }
 }
 
+/// How a dated prime of one type is getting on.
+public enum PrimeState: String, Codable, Hashable, Sendable {
+    /// The window is being walked and part of it may already be delivered.
+    case priming
+    /// The frontier reached the start of the window. Everything in it is here.
+    case covered
+    /// The walk cannot continue without either dropping records or reading more
+    /// than a background launch can hold, so it stopped and said so.
+    ///
+    /// Nothing is lost by this: the anchored sweep still reaches every record
+    /// eventually. What is lost is the *speed*, and a stalled prime says that
+    /// plainly rather than quietly claiming the window.
+    case stalled
+}
+
+/// What a dated prime has actually covered for one type, in one cursor space.
+///
+/// The field that matters is ``frontier``, and it matters because of what it is
+/// not. `windowStart` is an intention — the oldest instant this prime is aiming
+/// at — and no surface may ever report it, because aiming at a date is not the
+/// same as holding it. The frontier is the achieved position: it moves only
+/// inside the same transaction that records a delivery the destination
+/// accepted, so `[frontier, windowEnd)` is a claim the app can stand behind.
+public struct PrimeRecord: Equatable, Sendable {
+    public let type: HealthTypeKey
+    /// The oldest instant this prime is aiming at. An intention, not a claim.
+    public let windowStart: Date
+    /// The newest instant of the window, fixed when the prime began.
+    ///
+    /// Fixed rather than "now" so the window does not slide out from under a
+    /// walk that takes days: a moving end would leave a permanent sliver of
+    /// unread recent data that the frontier could never catch.
+    public let windowEnd: Date
+    /// Everything from here to ``windowEnd`` has been delivered and accepted.
+    public let frontier: Date
+    /// The chunk length that suited this type's density last time.
+    public let chunkSeconds: TimeInterval
+    /// Records this prime has handed over, as the phone counts them.
+    public let deliveredCount: Int
+    public let state: PrimeState
+    public let failureReason: String?
+    public let updatedAt: Date
+
+    public init(
+        type: HealthTypeKey,
+        windowStart: Date,
+        windowEnd: Date,
+        frontier: Date,
+        chunkSeconds: TimeInterval,
+        deliveredCount: Int,
+        state: PrimeState,
+        failureReason: String? = nil,
+        updatedAt: Date
+    ) {
+        self.type = type
+        self.windowStart = windowStart
+        self.windowEnd = windowEnd
+        self.frontier = frontier
+        self.chunkSeconds = chunkSeconds
+        self.deliveredCount = deliveredCount
+        self.state = state
+        self.failureReason = failureReason
+        self.updatedAt = updatedAt
+    }
+
+    /// The window that has genuinely been read, or nil when none has.
+    ///
+    /// A prime that has delivered nothing has no window, and deliberately does
+    /// not report a zero-length one: anything asking whether a primed window
+    /// exists would read `from == through` as "yes, an empty one" and present a
+    /// density claim about no time at all.
+    public var coveredWindow: (from: Date, through: Date)? {
+        guard frontier < windowEnd else {
+            return nil
+        }
+        return (frontier, windowEnd)
+    }
+
+    public var isCovered: Bool {
+        state == .covered
+    }
+}
+
+/// One type's prime frontier advance, staged until its delivery is accepted.
+///
+/// Deliberately parallel to ``PendingAnchorCommit`` and deliberately separate
+/// from it. They are committed in the same transaction when a batch carried
+/// both, but they are different rows in different tables, and no code path
+/// turns one into the other — a prime cannot advance an anchor by accident
+/// because there is no expressible way to say it.
+public struct PendingPrimeCommit: Equatable, Sendable {
+    public let type: HealthTypeKey
+    /// The frontier this advance was computed from. A mismatch means something
+    /// else moved the cursor underneath, and the write is refused rather than
+    /// applied, exactly as a stale anchor base is.
+    public let baseFrontier: Date
+    public let frontier: Date
+    public let chunkSeconds: TimeInterval
+    public let addedRecordCount: Int
+    public let state: PrimeState
+    public let failureReason: String?
+
+    public init(
+        type: HealthTypeKey,
+        baseFrontier: Date,
+        frontier: Date,
+        chunkSeconds: TimeInterval,
+        addedRecordCount: Int,
+        state: PrimeState,
+        failureReason: String? = nil
+    ) {
+        self.type = type
+        self.baseFrontier = baseFrontier
+        self.frontier = frontier
+        self.chunkSeconds = chunkSeconds
+        self.addedRecordCount = addedRecordCount
+        self.state = state
+        self.failureReason = failureReason
+    }
+}
+
 public enum ExportRunState: String, Codable, Hashable, Sendable {
     /// The run owns the current export and is actively draining.
     case running
