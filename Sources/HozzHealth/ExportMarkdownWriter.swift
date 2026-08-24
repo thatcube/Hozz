@@ -61,9 +61,10 @@ struct ExportMarkdownStatistics: Equatable {
 ///
 /// Sleep is also the one thing not totalled a record at a time. Health returns
 /// overlapping records for one night, so their durations are merged before
-/// anything is filed — which means holding the date pairs, and only those, for
-/// the length of the read. A decade of nights is on the order of tens of
-/// thousands of pairs against an export that may hold millions of records.
+/// anything is filed — which means holding date pairs, and only those, during
+/// the read. They are compacted as they accumulate, and merging collapses a
+/// night into a single stretch, so what is held tends towards one interval per
+/// night rather than one per record.
 enum ExportMarkdownWriter {
     struct Metadata {
         let runID: UUID
@@ -82,6 +83,14 @@ enum ExportMarkdownWriter {
     /// the note stays readable instead of becoming the dump it is not meant to
     /// be.
     static let workoutDetailLimit = 25
+
+    /// How many un-merged sleep stretches to hold before compacting them.
+    ///
+    /// Only a ceiling on working memory, never on what is counted: compaction
+    /// is the same merge that runs at the end, and merging twice gives the same
+    /// answer as merging once. Low enough that a decade of nights costs a few
+    /// tens of kilobytes, high enough that compaction is rare.
+    static let sleepCompactionThreshold = 4_096
 
     @discardableResult
     static func write(
@@ -107,12 +116,16 @@ enum ExportMarkdownWriter {
         // because two records of one night can end either side of midnight and
         // would never meet if each day were merged separately.
         //
-        // This is the one exception to holding no records: these are date pairs
-        // rather than records, and only for sleep. A decade of nights is on the
-        // order of tens of thousands of them, a megabyte or so, against an
-        // export that may hold millions of records of every other kind.
+        // Holding them all would undo the promise above, so they are compacted
+        // as they accumulate: merging is idempotent and collapses a night's
+        // records into one stretch, so what is retained tends towards one
+        // interval per night rather than one per record. The threshold doubles
+        // past whatever survives a compaction, which keeps the total work
+        // linear when the stretches genuinely are all distinct.
         var asleepStretches: [DateInterval] = []
         var inBedStretches: [DateInterval] = []
+        var asleepCompactionAt = sleepCompactionThreshold
+        var inBedCompactionAt = sleepCompactionThreshold
 
         while let line = try reader.nextLine() {
             statistics.linesRead += 1
@@ -197,8 +210,22 @@ enum ExportMarkdownWriter {
                 let stretch = DateInterval(start: start, end: end)
                 if SleepIntervals.isAsleep(value) {
                     asleepStretches.append(stretch)
+                    if asleepStretches.count >= asleepCompactionAt {
+                        asleepStretches = SleepIntervals.merge(asleepStretches)
+                        asleepCompactionAt = max(
+                            sleepCompactionThreshold,
+                            asleepStretches.count * 2
+                        )
+                    }
                 } else if SleepIntervals.isInBed(value) {
                     inBedStretches.append(stretch)
+                    if inBedStretches.count >= inBedCompactionAt {
+                        inBedStretches = SleepIntervals.merge(inBedStretches)
+                        inBedCompactionAt = max(
+                            sleepCompactionThreshold,
+                            inBedStretches.count * 2
+                        )
+                    }
                 }
             }
 

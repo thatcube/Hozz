@@ -540,6 +540,67 @@ final class ExportMarkdownTests: XCTestCase {
         return nil
     }
 
+    /// Compaction is only safe if merging part of the set early gives the same
+    /// answer as merging all of it at the end. That is the property, checked
+    /// directly rather than inferred from the export agreeing with itself.
+    ///
+    /// The intervals are deliberately nasty: overlapping, touching, one wholly
+    /// inside another, and one far away.
+    func testMergingEarlyGivesTheSameAnswerAsMergingLate() throws {
+        let base = Date(timeIntervalSince1970: 1_767_225_600)
+        func span(_ fromMinutes: Int, _ toMinutes: Int) -> DateInterval {
+            DateInterval(
+                start: base.addingTimeInterval(Double(fromMinutes) * 60),
+                end: base.addingTimeInterval(Double(toMinutes) * 60)
+            )
+        }
+
+        let first = [span(0, 60), span(30, 90), span(40, 50)]
+        let second = [span(90, 120), span(500, 560), span(550, 600)]
+
+        let allAtOnce = SleepIntervals.merge(first + second)
+        let compacted = SleepIntervals.merge(SleepIntervals.merge(first) + second)
+
+        XCTAssertEqual(compacted, allAtOnce)
+        // Worked out by hand: 0–120 minutes is one stretch, 500–600 another.
+        XCTAssertEqual(allAtOnce, [span(0, 120), span(500, 600)])
+        XCTAssertEqual(
+            allAtOnce.reduce(0.0) { $0 + $1.duration },
+            (120 + 100) * 60,
+            accuracy: 0.000_1
+        )
+    }
+
+    /// The real path, past the point where compaction actually happens.
+    ///
+    /// The property above says compaction is harmless; this says the export
+    /// really does invoke it and really does still get the right answer, which
+    /// the property alone cannot show.
+    func testAnExportLongEnoughToCompactStillCountsTheNightOnce() throws {
+        let segments = ExportMarkdownWriter.sleepCompactionThreshold + 500
+        XCTAssertGreaterThan(segments, ExportMarkdownWriter.sleepCompactionThreshold)
+
+        // Every record covers the same two hours of one night, from a great
+        // many sources. Merged, that is two hours. Added up, it would be
+        // thousands.
+        let lines = (0..<segments).map { _ in
+            sleepSegment(
+                start: "2026-01-03T05:00:00.000Z",
+                end: "2026-01-03T07:00:00.000Z",
+                value: 1
+            )
+        }
+
+        let (entries, _) = try build(lines)
+        let text = try note(entries, "2026-01-03")
+        XCTAssertTrue(text.contains("Asleep for **2 h**"), text)
+        XCTAssertTrue(text.contains("sleep_hours: 2"), text)
+        XCTAssertTrue(
+            text.contains("from \(segments) segments"),
+            "The records are still all counted: \(text)"
+        )
+    }
+
     /// Sleep stage codes are an enumeration. Summing them would produce a
     /// number that looks like data and means nothing.
     func testCategoryCodesAreCountedButNotSummed() throws {
