@@ -33,7 +33,17 @@ settings:
     #
     # To build with them: HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS on the
     # xcodebuild command line, or in the gitignored Local.xcconfig.
-    SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) $(HOZZ_CLINICAL_FLAG)
+    #
+    # DEBUG is declared here too, and only for the Debug configuration.
+    # XcodeGen supplies it by default, but naming this setting at all replaces
+    # that default — so before this, `#if DEBUG` anywhere in the project
+    # compiled to nothing at all, in every configuration, silently. Anything
+    # written behind one was simply absent, which is a bad way to find out.
+  configs:
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) DEBUG $(HOZZ_CLINICAL_FLAG)
+    Release:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: $(inherited) $(HOZZ_CLINICAL_FLAG)
 
 targetTemplates:
   HozzFramework:

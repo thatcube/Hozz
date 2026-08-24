@@ -90,46 +90,67 @@ enum DashboardMetrics {
     static var distanceUnitLabel: String { usesImperial ? "mi" : "km" }
     static var massUnitLabel: String { usesImperial ? "lb" : "kg" }
 
+    /// The unit a metric is read in, together with what its values must be
+    /// multiplied by to mean what the label says.
+    ///
+    /// The scale exists because of one trap. HealthKit's percent unit is a
+    /// fraction, not a percentage — the header says `% (0.0 - 1.0)` — so a
+    /// blood oxygen of 98% comes back as `0.98`. Printed beside a "%" label
+    /// that reads as "1.0 %", which is both alarming and wrong. Carrying the
+    /// unit and its scale in one value is what stops the two from drifting
+    /// apart, since they are used in different places.
+    struct Reading: Sendable {
+        let unit: HKUnit
+        let scale: Double
+
+        init(_ unit: HKUnit, scale: Double = 1) {
+            self.unit = unit
+            self.scale = scale
+        }
+    }
+
     /// The unit a metric is read and drawn in.
     ///
     /// Chosen once, here, so a series can never mix units — the aggregator
     /// refuses to add across units, and this is what makes that a guard rather
     /// than an everyday occurrence.
-    static func unit(for metric: DashboardMetric) -> HKUnit? {
+    static func reading(for metric: DashboardMetric) -> Reading? {
         switch metric.kind {
         case .sleep:
-            return .hour()
+            return Reading(.hour())
         case .quantity(let identifier):
             switch HKQuantityTypeIdentifier(rawValue: identifier) {
             case .stepCount, .flightsClimbed:
-                return .count()
+                return Reading(.count())
             case .activeEnergyBurned, .basalEnergyBurned, .dietaryEnergyConsumed:
-                return .kilocalorie()
+                return Reading(.kilocalorie())
             case .distanceWalkingRunning, .distanceCycling, .distanceSwimming:
-                return usesImperial ? .mile() : .meterUnit(with: .kilo)
+                return Reading(usesImperial ? .mile() : .meterUnit(with: .kilo))
             case .heartRate, .restingHeartRate, .walkingHeartRateAverage, .respiratoryRate:
-                return .count().unitDivided(by: .minute())
+                return Reading(.count().unitDivided(by: .minute()))
             case .heartRateVariabilitySDNN:
-                return .secondUnit(with: .milli)
+                return Reading(.secondUnit(with: .milli))
             case .oxygenSaturation, .bodyFatPercentage, .walkingAsymmetryPercentage:
-                return .percent()
+                // Read as the fraction HealthKit stores, shown as the
+                // percentage everyone means by it.
+                return Reading(.percent(), scale: 100)
             case .bodyMass, .leanBodyMass:
-                return usesImperial ? .pound() : .gramUnit(with: .kilo)
+                return Reading(usesImperial ? .pound() : .gramUnit(with: .kilo))
             case .height:
-                return usesImperial ? .inch() : .meterUnit(with: .centi)
+                return Reading(usesImperial ? .inch() : .meterUnit(with: .centi))
             case .appleExerciseTime, .appleStandTime:
-                return .minute()
+                return Reading(.minute())
             case .vo2Max:
-                return HKUnit(from: "ml/kg*min")
+                return Reading(HKUnit(from: "ml/kg*min"))
             case .bodyTemperature, .basalBodyTemperature:
-                return usesImperial ? .degreeFahrenheit() : .degreeCelsius()
+                return Reading(usesImperial ? .degreeFahrenheit() : .degreeCelsius())
             case .bloodGlucose:
-                return HKUnit(from: "mg/dL")
+                return Reading(HKUnit(from: "mg/dL"))
             case .environmentalAudioExposure, .headphoneAudioExposure:
-                return .decibelAWeightedSoundPressureLevel()
+                return Reading(.decibelAWeightedSoundPressureLevel())
             default:
-                // Anything not named above is read in whatever HealthKit says
-                // is canonical for it, resolved on the type at query time.
+                // Anything not named above has no unit chosen here, and the
+                // caller reads it in HealthKit's own canonical one.
                 return nil
             }
         }

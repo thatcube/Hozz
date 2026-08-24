@@ -130,6 +130,23 @@ enum MetricRange: String, CaseIterable, Identifiable, Sendable {
         case .year: "month"
         }
     }
+
+    /// The calendar unit one bucket spans.
+    ///
+    /// A bar drawn against a date axis has to be told this. Without it Swift
+    /// Charts treats the axis as plainly continuous, has no bin width to give
+    /// the bar, and draws nothing — silently, with the axes still labelled, so
+    /// the chart looks merely empty rather than broken.
+    var plottableUnit: Calendar.Component { bucketUnit }
+
+    /// How to refer to the bucket in progress. "This day is still going" is
+    /// not something anyone says.
+    var currentBucketName: String {
+        switch self {
+        case .week, .month: "Today"
+        case .year: "This month"
+        }
+    }
 }
 
 // MARK: - Building buckets
@@ -138,11 +155,23 @@ enum MetricBucketing {
     /// The buckets a range covers, oldest first, with the last one holding
     /// `now`.
     ///
-    /// Every boundary is produced by calendar arithmetic rather than by adding
-    /// seconds. On the day a clock goes forward the local day is twenty-three
-    /// hours long, and stepping by 86,400 seconds walks the boundary an hour
-    /// off and keeps it there for the rest of the range — so every bucket
-    /// after a spring Sunday would be an hour wrong.
+    /// Every boundary is normalised to the true start of its local unit, and
+    /// each bucket ends exactly where the next begins, so the chain is
+    /// contiguous by construction rather than by coincidence.
+    ///
+    /// Both of those matter more than they look. Stepping by 86,400 seconds
+    /// walks the boundary an hour off on the day a clock changes and keeps it
+    /// there. But calendar arithmetic alone is not enough either: `byAdding`
+    /// preserves the wall time it started from, and in a zone whose clock
+    /// changes *at midnight* — Santiago in September, Havana in November,
+    /// Cairo in April — local midnight either does not exist that day or
+    /// exists twice, so the walk drifts to 01:00 and stays there. Computing
+    /// each end independently as "start plus one unit" then leaves a real hole
+    /// or a real overlap in the chain, and a reading in the hole belongs to no
+    /// bucket at all: it is dropped and reported as an absence.
+    ///
+    /// Normalising after every step and taking each end from the next start
+    /// removes both failures.
     static func buckets(
         for range: MetricRange,
         endingAt now: Date,
@@ -156,19 +185,38 @@ enum MetricBucketing {
         var starts: [Date] = [currentStart]
         var cursor = currentStart
         for _ in 1..<max(1, range.bucketCount) {
-            guard let previous = calendar.date(byAdding: unit, value: -1, to: cursor) else {
+            guard
+                let stepped = calendar.date(byAdding: unit, value: -1, to: cursor),
+                let normalised = start(of: unit, containing: stepped, in: calendar),
+                // Must move backwards. A zone whose clock change swallows the
+                // boundary could otherwise normalise back onto the day just
+                // recorded and repeat it forever.
+                normalised < cursor
+            else {
                 break
             }
-            starts.append(previous)
-            cursor = previous
+            starts.append(normalised)
+            cursor = normalised
         }
         starts.reverse()
 
-        return starts.compactMap { start in
-            guard let end = calendar.date(byAdding: unit, value: 1, to: start) else {
+        // The final boundary is the only one that has to be stepped forwards;
+        // every other end is simply the next start, which is what makes the
+        // chain airtight.
+        guard
+            let afterLast = calendar.date(byAdding: unit, value: 1, to: currentStart),
+            let finalEnd = start(of: unit, containing: afterLast, in: calendar),
+            finalEnd > currentStart
+        else {
+            return []
+        }
+
+        return starts.indices.compactMap { index in
+            let end = index + 1 < starts.count ? starts[index + 1] : finalEnd
+            guard end > starts[index] else {
                 return nil
             }
-            return DateInterval(start: start, end: end)
+            return DateInterval(start: starts[index], end: end)
         }
     }
 

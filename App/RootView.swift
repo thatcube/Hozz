@@ -14,7 +14,30 @@ struct RootView: View {
     }
 
     var body: some View {
+        #if DEBUG
+        if DashboardHarnessLaunch.isRequested {
+            DashboardDesignHarness()
+        } else {
+            tabs
+        }
+        #else
+        tabs
+        #endif
+    }
+
+    private var tabs: some View {
         TabView {
+            NavigationStack {
+                DashboardView()
+            }
+            .tabItem {
+                Label {
+                    Text("Health")
+                } icon: {
+                    Image(HozzIcon.chartLine.rawValue).renderingMode(.template)
+                }
+            }
+
             NavigationStack {
                 SyncDashboardView(model: syncModel)
             }

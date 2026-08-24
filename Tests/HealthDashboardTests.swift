@@ -169,6 +169,132 @@ final class HealthDashboardTests: XCTestCase {
         }
     }
 
+    /// New York changes its clocks at two in the morning, which is the gentle
+    /// case: local midnight still happens exactly once.
+    ///
+    /// These zones move theirs *at* midnight, so on the transition day local
+    /// midnight either never happens or happens twice. Stepping a day back
+    /// from a midnight and then adding a day to get the end drifts to 01:00
+    /// and leaves a real hole — or a real overlap — in the chain. A reading in
+    /// the hole belongs to no bucket and is dropped, then reported as an
+    /// absence, which is the one thing a bucket carrying nil is promised not
+    /// to mean.
+    func testBucketsStayContiguousInZonesWhoseClocksChangeAtMidnight() throws {
+        let awkward: [(String, Int, Int, Int)] = [
+            ("America/Santiago", 2025, 9, 10),
+            ("America/Havana", 2025, 11, 5),
+            ("Africa/Cairo", 2025, 4, 29),
+            ("America/Asuncion", 2025, 10, 8),
+            ("Asia/Beirut", 2025, 3, 31)
+        ]
+
+        for (name, year, month, day) in awkward {
+            let zone = try XCTUnwrap(TimeZone(identifier: name))
+            let calendar = calendar(zone)
+            for range in MetricRange.allCases {
+                let buckets = MetricBucketing.buckets(
+                    for: range,
+                    endingAt: date(year, month, day, 12, zone: zone),
+                    calendar: calendar
+                )
+                XCTAssertEqual(
+                    buckets.count,
+                    range.bucketCount,
+                    "\(name) \(range.title) lost a bucket."
+                )
+                for (earlier, later) in zip(buckets, buckets.dropFirst()) {
+                    XCTAssertEqual(
+                        earlier.end,
+                        later.start,
+                        "\(name) \(range.title): a hole or overlap here silently drops readings."
+                    )
+                }
+                // Every boundary must be a real local start-of-unit, not
+                // whatever wall time survived the arithmetic.
+                if range.bucketUnit == .day {
+                    for bucket in buckets {
+                        XCTAssertEqual(
+                            bucket.start,
+                            calendar.startOfDay(for: bucket.start),
+                            "\(name): \(bucket.start) is not the start of a local day."
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    /// Contiguity alone is not enough: every instant in the range has to land
+    /// in exactly one bucket, checked instant by instant across a transition.
+    func testEveryInstantAcrossAMidnightTransitionLandsInExactlyOneBucket() throws {
+        let zone = try XCTUnwrap(TimeZone(identifier: "America/Santiago"))
+        let calendar = calendar(zone)
+        let buckets = MetricBucketing.buckets(
+            for: .week,
+            endingAt: date(2025, 9, 10, 12, zone: zone),
+            calendar: calendar
+        )
+        let first = try XCTUnwrap(buckets.first)
+        let last = try XCTUnwrap(buckets.last)
+
+        // Every quarter hour of the week, counted independently of the binary
+        // search by scanning all the buckets.
+        var instant = first.start
+        while instant < last.end {
+            let matches = buckets.filter { $0.start <= instant && instant < $0.end }
+            XCTAssertEqual(
+                matches.count,
+                1,
+                "\(instant) belongs to \(matches.count) buckets; it must belong to one."
+            )
+            XCTAssertNotNil(
+                MetricBucketing.index(of: instant, in: buckets),
+                "\(instant) is inside the range but the search found no bucket."
+            )
+            instant = instant.addingTimeInterval(900)
+        }
+    }
+
+    /// The consequence, in the shape someone would actually see it: seven
+    /// ordinary nights across a midnight transition must be seven bars, not
+    /// one bar of sixteen hours beside an empty one.
+    func testSevenNightsAcrossAMidnightTransitionAreSevenSeparateDays() throws {
+        let zone = try XCTUnwrap(TimeZone(identifier: "America/Santiago"))
+        let calendar = calendar(zone)
+        let now = date(2025, 9, 10, 12, zone: zone)
+        let intervals = MetricBucketing.buckets(for: .week, endingAt: now, calendar: calendar)
+
+        // One eight-hour night ending each morning of the week.
+        let nights: [DateInterval] = intervals.compactMap { bucket in
+            let wake = calendar.date(byAdding: .hour, value: 7, to: bucket.start)
+            guard let wake, let sleep = calendar.date(byAdding: .hour, value: -8, to: wake) else {
+                return nil
+            }
+            return DateInterval(start: sleep, end: wake)
+        }
+        XCTAssertEqual(nights.count, 7, "Precondition: seven nights.")
+
+        let series = MetricAggregator.aggregate(
+            SleepAttribution.readings(from: nights, calendar: calendar),
+            into: intervals,
+            using: .total
+        )
+
+        XCTAssertEqual(
+            series.buckets.filter(\.hasData).count,
+            7,
+            "Every night must reach its own day."
+        )
+        for bucket in series.buckets {
+            XCTAssertEqual(
+                bucket.value ?? 0,
+                8,
+                accuracy: 0.001,
+                "No day may hold two nights, and none may lose one."
+            )
+        }
+    }
+
     func testAYearIsDrawnInTwelveMonthlyBucketsEndingWithThisMonth() {
         let calendar = calendar(newYork)
         let buckets = MetricBucketing.buckets(
@@ -791,6 +917,181 @@ final class HealthDashboardTests: XCTestCase {
         let readings = SleepAttribution.readings(from: [early, late], calendar: calendar)
         let total = readings.reduce(0.0) { $0 + $1.value }
         XCTAssertEqual(total, 3, accuracy: 0.000_1, "Three hours of sleep, counted once.")
+    }
+
+    // MARK: - Units the display attaches
+
+    /// HealthKit's percent unit is a fraction, not a percentage: the header
+    /// says `% (0.0 - 1.0)`. A blood oxygen of 98% arrives as 0.98, and shown
+    /// beside a "%" label with one decimal it reads "1.0 %" — alarming and
+    /// wrong. The scale and the label have to agree, and they are declared
+    /// in different places, so this checks they do.
+    func testEveryPercentMetricIsScaledToMatchItsPercentLabel() throws {
+        var checked = 0
+        for metric in DashboardMetrics.all {
+            let reading = try XCTUnwrap(
+                DashboardMetrics.reading(for: metric),
+                "\(metric.title) has no unit chosen for it."
+            )
+            if reading.unit == HKUnit.percent() {
+                checked += 1
+                XCTAssertEqual(
+                    reading.scale,
+                    100,
+                    "\(metric.title) is read as a fraction and must be scaled to a percentage."
+                )
+                XCTAssertEqual(
+                    metric.unitLabel,
+                    "%",
+                    "\(metric.title) is scaled to a percentage, so it must say so."
+                )
+                // Worked by hand: HealthKit's 0.98 is 98 per cent.
+                XCTAssertEqual(0.98 * reading.scale, 98, accuracy: 0.000_001)
+            } else {
+                XCTAssertEqual(
+                    reading.scale,
+                    1,
+                    "\(metric.title) is read in its own unit and must not be rescaled."
+                )
+            }
+        }
+        XCTAssertGreaterThan(checked, 0, "Precondition: at least one percent metric exists.")
+    }
+
+    func testEveryMetricOfferedHasAUnitAndAnIdentity() throws {
+        var seen: Set<String> = []
+        for metric in DashboardMetrics.all {
+            XCTAssertTrue(seen.insert(metric.id).inserted, "\(metric.id) is listed twice.")
+            XCTAssertNotNil(
+                DashboardMetrics.reading(for: metric),
+                "\(metric.title) would be read in the wrong unit."
+            )
+            XCTAssertFalse(metric.unitLabel.isEmpty)
+        }
+    }
+
+    // MARK: - The shape HealthKit actually returns
+
+    /// HealthKit does not say how many readings a bucket stands for, so the
+    /// reader sets `readingCount` to zero and the whole range is asked for
+    /// separately. This is that shape, which no other test drives.
+    func testASeriesShapedTheWayHealthKitReturnsItSummarisesCorrectly() throws {
+        let calendar = calendar(newYork)
+        let now = date(2025, 6, 15, 12, zone: newYork)
+        let intervals = MetricBucketing.buckets(for: .week, endingAt: now, calendar: calendar)
+        let values: [Double?] = [nil, 8_000, 10_000, nil, 12_000, 9_000, 3_000]
+
+        let buckets = zip(intervals, values).map { interval, value in
+            MetricBucket(
+                interval: interval,
+                value: value,
+                minimum: value,
+                maximum: value,
+                readingCount: 0,
+                sampleCount: value == nil ? 0 : 1
+            )
+        }
+
+        // A cumulative type needs no whole-range figure: a sum of sums is the
+        // same number however it is grouped.
+        let steps = MetricSeries(
+            buckets: buckets,
+            unit: "count",
+            aggregation: .total,
+            hasUnitConflict: false,
+            containsAggregatedReadings: false
+        )
+        // By hand: 8,000 + 10,000 + 12,000 + 9,000 + 3,000 = 42,000 over five
+        // days with data, so 8,400 each.
+        XCTAssertEqual(steps.summary.headline, 42_000)
+        XCTAssertEqual(steps.summary.averagePerActiveBucket, 8_400)
+        XCTAssertEqual(steps.summary.bucketsWithData, 5)
+        XCTAssertTrue(steps.summary.hasData)
+
+        // A measured type carries HealthKit's own whole-range answer.
+        let heart = MetricSeries(
+            buckets: buckets,
+            unit: "count/min",
+            aggregation: .average,
+            hasUnitConflict: false,
+            containsAggregatedReadings: false,
+            overall: MetricOverall(value: 58.4, minimum: 41, maximum: 168)
+        )
+        XCTAssertEqual(heart.summary.headline, 58.4)
+        XCTAssertEqual(heart.summary.lowest, 41)
+        XCTAssertEqual(heart.summary.highest, 168)
+        XCTAssertTrue(heart.summary.hasData)
+    }
+
+    /// With neither counts nor a whole-range figure there is no honest average
+    /// to report, and the mean of the daily means must not be passed off as
+    /// one. Reporting nothing is the correct direction to be wrong in.
+    func testAMeasuredSeriesWithNeitherCountsNorAWholeRangeFigureReportsNoAverage() throws {
+        let calendar = calendar(newYork)
+        let intervals = MetricBucketing.buckets(
+            for: .week,
+            endingAt: date(2025, 6, 15, 12, zone: newYork),
+            calendar: calendar
+        )
+        let buckets = intervals.enumerated().map { index, interval in
+            MetricBucket(
+                interval: interval,
+                value: index < 2 ? Double(60 + index * 40) : nil,
+                minimum: nil,
+                maximum: nil,
+                readingCount: 0,
+                sampleCount: index < 2 ? 1 : 0
+            )
+        }
+        let series = MetricSeries(
+            buckets: buckets,
+            unit: "count/min",
+            aggregation: .average,
+            hasUnitConflict: false,
+            containsAggregatedReadings: false
+        )
+
+        XCTAssertTrue(series.hasAnyData, "There are values to draw.")
+        XCTAssertNil(
+            series.summary.headline,
+            "80 would be the mean of the daily means, which is not the average."
+        )
+    }
+
+    // MARK: - Sleep, in the shapes a watch actually writes
+
+    /// A watch writes a night as a chain of touching stage samples — core,
+    /// deep, REM, core — each beginning exactly where the last ended. They
+    /// have to become one stretch, not four.
+    func testTouchingSleepStagesBecomeOneStretch() {
+        let base = date(2025, 6, 12, 23, zone: newYork)
+        let stages = (0..<4).map { index in
+            DateInterval(
+                start: base.addingTimeInterval(Double(index) * 3_600),
+                end: base.addingTimeInterval(Double(index + 1) * 3_600)
+            )
+        }
+
+        let merged = SleepAttribution.merge(stages)
+        XCTAssertEqual(merged.count, 1, "Four touching stages are one night.")
+        // Four hours, whether counted as one stretch or four.
+        XCTAssertEqual(merged[0].duration, 4 * 3_600)
+
+        let readings = SleepAttribution.readings(from: stages, calendar: calendar(newYork))
+        XCTAssertEqual(readings.count, 1, "One night, filed under one day.")
+        XCTAssertEqual(readings[0].value, 4, accuracy: 0.000_1)
+        XCTAssertEqual(readings[0].start, date(2025, 6, 13, zone: newYork))
+    }
+
+    /// A stretch of zero length is not sleep and must not create a day.
+    func testZeroLengthSleepIsIgnored() {
+        let instant = date(2025, 6, 13, 2, zone: newYork)
+        let readings = SleepAttribution.readings(
+            from: [DateInterval(start: instant, end: instant)],
+            calendar: calendar(newYork)
+        )
+        XCTAssertTrue(readings.isEmpty)
+        XCTAssertTrue(SleepAttribution.merge([DateInterval(start: instant, end: instant)]).isEmpty)
     }
 
     // MARK: - Ranges

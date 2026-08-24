@@ -20,15 +20,22 @@ actor HealthMetricReader {
     // Safe to share: `HKHealthStore` documents its queries as usable from any
     // thread, and this type only ever executes them. The same reasoning the
     // export backends are written under.
-    private nonisolated(unsafe) let healthStore: HKHealthStore
+    // Reachable from the workout and electrocardiogram reads in
+    // WorkoutAndECGReading.swift, which extend this actor.
+    nonisolated(unsafe) let healthStore: HKHealthStore
     private let calendar: Calendar
 
-    init(
-        healthStore: HKHealthStore = HKHealthStore(),
-        calendar: Calendar = .current
-    ) {
+    /// The calendar the date maths in extensions of this actor uses.
+    var calendarForQueries: Calendar { calendar }
+
+    /// - Note: The calendar is deliberately not injectable.
+    ///   `HKStatisticsCollectionQuery` computes its own intervals with the
+    ///   system calendar and cannot be told to use another, so a reader
+    ///   bucketing on a different one would put the two chains on different
+    ///   boundaries and the mapping between them would stop being one to one.
+    init(healthStore: HKHealthStore = HKHealthStore()) {
         self.healthStore = healthStore
-        self.calendar = calendar
+        self.calendar = .current
     }
 
     var isAvailable: Bool {
@@ -73,6 +80,31 @@ actor HealthMetricReader {
             }
         }
         return types
+    }
+
+    /// Asks for read access to the types the dashboard draws.
+    ///
+    /// HealthKit answers `success` once the sheet has been dealt with, whatever
+    /// the person chose. It is not a statement that anything was granted, and
+    /// nothing here treats it as one.
+    func requestAccess(to metrics: [DashboardMetric]) async throws {
+        guard HKHealthStore.isHealthDataAvailable() else {
+            throw HealthMetricError.healthUnavailable
+        }
+        let types = readTypes(for: metrics)
+        guard !types.isEmpty else {
+            return
+        }
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Void, any Error>) in
+            healthStore.requestAuthorization(toShare: [], read: types) { _, error in
+                if let error {
+                    continuation.resume(throwing: HealthKitFailure.classify(error))
+                } else {
+                    continuation.resume()
+                }
+            }
+        }
     }
 
     // MARK: - Series
@@ -124,11 +156,12 @@ actor HealthMetricReader {
             ) else {
                 throw HealthMetricError.unknownType(identifier)
             }
-            let unit = DashboardMetrics.unit(for: metric) ?? .count()
+            let reading = DashboardMetrics.reading(for: metric)
+                ?? DashboardMetrics.Reading(.count())
             let aggregation = MetricAggregation(type.aggregationStyle)
             return try await quantitySeries(
                 type: type,
-                unit: unit,
+                reading: reading,
                 aggregation: aggregation,
                 intervals: intervals,
                 range: range
@@ -138,11 +171,13 @@ actor HealthMetricReader {
 
     private func quantitySeries(
         type: HKQuantityType,
-        unit: HKUnit,
+        reading: DashboardMetrics.Reading,
         aggregation: MetricAggregation,
         intervals: [DateInterval],
         range: MetricRange
     ) async throws -> MetricSeries {
+        let unit = reading.unit
+        let scale = reading.scale
         guard let first = intervals.first, let last = intervals.last else {
             throw HealthMetricError.emptyRange
         }
@@ -197,9 +232,11 @@ actor HealthMetricReader {
                     gathered.append(
                         StatisticsBucket(
                             start: statistics.startDate,
-                            value: quantity.doubleValue(for: unit),
-                            minimum: statistics.minimumQuantity()?.doubleValue(for: unit),
-                            maximum: statistics.maximumQuantity()?.doubleValue(for: unit)
+                            value: quantity.doubleValue(for: unit) * scale,
+                            minimum: statistics.minimumQuantity()
+                                .map { $0.doubleValue(for: unit) * scale },
+                            maximum: statistics.maximumQuantity()
+                                .map { $0.doubleValue(for: unit) * scale }
                         )
                     )
                 }
@@ -211,17 +248,25 @@ actor HealthMetricReader {
         let overall = try await wholeRange(
             type: type,
             unit: unit,
+            scale: scale,
             aggregation: aggregation,
             from: rangeStart,
             to: rangeEnd
         )
 
+        // Merged rather than assigned. HealthKit walks its own intervals
+        // forward from the anchor with the system calendar, so on the one day
+        // a year a local day is twenty-five hours long it can return two
+        // statistics whose starts both fall inside a single bucket here.
+        // Overwriting would drop one of them silently — from the bar and, for
+        // a cumulative type, from the range total with it.
         var byIndex: [Int: StatisticsBucket] = [:]
         for bucket in bucketValues {
             guard let index = MetricBucketing.index(of: bucket.start, in: intervals) else {
                 continue
             }
-            byIndex[index] = bucket
+            byIndex[index] = byIndex[index].map { $0.merged(with: bucket, using: aggregation) }
+                ?? bucket
         }
 
         let buckets = intervals.enumerated().map { index, interval in
@@ -262,6 +307,7 @@ actor HealthMetricReader {
     private func wholeRange(
         type: HKQuantityType,
         unit: HKUnit,
+        scale: Double,
         aggregation: MetricAggregation,
         from start: Date,
         to end: Date
@@ -278,7 +324,15 @@ actor HealthMetricReader {
                     // some types. That is not a failure worth surfacing — it
                     // is the empty answer — so it becomes "nothing" here and
                     // the buckets say the same thing.
-                    if (error as NSError).code == HKError.errorNoData.rawValue {
+                    //
+                    // The domain is checked as well as the code, following
+                    // HealthKitCharacteristicsReader. Code 7 exists in several
+                    // domains, and swallowing a Cocoa or POSIX error as "no
+                    // data" would leave the range headline quietly absent over
+                    // a chart that is visibly drawing.
+                    let nsError = error as NSError
+                    if nsError.domain == HKError.errorDomain,
+                       nsError.code == HKError.errorNoData.rawValue {
                         continuation.resume(returning: nil)
                     } else {
                         continuation.resume(throwing: HealthKitFailure.classify(error))
@@ -299,9 +353,11 @@ actor HealthMetricReader {
                 }
                 continuation.resume(
                     returning: MetricOverall(
-                        value: quantity.doubleValue(for: unit),
-                        minimum: statistics.minimumQuantity()?.doubleValue(for: unit),
-                        maximum: statistics.maximumQuantity()?.doubleValue(for: unit)
+                        value: quantity.doubleValue(for: unit) * scale,
+                        minimum: statistics.minimumQuantity()
+                            .map { $0.doubleValue(for: unit) * scale },
+                        maximum: statistics.maximumQuantity()
+                            .map { $0.doubleValue(for: unit) * scale }
                     )
                 )
             }
@@ -390,10 +446,29 @@ private struct StatisticsBucket: Sendable {
     let value: Double
     let minimum: Double?
     let maximum: Double?
+
+    /// Two statistics that landed in the same bucket, combined the way that
+    /// bucket's type allows.
+    ///
+    /// Sums add exactly. Averages cannot be combined exactly without knowing
+    /// how many readings each stands for, and HealthKit does not say — so the
+    /// two are meaned, which is approximate. That approximation only ever
+    /// reaches a drawn bar: every reported statistic for a measured type comes
+    /// from the whole-range query, which sees the readings themselves.
+    func merged(with other: StatisticsBucket, using aggregation: MetricAggregation) -> Self {
+        StatisticsBucket(
+            start: Swift.min(start, other.start),
+            value: aggregation == .total ? value + other.value : (value + other.value) / 2,
+            minimum: [minimum, other.minimum].compactMap { $0 }.min(),
+            maximum: [maximum, other.maximum].compactMap { $0 }.max()
+        )
+    }
 }
 enum HealthMetricError: Error, LocalizedError, Equatable {
     case unknownType(String)
     case emptyRange
+    case healthUnavailable
+    case waveformUnreadable
 
     var errorDescription: String? {
         switch self {
@@ -401,6 +476,10 @@ enum HealthMetricError: Error, LocalizedError, Equatable {
             "This version of iOS does not know the type \(identifier)."
         case .emptyRange:
             "That range covers no time at all."
+        case .healthUnavailable:
+            "Apple Health is unavailable or restricted on this device."
+        case .waveformUnreadable:
+            "Health did not return the readings behind this recording."
         }
     }
 }
