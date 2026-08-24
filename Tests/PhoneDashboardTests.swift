@@ -4,6 +4,7 @@ import HozzCatalog
 import HozzHealth
 import XCTest
 @testable import Hozz
+@testable import HozzHealth
 
 /// The arithmetic behind the iPhone's charts.
 ///
@@ -823,9 +824,9 @@ final class PhoneDashboardTests: XCTestCase {
         XCTAssertEqual(merged.reduce(0) { $0 + $1.duration }, 5 * 3_600)
     }
 
-    /// A night beginning before midnight belongs to the morning it ends on,
-    /// which is where a person looks for it.
-    func testANightBeginningInTheEveningIsFiledUnderTheFollowingDay() {
+    /// Case 1 of 4. An ordinary night: asleep before midnight, awake after it.
+    /// Both rules agree here, which is why the disagreement went unnoticed.
+    func testAnOrdinaryNightIsFiledUnderTheMorningItEndedOn() {
         let calendar = calendar(newYork)
         let night = DateInterval(
             start: date(2025, 6, 12, 23, 30, zone: newYork),
@@ -854,17 +855,10 @@ final class PhoneDashboardTests: XCTestCase {
         XCTAssertEqual(readings[0].value, 1, accuracy: 0.000_1)
     }
 
-    /// Time in bed is not time asleep, and reporting it as such is the most
-    /// common way a sleep figure flatters someone.
-    /// The awkward case, pinned deliberately rather than left undiscovered.
-    ///
-    /// Deciding on the start alone means an evening nap is filed under the
-    /// following day, though nobody woke then. That is a consequence of the
-    /// rule and not a defect in it — deciding on the end instead would split a
-    /// night that began with dozing on the sofa across two days — but it is
-    /// why the caption states the mechanism rather than saying sleep counts
-    /// towards the day you woke up, which this case would make false.
-    func testAnEveningNapIsFiledUnderTheFollowingDay() {
+    /// Case 2 of 4. An evening nap ends on the evening it began, so it belongs
+    /// to that day. The old rule filed it under the following day — a day the
+    /// sleeper was never asleep at all.
+    func testAnEveningNapStaysOnTheDayItHappened() {
         let calendar = calendar(newYork)
         let nap = DateInterval(
             start: date(2025, 6, 12, 19, zone: newYork),
@@ -875,15 +869,16 @@ final class PhoneDashboardTests: XCTestCase {
         XCTAssertEqual(readings.count, 1)
         XCTAssertEqual(
             readings[0].start,
-            date(2025, 6, 13, zone: newYork),
-            "Nineteen hundred is after the boundary, so it counts towards the 13th."
+            date(2025, 6, 12, zone: newYork),
+            "They woke on the 12th, so it counts towards the 12th."
         )
         XCTAssertEqual(readings[0].value, 1, accuracy: 0.000_1)
     }
 
-    /// The mirror of the case above: someone asleep before the boundary has
-    /// the night filed under the day it began, not the day they woke.
-    func testANightBegunBeforeTheBoundaryIsFiledUnderTheDayItStarted() {
+    /// Case 3 of 4. Someone asleep before six in the evening still wakes the
+    /// next morning, and that is the day the night belongs to. The old rule
+    /// filed the whole night under the day it began.
+    func testANightBegunEarlyInTheEveningStillCountsTowardsTheMorningAfter() {
         let calendar = calendar(newYork)
         let night = DateInterval(
             start: date(2025, 6, 12, 17, 30, zone: newYork),
@@ -893,31 +888,92 @@ final class PhoneDashboardTests: XCTestCase {
         let readings = SleepAttribution.readings(from: [night], calendar: calendar)
         XCTAssertEqual(
             readings[0].start,
-            date(2025, 6, 12, zone: newYork),
-            "Half past five is before the boundary, so it counts towards the 12th."
+            date(2025, 6, 13, zone: newYork),
+            "They woke on the 13th, however early they went to bed."
         )
         // 17:30 to 06:00 is twelve and a half hours.
         XCTAssertEqual(readings[0].value, 12.5, accuracy: 0.000_1)
     }
 
-    /// The caption says "at 6pm or later", so the instant itself has to fall on
-    /// the later side. One second earlier must not.
-    func testTheBoundaryInstantItselfCountsTowardsTheNextDay() {
+    /// Case 4 of 4, found by a reviewer. A stretch spanning two midnights ends
+    /// two days after it began, and the old rule could only ever move the
+    /// filing forward by one — so it landed a day before they woke.
+    func testSleepCrossingTwoMidnightsIsFiledOnTheDayItEnded() {
         let calendar = calendar(newYork)
-
-        let atSix = SleepAttribution.day(
-            forSleepStartingAt: date(2025, 6, 12, 18, 0, zone: newYork),
-            calendar: calendar
-        )
-        let justBefore = SleepAttribution.day(
-            forSleepStartingAt: date(2025, 6, 12, 17, 59, zone: newYork),
-            calendar: calendar
+        let long = DateInterval(
+            start: date(2025, 6, 12, 23, 0, zone: newYork),
+            end: date(2025, 6, 14, 10, 0, zone: newYork)
         )
 
-        XCTAssertEqual(atSix, date(2025, 6, 13, zone: newYork), "Six exactly is 'or later'.")
-        XCTAssertEqual(justBefore, date(2025, 6, 12, zone: newYork), "A minute before is not.")
+        let readings = SleepAttribution.readings(from: [long], calendar: calendar)
+        XCTAssertEqual(
+            readings[0].start,
+            date(2025, 6, 14, zone: newYork),
+            "The 14th is when they woke; the old rule said the 13th."
+        )
+        // 23:00 on the 12th to 10:00 on the 14th is 35 hours.
+        XCTAssertEqual(readings[0].value, 35, accuracy: 0.000_1)
     }
 
+    /// The case the new rule loses, pinned so nobody thinks it was overlooked.
+    ///
+    /// A doze on the sofa that ends before midnight is its own stretch and is
+    /// filed under the evening it happened, rather than joined to the night
+    /// that follows. Defensible rather than plainly wrong, and the rarest of
+    /// the four — but it is a real difference and it should be visible.
+    func testADozeEndingBeforeMidnightIsFiledSeparatelyFromTheNight() {
+        let calendar = calendar(newYork)
+        let doze = DateInterval(
+            start: date(2025, 6, 12, 22, 0, zone: newYork),
+            end: date(2025, 6, 12, 23, 0, zone: newYork)
+        )
+        let night = DateInterval(
+            start: date(2025, 6, 12, 23, 30, zone: newYork),
+            end: date(2025, 6, 13, 7, 0, zone: newYork)
+        )
+
+        // A half-hour awake separates them, so they do not merge.
+        let readings = SleepAttribution.readings(from: [doze, night], calendar: calendar)
+        XCTAssertEqual(readings.count, 2, "Two stretches, two days.")
+        XCTAssertEqual(readings[0].start, date(2025, 6, 12, zone: newYork))
+        XCTAssertEqual(readings[0].value, 1, accuracy: 0.000_1)
+        XCTAssertEqual(readings[1].start, date(2025, 6, 13, zone: newYork))
+        XCTAssertEqual(readings[1].value, 7.5, accuracy: 0.000_1)
+    }
+
+    /// The sharp edge that worried me under the old rule, checked rather than
+    /// assumed to have gone.
+    ///
+    /// `merge` joins *touching* stretches. Under the start rule, a record
+    /// beginning at 17:45 that abutted a night pulled the merged start before
+    /// the six o'clock boundary and dragged the whole night onto the previous
+    /// day. Filing on the end makes the merged stretch's start irrelevant, so
+    /// the night lands where the sleeper woke however early the first record
+    /// began.
+    func testARecordAbuttingANightNoLongerDragsItOntoTheDayBefore() {
+        let calendar = calendar(newYork)
+        let early = DateInterval(
+            start: date(2025, 6, 12, 17, 45, zone: newYork),
+            end: date(2025, 6, 12, 18, 15, zone: newYork)
+        )
+        let night = DateInterval(
+            start: date(2025, 6, 12, 18, 15, zone: newYork),
+            end: date(2025, 6, 13, 6, 0, zone: newYork)
+        )
+
+        let readings = SleepAttribution.readings(from: [early, night], calendar: calendar)
+        XCTAssertEqual(readings.count, 1, "Touching stretches are one stretch.")
+        XCTAssertEqual(
+            readings[0].start,
+            date(2025, 6, 13, zone: newYork),
+            "The merged stretch ends on the 13th, so it counts towards the 13th."
+        )
+        // 17:45 to 06:00 is twelve and a quarter hours.
+        XCTAssertEqual(readings[0].value, 12.25, accuracy: 0.000_1)
+    }
+
+    /// Time in bed is not time asleep, and reporting it as such is the most
+    /// common way a sleep figure flatters someone.
     func testTimeInBedAndTimeAwakeAreNotCountedAsSleep() {
         XCTAssertFalse(
             HealthMetricReader.isAsleep(HKCategoryValueSleepAnalysis.inBed.rawValue)
@@ -966,23 +1022,96 @@ final class PhoneDashboardTests: XCTestCase {
     }
 
     /// Merging must happen across the whole set before anything is filed under
-    /// a day, or two records of the same night that straddle the six o'clock
-    /// boundary are never compared and their shared hours are counted twice.
-    func testOverlapAcrossTheAttributionBoundaryIsStillMergedOnce() {
+    /// a day, or two records of one night that end either side of midnight are
+    /// never compared and their shared hours are counted twice.
+    func testOverlapAcrossMidnightIsStillMergedOnce() {
         let calendar = calendar(newYork)
+        // Ends on the 12th.
         let early = DateInterval(
-            start: date(2025, 6, 12, 17, 30, zone: newYork),
-            end: date(2025, 6, 12, 19, 30, zone: newYork)
+            start: date(2025, 6, 12, 22, 0, zone: newYork),
+            end: date(2025, 6, 12, 23, 30, zone: newYork)
         )
+        // Ends on the 13th, and overlaps the first by half an hour.
         let late = DateInterval(
-            start: date(2025, 6, 12, 18, 30, zone: newYork),
-            end: date(2025, 6, 12, 20, 30, zone: newYork)
+            start: date(2025, 6, 12, 23, 0, zone: newYork),
+            end: date(2025, 6, 13, 2, 0, zone: newYork)
         )
 
-        // Union is 17:30 to 20:30, three hours. Added separately it is four.
+        // Filed first and merged afterwards, these never meet: 1.5 hours would
+        // land on the 12th and 3 on the 13th, totalling 4.5 for a night that
+        // was four hours long. Merged first, the union is 22:00 to 02:00.
         let readings = SleepAttribution.readings(from: [early, late], calendar: calendar)
-        let total = readings.reduce(0.0) { $0 + $1.value }
-        XCTAssertEqual(total, 3, accuracy: 0.000_1, "Three hours of sleep, counted once.")
+        XCTAssertEqual(readings.count, 1, "One union is one stretch, on one day.")
+        XCTAssertEqual(readings[0].start, date(2025, 6, 13, zone: newYork))
+        XCTAssertEqual(readings[0].value, 4, accuracy: 0.000_1, "Four hours, counted once.")
+    }
+
+    /// The caption promises "the day you woke up". This holds the rule to that
+    /// promise across every shape of stretch, and does it with a mechanism the
+    /// dashboard does not use.
+    ///
+    /// The oracle is `LocalDayFormatter`, the export's own day arithmetic:
+    /// it adds the zone offset to the Unix instant and floors by 86,400,
+    /// touching no calendar at all, where the dashboard asks `Calendar` for the
+    /// start of the day. Two unrelated routes to the same answer. It is also
+    /// the implementation the phone is being aligned with, so agreement here is
+    /// the thing that stops the chart and the exported note disagreeing about
+    /// what "last night" means.
+    func testEveryStretchIsFiledUnderTheDayItsSleeperWokeUp() {
+        let zones = [newYork, TimeZone(identifier: "Australia/Sydney")!]
+        for zone in zones {
+            let calendar = calendar(zone)
+            let oracle = LocalDayFormatter(timeZone: zone)
+
+            let stretches: [(String, DateInterval)] = [
+                ("ordinary night", DateInterval(
+                    start: date(2025, 6, 12, 23, 30, zone: zone),
+                    end: date(2025, 6, 13, 7, 0, zone: zone)
+                )),
+                ("evening nap", DateInterval(
+                    start: date(2025, 6, 12, 19, 0, zone: zone),
+                    end: date(2025, 6, 12, 20, 0, zone: zone)
+                )),
+                ("asleep before six", DateInterval(
+                    start: date(2025, 6, 12, 17, 30, zone: zone),
+                    end: date(2025, 6, 13, 6, 0, zone: zone)
+                )),
+                ("two midnights", DateInterval(
+                    start: date(2025, 6, 12, 23, 0, zone: zone),
+                    end: date(2025, 6, 14, 10, 0, zone: zone)
+                )),
+                ("woke exactly at midnight", DateInterval(
+                    start: date(2025, 6, 12, 21, 0, zone: zone),
+                    end: date(2025, 6, 13, 0, 0, zone: zone)
+                )),
+                ("across a clock change", DateInterval(
+                    start: date(2025, 3, 8, 23, 0, zone: zone),
+                    end: date(2025, 3, 9, 8, 0, zone: zone)
+                )),
+                ("night shift, slept by day", DateInterval(
+                    start: date(2025, 6, 12, 8, 0, zone: zone),
+                    end: date(2025, 6, 12, 16, 0, zone: zone)
+                ))
+            ]
+
+            for (name, stretch) in stretches {
+                let readings = SleepAttribution.readings(from: [stretch], calendar: calendar)
+                XCTAssertEqual(readings.count, 1, "\(name) in \(zone.identifier)")
+                guard let filed = readings.first?.start else {
+                    continue
+                }
+                XCTAssertEqual(
+                    oracle.dayNumber(for: filed),
+                    oracle.dayNumber(for: stretch.end),
+                    """
+                    \(name) in \(zone.identifier): filed under \
+                    \(LocalDayFormatter.text(forDayNumber: oracle.dayNumber(for: filed))) \
+                    but the sleeper woke on \
+                    \(LocalDayFormatter.text(forDayNumber: oracle.dayNumber(for: stretch.end)))
+                    """
+                )
+            }
+        }
     }
 
     // MARK: - Units the display attaches
@@ -1024,57 +1153,41 @@ final class PhoneDashboardTests: XCTestCase {
         XCTAssertGreaterThan(checked, 0, "Precondition: at least one percent metric exists.")
     }
 
-    /// A metric whose values are filed under a day other than the one the
-    /// reading started on has made a choice on the reader's behalf, and a
-    /// choice nobody can see makes a correct number look like a mistake. This
-    /// finds such metrics by exercising the attribution rather than by knowing
-    /// which they are, then insists each one says so on screen.
+    /// Sleep does not report the day it was measured on; it reports the day it
+    /// ended on, which for an evening nap is not the day it started. A metric
+    /// that re-files a reading has made a choice on the reader's behalf, and a
+    /// choice nobody can see makes a correct number look like a mistake.
     ///
-    /// It checks only that something is said. Whether what is said is *true*
-    /// is pinned separately, by
-    /// `testTheCaptionNamesTheHourTheRuleActuallyUses` and
-    /// `testTheBoundaryInstantItselfCountsTowardsTheNextDay`.
-    func testAMetricThatFilesAReadingUnderADifferentDaySaysSoOnScreen() throws {
+    /// This establishes the re-filing by exercising it rather than by knowing
+    /// which metric does it, then insists that metric says so on screen.
+    /// Whether what it says is *true* is pinned by
+    /// `testEveryStretchIsFiledUnderTheDayItsSleeperWokeUp`.
+    func testAMetricThatRefilesAReadingSaysSoOnScreen() throws {
         let calendar = calendar(newYork)
         let sleep = try XCTUnwrap(
             DashboardMetrics.all.first { $0.kind == .sleep },
             "Precondition: sleep is on offer."
         )
 
-        // Worked by hand against the rule, not read back from it: a night that
-        // begins at 23:30 on the 12th is filed under the 13th, and one that
-        // begins at 06:00 on the 12th is filed under the 12th. If both landed
-        // on the day they started, no explanation would be owed.
-        let lateNight = date(2025, 6, 12, 23, 30, zone: newYork)
-        let morning = date(2025, 6, 12, 6, 0, zone: newYork)
-
-        let lateNightDay = try XCTUnwrap(
-            SleepAttribution.day(forSleepStartingAt: lateNight, calendar: calendar)
+        // A night that begins at 23:30 on the 12th is reported on the 13th.
+        // Every other metric would report it on the 12th, the day it started.
+        let night = DateInterval(
+            start: date(2025, 6, 12, 23, 30, zone: newYork),
+            end: date(2025, 6, 13, 7, 0, zone: newYork)
         )
-        let morningDay = try XCTUnwrap(
-            SleepAttribution.day(forSleepStartingAt: morning, calendar: calendar)
+        let filed = try XCTUnwrap(
+            SleepAttribution.readings(from: [night], calendar: calendar).first?.start
         )
 
-        XCTAssertEqual(
-            lateNightDay,
-            date(2025, 6, 13, 0, 0, zone: newYork),
-            "A night beginning before midnight belongs to the morning it ends on."
-        )
-        XCTAssertEqual(
-            morningDay,
-            date(2025, 6, 12, 0, 0, zone: newYork),
-            "A morning nap belongs to the day it happened on."
-        )
-
-        // Established, not assumed: this metric really does re-file a reading.
+        XCTAssertEqual(filed, date(2025, 6, 13, zone: newYork))
         XCTAssertNotEqual(
-            lateNightDay,
-            calendar.startOfDay(for: lateNight),
-            "Precondition: sleep attribution is non-obvious, so it owes an explanation."
+            filed,
+            calendar.startOfDay(for: night.start),
+            "Precondition: sleep really is re-filed, so it owes an explanation."
         )
         XCTAssertNotNil(
             sleep.note,
-            "Sleep is filed under a day it did not start on and must say so."
+            "Sleep is reported on a day it did not start on and must say so."
         )
     }
 
@@ -1090,38 +1203,104 @@ final class PhoneDashboardTests: XCTestCase {
         }
     }
 
-    /// The caption is written by hand and the boundary is a constant, so
-    /// nothing but a test keeps the two saying the same thing. Moving the
-    /// constant without rewriting the sentence would leave the app stating a
-    /// rule it does not follow, which is worse than stating none: a reader
-    /// who is told the rule will believe it and stop questioning the number.
-    ///
-    /// The hour is spoken here rather than read out of the caption — 18 on a
-    /// twenty-four hour clock is six in the evening — so this is a second
-    /// opinion on the sentence and not a copy of it.
-    func testTheCaptionNamesTheHourTheRuleActuallyUses() throws {
+    /// The caption makes two claims. Each one is checked against what the code
+    /// actually does, so the sentence cannot drift away from the rule while
+    /// still sounding authoritative — which is the failure that shipped once
+    /// already and is worse than saying nothing, because a reader who is told
+    /// the rule stops questioning the number.
+    func testEachClaimTheCaptionMakesIsOneTheCodeKeeps() throws {
+        let calendar = calendar(newYork)
         let sleep = try XCTUnwrap(DashboardMetrics.all.first { $0.kind == .sleep })
         let note = try XCTUnwrap(sleep.note, "Sleep must explain how it files a night.")
 
-        let hour = SleepAttribution.dayBoundaryHour
-        let spoken: String = switch hour {
-        case 0: "12am"
-        case 1..<12: "\(hour)am"
-        case 12: "12pm"
-        default: "\(hour - 12)pm"
-        }
+        // Claim one: "filed under the day you woke up".
+        XCTAssertTrue(
+            note.localizedCaseInsensitiveContains("woke up"),
+            "The caption must name the wake day. It says: \(note)"
+        )
+        let night = DateInterval(
+            start: date(2025, 6, 12, 23, 30, zone: newYork),
+            end: date(2025, 6, 13, 7, 0, zone: newYork)
+        )
+        XCTAssertEqual(
+            SleepAttribution.readings(from: [night], calendar: calendar).first?.start,
+            date(2025, 6, 13, zone: newYork),
+            "The caption says the wake day, so the wake day is what it must report."
+        )
 
+        // Claim two: "overlapping records are counted once".
         XCTAssertTrue(
-            note.contains(spoken),
-            """
-            The rule turns on \(spoken), so the caption has to name \(spoken). \
-            It says: \(note)
-            """
+            note.localizedCaseInsensitiveContains("once"),
+            "The caption must say overlaps are counted once. It says: \(note)"
         )
-        XCTAssertTrue(
-            note.localizedCaseInsensitiveContains("next day"),
-            "Sleep past the boundary moves forward a day, and the caption must say so."
+        let watch = DateInterval(
+            start: date(2025, 6, 12, 23, 0, zone: newYork),
+            end: date(2025, 6, 13, 6, 0, zone: newYork)
         )
+        let phone = DateInterval(
+            start: date(2025, 6, 13, 1, 0, zone: newYork),
+            end: date(2025, 6, 13, 7, 0, zone: newYork)
+        )
+        // 23:00 to 07:00 is eight hours. Added separately it would be thirteen.
+        let merged = try XCTUnwrap(
+            SleepAttribution.readings(from: [watch, phone], calendar: calendar).first?.value
+        )
+        XCTAssertEqual(
+            merged,
+            8,
+            accuracy: 0.000_1,
+            "Two devices describing one night is one night."
+        )
+
+        // And a guard against the sentence this replaced: naming a clock hour
+        // would mean the start-based rule had come back without the caption
+        // being revisited.
+        XCTAssertNil(
+            note.range(of: #"\d\s*(am|pm)"#, options: [.regularExpression, .caseInsensitive]),
+            "The rule turns on no particular hour, so the caption must not name one."
+        )
+    }
+
+    /// The one place this catalogue reads the same fact twice: `reading(for:)`
+    /// picks miles or kilometres from the locale, and `distanceUnitLabel` picks
+    /// "mi" or "km" from the locale, separately. Editing one and not the other
+    /// is how a 1.14 metre stride comes to be printed as "0.00 km" — a number
+    /// that is wrong and looks deliberate.
+    ///
+    /// The expected pairings are written out here rather than derived, so this
+    /// is a second opinion and not a restatement.
+    func testDistanceAndMassLabelsAgreeWithTheUnitsTheyAreRead() throws {
+        let pairs: [(HKQuantityTypeIdentifier, [(HKUnit, String)])] = [
+            (.distanceWalkingRunning, [(.mile(), "mi"), (.meterUnit(with: .kilo), "km")]),
+            (.bodyMass, [(.pound(), "lb"), (.gramUnit(with: .kilo), "kg")])
+        ]
+
+        for (identifier, allowed) in pairs {
+            let metric = try XCTUnwrap(
+                DashboardMetrics.all.first { $0.quantityIdentifier == identifier },
+                "\(identifier.rawValue) is not on offer."
+            )
+            let reading = try XCTUnwrap(DashboardMetrics.reading(for: metric))
+            let expected = try XCTUnwrap(
+                allowed.first { $0.0 == reading.unit }?.1,
+                "\(metric.title) is read in \(reading.unit), which is neither of its two units."
+            )
+            XCTAssertEqual(
+                metric.unitLabel,
+                expected,
+                "\(metric.title) is read in \(reading.unit) but labelled \(metric.unitLabel)."
+            )
+        }
+    }
+
+    /// Respiratory rate and heart rate are both counts per minute, and calling
+    /// breaths "bpm" is the kind of mislabelling that reads as authoritative.
+    func testBreathsAreNotLabelledAsBeats() throws {
+        let breathing = try XCTUnwrap(
+            DashboardMetrics.all.first { $0.quantityIdentifier == .respiratoryRate }
+        )
+        XCTAssertNotEqual(breathing.unitLabel, "bpm", "Breaths are not beats.")
+        XCTAssertEqual(breathing.unitLabel, "br/min")
     }
 
     func testEveryMetricOfferedHasAUnitAndAnIdentity() throws {
