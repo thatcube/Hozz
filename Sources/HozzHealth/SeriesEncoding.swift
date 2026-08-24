@@ -134,13 +134,20 @@ public enum SeriesEncoding {
     }
 
     /// One page of elements, addressed by its absolute offset in the sample.
+    ///
+    /// - Parameter extra: Fields the page needs to be readable on its own —
+    ///   the unit a quantity series' readings are in, for instance, which is
+    ///   the same for all five hundred of them and would be five hundred
+    ///   copies of one string if it sat on each. It cannot displace a field
+    ///   this record's own shape defines, so a shape's meaning stays fixed.
     public static func elementsChange(
         shape: SeriesShape,
         sample: UUID,
         offset: Int,
         elements: [any SeriesElement],
         sampleStart: Date,
-        sampleEnd: Date
+        sampleEnd: Date,
+        extra: [String: any Sendable] = [:]
     ) throws -> HealthChange {
         let sequence = offset / shape.elementsPerRecord
         let id = identifier(
@@ -165,7 +172,7 @@ public enum SeriesEncoding {
             "startDate": timestamp(start),
             "endDate": timestamp(end),
             shape.elementsKey: elements.map { $0.seriesObject as [String: Any] }
-        ]
+        ].merging(extra.mapValues { $0 as Any }) { defined, _ in defined }
         return .upsert(
             CapturedHealthObject(
                 id: id,

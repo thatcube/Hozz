@@ -168,6 +168,14 @@ public actor SeriesReader<Backend: SeriesBackend> {
             }
             sample = reopened
         }
+        // Dropped before a single element is pulled, and only put back once
+        // the page is built. The stream is a reference: reading from the local
+        // copy advances the one the actor is holding, so a throw part-way
+        // through would leave a cursor that says offset 500 pointing at a
+        // stream already past 1,000 — and the next page would skip the
+        // difference without anything noticing. Forgetting it costs a re-open
+        // after a failure and cannot lose an element.
+        live = nil
 
         var changes: [HealthChange] = []
         while changes.count < shape.recordsPerPage {
