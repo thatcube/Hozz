@@ -1030,9 +1030,10 @@ final class PhoneDashboardTests: XCTestCase {
     /// finds such metrics by exercising the attribution rather than by knowing
     /// which they are, then insists each one says so on screen.
     ///
-    /// It also guards the coupling in the other direction: moving
-    /// `dayBoundaryHour` without rewriting the sentence would leave the app
-    /// stating a rule it no longer follows.
+    /// It checks only that something is said. Whether what is said is *true*
+    /// is pinned separately, by
+    /// `testTheCaptionNamesTheHourTheRuleActuallyUses` and
+    /// `testTheBoundaryInstantItselfCountsTowardsTheNextDay`.
     func testAMetricThatFilesAReadingUnderADifferentDaySaysSoOnScreen() throws {
         let calendar = calendar(newYork)
         let sleep = try XCTUnwrap(
@@ -1087,6 +1088,40 @@ final class PhoneDashboardTests: XCTestCase {
                 "\(metric.title) is filed under the day it was measured; a note only adds noise."
             )
         }
+    }
+
+    /// The caption is written by hand and the boundary is a constant, so
+    /// nothing but a test keeps the two saying the same thing. Moving the
+    /// constant without rewriting the sentence would leave the app stating a
+    /// rule it does not follow, which is worse than stating none: a reader
+    /// who is told the rule will believe it and stop questioning the number.
+    ///
+    /// The hour is spoken here rather than read out of the caption — 18 on a
+    /// twenty-four hour clock is six in the evening — so this is a second
+    /// opinion on the sentence and not a copy of it.
+    func testTheCaptionNamesTheHourTheRuleActuallyUses() throws {
+        let sleep = try XCTUnwrap(DashboardMetrics.all.first { $0.kind == .sleep })
+        let note = try XCTUnwrap(sleep.note, "Sleep must explain how it files a night.")
+
+        let hour = SleepAttribution.dayBoundaryHour
+        let spoken: String = switch hour {
+        case 0: "12am"
+        case 1..<12: "\(hour)am"
+        case 12: "12pm"
+        default: "\(hour - 12)pm"
+        }
+
+        XCTAssertTrue(
+            note.contains(spoken),
+            """
+            The rule turns on \(spoken), so the caption has to name \(spoken). \
+            It says: \(note)
+            """
+        )
+        XCTAssertTrue(
+            note.localizedCaseInsensitiveContains("next day"),
+            "Sleep past the boundary moves forward a day, and the caption must say so."
+        )
     }
 
     func testEveryMetricOfferedHasAUnitAndAnIdentity() throws {
