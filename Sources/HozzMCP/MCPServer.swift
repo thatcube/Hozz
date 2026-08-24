@@ -155,26 +155,112 @@ public actor MCPServer {
     /// heart rate is sampled, so a day's heart rate is the average. Summing
     /// heart rates produces a number that means nothing, and the tools say
     /// which they used so nobody has to guess.
-    private static let accumulatedTypes: Set<String> = [
-        "HKQuantityTypeIdentifierStepCount",
-        "HKQuantityTypeIdentifierDistanceWalkingRunning",
-        "HKQuantityTypeIdentifierDistanceCycling",
-        "HKQuantityTypeIdentifierDistanceSwimming",
-        "HKQuantityTypeIdentifierActiveEnergyBurned",
-        "HKQuantityTypeIdentifierBasalEnergyBurned",
-        "HKQuantityTypeIdentifierAppleExerciseTime",
-        "HKQuantityTypeIdentifierAppleStandTime",
-        "HKQuantityTypeIdentifierFlightsClimbed",
-        "HKQuantityTypeIdentifierDietaryEnergyConsumed",
-        "HKQuantityTypeIdentifierDietaryWater"
-    ]
-
-    private static func isAccumulated(_ type: String) -> Bool {
-        accumulatedTypes.contains(type)
+    ///
+    /// Deferred to ``HealthMeasure``, which is the app's one table of what a
+    /// type is. This used to be a hand-kept list of eleven identifiers beside
+    /// it, and it had drifted: dietary protein, wheelchair distance, time in
+    /// daylight, move time, swimming strokes, push count and several more were
+    /// absent, so every one of them was *averaged* across a day by the trend,
+    /// comparison and anomaly tools. A day's protein reported as the mean of
+    /// each thing eaten is not a day's protein.
+    private static func measure(for type: String) -> HealthMeasure {
+        HealthMeasure.measure(for: type, storedUnit: nil)
     }
 
     private static func statisticName(for type: String) -> String {
-        isAccumulated(type) ? "daily total" : "daily average"
+        switch measure(for: type).kind {
+        case .total: "daily total"
+        case .average: "daily average"
+        case .duration: "daily time"
+        case .occurrences: "daily count"
+        }
+    }
+
+    /// The unit the *daily figure* is in, which is not always the unit the
+    /// samples are stored in.
+    ///
+    /// `dailySeries` reports what a day of a type means, and for a duration
+    /// that is seconds and for an occurrence it is a bare count. Taking the
+    /// unit from the stored rows instead printed a workout *count* as "sec",
+    /// because a workout sample stores its duration and carries that unit —
+    /// a number labelled as something it is not.
+    private static func seriesUnit(
+        for type: String,
+        storedUnit: String?
+    ) -> String {
+        switch measure(for: type).kind {
+        case .duration: "seconds"
+        case .occurrences: ""
+        case .total, .average: storedUnit ?? ""
+        }
+    }
+
+    /// A range boundary, or nothing when the argument was not given.
+    ///
+    /// Throws rather than returning nil for an argument that *was* given and
+    /// could not be read.
+    private static func boundary(
+        _ raw: Any?,
+        name: String,
+        edge: QueryTimestamp.Edge
+    ) throws -> Date? {
+        // A JSON `null` decodes to `NSNull`, which is not `nil`. A model
+        // filling a schema emits one for every optional property it has no
+        // value for, and refusing those would fail calls that are perfectly
+        // well formed. An explicit null means "no bound", the same as omitting
+        // the key.
+        guard let raw, !(raw is NSNull) else { return nil }
+        guard let text = raw as? String else {
+            throw MCPError.unreadableArgument(
+                name: name,
+                value: String(describing: raw),
+                expected: "a date or timestamp as a string"
+            )
+        }
+        guard !text.trimmingCharacters(in: .whitespaces).isEmpty else {
+            return nil
+        }
+        return try QueryTimestamp.parse(text, as: edge, argument: name)
+    }
+
+    /// A range that runs backwards is a swapped pair of arguments.
+    ///
+    /// Left alone it produced no rows, which the tool then reported as "has no
+    /// records in that range" — an answer that looks entirely normal and reads
+    /// as "you have no data". Same class as the silently discarded filter.
+    private static func checkOrder(from: Date?, to: Date?) throws {
+        guard let from, let to, from > to else { return }
+        throw MCPError.unreadableArgument(
+            name: "to",
+            value: Self.day(to),
+            expected: "a date on or after \"from\" (\(Self.day(from))); "
+                + "the range appears to be the wrong way round"
+        )
+    }
+
+    /// The requested bucket, or an error naming the ones that exist.
+    ///
+    /// A misspelling used to fall through to `.day`, so asking for "weekly"
+    /// quietly answered by day and the reply's own header said so in a line
+    /// nobody reads twice.
+    private static func bucket(_ raw: Any?) throws -> BucketSize {
+        guard let raw, !(raw is NSNull) else { return .day }
+        guard let text = raw as? String, !text.isEmpty else {
+            throw MCPError.unreadableArgument(
+                name: "bucket",
+                value: String(describing: raw),
+                expected: BucketSize.allCases.map(\.rawValue).joined(separator: ", ")
+            )
+        }
+        guard let bucket = BucketSize(rawValue: text) else {
+            throw MCPError.unreadableArgument(
+                name: "bucket",
+                value: text,
+                expected: "one of "
+                    + BucketSize.allCases.map(\.rawValue).joined(separator: ", ")
+            )
+        }
+        return bucket
     }
 
     /// A type's daily series, plus how many records backed each day.
@@ -195,7 +281,10 @@ public actor MCPServer {
                 day: Double(
                     LocalDayExpression.day(for: bucket.start, timeZone: .current)
                 ),
-                value: Self.isAccumulated(type) ? bucket.sum : bucket.average,
+                // The figure the store says means something for this type,
+                // rather than one of two picked here. For a category type both
+                // of those were arithmetic on enumeration cases.
+                value: bucket.value,
                 recordCount: bucket.count
             )
         }
@@ -258,8 +347,10 @@ public actor MCPServer {
                 """
         }
 
-        let unit = (try await store.summaries())
-            .first { $0.type == type }?.unit ?? ""
+        let unit = Self.seriesUnit(
+            for: type,
+            storedUnit: (try await store.summaries()).first { $0.type == type }?.unit
+        )
         var text = "\(type), \(Self.statisticName(for: type)), "
         text += "\(trend.dayCount) days with data in the last \(days).\n\n"
 
@@ -400,8 +491,10 @@ public actor MCPServer {
                 """
         }
 
-        let unit = (try await store.summaries())
-            .first { $0.type == type }?.unit ?? ""
+        let unit = Self.seriesUnit(
+            for: type,
+            storedUnit: (try await store.summaries()).first { $0.type == type }?.unit
+        )
         var text = "\(type), \(Self.statisticName(for: type)). "
         text += "Usual value \(Self.number(report.median)) \(unit) "
         text += "across \(report.consideredDays) days judged.\n\n"
@@ -892,10 +985,10 @@ public actor MCPServer {
         guard let type = arguments["type"] as? String else {
             throw MCPError.missingArgument("type")
         }
-        let bucket = (arguments["bucket"] as? String)
-            .flatMap(BucketSize.init(rawValue:)) ?? .day
-        let from = (arguments["from"] as? String).flatMap(Timestamps.date(from:))
-        let to = (arguments["to"] as? String).flatMap(Timestamps.date(from:))
+        let bucket = try Self.bucket(arguments["bucket"])
+        let from = try Self.boundary(arguments["from"], name: "from", edge: .start)
+        let to = try Self.boundary(arguments["to"], name: "to", edge: .end)
+        try Self.checkOrder(from: from, to: to)
 
         let buckets = try await store.aggregate(
             type: type,
@@ -920,39 +1013,98 @@ public actor MCPServer {
             .first { $0.type == type }?
             .unit
 
+        let measure = Self.measure(for: type)
         var text = "\(type) by \(bucket.rawValue)"
-        if let unit {
+        if let unit, measure.kind == .total || measure.kind == .average {
             text += " (\(unit))"
         }
         text += ":\n"
-        text += "date, sum, average, min, max, count\n"
-        text += buckets
-            .map { bucket in
-                [
-                    Self.day(bucket.start),
-                    Self.number(bucket.sum),
-                    Self.number(bucket.average),
-                    Self.number(bucket.minimum),
-                    Self.number(bucket.maximum),
-                    String(bucket.count)
-                ].joined(separator: ", ")
-            }
-            .joined(separator: "\n")
-        text += """
 
-            \nBoth sum and average are given because the right one depends on \
-            the type: summing an instantaneous measure like heart rate is \
-            meaningless, and averaging a cumulative one like step count \
-            understates the period.
-            """
+        switch measure.kind {
+        case .total, .average:
+            text += "date, sum, average, min, max, count\n"
+            text += buckets
+                .map { bucket in
+                    [
+                        Self.day(bucket.start),
+                        Self.number(bucket.sum),
+                        Self.number(bucket.average),
+                        Self.number(bucket.minimum),
+                        Self.number(bucket.maximum),
+                        String(bucket.count)
+                    ].joined(separator: ", ")
+                }
+                .joined(separator: "\n")
+            text += """
+
+                \nBoth sum and average are given because the right one depends \
+                on the type: summing an instantaneous measure like heart rate \
+                is meaningless, and averaging a cumulative one like step count \
+                understates the period.
+                """
+
+        case .occurrences, .duration:
+            // A category type's stored value is an enumeration case, so there
+            // is no sum, average, minimum or maximum of it worth printing.
+            // Offering those columns at all invites the reading they cannot
+            // support, so they are simply not here.
+            let heading = measure.kind == .duration ? "minutes" : "count"
+            text += "date, \(heading), samples\n"
+            text += buckets
+                .map { bucket in
+                    let value = measure.kind == .duration
+                        ? bucket.value / 60
+                        : bucket.value
+                    return [
+                        Self.day(bucket.start),
+                        Self.number(value),
+                        String(bucket.count)
+                    ].joined(separator: ", ")
+                }
+                .joined(separator: "\n")
+            text += "\n\n\(Self.categoryNote(for: type, measure: measure))"
+        }
+
         text += "\n\n\(Self.dayBasis)"
         return text
     }
 
+    /// What a category type's column actually counts, and why it is not a sum.
+    private static func categoryNote(
+        for type: String,
+        measure: HealthMeasure
+    ) -> String {
+        switch type {
+        case "HKCategoryTypeIdentifierAppleStandHour":
+            return "The count is hours **stood**. "
+                + "HKCategoryValueAppleStandHour records 0 for stood and 1 for "
+                + "idle, so adding the stored numbers would total the idle "
+                + "hours instead — the exact opposite — and a zero here means "
+                + "a day recorded with no standing in it, not a day unrecorded."
+        case "HKCategoryTypeIdentifierSleepAnalysis":
+            return "Minutes are time **asleep**: the core, deep, REM and "
+                + "unspecified-asleep stages only. Time in bed is not time "
+                + "asleep and time awake is neither, so neither is counted. "
+                + "A zero means a night recorded with no sleep staged in it. "
+                + "Records that cover the same minutes are added rather than "
+                + "merged, so a night tracked by two apps at once reads longer "
+                + "than it was."
+        default:
+            return measure.kind == .duration
+                ? "Minutes are the time these samples cover. Their stored "
+                    + "values are enumeration cases, which is why no sum or "
+                    + "average of them is given."
+                : "The count is how many of these were recorded. Their stored "
+                    + "values are enumeration cases, which is why no sum or "
+                    + "average of them is given."
+        }
+    }
+
     private func samples(_ arguments: [String: Any]) async throws -> String {
         let type = arguments["type"] as? String
-        let from = (arguments["from"] as? String).flatMap(Timestamps.date(from:))
-        let to = (arguments["to"] as? String).flatMap(Timestamps.date(from:))
+        let from = try Self.boundary(arguments["from"], name: "from", edge: .start)
+        let to = try Self.boundary(arguments["to"], name: "to", edge: .end)
+        try Self.checkOrder(from: from, to: to)
         let limit = min((arguments["limit"] as? Int) ?? 100, 1000)
 
         let records = try await store.samples(
@@ -1029,6 +1181,12 @@ public actor MCPServer {
 public enum MCPError: Error, LocalizedError, Sendable {
     case unknownTool(String)
     case missingArgument(String)
+    /// An argument that arrived but could not be understood.
+    ///
+    /// Reported rather than ignored. A filter that is quietly dropped returns
+    /// an answer that looks entirely normal and is about the wrong period,
+    /// which is the hardest kind of wrong to notice.
+    case unreadableArgument(name: String, value: String, expected: String)
 
     public var errorDescription: String? {
         switch self {
@@ -1036,6 +1194,10 @@ public enum MCPError: Error, LocalizedError, Sendable {
             "There is no tool called \"\(name)\"."
         case .missingArgument(let name):
             "The \"\(name)\" argument is required."
+        case .unreadableArgument(let name, let value, let expected):
+            "Could not read \"\(value)\" as the \"\(name)\" argument. "
+                + "Expected \(expected). Nothing was returned rather than "
+                + "ignoring the argument and answering about the wrong period."
         }
     }
 }
@@ -1089,8 +1251,13 @@ enum Tools {
         [
             "name": "aggregate_health_data",
             "description": """
-                Aggregate one Health type into time buckets, returning sum, \
-                average, minimum, maximum and count for each. This is the right \
+                Aggregate one Health type into time buckets. For a \
+                measured or cumulative type this returns sum, average, \
+                minimum, maximum and count for each bucket. For a category \
+                type — sleep, stand hours — the stored value is an \
+                enumeration case with no meaningful sum, so the reply instead \
+                gives the thing the type means: minutes asleep, or hours \
+                stood. Every reply names its own columns. This is the right \
                 tool for questions about trends over time. Prefer it over \
                 fetching raw samples. Buckets are local calendar days, weeks \
                 and months in the time zone this computer is set to, not UTC — \

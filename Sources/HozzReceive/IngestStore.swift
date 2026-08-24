@@ -92,6 +92,20 @@ public struct AggregateBucket: Hashable, Sendable {
     public let minimum: Double
     public let maximum: Double
     public let count: Int
+    /// What kind of number this type actually has.
+    ///
+    /// Carried so a caller never has to guess, and so a category type — whose
+    /// stored value is an enumeration rather than a measurement — can be
+    /// reported as the thing it means instead of as arithmetic on case numbers.
+    public let kind: MeasureKind
+    /// The one figure that means something for this type: a total for
+    /// something cumulative, a mean for something measured, seconds for a
+    /// duration, and a count of the case that matters for an occurrence.
+    ///
+    /// `sum`, `average`, `minimum` and `maximum` remain what they always were
+    /// for quantity types. For a category type they are arithmetic on
+    /// enumeration cases and mean nothing; this is the number to use.
+    public let value: Double
 
     public init(
         start: Date,
@@ -99,7 +113,9 @@ public struct AggregateBucket: Hashable, Sendable {
         average: Double,
         minimum: Double,
         maximum: Double,
-        count: Int
+        count: Int,
+        kind: MeasureKind = .total,
+        value: Double? = nil
     ) {
         self.start = start
         self.sum = sum
@@ -107,6 +123,8 @@ public struct AggregateBucket: Hashable, Sendable {
         self.minimum = minimum
         self.maximum = maximum
         self.count = count
+        self.kind = kind
+        self.value = value ?? (kind == .average ? average : sum)
     }
 }
 

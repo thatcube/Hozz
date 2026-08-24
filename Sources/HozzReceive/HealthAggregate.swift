@@ -6,11 +6,17 @@ extension IngestStore {
     /// Aggregation over local-time buckets, shared by the MCP tools and the
     /// Mac dashboards.
     ///
-    /// The statistics themselves are deliberately unchanged from the version
-    /// this replaces — a plain `SUM`, `AVG`, `MIN`, `MAX` and row count over
-    /// `value`. Only where a bucket begins is different. Changing the numbers
-    /// and the boundaries in one step would make it impossible to tell which
-    /// change moved a figure somebody had already read.
+    /// For a quantity type the statistics are a plain `SUM`, `AVG`, `MIN`,
+    /// `MAX` and row count over `value`, exactly as they have always been.
+    ///
+    /// A category type is different, because its stored value is an
+    /// enumeration case rather than a measurement.
+    /// `HKCategoryValueAppleStandHour` is 0 for *stood* and 1 for *idle*, so
+    /// the sum of a day's values is the number of hours somebody sat down —
+    /// and an assistant reading "sum: 10" for a stand-hour type will say "you
+    /// stood for ten hours", which is precisely inverted. There is no
+    /// meaningful sum of enumeration cases at all, so these report the thing
+    /// the type actually means: hours stood, or minutes asleep.
     ///
     /// Boundaries come from ``TimeBucketPlan``, which builds them with a
     /// `Calendar`. That is what makes a 23-hour and a 25-hour day come out as
@@ -76,11 +82,23 @@ extension IngestStore {
             return []
         }
 
+        let measure = try measure(for: type)
         let values = plan.columns.map { column in
             "(\(column.index),"
                 + "'\(Timestamps.text(from: column.start))',"
                 + "'\(Timestamps.text(from: column.end))')"
         }.joined(separator: ",")
+
+        // Only the cases that count towards the measure. A sleep sample marked
+        // awake is not sleep, and a stand hour marked idle is the opposite of
+        // one. Empty for every quantity type, where every row counts.
+        let counted: String
+        if measure.countedValues.isEmpty {
+            counted = "1"
+        } else {
+            let list = measure.countedValues.sorted().map(String.init).joined(separator: ", ")
+            counted = "(CASE WHEN CAST(s.value AS INTEGER) IN (\(list)) THEN 1 ELSE 0 END)"
+        }
 
         // The caller's own bounds are still applied inside the join, so a range
         // starting mid-day reports only that day's later samples even though
@@ -89,7 +107,12 @@ extension IngestStore {
             """
             WITH b(idx, lo, hi) AS (VALUES \(values))
             SELECT b.idx, SUM(s.value), AVG(s.value),
-                   MIN(s.value), MAX(s.value), COUNT(*)
+                   MIN(s.value), MAX(s.value), COUNT(*),
+                   SUM(\(counted)),
+                   SUM(CASE WHEN \(counted) = 1 THEN
+                            MAX(0.0, (julianday(s.end_date)
+                                      - julianday(s.start_date)) * 86400.0)
+                       ELSE 0 END)
               FROM b JOIN sample s
                 ON s.type = ?
                AND s.start_date >= b.lo
@@ -112,7 +135,9 @@ extension IngestStore {
                 average: row.real(2),
                 minimum: row.real(3),
                 maximum: row.real(4),
-                count: Int(row.integer(5))
+                count: Int(row.integer(5)),
+                counted: Int(row.optionalReal(6) ?? 0),
+                duration: row.optionalReal(7) ?? 0
             )
         }
 
@@ -127,13 +152,26 @@ extension IngestStore {
             guard let start = starts[row.index], row.count > 0 else {
                 return nil
             }
+            let meaningful: Double = switch measure.kind {
+            case .total: row.sum
+            case .average: row.average
+            // Rounded to the millisecond. `julianday` arithmetic carries a
+            // few microseconds of floating-point noise, which is invisible in
+            // seconds and turns "120" minutes into "120.00" the moment anyone
+            // formats it — a number that looks like it was measured to a
+            // precision nobody has.
+            case .duration: (row.duration * 1000).rounded() / 1000
+            case .occurrences: Double(row.counted)
+            }
             return AggregateBucket(
                 start: start,
                 sum: row.sum,
                 average: row.average,
                 minimum: row.minimum,
                 maximum: row.maximum,
-                count: row.count
+                count: row.count,
+                kind: measure.kind,
+                value: meaningful
             )
         }
     }
