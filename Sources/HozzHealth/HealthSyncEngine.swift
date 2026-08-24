@@ -397,6 +397,13 @@ public actor HealthSyncEngine {
                     return result
                 }
             } catch {
+                if error is CancellationError || Task.isCancelled {
+                    // The ordinary background case: iOS took its time back and
+                    // the pass is checkpointing. Recording a coverage failure
+                    // would report a healthy type as broken.
+                    result.wasInterrupted = true
+                    return result
+                }
                 let failure = HealthKitFailure.classify(
                     error,
                     typeIdentifier: type.rawValue

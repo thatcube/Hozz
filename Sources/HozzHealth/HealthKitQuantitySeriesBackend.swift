@@ -63,6 +63,18 @@ public struct HealthKitQuantitySeriesBackend: QuantitySeriesBackend {
     /// actor, because its yields are ordered. Delivering readings through
     /// unordered tasks would scramble a series, and the offsets that address
     /// them would then name different readings on every run.
+    ///
+    /// The stream buffers without limit, and that is a decision rather than an
+    /// oversight. `HKQuantitySeriesSampleQuery` has no way to be paused: it
+    /// calls its handler as fast as it can until the sample is done, so
+    /// whatever is not consumed is held. The bounded buffering policies both
+    /// answer a full buffer by *discarding a reading*, which trades a memory
+    /// bound for exactly the thing this whole design exists to prevent. So the
+    /// bound is the sample's own length: paging keeps records and bytes per
+    /// page small, but a sample that is open is a sample whose remaining
+    /// readings are in memory. A reading is twenty-four bytes, so even a very
+    /// long series is megabytes rather than tens of them — and the same is
+    /// true of a route's locations and a recording's voltages today.
     public func readings(
         for sample: UUID,
         type: HealthTypeKey,

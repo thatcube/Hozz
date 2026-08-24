@@ -134,6 +134,11 @@ public actor HealthKitHealthDataSource: HealthDataSource {
                 unit: unit,
                 recordLimit: limit
             )
+            // A sample whose readings could not be had is an encoding failure
+            // like any other, and the run's manifest reports how many there
+            // were. Leaving these out would understate what the export says
+            // about itself.
+            encodingErrors[type, default: 0] += expansion.failures
             return HealthChangeBatch(
                 changes: expansion.changes,
                 proposedAnchor: try expansion.anchor.token()

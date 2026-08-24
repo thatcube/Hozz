@@ -60,10 +60,19 @@ public actor QuantitySeriesExpander {
     public struct Expansion: Sendable {
         public let changes: [HealthChange]
         public let anchor: QuantityAnchor
+        /// Samples whose readings could not be had, written into the export as
+        /// explicit failures. Counted so the run's own tally of encoding
+        /// problems matches what the export actually contains.
+        public let failures: Int
 
-        public init(changes: [HealthChange], anchor: QuantityAnchor) {
+        public init(
+            changes: [HealthChange],
+            anchor: QuantityAnchor,
+            failures: Int = 0
+        ) {
             self.changes = changes
             self.anchor = anchor
+            self.failures = failures
         }
     }
 
@@ -124,7 +133,14 @@ public actor QuantitySeriesExpander {
                     type: type,
                     shape: shape,
                     anchor: anchor,
-                    message: "The sample changed in Health while its readings were being read."
+                    // Deliberately not "the sample changed in Health". Health
+                    // gives the same silence for a sample the user deleted, a
+                    // sample that was rewritten, and a type whose permission
+                    // was withdrawn, and this cannot tell them apart. Naming
+                    // one of them would be a guess presented as a fact — and
+                    // the commonest of the three, an ordinary deletion, is not
+                    // something to alarm anyone about.
+                    message: "Health no longer offers this sample, so its readings are not in this export. It may have been deleted, changed, or permission to read this type may have been withdrawn."
                 )
             }
             series = reopened
@@ -240,15 +256,26 @@ public actor QuantitySeriesExpander {
                     )
                 )
             ],
-            anchor: anchor.advancedPastPendingSample()
+            anchor: anchor.advancedPastPendingSample(),
+            failures: 1
         )
     }
 
     /// Pulls from the stream until the buffer can fill a record, or the sample
-    /// runs out. Never holds more than one record's worth plus one batch.
+    /// runs out.
+    ///
+    /// The cancellation check is the difference between a checkpoint and a
+    /// truncation. `AsyncThrowingStream` answers a cancelled read by *ending
+    /// the stream* rather than by throwing, so a `nil` here means either "the
+    /// sample is finished" or "this task was cancelled", and the two lead
+    /// opposite ways: one seals the sample and drops it from the queue, the
+    /// other must leave the cursor exactly where it was. Cancellation is not
+    /// an edge case — the background scheduler cancels on purpose when iOS
+    /// takes its time back, precisely so the next attempt resumes.
     private func fill(_ series: inout LiveSeries, upTo count: Int) async throws {
         while series.buffer.count < count, !series.isExhausted {
             guard let batch = try await series.stream.next() else {
+                try Task.checkCancellation()
                 series.isExhausted = true
                 return
             }
@@ -283,6 +310,10 @@ public actor QuantitySeriesExpander {
         // stays open across pages.
         while series.offset < delivered, !series.isExhausted {
             guard let batch = try await series.stream.next() else {
+                // Cancellation ends the stream rather than throwing, and
+                // mistaking it for the end of the sample here would report a
+                // sample that shrank when nothing shrank.
+                try Task.checkCancellation()
                 series.isExhausted = true
                 break
             }

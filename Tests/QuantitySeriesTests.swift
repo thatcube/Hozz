@@ -17,6 +17,13 @@ private final class FakeQuantitySeriesBackend: QuantitySeriesBackend, @unchecked
     private var storedSeries: [UUID: [QuantityReading]]
     private var storedFacts: [UUID: SeriesFacts]
     private let batchSize: Int
+    /// Thrown once the readings below have been handed over, so a failure part
+    /// way through a sample can be tested rather than assumed about.
+    private let failure: (any Error)?
+    /// Leaves the stream open after the readings run out, as a query that is
+    /// still running does. The only thing that can end it then is the reader
+    /// being cancelled.
+    private let neverFinishes: Bool
     private var factsCalls = 0
     private var readingsCalls = 0
     private var readingsDelivered = 0
@@ -24,11 +31,15 @@ private final class FakeQuantitySeriesBackend: QuantitySeriesBackend, @unchecked
     init(
         series: [UUID: [QuantityReading]],
         facts: [UUID: SeriesFacts],
-        batchSize: Int = 64
+        batchSize: Int = 64,
+        failure: (any Error)? = nil,
+        neverFinishes: Bool = false
     ) {
         self.storedSeries = series
         self.storedFacts = facts
         self.batchSize = batchSize
+        self.failure = failure
+        self.neverFinishes = neverFinishes
     }
 
     var openedStreams: Int {
@@ -78,6 +89,8 @@ private final class FakeQuantitySeriesBackend: QuantitySeriesBackend, @unchecked
         }
 
         let size = batchSize
+        let failure = failure
+        let neverFinishes = neverFinishes
         return AsyncThrowingStream { continuation in
             var index = 0
             while index < all.count {
@@ -86,6 +99,16 @@ private final class FakeQuantitySeriesBackend: QuantitySeriesBackend, @unchecked
                 self.lock.withLock { self.readingsDelivered += batch.count }
                 continuation.yield(batch)
                 index = end
+            }
+            if let failure {
+                continuation.finish(throwing: failure)
+                return
+            }
+            if neverFinishes {
+                // Left open on purpose. A real query that has not reached the
+                // end of its sample behaves exactly like this, and the only
+                // thing that ends the read is the reader being cancelled.
+                return
             }
             continuation.finish()
         }
@@ -161,7 +184,8 @@ final class QuantitySeriesTests: XCTestCase {
     /// they arrived, so a run that emitted them out of order would be caught
     /// here rather than quietly reassembled.
     private func exportedReadings(
-        _ changes: [HealthChange]
+        _ changes: [HealthChange],
+        startingAt firstOffset: Int = 0
     ) throws -> [[String: Any]] {
         var pages: [(offset: Int, readings: [[String: Any]])] = []
         for change in changes {
@@ -183,7 +207,7 @@ final class QuantitySeriesTests: XCTestCase {
         }
         pages.sort { $0.offset < $1.offset }
 
-        var expected = 0
+        var expected = firstOffset
         for page in pages {
             XCTAssertEqual(
                 page.offset,
@@ -295,6 +319,32 @@ final class QuantitySeriesTests: XCTestCase {
             sample's aggregate reports, or the export contradicts itself.
             """
         )
+
+        // And against the aggregate as the export actually writes it, through
+        // the encoder that writes it — so the two halves of the record are
+        // checked against each other rather than each against the fixture.
+        let aggregate = HealthSampleEncoder.quantityObject(
+            unit: unit,
+            value: expectedAverage,
+            description: "\(expectedAverage) count/min",
+            count: literalValues.count
+        )
+        XCTAssertEqual(
+            actualAverage,
+            aggregate["value"] as? Double ?? .nan,
+            accuracy: 0.000_001
+        )
+        XCTAssertEqual(
+            actualValues.count,
+            aggregate["count"] as? Int,
+            "As many readings exported as the aggregate says it stands for."
+        )
+        XCTAssertEqual(
+            aggregate["unit"] as? String,
+            unit,
+            "And in the unit the reading pages are written in."
+        )
+        XCTAssertEqual(aggregate["aggregatesSeries"] as? Bool, true)
     }
 
     func testExpandedReadingsSumBackToACumulativeAggregate() async throws {
@@ -339,9 +389,20 @@ final class QuantitySeriesTests: XCTestCase {
 
     func testEveryReadingTimestampFallsInsideTheParentSampleRange() async throws {
         let sample = UUID()
+        // The parent's range is written out independently of the readings, as
+        // HealthKit reports it: a series sample spans the whole recording, so
+        // its bounds are wider than the first and last reading rather than
+        // equal to them. Deriving them from the readings would make this test
+        // true by construction and prove nothing.
+        let parent = SeriesFacts(
+            startDate: base.addingTimeInterval(-30),
+            endDate: base.addingTimeInterval(120)
+        )
         let elements = readings(literalValues)
-        let parent = facts(for: elements)
-        let backend = makeBackend(sample, values: literalValues)
+        let backend = FakeQuantitySeriesBackend(
+            series: [sample: elements],
+            facts: [sample: parent]
+        )
 
         let run = try await drainToCompletion(
             sample: sample,
@@ -349,7 +410,7 @@ final class QuantitySeriesTests: XCTestCase {
             recordLimit: 8
         )
         let exported = try exportedReadings(run.changes)
-        XCTAssertFalse(exported.isEmpty)
+        XCTAssertEqual(exported.count, literalValues.count)
 
         for reading in exported {
             guard
@@ -363,6 +424,13 @@ final class QuantitySeriesTests: XCTestCase {
             XCTAssertLessThanOrEqual(end, parent.endDate)
             XCTAssertLessThanOrEqual(start, end, "A range that runs backwards.")
         }
+
+        // The end marker stands for the sample, so it carries the sample's own
+        // range rather than the span of whichever readings happened to be in
+        // the last page.
+        let end = try endMarker(run.changes)
+        XCTAssertEqual(timestamp(end?["startDate"]), parent.startDate)
+        XCTAssertEqual(timestamp(end?["endDate"]), parent.endDate)
     }
 
     func testAReadingPageCarriesTheSameUnitTheAggregateIsWrittenIn() async throws {
@@ -630,7 +698,126 @@ final class QuantitySeriesTests: XCTestCase {
                 the end marker — never a whole ten-thousand-reading sample.
                 """
             )
+            XCTAssertEqual(
+                expansion.changes.count,
+                min(limit, QuantitySeriesEncoding.recordsPerPage),
+                """
+                And it must actually take it. There are ten thousand readings \
+                waiting, so a page that returned fewer would be pacing the \
+                drain far slower than it was told it could go.
+                """
+            )
         }
+    }
+
+    // MARK: - The switch
+
+    /// Expansion can be turned off, and turning it off cannot strand readings.
+    ///
+    /// The switch governs whether a series is *queued*, never whether a queued
+    /// one is drained. A cursor written while it was on has to empty whatever
+    /// it holds, or the aggregate's promise of `count` readings is never
+    /// answered and the cursor never returns to its ordinary shape.
+    func testTurningExpansionOffStillFinishesWhatIsAlreadyQueued() async throws {
+        let sample = UUID()
+        let elements = readings(literalValues)
+        let backend = FakeQuantitySeriesBackend(
+            series: [sample: elements],
+            facts: [sample: facts(for: elements)]
+        )
+        let source = HealthKitHealthDataSource(
+            expandsQuantitySeries: false,
+            quantitySeriesBackend: backend
+        )
+        let cursor = try QuantityAnchor(
+            healthKitAnchor: Data("cursor".utf8),
+            pendingSeries: [sample]
+        ).token()
+
+        let batch = try await source.changes(
+            for: heartRate,
+            after: cursor,
+            limit: 8
+        )
+
+        XCTAssertEqual(
+            try exportedReadings(batch.changes).compactMap {
+                $0["value"] as? Double
+            },
+            literalValues,
+            "A queue written while it was on still drains when it is off."
+        )
+        XCTAssertTrue(
+            try QuantityAnchor.decode(batch.proposedAnchor).pendingSeries
+                .isEmpty,
+            "And the cursor returns to its ordinary shape rather than sticking."
+        )
+    }
+
+    /// Pending readings are written before any new page is asked for.
+    ///
+    /// HealthKit's anchor has already moved past a queued sample, and there is
+    /// no predicate that could find it again, so anything that ran the
+    /// ordinary query first would lose those readings for good.
+    func testPendingReadingsComeBeforeAnyNewPage() async throws {
+        let sample = UUID()
+        let elements = readings(literalValues)
+        let backend = FakeQuantitySeriesBackend(
+            series: [sample: elements],
+            facts: [sample: facts(for: elements)]
+        )
+        // No HealthKit store is touched at all on this path, which is the
+        // point: a cursor with work pending never reaches the anchored query.
+        let source = HealthKitHealthDataSource(quantitySeriesBackend: backend)
+        let cursor = try QuantityAnchor(
+            healthKitAnchor: Data("not a real HealthKit anchor".utf8),
+            pendingSeries: [sample]
+        ).token()
+
+        let batch = try await source.changes(
+            for: heartRate,
+            after: cursor,
+            limit: 8
+        )
+        XCTAssertFalse(batch.changes.isEmpty)
+        XCTAssertNotEqual(
+            batch.proposedAnchor,
+            cursor,
+            "A page that wrote records must move the cursor."
+        )
+        for change in batch.changes {
+            XCTAssertEqual(
+                change.type,
+                heartRate,
+                "Every record in a page belongs to the type that was asked for."
+            )
+        }
+    }
+
+    func testASampleThatCannotBeReadIsCountedAsAnEncodingFailure() async throws {
+        let sample = UUID()
+        let backend = FakeQuantitySeriesBackend(series: [:], facts: [:])
+        let source = HealthKitHealthDataSource(quantitySeriesBackend: backend)
+
+        _ = try await source.changes(
+            for: heartRate,
+            after: try QuantityAnchor(
+                healthKitAnchor: Data("cursor".utf8),
+                pendingSeries: [sample]
+            ).token(),
+            limit: 8
+        )
+
+        let count = await source.encodingErrorCount(for: heartRate)
+        XCTAssertEqual(
+            count,
+            1,
+            """
+            The run's manifest reports how many objects could not be encoded. \
+            Leaving these out would understate what the export says about \
+            itself.
+            """
+        )
     }
 
     // MARK: - Samples that change underneath the cursor
@@ -826,6 +1013,221 @@ final class QuantitySeriesTests: XCTestCase {
         }
         XCTAssertEqual(bySample[first.uuidString.lowercased()], firstValues)
         XCTAssertEqual(bySample[second.uuidString.lowercased()], secondValues)
+    }
+
+    // MARK: - Interruption that is not the end of the sample
+
+    /// The bug this test exists for: a cancelled read looks exactly like a
+    /// finished one.
+    ///
+    /// `AsyncThrowingStream` answers a cancelled read by ending the stream
+    /// rather than by throwing, so a reader that treats "no more batches" as
+    /// "the sample is over" will seal a half-read series with an end marker,
+    /// drop it from the queue, and move HealthKit's anchor past it — and there
+    /// is no predicate that can ever find that sample again. The background
+    /// scheduler cancels *on purpose* when iOS takes its time back, so this is
+    /// the ordinary checkpoint, not a rare accident.
+    func testACancelledReadLeavesTheCursorAloneRatherThanSealingTheSample() async throws {
+        let sample = UUID()
+        let elements = readings((0..<300).map { Double($0) })
+        let backend = FakeQuantitySeriesBackend(
+            series: [sample: elements],
+            facts: [sample: facts(for: elements)],
+            // Fewer readings than a full record, and the query never ends, so
+            // the reader is left waiting exactly as it would mid-sample.
+            neverFinishes: true
+        )
+        let expander = QuantitySeriesExpander(backend: backend)
+        let anchor = QuantityAnchor(
+            healthKitAnchor: Data("cursor".utf8),
+            pendingSeries: [sample]
+        )
+        // Bound locally so the task captures values rather than the test case.
+        let type = heartRate
+        let unitString = unit
+
+        let task = Task {
+            try await expander.expand(
+                from: anchor,
+                type: type,
+                unit: unitString,
+                recordLimit: 8
+            )
+        }
+        try await Task.sleep(for: .milliseconds(150))
+        task.cancel()
+
+        do {
+            let expansion = try await task.value
+            XCTFail(
+                """
+                Cancellation was read as the end of the sample. The page \
+                returned \(expansion.changes.count) records and left the \
+                cursor at \(expansion.anchor.pendingSeries.count) pending \
+                samples; every reading after \
+                \(expansion.anchor.deliveredReadings) is now unreachable.
+                """
+            )
+        } catch is CancellationError {
+            // Correct: nothing is written, so the caller commits nothing and
+            // the sample is still named by the cursor it started from.
+        }
+    }
+
+    func testAStreamThatFailsMidSampleLeavesTheCursorWhereItWas() async throws {
+        struct Boom: Error {}
+        let sample = UUID()
+        let elements = readings((0..<300).map { Double($0) })
+        let backend = FakeQuantitySeriesBackend(
+            series: [sample: elements],
+            facts: [sample: facts(for: elements)],
+            failure: Boom()
+        )
+
+        do {
+            _ = try await QuantitySeriesExpander(backend: backend).expand(
+                from: QuantityAnchor(
+                    healthKitAnchor: Data("cursor".utf8),
+                    pendingSeries: [sample]
+                ),
+                type: heartRate,
+                unit: unit,
+                recordLimit: 8
+            )
+            XCTFail("A failed read must not be reported as a finished sample.")
+        } catch is Boom {
+            // Correct.
+        }
+    }
+
+    /// The reason the live stream is forgotten before a page is built.
+    ///
+    /// The stream is held by reference, so reading from it during a page that
+    /// then fails advances the reader the cursor still points at. If it were
+    /// kept, the next page would carry on from where the *failed* page got to
+    /// while labelling those readings with the offset the cursor recorded —
+    /// writing readings under offsets that name different readings.
+    func testAFailedPageDoesNotLeaveAStreamThatWouldSkipReadings() async throws {
+        struct Boom: Error {}
+        let sample = UUID()
+        let values = (0..<1_200).map { Double($0) }
+        let elements = readings(values)
+        let expander = QuantitySeriesExpander(
+            backend: FakeQuantitySeriesBackend(
+                series: [sample: elements],
+                facts: [sample: facts(for: elements)],
+                failure: Boom()
+            )
+        )
+        let anchor = QuantityAnchor(
+            healthKitAnchor: Data("cursor".utf8),
+            pendingSeries: [sample]
+        )
+
+        // One page succeeds, taking readings 0..<500 and leaving the rest
+        // buffered; the next fails once the buffered readings run out.
+        let first = try await expander.expand(
+            from: anchor,
+            type: heartRate,
+            unit: unit,
+            recordLimit: 1
+        )
+        let afterFirst = first.anchor
+        do {
+            _ = try await expander.expand(
+                from: afterFirst,
+                type: heartRate,
+                unit: unit,
+                recordLimit: 8
+            )
+            XCTFail("Expected the injected failure.")
+        } catch is Boom {}
+
+        // Retried from the cursor the failed page started at, against a
+        // backend that now works. It must produce readings 500 onwards.
+        let healthy = QuantitySeriesExpander(
+            backend: FakeQuantitySeriesBackend(
+                series: [sample: elements],
+                facts: [sample: facts(for: elements)]
+            )
+        )
+        let retry = try await healthy.expand(
+            from: afterFirst,
+            type: heartRate,
+            unit: unit,
+            recordLimit: 1
+        )
+        let exported = try exportedReadings(retry.changes, startingAt: 500)
+        XCTAssertEqual(
+            exported.first?["value"] as? Double,
+            500,
+            "The retry must resume at the first reading that is not durable."
+        )
+    }
+
+    /// One expander serves roughly a hundred and ninety types.
+    ///
+    /// The cached stream is keyed by type as well as by sample and offset. If
+    /// it were not, two types whose cursors happened to sit at the same offset
+    /// would share a stream, and one type's readings would be exported under
+    /// the other's identifiers.
+    func testAStreamIsNeverReusedAcrossTypes() async throws {
+        let sample = UUID()
+        let cyclingPower = HealthTypeKey("HKQuantityTypeIdentifierCyclingPower")
+        let values = (0..<1_200).map { Double(60 + $0 % 40) }
+        let elements = readings(values)
+        // Deliberately one sample identifier answering for both types, which
+        // is the collision a type-blind cache would fall into: same sample,
+        // same offset, different type.
+        let backend = FakeQuantitySeriesBackend(
+            series: [sample: elements],
+            facts: [sample: facts(for: elements)]
+        )
+        let expander = QuantitySeriesExpander(backend: backend)
+
+        // Heart rate takes a page and leaves the stream cached at offset 500.
+        let heart = try await expander.expand(
+            from: QuantityAnchor(
+                healthKitAnchor: Data("cursor".utf8),
+                pendingSeries: [sample]
+            ),
+            type: heartRate,
+            unit: unit,
+            recordLimit: 1
+        )
+        XCTAssertEqual(heart.anchor.deliveredReadings, 500)
+        let openedForHeartRate = backend.openedStreams
+
+        // A different type, same sample, same offset.
+        let power = try await expander.expand(
+            from: heart.anchor,
+            type: cyclingPower,
+            unit: "W",
+            recordLimit: 1
+        )
+        XCTAssertGreaterThan(
+            backend.openedStreams,
+            openedForHeartRate,
+            """
+            The cached stream belongs to a different type. Continuing it would \
+            export one type's readings under another type's identifiers.
+            """
+        )
+        XCTAssertEqual(
+            try object(power.changes[0])["type"] as? String,
+            cyclingPower.rawValue
+        )
+        XCTAssertEqual(
+            try object(power.changes[0])["unit"] as? String,
+            "W",
+            "And in its own unit, not the one the cached stream was read in."
+        )
+        XCTAssertEqual(
+            try exportedReadings(power.changes, startingAt: 500)
+                .first?["value"] as? Double,
+            values[500],
+            "Re-opened from the backend, so it starts at the recorded offset."
+        )
     }
 
     // MARK: - The shared encoding stays as it was
