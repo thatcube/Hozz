@@ -711,25 +711,24 @@ final class QuantitySeriesTests: XCTestCase {
         }
     }
 
-    // MARK: - The switch
+    // MARK: - Draining a cursor written by another build
 
-    /// Expansion can be turned off, and turning it off cannot strand readings.
+    /// A queue in a stored cursor is always emptied, whatever this build
+    /// would have chosen to put there.
     ///
-    /// The switch governs whether a series is *queued*, never whether a queued
-    /// one is drained. A cursor written while it was on has to empty whatever
-    /// it holds, or the aggregate's promise of `count` readings is never
-    /// answered and the cursor never returns to its ordinary shape.
-    func testTurningExpansionOffStillFinishesWhatIsAlreadyQueued() async throws {
+    /// Expansion is unconditional now, but the property that matters is not
+    /// "the switch is gone" — it is that draining a queue is never conditional
+    /// on anything. A cursor carrying work has to empty, or the aggregate's
+    /// promise of `count` readings is never answered and the cursor never
+    /// returns to its ordinary shape.
+    func testACursorArrivingWithWorkQueuedIsAlwaysDrained() async throws {
         let sample = UUID()
         let elements = readings(literalValues)
         let backend = FakeQuantitySeriesBackend(
             series: [sample: elements],
             facts: [sample: facts(for: elements)]
         )
-        let source = HealthKitHealthDataSource(
-            expandsQuantitySeries: false,
-            quantitySeriesBackend: backend
-        )
+        let source = HealthKitHealthDataSource(quantitySeriesBackend: backend)
         let cursor = try QuantityAnchor(
             healthKitAnchor: Data("cursor".utf8),
             pendingSeries: [sample]
@@ -745,8 +744,7 @@ final class QuantitySeriesTests: XCTestCase {
             try exportedReadings(batch.changes).compactMap {
                 $0["value"] as? Double
             },
-            literalValues,
-            "A queue written while it was on still drains when it is off."
+            literalValues
         )
         XCTAssertTrue(
             try QuantityAnchor.decode(batch.proposedAnchor).pendingSeries
@@ -1244,8 +1242,7 @@ final class QuantitySeriesTests: XCTestCase {
             unit: unit,
             value: 72.4,
             description: "72.4 count/min",
-            count: 300,
-            expandsSeries: true
+            count: 300
         )
         XCTAssertEqual(expanded["aggregatesSeries"] as? Bool, true)
         XCTAssertEqual(
@@ -1254,25 +1251,13 @@ final class QuantitySeriesTests: XCTestCase {
             "The mark that means: do not add this to its own children."
         )
 
-        // With expansion off the readings are not in the export, so claiming
-        // they are would send a consumer looking for records that do not exist.
-        let unexpanded = HealthSampleEncoder.quantityObject(
-            unit: unit,
-            value: 72.4,
-            description: "72.4 count/min",
-            count: 300,
-            expandsSeries: false
-        )
-        XCTAssertEqual(unexpanded["aggregatesSeries"] as? Bool, true)
-        XCTAssertNil(unexpanded["seriesReadingsExported"])
-
-        // An ordinary measurement has no children at all.
+        // An ordinary measurement has no children at all, so it must carry
+        // neither mark — a consumer that skipped it would drop a real reading.
         let single = HealthSampleEncoder.quantityObject(
             unit: unit,
             value: 72,
             description: "72 count/min",
-            count: 1,
-            expandsSeries: true
+            count: 1
         )
         XCTAssertNil(single["aggregatesSeries"])
         XCTAssertNil(single["seriesReadingsExported"])
@@ -1318,8 +1303,7 @@ final class QuantitySeriesTests: XCTestCase {
                         unit: unit,
                         value: 72.4,
                         description: "72.4 count/min",
-                        count: 3,
-                        expandsSeries: true
+                        count: 3
                     )
                 ])
             )

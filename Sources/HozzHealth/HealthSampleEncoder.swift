@@ -14,8 +14,7 @@ public struct HealthSampleEncoder: Sendable {
     public func encode(
         sample: HKSample,
         catalogEntry: HealthCatalogEntry,
-        medications: [AnyHashable: MedicationConceptFacts] = [:],
-        expandsSeries: Bool = false
+        medications: [AnyHashable: MedicationConceptFacts] = [:]
     ) throws -> Data {
         var object = baseObject(sample: sample)
 
@@ -69,15 +68,7 @@ public struct HealthSampleEncoder: Sendable {
                 unit: unitString,
                 value: quantity.quantity.doubleValue(for: unit),
                 description: quantity.quantity.description,
-                count: quantity.count,
-                // The same rule the drain uses to decide whether to queue the
-                // sample, so the record's claim and the drain's behaviour can
-                // never disagree.
-                expandsSeries: expandsSeries
-                    && QuantitySeriesEncoding.isExpandable(
-                        count: quantity.count,
-                        canonicalUnit: catalogEntry.canonicalUnit
-                    )
+                count: quantity.count
             )
         case let category as HKCategorySample:
             object["kind"] = "category"
@@ -197,7 +188,8 @@ public struct HealthSampleEncoder: Sendable {
         }
     }
 
-    /// Shapes a quantity, saying plainly when the one number stands for many.
+    /// Shapes a quantity, saying plainly when the one number stands for many
+    /// and that the many are here too.
     ///
     /// HealthKit stores some readings — a workout's power or cadence, for
     /// instance — as a *series*: one sample whose `quantity` is an aggregate
@@ -206,20 +198,21 @@ public struct HealthSampleEncoder: Sendable {
     /// readings is indistinguishable from a single measurement, which is a
     /// quiet way of overstating what Hozz actually knows.
     ///
-    /// When those readings are also in the export, this record has to say so.
-    /// `aggregatesSeries` alone says "there is more detail than this number";
-    /// it does not say "and it is in here too, keyed to this record's id".
-    /// Without that, anything that learns to read reading pages into the same
-    /// column would add a value to the very readings it is the aggregate of —
-    /// counting an hour of heart rate twice, once as an average and once as
-    /// three hundred readings. `seriesReadingsExported` is the mark that says:
-    /// do not add this to its own children.
+    /// Two marks rather than one, because they say different things.
+    /// `aggregatesSeries` says "there is more detail behind this number".
+    /// `seriesReadingsExported` says "and it is in this export, keyed to this
+    /// record's id" — which is what stops a consumer adding a value to the
+    /// very readings it is the aggregate of, counting an hour of heart rate
+    /// twice: once as an average, once as three hundred readings. Hozz always
+    /// exports the readings now, so today they always travel together; they
+    /// are kept separate because only one of them is a promise about the rest
+    /// of the export, and only that one has to be withdrawn if it stops being
+    /// true.
     static func quantityObject(
         unit: String,
         value: Double,
         description: String,
-        count: Int,
-        expandsSeries: Bool = false
+        count: Int
     ) -> [String: Any] {
         var object: [String: Any] = [
             "unit": unit,
@@ -229,9 +222,10 @@ public struct HealthSampleEncoder: Sendable {
         ]
         if count > 1 {
             object["aggregatesSeries"] = true
-            if expandsSeries {
-                object["seriesReadingsExported"] = true
-            }
+            // A unit is always present here — the quantity branch throws
+            // without one — so a sample standing for more than one reading is
+            // exactly a sample this build expands.
+            object["seriesReadingsExported"] = true
         }
         return object
     }

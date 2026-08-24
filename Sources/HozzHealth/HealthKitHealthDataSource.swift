@@ -40,7 +40,6 @@ public actor HealthKitHealthDataSource: HealthDataSource {
     /// queue is always finished, whatever this says. Turning it off mid-series
     /// would otherwise strand readings whose aggregate has already been
     /// exported promising them, and leave a cursor that never empties.
-    private let expandsQuantitySeries: Bool
     private var encodingErrors: [HealthTypeKey: Int] = [:]
     private var medicationDirectory: [AnyHashable: MedicationConceptFacts]?
 
@@ -48,12 +47,10 @@ public actor HealthKitHealthDataSource: HealthDataSource {
         healthStore: HKHealthStore = HKHealthStore(),
         encoder: HealthSampleEncoder = HealthSampleEncoder(),
         types: [ExportableHealthType] = HealthKitTypeRegistry.exportableTypes(),
-        expandsQuantitySeries: Bool = true,
         quantitySeriesBackend: (any QuantitySeriesBackend)? = nil
     ) {
         self.healthStore = healthStore
         self.encoder = encoder
-        self.expandsQuantitySeries = expandsQuantitySeries
         self.quantitySeries = QuantitySeriesExpander(
             backend: quantitySeriesBackend
                 ?? HealthKitQuantitySeriesBackend(healthStore: healthStore),
@@ -160,7 +157,7 @@ public actor HealthKitHealthDataSource: HealthDataSource {
             changes: page.changes,
             proposedAnchor: try QuantityAnchor(
                 healthKitAnchor: page.anchor.data,
-                pendingSeries: expandsQuantitySeries ? page.seriesSamples : []
+                pendingSeries: page.seriesSamples
             ).token()
         )
     }
@@ -216,7 +213,6 @@ public actor HealthKitHealthDataSource: HealthDataSource {
         let key = type.catalogEntry.key
         let catalogEntry = type.catalogEntry
         let sampleType = type.sampleType
-        let expandsSeries = expandsQuantitySeries
 
         return try await withCheckedThrowingContinuation { continuation in
             let query = HKAnchoredObjectQuery(
@@ -253,8 +249,7 @@ public actor HealthKitHealthDataSource: HealthDataSource {
                         let payload = try encoder.encode(
                             sample: sample,
                             catalogEntry: catalogEntry,
-                            medications: medications,
-                            expandsSeries: expandsSeries
+                            medications: medications
                         )
                         changes.append(
                             .upsert(
