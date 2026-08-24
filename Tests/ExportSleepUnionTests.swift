@@ -119,46 +119,11 @@ final class ExportSleepUnionTests: XCTestCase {
         XCTAssertEqual(TimeUnion.merge([empty]).count, 0)
     }
 
-    /// The export's own summary counts an overlapping night once.
-    ///
-    /// This drives `DaySummary` rather than `TimeUnion` directly, because the
-    /// bug was not in the union — there was no union. It was in the summary
-    /// adding durations as records arrived.
-    func testTheDaySummaryCountsAnOverlappingNightOnce() {
-        var summary = ExportMarkdownWriter.DaySummary()
-        let watch = sleepRecord(
-            id: "watch",
-            from: "2026-03-01T23:00:00Z",
-            to: "2026-03-02T07:00:00Z"
-        )
-        let phone = sleepRecord(
-            id: "phone",
-            from: "2026-03-01T23:30:00Z",
-            to: "2026-03-02T06:30:00Z"
-        )
+    // The end-to-end check that a night described twice is reported once now
+    // lives in PhoneDashboardTests, as
+    // `testTheNoteAndTheChartReportTheSameHoursForTheSameNight` — it drives the
+    // export and the chart from one set of records and compares them, which is
+    // stronger than driving either alone. What remains here is the union
+    // itself, which both of them rest on.
 
-        summary.add(sleep: watch)
-        summary.add(sleep: phone)
-
-        XCTAssertEqual(summary.asleepSeconds, 8 * 3_600, accuracy: 0.5)
-        XCTAssertEqual(
-            summary.sleepSegments,
-            2,
-            "Both records still arrived; it is the minutes that must not double."
-        )
-    }
-
-    /// An asleep record as the spool actually writes one.
-    private func sleepRecord(id: String, from: String, to: String) -> ExportRecord {
-        let object: [String: Any] = [
-            "kind": "category",
-            "id": id,
-            "type": "HKCategoryTypeIdentifierSleepAnalysis",
-            "startDate": from,
-            "endDate": to,
-            "value": 1
-        ]
-        let line = try! JSONSerialization.data(withJSONObject: object)
-        return ExportRecord(line: line)!
-    }
 }

@@ -1,6 +1,5 @@
 import Foundation
 import HozzCatalog
-import HozzCore
 
 /// What the pass produced, and what it had to hold to produce it.
 struct ExportMarkdownStatistics: Equatable {
@@ -59,6 +58,13 @@ struct ExportMarkdownStatistics: Equatable {
 /// under the local day it started — except sleep, which is filed under the day
 /// it *ended*, because "last night's sleep" belongs to the morning you woke up
 /// and not to two notes either side of midnight.
+///
+/// Sleep is also the one thing not totalled a record at a time. Health returns
+/// overlapping records for one night, so their durations are merged before
+/// anything is filed — which means holding date pairs, and only those, during
+/// the read. They are compacted as they accumulate, and merging collapses a
+/// night into a single stretch, so what is held tends towards one interval per
+/// night rather than one per record.
 enum ExportMarkdownWriter {
     struct Metadata {
         let runID: UUID
@@ -78,6 +84,14 @@ enum ExportMarkdownWriter {
     /// be.
     static let workoutDetailLimit = 25
 
+    /// How many un-merged sleep stretches to hold before compacting them.
+    ///
+    /// Only a ceiling on working memory, never on what is counted: compaction
+    /// is the same merge that runs at the end, and merging twice gives the same
+    /// answer as merging once. Low enough that a decade of nights costs a few
+    /// tens of kilobytes, high enough that compaction is rare.
+    static let sleepCompactionThreshold = 4_096
+
     @discardableResult
     static func write(
         readingFrom sourceURL: URL,
@@ -93,6 +107,25 @@ enum ExportMarkdownWriter {
 
         var reader = try NDJSONLineReader(fileURL: sourceURL)
         defer { reader.close() }
+
+        // Sleep is the one thing that cannot be totalled a record at a time.
+        // Health returns overlapping records — a watch, a phone and a sleep app
+        // all describing one night — and adding their durations reports eleven
+        // hours for a seven-hour night. They have to be merged, and merging has
+        // to happen across the whole set before anything is filed under a day,
+        // because two records of one night can end either side of midnight and
+        // would never meet if each day were merged separately.
+        //
+        // Holding them all would undo the promise above, so they are compacted
+        // as they accumulate: merging is idempotent and collapses a night's
+        // records into one stretch, so what is retained tends towards one
+        // interval per night rather than one per record. The threshold doubles
+        // past whatever survives a compaction, which keeps the total work
+        // linear when the stretches genuinely are all distinct.
+        var asleepStretches: [DateInterval] = []
+        var inBedStretches: [DateInterval] = []
+        var asleepCompactionAt = sleepCompactionThreshold
+        var inBedCompactionAt = sleepCompactionThreshold
 
         while let line = try reader.nextLine() {
             statistics.linesRead += 1
@@ -169,11 +202,54 @@ enum ExportMarkdownWriter {
                 timeZone: metadata.timeZone
             )
 
+            if isSleep,
+               let start = record.startDate,
+               let end = record.endDate,
+               end > start,
+               let value = record.value.map({ Int($0) }) {
+                let stretch = DateInterval(start: start, end: end)
+                if SleepIntervals.isAsleep(value) {
+                    asleepStretches.append(stretch)
+                    if asleepStretches.count >= asleepCompactionAt {
+                        asleepStretches = SleepIntervals.merge(asleepStretches)
+                        asleepCompactionAt = max(
+                            sleepCompactionThreshold,
+                            asleepStretches.count * 2
+                        )
+                    }
+                } else if SleepIntervals.isInBed(value) {
+                    inBedStretches.append(stretch)
+                    if inBedStretches.count >= inBedCompactionAt {
+                        inBedStretches = SleepIntervals.merge(inBedStretches)
+                        inBedCompactionAt = max(
+                            sleepCompactionThreshold,
+                            inBedStretches.count * 2
+                        )
+                    }
+                }
+            }
+
             if record.kind == "workout" {
                 statistics.workoutsSummarised += 1
             } else {
                 statistics.samplesSummarised += 1
             }
+        }
+
+        // Now that every record has been seen, the night can be worked out. A
+        // stretch is filed under the local day it ended on — the day the
+        // sleeper woke up — which is the rule the chart follows too.
+        for (dayNumber, seconds) in SleepIntervals.secondsByDay(
+            asleepStretches,
+            dayNumber: { day.dayNumber(for: $0) }
+        ) {
+            days[dayNumber, default: DaySummary()].asleepSeconds += seconds
+        }
+        for (dayNumber, seconds) in SleepIntervals.secondsByDay(
+            inBedStretches,
+            dayNumber: { day.dayNumber(for: $0) }
+        ) {
+            days[dayNumber, default: DaySummary()].inBedSeconds += seconds
         }
 
         statistics.retainedDays = days.count
@@ -567,15 +643,9 @@ enum ExportMarkdownWriter {
         var workouts: [WorkoutLine] = []
         var workoutCount = 0
         var workoutSeconds = 0.0
-        // Stretches rather than a running total, because two devices describing
-        // one night each write a record, and adding their durations reports that
-        // night twice. The union is taken when the figure is read.
-        var asleepStretches: [DateInterval] = []
-        var inBedStretches: [DateInterval] = []
+        var asleepSeconds = 0.0
+        var inBedSeconds = 0.0
         var sleepSegments = 0
-
-        var asleepSeconds: Double { TimeUnion.seconds(of: asleepStretches) }
-        var inBedSeconds: Double { TimeUnion.seconds(of: inBedStretches) }
 
         mutating func count(typeID: Int) {
             var entry = totals[typeID] ?? Totals()
@@ -658,26 +728,14 @@ enum ExportMarkdownWriter {
             )
         }
 
+        /// Counts a sleep record. The seconds are *not* added here.
+        ///
+        /// Overlapping records describe the same night, so their durations
+        /// cannot be added as they arrive — they are merged across the whole
+        /// export first and filed afterwards. `sleepSegments` stays a count of
+        /// records, which is what it has always been and is honest as it is.
         mutating func add(sleep record: ExportRecord) {
             sleepSegments += 1
-            guard
-                let start = record.startDate,
-                let end = record.endDate,
-                end > start
-            else {
-                return
-            }
-            let stretch = DateInterval(start: start, end: end)
-            switch Int(record.value ?? -1) {
-            case 0:
-                inBedStretches.append(stretch)
-            // 1 is the old undifferentiated "asleep"; 3, 4 and 5 are the core,
-            // deep and REM stages that replaced it. 2 is awake, and is neither.
-            case 1, 3, 4, 5:
-                asleepStretches.append(stretch)
-            default:
-                break
-            }
         }
 
         func total(of type: String, in types: TypeTable) -> Double? {
