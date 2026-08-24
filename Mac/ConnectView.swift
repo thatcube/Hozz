@@ -1,6 +1,7 @@
 import SwiftUI
 import UniformTypeIdentifiers
 import HozzReceive
+import HozzUI
 
 /// The pairing screen: everything needed to point a phone at this computer.
 struct ConnectView: View {
@@ -65,7 +66,7 @@ struct ConnectView: View {
                         ? "folder.badge.plus"
                         : "folder.fill.badge.checkmark")
                         .font(.title2)
-                        .foregroundStyle(services.watchedFolder == nil ? Color.secondary : Color.green)
+                        .foregroundStyle(services.watchedFolder == nil ? Color.secondary : HozzPalette.blue)
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text(services.watchedFolder == nil

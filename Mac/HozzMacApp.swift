@@ -1,5 +1,6 @@
 import Charts
 import SwiftUI
+import HozzUI
 import HozzReceive
 import os
 
@@ -102,5 +103,8 @@ struct RootView: View {
                 ActivityView(services: services)
             }
         }
+        // The website's wash, behind the whole window rather than on each pane,
+        // so the panes keep their own material and only the light changes.
+        .background(HozzPalette.surfaceWash)
     }
 }

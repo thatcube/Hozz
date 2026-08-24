@@ -340,6 +340,16 @@ targets:
         PRODUCT_NAME: HozzCore
         PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.mac.HozzCore
 
+  HozzUIMac:
+    templates:
+      - HozzMacFramework
+    sources:
+      - Sources/HozzUI
+    settings:
+      base:
+        PRODUCT_NAME: HozzUI
+        PRODUCT_BUNDLE_IDENTIFIER: com.thatcube.mac.HozzUI
+
   HozzStoreMac:
     templates:
       - HozzMacFramework
@@ -359,6 +369,7 @@ targets:
       - Sources/HozzDeliver
     dependencies:
       - target: HozzCoreMac
+      - target: HozzUIMac
       - target: HozzStoreMac
     settings:
       base:
