@@ -397,7 +397,18 @@ final class ReceiveTests: XCTestCase {
             idempotencyKey: "k1"
         )
 
-        let buckets = try await store.aggregate(type: "Steps", bucket: .day)
+        // Pinned to UTC so this asserts what it is about — that sum and average
+        // are reported separately — rather than quietly also depending on the
+        // zone the machine running it happens to be set to. Buckets are local
+        // days, so on a machine far enough ahead of UTC the 18:00Z sample would
+        // land on the 2nd and this would fail for a reason unrelated to its
+        // subject. Local-day bucketing is covered directly in
+        // `HealthDashboardTests`.
+        let buckets = try await store.aggregate(
+            type: "Steps",
+            bucket: .day,
+            timeZone: .gmt
+        )
 
         XCTAssertEqual(buckets.count, 2)
         XCTAssertEqual(buckets[0].sum, 400)
@@ -425,7 +436,8 @@ final class ReceiveTests: XCTestCase {
         let buckets = try await store.aggregate(
             type: "Steps",
             bucket: .day,
-            from: try date("2026-01-15T00:00:00.000Z")
+            from: try date("2026-01-15T00:00:00.000Z"),
+            timeZone: .gmt
         )
 
         XCTAssertEqual(buckets.count, 1)
