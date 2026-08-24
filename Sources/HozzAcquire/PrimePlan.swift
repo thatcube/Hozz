@@ -181,6 +181,25 @@ public enum PrimePlan {
         clamp(seconds) <= minimumChunk
     }
 
+    /// Whether a chunk got the whole length it asked for.
+    ///
+    /// A chunk clamped by the window's start, or by the moment a top-up was
+    /// asked about, is not a measurement of anything. Five minutes of a dense
+    /// type holds few records because it is five minutes, not because the type
+    /// is sparse, and sizing the next chunk from that count would grow it
+    /// eightfold and then have to undo that a query at a time. The same
+    /// mistake runs the other way at the end of a backfill, where a chunk
+    /// clamped to a sliver would shrink a perfectly good length to nothing.
+    ///
+    /// So a clamped chunk is read and delivered like any other, and simply
+    /// says nothing about how long the next one should be.
+    public static func isFullLength(
+        _ chunk: Range<Date>,
+        seconds: TimeInterval
+    ) -> Bool {
+        chunk.upperBound.timeIntervalSince(chunk.lowerBound) >= clamp(seconds)
+    }
+
     private static func clamp(_ seconds: TimeInterval) -> TimeInterval {
         guard seconds.isFinite, seconds > minimumChunk else {
             return minimumChunk

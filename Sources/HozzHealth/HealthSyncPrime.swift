@@ -352,7 +352,9 @@ extension HealthSyncEngine {
             walk.changes.append(contentsOf: batch.changes)
             walk.bytes += batch.changes.reduce(0) { $0 + $1.approximateByteCount }
             coveredThrough = chunk.upperBound
-            seconds = PrimePlan.resized(seconds, after: batch.changes.count)
+            if PrimePlan.isFullLength(chunk, seconds: seconds) {
+                seconds = PrimePlan.resized(seconds, after: batch.changes.count)
+            }
         }
 
         // Then backwards into the past, until the oldest instant aimed at.
@@ -406,7 +408,9 @@ extension HealthSyncEngine {
             // that ordering is the whole resumability story, and reversing it
             // would claim a stretch that a failed delivery never carried.
             frontier = chunk.lowerBound
-            seconds = PrimePlan.resized(seconds, after: batch.changes.count)
+            if PrimePlan.isFullLength(chunk, seconds: seconds) {
+                seconds = PrimePlan.resized(seconds, after: batch.changes.count)
+            }
 
             if frontier <= record.windowStart {
                 state = .covered

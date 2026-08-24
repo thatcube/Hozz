@@ -270,6 +270,44 @@ final class PrimePlanTests: XCTestCase {
         )
     }
 
+    /// A chunk cut short by an edge is not a measurement of density.
+    ///
+    /// Five minutes of a dense type holds few records because it is five
+    /// minutes. Sized from that count, the next chunk would grow eightfold and
+    /// then have to be narrowed back a query at a time — on exactly the dense
+    /// types the prime exists for.
+    func testAChunkCutShortByAnEdgeIsNotTreatedAsAMeasurement() throws {
+        let fullBackfill = try XCTUnwrap(
+            PrimePlan.chunk(
+                frontier: origin,
+                windowStart: origin.addingTimeInterval(-90 * 86_400),
+                seconds: 86_400
+            )
+        )
+        XCTAssertTrue(PrimePlan.isFullLength(fullBackfill, seconds: 86_400))
+
+        // The last chunk of a backfill, clamped by the window's start.
+        let clippedBackfill = try XCTUnwrap(
+            PrimePlan.chunk(
+                frontier: origin,
+                windowStart: origin.addingTimeInterval(-600),
+                seconds: 86_400
+            )
+        )
+        XCTAssertFalse(PrimePlan.isFullLength(clippedBackfill, seconds: 86_400))
+
+        // A top-up clamped by the moment it was asked about, which is the
+        // common case: the edge is usually only minutes stale.
+        let clippedTopUp = try XCTUnwrap(
+            PrimePlan.topUp(
+                coveredThrough: origin,
+                ceiling: origin.addingTimeInterval(300),
+                seconds: 86_400
+            )
+        )
+        XCTAssertFalse(PrimePlan.isFullLength(clippedTopUp, seconds: 86_400))
+    }
+
     /// The two walks meet without overlapping and without a seam.
     func testTheBackfillAndTheTopUpShareOneEdgeExactly() throws {
         let started = origin
