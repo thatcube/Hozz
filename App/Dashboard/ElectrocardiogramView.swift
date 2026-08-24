@@ -1,4 +1,5 @@
 import Charts
+import HealthKit
 import HozzUI
 import Observation
 import SwiftUI
@@ -20,7 +21,7 @@ final class ElectrocardiogramListViewModel {
         isLoading = true
         defer { isLoading = false }
         do {
-            readings = try await reader.electrocardiograms()
+            readings = try await reader.electrocardiograms(limit: HKObjectQueryNoLimit)
             failure = nil
         } catch {
             failure = error.localizedDescription
@@ -60,13 +61,15 @@ struct ElectrocardiogramListView: View {
                     }
                     .hozzCard()
                 } else {
-                    ForEach(model.readings) { reading in
-                        NavigationLink {
-                            ElectrocardiogramDetailView(summary: reading)
-                        } label: {
-                            ECGRow(reading: reading)
+                    LazyVStack(spacing: 12) {
+                        ForEach(model.readings) { reading in
+                            NavigationLink {
+                                ElectrocardiogramDetailView(summary: reading)
+                            } label: {
+                                ECGRow(reading: reading)
+                            }
+                            .buttonStyle(.plain)
                         }
-                        .buttonStyle(.plain)
                     }
                 }
             }

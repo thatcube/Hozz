@@ -1094,6 +1094,198 @@ final class HealthDashboardTests: XCTestCase {
         XCTAssertTrue(SleepAttribution.merge([DateInterval(start: instant, end: instant)]).isEmpty)
     }
 
+    // MARK: - What a chart is asked to draw
+
+    /// A `ClosedRange` whose bounds are the wrong way round, or not numbers at
+    /// all, traps rather than drawing oddly. Health values reaching a chart
+    /// have to be checked before they become an axis.
+    func testAChartDomainIsAlwaysAValidRange() throws {
+        let calendar = calendar(newYork)
+        let intervals = MetricBucketing.buckets(
+            for: .week,
+            endingAt: date(2025, 6, 15, 12, zone: newYork),
+            calendar: calendar
+        )
+
+        let awkward: [[Double?]] = [
+            [nil, nil, nil, nil, nil, nil, nil],
+            [0, 0, 0, 0, 0, 0, 0],
+            [5, 5, 5, 5, 5, 5, 5],
+            [-10, -20, -30, nil, nil, nil, nil],
+            [.nan, 5, 6, nil, nil, nil, nil],
+            [.infinity, 5, nil, nil, nil, nil, nil],
+            [1e12, 1, nil, nil, nil, nil, nil],
+            [42, nil, nil, nil, nil, nil, nil]
+        ]
+
+        for values in awkward {
+            for aggregation in [MetricAggregation.total, .average] {
+                let series = MetricSeries(
+                    buckets: zip(intervals, values).map { interval, value in
+                        MetricBucket(
+                            interval: interval,
+                            value: value,
+                            minimum: value,
+                            maximum: value,
+                            readingCount: 0,
+                            sampleCount: value == nil ? 0 : 1
+                        )
+                    },
+                    unit: "count",
+                    aggregation: aggregation,
+                    hasUnitConflict: false,
+                    containsAggregatedReadings: false
+                )
+
+                let domain = series.domain()
+                XCTAssertLessThanOrEqual(
+                    domain.lowerBound,
+                    domain.upperBound,
+                    "\(values) as \(aggregation) produced an inverted range."
+                )
+                XCTAssertTrue(
+                    domain.lowerBound.isFinite && domain.upperBound.isFinite,
+                    "\(values) as \(aggregation) produced a domain that is not a number."
+                )
+
+                // And nothing that is not a number reaches a mark.
+                for point in series.plottable(now: .now) {
+                    XCTAssertTrue(point.value.isFinite)
+                }
+            }
+        }
+    }
+
+    // MARK: - Workouts
+
+    /// A triathlon's `allStatistics` holds swimming, cycling and running
+    /// distances at once, because it describes the whole workout rather than
+    /// one leg of it. Reporting any one of them as "distance" for the event is
+    /// wrong, and summing them is worse — metres swum and metres ridden are
+    /// not the same quantity.
+    func testAWorkoutThatRecordedSeveralDistancesReportsNoSingleOne() {
+        let triathlon: [HKQuantityTypeIdentifier: Double] = [
+            .distanceSwimming: 1_500,
+            .distanceCycling: 40_000,
+            .distanceWalkingRunning: 10_000
+        ]
+        XCTAssertNil(
+            HealthMetricReader.soleDistance(triathlon),
+            "10 km would be the run's, and 51.5 km is not a distance anyone travelled."
+        )
+    }
+
+    func testAnOrdinaryRunReportsItsOwnDistance() {
+        XCTAssertEqual(
+            HealthMetricReader.soleDistance([.distanceWalkingRunning: 7_240]),
+            7_240
+        )
+        XCTAssertEqual(
+            HealthMetricReader.soleDistance([.distanceSwimming: 1_500]),
+            1_500
+        )
+    }
+
+    /// A type present but measuring nothing is not a second kind of distance.
+    func testAZeroDistanceDoesNotCountAsASecondKind() {
+        XCTAssertEqual(
+            HealthMetricReader.soleDistance([
+                .distanceWalkingRunning: 5_000,
+                .distanceCycling: 0
+            ]),
+            5_000
+        )
+    }
+
+    func testAWorkoutThatMeasuredNoDistanceReportsNone() {
+        XCTAssertNil(HealthMetricReader.soleDistance([:]))
+        XCTAssertNil(HealthMetricReader.soleDistance([.distanceCycling: 0]))
+    }
+
+    // MARK: - Electrocardiograms
+
+    /// A spike a few readings wide is the one feature of a trace anyone looks
+    /// at. Sampling every nth reading walks straight past it; keeping both
+    /// extremes of each column cannot.
+    func testDecimationKeepsASpikeThatPlainSamplingWouldMiss() throws {
+        let hertz = 512
+        var points = (0..<hertz).map { index in
+            ECGPoint(
+                secondsSinceStart: Double(index) / Double(hertz),
+                microvolts: 10
+            )
+        }
+        // One reading, in the middle, far above the rest.
+        points[256] = ECGPoint(secondsSinceStart: 256 / 512.0, microvolts: 900)
+
+        // Independently: taking every 8th reading steps 0, 8, 16 … 256 is a
+        // multiple of 8, so shift the spike one sample to make plain sampling
+        // genuinely miss it.
+        points[257] = points[256]
+        points[256] = ECGPoint(secondsSinceStart: 256 / 512.0, microvolts: 10)
+        let sampled = stride(from: 0, to: points.count, by: 8).map { points[$0].microvolts }
+        XCTAssertEqual(sampled.max(), 10, "Precondition: plain sampling misses the spike.")
+
+        let envelope = ECGDecimation.envelope(points, buckets: 64)
+        XCTAssertEqual(envelope.count, 64)
+        XCTAssertEqual(
+            envelope.map(\.high).max(),
+            900,
+            "The spike has to survive being shrunk, or the trace is a lie."
+        )
+        XCTAssertEqual(envelope.map(\.low).min(), 10)
+    }
+
+    func testDecimationHandlesTraceShapesThatWouldOtherwiseCrash() {
+        XCTAssertTrue(ECGDecimation.envelope([], buckets: 100).isEmpty)
+        XCTAssertTrue(
+            ECGDecimation.envelope(
+                [ECGPoint(secondsSinceStart: 0, microvolts: 5)],
+                buckets: 0
+            ).isEmpty
+        )
+        // Fewer readings than columns: each becomes its own column rather than
+        // being merged into nothing.
+        let few = (0..<3).map {
+            ECGPoint(secondsSinceStart: Double($0), microvolts: Double($0))
+        }
+        XCTAssertEqual(ECGDecimation.envelope(few, buckets: 50).count, 3)
+        XCTAssertEqual(ECGDecimation.envelope(few, buckets: 3).count, 3)
+    }
+
+    /// The rule the ECG view exists to keep.
+    func testATraceIsOnlyWholeWhenEveryReadingItClaimsArrived() {
+        let points = (0..<100).map {
+            ECGPoint(secondsSinceStart: Double($0), microvolts: 1)
+        }
+        XCTAssertTrue(
+            ECGWaveform(
+                sampleID: UUID(),
+                points: points,
+                expectedCount: 100,
+                samplingFrequencyHertz: 512
+            ).isComplete
+        )
+        XCTAssertFalse(
+            ECGWaveform(
+                sampleID: UUID(),
+                points: points,
+                expectedCount: 15_360,
+                samplingFrequencyHertz: 512
+            ).isComplete,
+            "A hundred of fifteen thousand readings is not a heartbeat."
+        )
+        XCTAssertFalse(
+            ECGWaveform(
+                sampleID: UUID(),
+                points: [],
+                expectedCount: 0,
+                samplingFrequencyHertz: nil
+            ).isComplete,
+            "A recording claiming no readings cannot be vouched for as whole."
+        )
+    }
+
     // MARK: - Ranges
 
     func testEachRangeAsksForTheNumberOfBucketsItPromises() throws {

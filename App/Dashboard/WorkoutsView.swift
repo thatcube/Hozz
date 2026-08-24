@@ -1,4 +1,5 @@
 import Charts
+import HealthKit
 import HozzUI
 import Observation
 import SwiftUI
@@ -20,7 +21,12 @@ final class WorkoutsViewModel {
         isLoading = true
         defer { isLoading = false }
         do {
-            workouts = try await reader.workouts(inLast: 365)
+            // No cap. The summary below adds these up and calls the result a
+            // year's total, and the dashboard row that leads here counts them
+            // without a cap — so a truncated list made two screens disagree
+            // about the same question, one of them confidently wrong by
+            // roughly four to one.
+            workouts = try await reader.workouts(inLast: 365, limit: HKObjectQueryNoLimit)
             failure = nil
         } catch {
             failure = error.localizedDescription
@@ -63,8 +69,13 @@ struct WorkoutsView: View {
                     .hozzCard()
                 } else {
                     summaryCard
-                    ForEach(model.workouts) { workout in
-                        WorkoutCard(workout: workout)
+                    // Lazy on purpose: a year can hold hundreds of these, and
+                    // building every card before the first one appears is a
+                    // screen that looks frozen.
+                    LazyVStack(spacing: 13) {
+                        ForEach(model.workouts) { workout in
+                            WorkoutCard(workout: workout)
+                        }
                     }
                 }
             }

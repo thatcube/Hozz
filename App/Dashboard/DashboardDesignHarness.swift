@@ -249,7 +249,9 @@ struct DashboardDesignHarness: View {
             end: now.addingTimeInterval(-170_000),
             duration: 10_000,
             energyKilocalories: 1_180,
-            distanceMeters: 41_600,
+            // Nothing, on purpose: a workout that measured three kinds of
+            // distance has no single one, and the legs below carry them.
+            distanceMeters: nil,
             averageHeartRate: 141,
             minimumHeartRate: 88,
             maximumHeartRate: 179,

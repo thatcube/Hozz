@@ -174,8 +174,20 @@ extension HealthMetricReader {
         }
     }
 
+    /// How many workouts there are, without building any of them.
+    ///
+    /// Deliberately not `workouts(inLast:).count`. Summarising a workout reads
+    /// its statistics and walks its legs, and doing that to eight hundred of
+    /// them to put one number on a row is work nobody asked for — on the
+    /// overview, which is the screen that has to appear quickly.
     func workoutCount(inLast days: Int) async throws -> Int {
-        try await workouts(inLast: days, limit: HKObjectQueryNoLimit).count
+        let end = Date()
+        let start = calendarForQueries.date(byAdding: .day, value: -days, to: end) ?? end
+        return try await count(
+            of: HKObjectType.workoutType(),
+            from: start,
+            to: end
+        )
     }
 
     nonisolated static func summarise(_ workout: HKWorkout) -> WorkoutSummary {
@@ -190,7 +202,12 @@ extension HealthMetricReader {
                 ),
                 start: activity.startDate,
                 end: end,
-                duration: end.timeIntervalSince(activity.startDate),
+                // HealthKit's own figure, which excludes time the activity was
+                // paused. Elapsed wall clock does not, and the workout above
+                // it is measured the pause-aware way — so a session paused for
+                // eight minutes showed a leg longer than the workout
+                // containing it, and legs that summed past their own total.
+                duration: activity.duration,
                 energyKilocalories: sum(
                     activity.allStatistics,
                     identifier: .activeEnergyBurned,
@@ -274,12 +291,33 @@ extension HealthMetricReader {
         if #available(iOS 18.0, *) {
             identifiers.append(contentsOf: [.distancePaddleSports, .distanceRowing])
         }
+        var metres: [HKQuantityTypeIdentifier: Double] = [:]
         for identifier in identifiers {
-            if let value = sum(statistics, identifier: identifier, unit: .meter()), value > 0 {
-                return value
+            if let value = sum(statistics, identifier: identifier, unit: .meter()) {
+                metres[identifier] = value
             }
         }
-        return nil
+        return soleDistance(metres)
+    }
+
+    /// The one distance a workout recorded, or nothing when it recorded
+    /// several.
+    ///
+    /// `allStatistics` covers the whole workout rather than one activity, so a
+    /// triathlon holds swimming, cycling and running distances at once.
+    /// Picking the first match reported the run's ten kilometres as the whole
+    /// event's, under a plain "distance" label that read as a considered
+    /// total. Adding them would be no better: metres swum and metres ridden
+    /// are not the same quantity, and their sum is not a distance anybody
+    /// travelled in any one sense.
+    ///
+    /// So a workout that measured more than one kind has no single distance to
+    /// report, and its legs carry them separately instead.
+    nonisolated static func soleDistance(
+        _ metresByType: [HKQuantityTypeIdentifier: Double]
+    ) -> Double? {
+        let recorded = metresByType.values.filter { $0 > 0 }
+        return recorded.count == 1 ? recorded.first : nil
     }
 
     // MARK: - ECG
@@ -307,7 +345,36 @@ extension HealthMetricReader {
     }
 
     func electrocardiogramCount() async throws -> Int {
-        try await electrocardiograms(limit: HKObjectQueryNoLimit).count
+        try await count(of: HKObjectType.electrocardiogramType(), from: nil, to: nil)
+    }
+
+    /// Counts samples without materialising anything from them.
+    private func count(
+        of type: HKSampleType,
+        from start: Date?,
+        to end: Date?
+    ) async throws -> Int {
+        try await withCheckedThrowingContinuation {
+            (continuation: CheckedContinuation<Int, any Error>) in
+            let predicate: NSPredicate? = (start == nil && end == nil)
+                ? nil
+                : HKQuery.predicateForSamples(withStart: start, end: end, options: [])
+            let query = HKSampleQuery(
+                sampleType: type,
+                predicate: predicate,
+                limit: HKObjectQueryNoLimit,
+                sortDescriptors: nil
+            ) { _, samples, error in
+                if let error {
+                    continuation.resume(throwing: HealthKitFailure.classify(error))
+                    return
+                }
+                // Only the count crosses back out, so no sample escapes the
+                // callback and nothing is built from one.
+                continuation.resume(returning: samples?.count ?? 0)
+            }
+            healthStore.execute(query)
+        }
     }
 
     nonisolated static func summarise(_ sample: HKElectrocardiogram) -> ECGSummary {

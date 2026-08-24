@@ -11,6 +11,15 @@ final class MetricDetailViewModel {
 
     private let reader: HealthMetricReader
     private let metric: DashboardMetric
+    /// Which load is the current one.
+    ///
+    /// A cancelled task is not a stopped one: the HealthKit query has already
+    /// been handed off, its callback still fires, and its continuation still
+    /// resumes. So switching from Week to Year could see the cheap Week query
+    /// land *after* the expensive Year one and leave a week of data on screen
+    /// under the year's labels, permanently. Only the newest request may
+    /// write.
+    private var generation = 0
 
     init(metric: DashboardMetric, reader: HealthMetricReader = HealthMetricReader()) {
         self.metric = metric
@@ -18,14 +27,30 @@ final class MetricDetailViewModel {
     }
 
     func load(range: MetricRange) async {
+        generation += 1
+        let request = generation
         isLoading = true
-        defer { isLoading = false }
+        // Cleared rather than left in place. The picker changes the moment it
+        // is tapped, so keeping the old series would draw one range's numbers
+        // under another's labels — a week's step total titled "Total, 12
+        // months", which is wrong by around fiftyfold and looks deliberate.
+        series = nil
+        failure = nil
+
         do {
-            series = try await reader.series(for: metric, range: range)
-            failure = nil
+            let loaded = try await reader.series(for: metric, range: range)
+            guard request == generation else {
+                return
+            }
+            series = loaded
+            isLoading = false
         } catch {
+            guard request == generation else {
+                return
+            }
             series = nil
             failure = error.localizedDescription
+            isLoading = false
         }
     }
 }

@@ -86,7 +86,11 @@ extension MetricSeries {
             ? buckets.last?.id
             : nil
         return buckets.compactMap { bucket in
-            guard let value = bucket.value else {
+            // A value that is not a number is not a measurement, so it is not
+            // drawn. It also cannot be allowed as far as the axis: a domain
+            // built from one is not a valid range and traps rather than
+            // rendering oddly.
+            guard let value = bucket.value, value.isFinite else {
                 return nil
             }
             return PlottablePoint(
@@ -118,8 +122,8 @@ extension MetricSeries {
     /// gets its own span: a resting heart rate between 48 and 62 drawn from
     /// zero is a flat line that says nothing.
     func domain(padding: Double = 0.18) -> ClosedRange<Double> {
-        let values = buckets.compactMap(\.value)
-        guard let low = values.min(), let high = values.max() else {
+        let values = buckets.compactMap(\.value).filter(\.isFinite)
+        guard let low = values.min(), let high = values.max(), low <= high else {
             return 0...1
         }
         switch aggregation {
@@ -132,7 +136,9 @@ extension MetricSeries {
                 let pad = max(abs(high) * 0.1, 1)
                 return (low - pad)...(high + pad)
             }
-            let pad = (high - low) * padding
+            // Never zero, so the bounds cannot collide however small the
+            // spread between the readings is.
+            let pad = max((high - low) * padding, .ulpOfOne)
             return (low - pad)...(high + pad)
         }
     }
