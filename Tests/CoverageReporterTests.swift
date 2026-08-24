@@ -351,88 +351,14 @@ final class CoverageReporterTests: XCTestCase {
         XCTAssertTrue(observation.isNew)
     }
 
-    /// The invariant that actually matters: a moment written down and read
-    /// back renders the same bytes as it did before it was stored.
-    ///
-    /// Stated this way rather than as "the timestamp round-trips", because it
-    /// does not and cannot. `Date` holds far more precision than ISO-8601
-    /// millisecond text, `Date.ISO8601FormatStyle` truncates rather than
-    /// rounds, and hardly any millisecond is exactly representable in binary —
-    /// so `format(parse(format(t)))` differs from `format(t)` for most
-    /// instants, and snapping to whole milliseconds first does not help
-    /// because the snapped value is not exactly representable either. Two
-    /// separate attempts to find a fixed point failed here before the actual
-    /// requirement became clear: the retry must format the *same* `Date`, not
-    /// a canonical neighbour of it.
-    ///
-    /// Swept across a whole second rather than at hand-picked instants,
-    /// because the first attempt passed every instant anyone thought to write
-    /// down and still failed about one run in ten against the real clock.
-    func testAStoredMomentRendersTheSameBytesAfterBeingReadBack() throws {
-        var checked = 0
-        for step in 0..<10_000 {
-            let raw = Date(
-                timeIntervalSince1970: 1_772_600_767 + Double(step) / 10_000
-            )
-            let first = CoverageReporter.observation(
-                matching: "abc",
-                storedDigest: nil,
-                storedMoment: nil,
-                now: raw
-            )
-            XCTAssertTrue(first.isNew)
-
-            // Exactly what the engine writes into the destination and reads
-            // back out of it on the next pass.
-            let written = Destination.observedCoverageText(first.moment)
-            var destination = Destination(
-                name: "Mac",
-                kind: .folder,
-                cadence: .whenDataArrives,
-                folderBookmark: Data("a".utf8)
-            )
-            destination.options[Destination.coverageObservedDigestKey] = "abc"
-            destination.options[Destination.coverageObservedAtKey] = written
-            let recovered = try XCTUnwrap(destination.observedCoverageMoment)
-
-            let reused = CoverageReporter.observation(
-                matching: "abc",
-                storedDigest: destination.observedCoverageDigest,
-                storedMoment: recovered,
-                now: raw.addingTimeInterval(3_600)
-            )
-            XCTAssertFalse(reused.isNew, "step \(step)")
-            XCTAssertEqual(
-                Timestamps.text(from: reused.moment),
-                Timestamps.text(from: first.moment),
-                "step \(step): the retry would render a different byte"
-            )
-            checked += 1
-        }
-        XCTAssertEqual(checked, 10_000)
-    }
-
-    /// The property the previous two fixes assumed and that does not hold,
-    /// written down so nobody reaches for it again.
-    func testTheWiresTimestampFormatIsNotARoundTrip() {
-        var drifted = 0
-        for step in 0..<1_000 {
-            let raw = Date(
-                timeIntervalSince1970: 1_772_600_767 + Double(step) / 1_000
-            )
-            let once = Timestamps.text(from: raw)
-            guard let reread = Timestamps.date(from: once) else { continue }
-            if Timestamps.text(from: reread) != once {
-                drifted += 1
-            }
-        }
-        XCTAssertGreaterThan(
-            drifted,
-            0,
-            "if this ever becomes zero the format changed, and the lossless "
-                + "storage below may no longer be needed"
-        )
-    }
+    // The sweep that pins this, and the test that asserts the wire format is
+    // not safe to round trip a moment through, both live in
+    // `CoverageDeliveryTests`. They arrived from the session that shipped the
+    // first fix, they drive the real `DeliveryEngine` rather than the pure
+    // function, and they assert the property rather than either
+    // implementation — so they hold against the exact storage below without
+    // modification. A second pair here asserting the same two things would
+    // read as an accident rather than a decision.
 
     /// A destination written by the build already on the maintainer's phone
     /// holds an ISO-8601 timestamp in this option, not a number.
