@@ -28,7 +28,6 @@ public struct LocalDayExpression {
     /// side of the epoch would land a day out; no health record predates 1970,
     /// but a bias costs nothing and removes the question.
     private static let bias = 62_135_596_800
-
     public init(timeZone: TimeZone, from start: Date, to end: Date) {
         var segments: [Segment] = []
         var cursor = start
@@ -71,9 +70,34 @@ public struct LocalDayExpression {
 
     /// The same mapping computed in Swift, so a test can check the two agree
     /// without reimplementing either.
-    public func day(for date: Date, timeZone: TimeZone) -> Int {
+    ///
+    /// Static because it depends on nothing but the instant and the zone: the
+    /// segments exist to move this arithmetic into SQL, not to change it.
+    public static func day(for date: Date, timeZone: TimeZone) -> Int {
         let seconds = Int(date.timeIntervalSince1970.rounded(.down))
-        return (seconds + timeZone.secondsFromGMT(for: date) + Self.bias) / 86400
+        return (seconds + timeZone.secondsFromGMT(for: date) + bias) / 86400
+    }
+
+    public func day(for date: Date, timeZone: TimeZone) -> Int {
+        Self.day(for: date, timeZone: timeZone)
+    }
+
+    /// The start of a local day, from the index ``day(for:timeZone:)`` gives.
+    ///
+    /// Resolved via midday rather than midnight. On the morning the clocks go
+    /// forward some zones have no 00:00 at all, and asking a calendar for a
+    /// time that never happened gets either the wrong hour or nothing; midday
+    /// is eleven hours from any transition, so one correction lands it.
+    public static func date(forDay day: Int, timeZone: TimeZone) -> Date {
+        let naiveMidday = Double(day) * 86400 - Double(bias) + 43200
+        let approximate = Date(timeIntervalSince1970: naiveMidday)
+        let midday = Date(
+            timeIntervalSince1970: naiveMidday
+                - Double(timeZone.secondsFromGMT(for: approximate))
+        )
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        return calendar.startOfDay(for: midday)
     }
 }
 
