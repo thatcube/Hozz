@@ -129,6 +129,28 @@ final class QuantityAnchorTests: XCTestCase {
         )
     }
 
+    func testTheStoredCursorHasAFixedByteLayout() throws {
+        let anchor = QuantityAnchor(
+            healthKitAnchor: Data("cursor".utf8),
+            pendingSeries: [
+                UUID(uuidString: "00000000-0000-4000-8000-000000000001")!,
+                UUID(uuidString: "00000000-0000-4000-8000-000000000002")!
+            ],
+            deliveredReadings: 7
+        )
+
+        // Written out rather than compared against a second call, which would
+        // only prove the encoder agrees with itself within one launch. JSON
+        // key order for a Swift dictionary is stable inside a process and
+        // varies between them, so a run-twice test passes whether or not the
+        // keys are sorted — and unsorted keys would make a cursor that had not
+        // moved look, on every launch, as though it had.
+        XCTAssertEqual(
+            String(decoding: try anchor.token().data, as: UTF8.self),
+            #"{"format":"hozzQuantityAnchor","hk":"Y3Vyc29y","offset":7,"series":["00000000-0000-4000-8000-000000000001","00000000-0000-4000-8000-000000000002"],"v":1}"#
+        )
+    }
+
     func testTheSameCursorAlwaysEncodesToTheSameBytes() throws {
         let token = try legacyToken()
         let samples = [UUID(), UUID(), UUID()]
@@ -175,6 +197,7 @@ final class QuantityAnchorTests: XCTestCase {
         let object: [String: Any] = [
             "format": "hozzQuantityAnchor",
             "v": 1,
+            "hk": Data("cursor".utf8).base64EncodedString(),
             "series": [UUID().uuidString, "not-a-uuid"],
             "offset": 0
         ]
@@ -198,6 +221,7 @@ final class QuantityAnchorTests: XCTestCase {
         let object: [String: Any] = [
             "format": "hozzQuantityAnchor",
             "v": 1,
+            "hk": Data("cursor".utf8).base64EncodedString(),
             "series": [],
             "offset": 500
         ]
@@ -214,6 +238,7 @@ final class QuantityAnchorTests: XCTestCase {
         let object: [String: Any] = [
             "format": "hozzQuantityAnchor",
             "v": 1,
+            "hk": Data("cursor".utf8).base64EncodedString(),
             "series": [UUID().uuidString],
             "offset": -1
         ]
@@ -237,6 +262,99 @@ final class QuantityAnchorTests: XCTestCase {
         let decoded = try QuantityAnchor.decode(token)
         XCTAssertEqual(decoded.healthKitAnchor, token.data)
         XCTAssertTrue(decoded.pendingSeries.isEmpty)
+    }
+
+    /// Bytes that are neither a composite cursor nor valid JSON at all.
+    ///
+    /// These are the inputs most likely to arrive from a store that was
+    /// written to while something was going wrong, and each one takes a
+    /// different route through the guard: `jsonObject` throwing, or succeeding
+    /// with something that is not a dictionary. Every one of them has to fall
+    /// back to "these are HealthKit's bytes" rather than throw, because
+    /// throwing on a legacy cursor would stall a type that was working.
+    func testNothingThatIsNotOursIsEverRefused() throws {
+        let inputs: [(String, Data)] = [
+            ("empty", Data()),
+            ("truncated archive", Data("bplist00\u{01}\u{02}".utf8)),
+            ("a JSON array", try JSONSerialization.data(withJSONObject: [1, 2])),
+            ("a bare number", Data("42".utf8)),
+            ("a quoted string", Data("\"cursor\"".utf8)),
+            ("random bytes", Data([0x00, 0xFF, 0x10, 0x7F]))
+        ]
+
+        for (name, data) in inputs {
+            let token = AnchorToken(data: data)
+            let decoded = try QuantityAnchor.decode(token)
+            XCTAssertEqual(
+                decoded.healthKitAnchor,
+                data,
+                "\(name) must be handed back as HealthKit's own bytes."
+            )
+            XCTAssertTrue(decoded.pendingSeries.isEmpty, name)
+        }
+    }
+
+    func testACompositeWithNoHealthKitPositionIsRefused() throws {
+        // Neither shape of this is writable: with a queue it would wedge the
+        // type the moment the queue emptied, and without one it would read as
+        // a fresh start and re-export the type's entire history.
+        for series in [[UUID().uuidString], []] {
+            let token = AnchorToken(
+                data: try JSONSerialization.data(
+                    withJSONObject: [
+                        "format": "hozzQuantityAnchor",
+                        "v": 1,
+                        "series": series,
+                        "offset": 0
+                    ]
+                )
+            )
+            XCTAssertThrowsError(try QuantityAnchor.decode(token)) { error in
+                XCTAssertEqual(error as? QuantityAnchorError, .malformed)
+            }
+        }
+    }
+
+    func testACursorWithNoHealthKitPositionCannotBeWritten() {
+        XCTAssertThrowsError(
+            try QuantityAnchor(
+                healthKitAnchor: nil,
+                pendingSeries: [UUID()]
+            ).token()
+        ) { error in
+            XCTAssertEqual(error as? QuantityAnchorError, .malformed)
+        }
+        XCTAssertThrowsError(try QuantityAnchor.start.token()) { error in
+            XCTAssertEqual(error as? QuantityAnchorError, .malformed)
+        }
+    }
+
+    /// Everything `decode` accepts, `token` can write back.
+    ///
+    /// The two drifting apart is how a cursor becomes unwritable: it reads
+    /// fine, work is done against it, and then the result cannot be stored —
+    /// which discards the work and does so again on every pass after.
+    func testEveryCursorThatCanBeReadCanBeWrittenBackAndReadAgain() throws {
+        let hk = try legacyToken().data
+        let samples = [UUID(), UUID()]
+        let cursors = [
+            QuantityAnchor(healthKitAnchor: hk),
+            QuantityAnchor(healthKitAnchor: hk, pendingSeries: [samples[0]]),
+            QuantityAnchor(
+                healthKitAnchor: hk,
+                pendingSeries: samples,
+                deliveredReadings: 1_000
+            )
+        ]
+
+        for cursor in cursors {
+            let once = try cursor.token()
+            let read = try QuantityAnchor.decode(once)
+            XCTAssertEqual(read.healthKitAnchor, cursor.healthKitAnchor)
+            XCTAssertEqual(read.pendingSeries, cursor.pendingSeries)
+            XCTAssertEqual(read.deliveredReadings, cursor.deliveredReadings)
+            XCTAssertEqual(try read.token(), once, "And stable thereafter.")
+        }
     }
 
     func testNoCursorAtAllIsTheStartRatherThanAFailure() throws {

@@ -103,24 +103,31 @@ public struct QuantityAnchor: Equatable, Sendable {
     }
 
     public func token() throws -> AnchorToken {
+        // Every cursor Hozz can store is one HealthKit gave a position for.
+        // Refusing here rather than writing a cursor without those bytes keeps
+        // `decode` and `token` able to represent exactly the same states, so a
+        // cursor that was read can always be written back.
+        guard let healthKitAnchor else {
+            throw QuantityAnchorError.malformed
+        }
         guard !pendingSeries.isEmpty else {
             // Nothing pending, so nothing to say beyond what HealthKit said.
-            guard let healthKitAnchor else {
-                throw QuantityAnchorError.malformed
-            }
             return AnchorToken(data: healthKitAnchor)
         }
 
-        var object: [String: Any] = [
+        let object: [String: Any] = [
             "format": Self.formatName,
             "v": Self.formatVersion,
+            "hk": healthKitAnchor.base64EncodedString(),
             "series": pendingSeries.map { $0.uuidString.lowercased() },
             "offset": deliveredReadings
         ]
-        if let healthKitAnchor {
-            object["hk"] = healthKitAnchor.base64EncodedString()
-        }
         return AnchorToken(
+            // Sorted, so the same cursor state is the same bytes on every
+            // launch. Without that a cursor that had not moved would look as
+            // though it had: the drain's check that an anchor advanced would
+            // stop catching a stuck stream, and every pass would commit
+            // cursors that went nowhere.
             data: try JSONSerialization.data(
                 withJSONObject: object,
                 options: [.sortedKeys, .withoutEscapingSlashes]
@@ -156,14 +163,19 @@ public struct QuantityAnchor: Equatable, Sendable {
         }
 
         let healthKitAnchor: Data?
-        if let encoded = object["hk"] as? String {
-            guard let decoded = Data(base64Encoded: encoded) else {
-                throw QuantityAnchorError.malformed
-            }
-            healthKitAnchor = decoded
-        } else {
-            healthKitAnchor = nil
+        // Required, not optional. A composite cursor without HealthKit's own
+        // position is a state this build never writes and cannot write back:
+        // with a queue it would wedge the type the moment the queue emptied,
+        // and without one it would read as a fresh start and re-export the
+        // type's whole history. Refusing keeps the stored cursor untouched
+        // instead.
+        guard let encoded = object["hk"] as? String else {
+            throw QuantityAnchorError.malformed
         }
+        guard let decoded = Data(base64Encoded: encoded) else {
+            throw QuantityAnchorError.malformed
+        }
+        healthKitAnchor = decoded
 
         guard let identifiers = object["series"] as? [String] else {
             throw QuantityAnchorError.malformed

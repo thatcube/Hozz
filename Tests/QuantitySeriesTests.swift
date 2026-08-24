@@ -709,7 +709,7 @@ final class QuantitySeriesTests: XCTestCase {
         XCTAssertNil(expansion.anchor.pendingSample)
     }
 
-    func testASeriesWithNoReadingsEndsHonestlyRatherThanSilently() async throws {
+    func testASeriesThatEnumeratesNothingIsAFailedReadNotAnEmptySeries() async throws {
         let sample = UUID()
         let backend = FakeQuantitySeriesBackend(
             series: [sample: []],
@@ -727,18 +727,52 @@ final class QuantitySeriesTests: XCTestCase {
                 recordLimit: 8
             )
 
-        XCTAssertEqual(
-            try endMarker(expansion.changes)?[
-                QuantitySeriesEncoding.elementsKey
-            ] as? Int,
-            0,
+        XCTAssertNil(
+            try endMarker(expansion.changes),
             """
-            Nought readings written is a fact, and saying so lets it be \
-            compared with the count the aggregate claims. Writing nothing \
-            would tell the drain the type was caught up.
+            Nothing reaches the queue that does not claim at least two \
+            readings, so an end marker saying nought would tell a receiver \
+            this sample is complete and has no detail behind it — and nothing \
+            would ever look at it again.
             """
         )
-        XCTAssertNil(expansion.anchor.pendingSample)
+        XCTAssertEqual(expansion.changes.count, 1)
+        XCTAssertEqual(
+            try object(expansion.changes[0])["kind"] as? String,
+            "sampleEncodingError"
+        )
+        XCTAssertNil(
+            expansion.anchor.pendingSample,
+            """
+            It still moves on: a sample that cannot be read would otherwise \
+            block every later sample of its type for good.
+            """
+        )
+    }
+
+    func testAnEmptyLastPageStillSealsASampleThatWasFullyWritten() async throws {
+        let sample = UUID()
+        // Exactly one full record's worth, so the page that writes it cannot
+        // also discover the stream has ended.
+        let values = (0..<500).map { Double($0) }
+        let backend = makeBackend(sample, values: values)
+
+        let run = try await drainToCompletion(
+            sample: sample,
+            backend: backend,
+            recordLimit: 1
+        )
+
+        XCTAssertEqual(
+            try endMarker(run.changes)?[QuantitySeriesEncoding.elementsKey]
+                as? Int,
+            500,
+            """
+            A page that finds the stream already spent must still seal the \
+            sample, or a fully written series never gets its end marker.
+            """
+        )
+        XCTAssertEqual(try exportedReadings(run.changes).count, 500)
     }
 
     func testSeveralQueuedSamplesAreExpandedOneAtATimeInOrder() async throws {

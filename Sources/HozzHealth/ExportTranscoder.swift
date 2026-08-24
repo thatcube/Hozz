@@ -93,6 +93,8 @@ enum ExportTranscoder {
         var routeRows: [RouteCSVRow] = []
         var ecgRows: [ECGCSVRow] = []
         var seriesCounts: [String: Int] = [:]
+        /// Whether a second pass is worth the read.
+        var sawSeriesReadings = false
 
         func closeEntry() throws {
             if currentType != nil {
@@ -141,6 +143,27 @@ enum ExportTranscoder {
             }
             if kind == "electrocardiogram" {
                 ecgRows.append(electrocardiogramCSVRow(from: object))
+                continue
+            }
+
+            // A quantity series is the one series that cannot be streamed past
+            // inline. Its readings interleave with the aggregates of their own
+            // type — a page of samples, then the readings of whichever of them
+            // were series, then the next page of samples — because HealthKit
+            // has no way to find series samples except by walking the ordinary
+            // stream. Writing them where they fall would close and reopen that
+            // type's sheet on every alternation and leave a hundred numbered
+            // fragments of it. A second pass over the same spool costs one more
+            // sequential read and keeps both sheets whole.
+            if kind == QuantitySeriesEncoding.elementKind {
+                sawSeriesReadings = true
+                continue
+            }
+            if kind == QuantitySeriesEncoding.endKind {
+                // How many readings a sample stands for is already on the
+                // aggregate's own row, as `count`. How many actually reached
+                // the export is a tally of the readings sheet, which is a
+                // column of sample identifiers away.
                 continue
             }
             if kind == "medicationDose" {
@@ -292,6 +315,13 @@ enum ExportTranscoder {
                 try archive.write(Data((row + "\n").utf8))
             }
             try archive.endEntry()
+        }
+
+        if sawSeriesReadings {
+            try writeQuantitySeriesReadings(
+                readingFrom: sourceURL,
+                into: archive
+            )
         }
 
         try archive.beginEntry(name: "export-log.ndjson")
@@ -547,6 +577,84 @@ enum ExportTranscoder {
                 ]
             }
             return fields.map(escape).joined(separator: ",")
+        }
+    }
+
+    /// Every quantity series reading, in one sheet, read straight back off the
+    /// spool.
+    ///
+    /// One sheet rather than one per type because the readings of a series are
+    /// only meaningful next to the sample they came from, and that sample is
+    /// named on every row. Splitting them by type would give someone with two
+    /// series types two files to join rather than one to filter.
+    ///
+    /// Nothing is held in memory: the spool is read a line at a time and each
+    /// page's readings are written as they go past, so a million readings cost
+    /// the same as a hundred.
+    static func writeQuantitySeriesReadings(
+        readingFrom sourceURL: URL,
+        into archive: ZipStreamWriter
+    ) throws {
+        var reader = try NDJSONLineReader(fileURL: sourceURL)
+        defer { reader.close() }
+
+        var isOpen = false
+        while let line = try reader.nextLine() {
+            guard
+                let object = try JSONSerialization.jsonObject(with: line)
+                    as? [String: Any],
+                object["kind"] as? String == QuantitySeriesEncoding.elementKind
+            else {
+                continue
+            }
+            if !isOpen {
+                try archive.beginEntry(name: "QuantitySeriesReadings.csv")
+                try archive.write(
+                    Data(
+                        "type,sample,sequence,offset,startDate,endDate,unit,value\n".utf8
+                    )
+                )
+                isOpen = true
+            }
+            for row in quantitySeriesReadingCSVRows(from: object) {
+                try archive.write(Data((row + "\n").utf8))
+            }
+        }
+        if isOpen {
+            try archive.endEntry()
+        }
+    }
+
+    /// One row per reading, so a series survives the grid instead of
+    /// collapsing into a single unreadable cell.
+    static func quantitySeriesReadingCSVRows(
+        from object: [String: Any]
+    ) -> [String] {
+        guard
+            let readings = object[QuantitySeriesEncoding.elementsKey]
+                as? [[String: Any]]
+        else {
+            return []
+        }
+        let type = object["type"] as? String ?? ""
+        let sample = object["sample"] as? String ?? ""
+        let sequence = number(object["sequence"])
+        let offset = (object["offset"] as? Int) ?? 0
+        let unit = object["unit"] as? String ?? ""
+
+        return readings.enumerated().map { index, reading in
+            [
+                type,
+                sample,
+                sequence,
+                // The reading's absolute position in its sample, which is what
+                // makes a row identifiable rather than merely present.
+                String(offset + index),
+                reading["startDate"] as? String ?? "",
+                reading["endDate"] as? String ?? "",
+                unit,
+                number(reading["value"])
+            ].map(escape).joined(separator: ",")
         }
     }
 

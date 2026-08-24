@@ -119,31 +119,12 @@ public actor QuantitySeriesExpander {
                 // promising `count` readings, so staying silent would leave a
                 // promise nothing ever answers.
                 live = nil
-                return Expansion(
-                    changes: [
-                        .upsert(
-                            CapturedHealthObject(
-                                // Deliberately not the sample's own UUID: that
-                                // identifier belongs to the aggregate record,
-                                // and writing an error under it would replace
-                                // a reading Hozz does have with a note about
-                                // one it does not.
-                                id: SeriesEncoding.identifier(
-                                    shape: shape,
-                                    sample: sampleID,
-                                    suffix: "error"
-                                ),
-                                type: type,
-                                canonicalPayload: try encoder
-                                    .encodeEncodingFailure(
-                                        id: sampleID,
-                                        typeIdentifier: type.rawValue,
-                                        message: "The sample changed in Health while its readings were being read."
-                                    )
-                            )
-                        )
-                    ],
-                    anchor: anchor.advancedPastPendingSample()
+                return try unreadable(
+                    sampleID,
+                    type: type,
+                    shape: shape,
+                    anchor: anchor,
+                    message: "The sample changed in Health while its readings were being read."
                 )
             }
             series = reopened
@@ -189,6 +170,24 @@ public actor QuantitySeriesExpander {
 
         let isFinished = series.isExhausted && series.buffer.isEmpty
         if isFinished {
+            // Nothing reaches the queue that does not claim at least two
+            // readings, so a sample that enumerates none has not been read —
+            // it is not a series that happens to be empty. Sealing it with an
+            // end marker would tell a receiver the sample is complete and has
+            // no detail behind it, and nothing would ever look again. The
+            // cursor still moves past it, because a sample that cannot be read
+            // would otherwise block every later one of its type; the record
+            // says plainly which sample it was.
+            guard series.offset > 0 else {
+                live = nil
+                return try unreadable(
+                    series.id,
+                    type: type,
+                    shape: shape,
+                    anchor: anchor,
+                    message: "Health returned no readings for a sample that reports more than one."
+                )
+            }
             changes.append(
                 try SeriesEncoding.endChange(
                     shape: shape,
@@ -208,6 +207,40 @@ public actor QuantitySeriesExpander {
             anchor: isFinished
                 ? anchor.advancedPastPendingSample()
                 : anchor.advanced(toReading: series.offset)
+        )
+    }
+
+    /// Records that a sample's readings could not be had, and moves on.
+    ///
+    /// The identifier is derived rather than the sample's own, because that
+    /// one belongs to the aggregate record: writing the failure under it would
+    /// replace a reading Hozz does have with a note about one it does not.
+    private func unreadable(
+        _ sampleID: UUID,
+        type: HealthTypeKey,
+        shape: SeriesShape,
+        anchor: QuantityAnchor,
+        message: String
+    ) throws -> Expansion {
+        Expansion(
+            changes: [
+                .upsert(
+                    CapturedHealthObject(
+                        id: SeriesEncoding.identifier(
+                            shape: shape,
+                            sample: sampleID,
+                            suffix: "error"
+                        ),
+                        type: type,
+                        canonicalPayload: try encoder.encodeEncodingFailure(
+                            id: sampleID,
+                            typeIdentifier: type.rawValue,
+                            message: message
+                        )
+                    )
+                )
+            ],
+            anchor: anchor.advancedPastPendingSample()
         )
     }
 
