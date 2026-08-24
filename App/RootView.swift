@@ -897,7 +897,3 @@ enum HozzLinks {
     static let sponsors = URL(string: "https://github.com/sponsors/thatcube")!
     static let developer = URL(string: "https://github.com/thatcube")!
 }
-
-enum HozzPalette {
-    static let action = Color(red: 0.00, green: 0.45, blue: 0.48)
-}

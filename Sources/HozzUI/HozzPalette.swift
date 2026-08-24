@@ -41,6 +41,34 @@ public enum HozzPalette {
     /// A rule that should barely register.
     public static let lineSoft = Color(light: 0xDEEBF2, dark: 0x1C3446)
 
+    /// The site's `--blue-light`, which is the colour every soft glow on the
+    /// page is made of — always as a radial fading to nothing, never as a fill.
+    ///
+    /// It sits between ``blueWash`` and ``blue``, and neither substitutes for
+    /// it: the wash is too pale to register once faded, and the brand blue is
+    /// strong enough to read as a coloured shape rather than as light.
+    ///
+    /// Dark is a lifted navy rather than the same pale value, for the reason
+    /// the ink is inverted — a pale bloom on a dark page is a smear, whereas a
+    /// navy one lightened slightly reads as the same light falling on a darker
+    /// surface.
+    public static let bloom = Color(light: 0xCAE1F1, dark: 0x2A4E71)
+
+    /// The app's tint: the colour of a button, a selected row, a chart line.
+    ///
+    /// This is ``blue`` under a name that says what it is for. It exists as its
+    /// own token because the app previously tinted itself with a teal that
+    /// appears nowhere on the website, and naming the role separately from the
+    /// hue is what lets the two stay in step from here on.
+    public static let action = blue
+
+    /// The shadow under a card.
+    ///
+    /// Nearly transparent on purpose. The site's cards are lifted by a wide,
+    /// very faint navy blur rather than a grey drop shadow, and anything
+    /// stronger turns the airy surface into a stack of tiles.
+    public static let cardShadow = Color(light: 0x132638, dark: 0x000000)
+
     /// The soft diagonal wash behind a card on the website.
     ///
     /// Kept shallow deliberately: it reads as light falling across a surface,

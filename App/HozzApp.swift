@@ -1,3 +1,4 @@
+import HozzUI
 import SwiftUI
 
 @main
