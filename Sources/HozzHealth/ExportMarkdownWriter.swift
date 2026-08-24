@@ -1,5 +1,6 @@
 import Foundation
 import HozzCatalog
+import HozzCore
 
 /// What the pass produced, and what it had to hold to produce it.
 struct ExportMarkdownStatistics: Equatable {

@@ -1,4 +1,5 @@
 import XCTest
+import HozzCore
 @testable import HozzHealth
 
 /// Sleep described twice must be counted once.
