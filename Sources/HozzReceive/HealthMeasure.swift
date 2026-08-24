@@ -8,7 +8,7 @@ import Foundation
 /// quantity type is either cumulative or discrete — so the classification is
 /// stated explicitly here rather than inferred from a unit, because a wrong
 /// guess in either direction produces a confident, wrong, believable number.
-public enum MeasureKind: String, Sendable, Hashable {
+public enum MeasureKind: String, Sendable, Hashable, CaseIterable {
     /// Values accumulate: a column is their total.
     case total
     /// Values are measurements: a column is their average.

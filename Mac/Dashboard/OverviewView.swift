@@ -208,27 +208,13 @@ struct OverviewView: View {
         }
     }
 
-    private var rangeCaption: String {
-        switch range {
-        case .week: "Past seven days"
-        case .month: "Past thirty days"
-        case .year: "Past year"
-        case .all: "Everything held"
-        }
-    }
-
     /// Says plainly when some of these rows are not from the chosen range.
     private func domainCaption(_ snapshots: [IngestStore.MetricSnapshot]) -> String {
-        let stale = snapshots.filter(\.isFromEarlierWindow).count
-        guard stale > 0 else {
-            return rangeCaption
-        }
-        if stale == snapshots.count {
-            return "\(rangeCaption) — none of these reach it yet, so each row "
-                + "shows its own most recent stretch."
-        }
-        return "\(rangeCaption) — \(stale) of \(snapshots.count) do not reach it "
-            + "yet and show their own most recent stretch."
+        OverviewNarration.heading(
+            range: range,
+            staleRows: snapshots.filter(\.isFromEarlierWindow).count,
+            totalRows: snapshots.count
+        )
     }
 
     private static func year(_ date: Date) -> String {
@@ -278,11 +264,11 @@ private struct MetricRow: View {
                         .font(.system(size: 16, weight: .medium, design: .rounded))
                         .monospacedDigit()
                         .foregroundStyle(HozzPalette.ink)
-                    Text(series.displayUnit.label.isEmpty
-                         ? series.measure.kind.noun
-                         : series.displayUnit.label)
-                        .font(.caption2)
-                        .foregroundStyle(HozzPalette.inkMuted)
+                    if let unit = snapshot.unitLabel {
+                        Text(unit)
+                            .font(.caption2)
+                            .foregroundStyle(HozzPalette.inkMuted)
+                    }
                 }
                 .frame(width: 78, alignment: .trailing)
             }
@@ -297,29 +283,8 @@ private struct MetricRow: View {
         return series.displayUnit.format(value)
     }
 
-    /// Says what the number is and, when it is not from the range asked for,
-    /// which window it is from instead.
     private var caption: String {
-        if series.hasMixedUnits {
-            return "Mixed units — not combined"
-        }
-        if series.headline == nil {
-            guard let latest = snapshot.latestOverall else {
-                return "No values yet"
-            }
-            return "Nothing yet · last \(Self.month(latest))"
-        }
-        if snapshot.isFromEarlierWindow, let latest = snapshot.latestOverall {
-            // Never presented as current. The number is real and so is the
-            // fact that it is two years old, and only saying the first half
-            // would be the more comfortable lie.
-            return "as of \(Self.month(latest)) · \(series.measure.kind.noun.lowercased())"
-        }
-        var text = series.measure.kind.noun.lowercased()
-        if !series.coverage.isEveryDay {
-            text += " · \(series.coverage.daysWithData)/\(series.coverage.dayCount) days"
-        }
-        return text
+        snapshot.rowCaption(monthName: Self.month)
     }
 
     private static func month(_ date: Date) -> String {
