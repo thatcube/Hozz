@@ -255,14 +255,17 @@ final class HealthDashboardTests: XCTestCase {
     /// The chart's columns come from `Calendar` and its coverage counts come
     /// from SQL. If the two disagreed about where a day starts, the bars and the
     /// "days with data" underneath them would describe different days.
+    ///
+    /// The expectation is built from `Calendar.startOfDay` — genuinely the
+    /// other implementation — and its *contents* are compared, not just its
+    /// size. An earlier version of this test built the expected set by calling
+    /// `LocalDayExpression.day(for:)`, the Swift twin of the formula under
+    /// test, and then only asserted the set had five members: it could not have
+    /// failed for any uniform whole-day shift, which is exactly the hollow test
+    /// this file exists to avoid.
     func testDatabaseAndCalendarAgreeOnWhereADayBegins() async throws {
         var samples: [[String: Any]] = []
-        var expectedDays: Set<Int> = []
-        let expression = LocalDayExpression(
-            timeZone: zone,
-            from: try local(2026, 3, 1),
-            to: try local(2026, 3, 15)
-        )
+        var startsOfDay: Set<Date> = []
 
         // Every hour across the spring-forward weekend.
         var cursor = try local(2026, 3, 6)
@@ -277,7 +280,7 @@ final class HealthDashboardTests: XCTestCase {
                     "count"
                 )
             )
-            expectedDays.insert(expression.day(for: cursor, timeZone: zone))
+            startsOfDay.insert(calendar.startOfDay(for: cursor))
             cursor = try XCTUnwrap(calendar.date(byAdding: .hour, value: 1, to: cursor))
             index += 1
         }
@@ -289,18 +292,122 @@ final class HealthDashboardTests: XCTestCase {
             plan: plan
         )
 
-        // Independently: five calendar days were touched, and Calendar's own
-        // startOfDay for each sample gives the same set the database counted.
-        XCTAssertEqual(expectedDays.count, 5)
-        XCTAssertEqual(series.coverage.daysWithData, 5)
+        // The days Calendar says were touched, as dates rather than as indices.
+        XCTAssertEqual(
+            startsOfDay.sorted(),
+            [
+                try local(2026, 3, 6),
+                try local(2026, 3, 7),
+                try local(2026, 3, 8),
+                try local(2026, 3, 9),
+                try local(2026, 3, 10)
+            ]
+        )
+        // The columns the plan drew are those same days, in that same order.
+        XCTAssertEqual(series.columns.map(\.start), startsOfDay.sorted())
+        // And the database found data on every one of them.
         XCTAssertEqual(series.columns.map(\.daysWithData), [1, 1, 1, 1, 1])
+        XCTAssertEqual(series.coverage.daysWithData, 5)
 
         // Columns are 6, 7, 8, 9 and 10 March. The clocks go forward on the
         // 8th, so that column — and only that one — is an hour short.
-        XCTAssertEqual(series.columns[2].start, try local(2026, 3, 8))
         XCTAssertEqual(index, 119, "24 + 24 + 23 + 24 + 24")
         XCTAssertEqual(series.sampleCount, 119)
         XCTAssertEqual(series.columns.map(\.sampleCount), [24, 24, 23, 24, 24])
+    }
+
+    /// Columns keep landing on local midnight in a zone that transitions at
+    /// midnight.
+    ///
+    /// Santiago puts its clocks forward at local 00:00, so that day has no
+    /// midnight at all. Advancing a cursor by adding a day preserves the wall
+    /// clock, so once `startOfDay` returned 01:00 for the transition day every
+    /// column after it began at 01:00 too — while the SQL kept counting true
+    /// midnights. The bars each straddled two local days, and a thirty-day
+    /// window reported forty-four days with data and announced that every one
+    /// of the thirty was covered.
+    func testColumnsDoNotDriftInAZoneThatChangesAtMidnight() throws {
+        let santiago = TimeZone(identifier: "America/Santiago")!
+        var santiagoCalendar = Calendar(identifier: .gregorian)
+        santiagoCalendar.timeZone = santiago
+
+        var components = DateComponents()
+        components.year = 2025
+        components.month = 9
+        components.day = 20
+        components.hour = 14
+        components.timeZone = TimeZone.gmt
+        let now = try XCTUnwrap(santiagoCalendar.date(from: components))
+
+        let plan = TimeBucketPlan.trailing(
+            30,
+            granularity: .day,
+            endingAt: now,
+            calendar: santiagoCalendar
+        )
+
+        XCTAssertEqual(plan.columns.count, 30)
+        for column in plan.columns {
+            XCTAssertEqual(
+                column.start,
+                santiagoCalendar.startOfDay(for: column.start),
+                "every column must begin where the calendar says a day begins"
+            )
+            XCTAssertEqual(column.dayCount(in: santiagoCalendar), 1)
+        }
+        // The transition day is 23 hours; every other day is 24.
+        let lengths = plan.columns.map { $0.end.timeIntervalSince($0.start) }
+        XCTAssertEqual(lengths.filter { $0 == 23 * 3600 }.count, 1)
+        XCTAssertEqual(lengths.filter { $0 == 24 * 3600 }.count, 29)
+        // Columns must meet exactly: no gaps, no overlaps.
+        for (earlier, later) in zip(plan.columns, plan.columns.dropFirst()) {
+            XCTAssertEqual(earlier.end, later.start)
+        }
+    }
+
+    /// Coverage can never exceed the days it is counted against.
+    func testCoverageNeverClaimsMoreDaysThanAColumnHas() async throws {
+        var samples: [[String: Any]] = []
+        for hour in 0..<(24 * 40) {
+            let moment = try XCTUnwrap(
+                calendar.date(
+                    byAdding: .hour,
+                    value: hour,
+                    to: try local(2026, 2, 20)
+                )
+            )
+            samples.append(
+                quantity(
+                    "h\(hour)",
+                    "HKQuantityTypeIdentifierStepCount",
+                    moment,
+                    1,
+                    "count"
+                )
+            )
+        }
+        let store = try await store(samples)
+
+        for granularity in [ChartGranularity.day, .week, .month] {
+            let plan = TimeBucketPlan.covering(
+                from: try local(2026, 2, 20),
+                to: try local(2026, 4, 5),
+                granularity: granularity,
+                calendar: calendar
+            )
+            let series = try await store.series(
+                type: "HKQuantityTypeIdentifierStepCount",
+                plan: plan
+            )
+            for column in series.columns {
+                XCTAssertLessThanOrEqual(
+                    column.daysWithData,
+                    column.dayCount,
+                    "\(granularity) column \(column.index) over-counted days"
+                )
+            }
+            XCTAssertLessThanOrEqual(series.coverage.fraction, 1.0)
+        }
     }
 
     /// A month column starts on the first and a week column on the first weekday.
@@ -543,7 +650,265 @@ final class HealthDashboardTests: XCTestCase {
         XCTAssertEqual(series.displayUnit.format(7200), "2.0")
     }
 
-    // MARK: - Units that cannot be combined
+    /// A day of nothing but idle hours is nought stand hours, not no data.
+    ///
+    /// The worst possible day to hide. Counting only the stood hours made a
+    /// fully recorded, entirely sedentary day identical to one the watch was
+    /// never worn — a gap in the chart and a day missing from coverage.
+    func testADayOfOnlyIdleHoursReportsZeroRatherThanNothing() async throws {
+        var samples: [[String: Any]] = []
+        for hour in 0..<24 {
+            samples.append(
+                category(
+                    "h\(hour)",
+                    "HKCategoryTypeIdentifierAppleStandHour",
+                    try local(2026, 5, 4, hour, 0),
+                    1,  // idle, every hour
+                    end: try local(2026, 5, 4, hour, 59)
+                )
+            )
+        }
+
+        let store = try await store(samples)
+        let series = try await store.series(
+            type: "HKCategoryTypeIdentifierAppleStandHour",
+            plan: try dayPlan(from: try local(2026, 5, 4), days: 1)
+        )
+
+        let column = series.columns[0]
+        XCTAssertEqual(column.sampleCount, 24, "the watch recorded all day")
+        XCTAssertEqual(column.countedCount, 0, "and none of it was standing")
+        XCTAssertFalse(column.isEmpty, "a fully recorded day is not empty")
+        XCTAssertEqual(column.daysWithData, 1)
+        XCTAssertEqual(
+            series.value(column),
+            0,
+            "zero stand hours is an answer; a gap is not"
+        )
+        XCTAssertEqual(series.headline, 0)
+        XCTAssertTrue(series.coverage.isEveryDay)
+    }
+
+    /// A night recorded only as in-bed and awake is nought minutes asleep.
+    func testANightWithNoSleepStagesReportsZeroMinutes() async throws {
+        let store = try await store([
+            category(
+                "bed", "HKCategoryTypeIdentifierSleepAnalysis",
+                try local(2026, 5, 4, 22, 0), 0,
+                end: try local(2026, 5, 4, 23, 30)
+            ),
+            category(
+                "awake", "HKCategoryTypeIdentifierSleepAnalysis",
+                try local(2026, 5, 4, 23, 0), 2,
+                end: try local(2026, 5, 4, 23, 40)
+            )
+        ])
+
+        let series = try await store.series(
+            type: "HKCategoryTypeIdentifierSleepAnalysis",
+            plan: try dayPlan(from: try local(2026, 5, 4), days: 1)
+        )
+
+        let column = series.columns[0]
+        XCTAssertEqual(column.sampleCount, 2)
+        XCTAssertEqual(column.countedCount, 0)
+        XCTAssertFalse(column.isEmpty)
+        XCTAssertEqual(series.value(column), 0, "no sleep is nought, not missing")
+        XCTAssertEqual(column.daysWithData, 1)
+    }
+
+    /// A day with genuinely nothing is still empty.
+    func testADayWithNoSamplesIsStillEmpty() async throws {
+        let store = try await store([
+            category(
+                "h", "HKCategoryTypeIdentifierAppleStandHour",
+                try local(2026, 5, 4, 9, 0), 0,
+                end: try local(2026, 5, 4, 10, 0)
+            )
+        ])
+        let series = try await store.series(
+            type: "HKCategoryTypeIdentifierAppleStandHour",
+            plan: try dayPlan(from: try local(2026, 5, 4), days: 2)
+        )
+
+        XCTAssertFalse(series.columns[0].isEmpty)
+        XCTAssertTrue(series.columns[1].isEmpty, "the second day has no records")
+        XCTAssertNil(series.value(series.columns[1]))
+        XCTAssertEqual(series.coverage.daysWithData, 1)
+        XCTAssertEqual(series.coverage.dayCount, 2)
+    }
+
+    /// Types HealthKit calls discrete are never summed, however countable
+    /// their names sound.
+    ///
+    /// Decibels are the sharp end of this: they are logarithmic, so a total is
+    /// not merely inaccurate but undefined, and a day of headphone use would
+    /// have rendered as something like "12,480 dBASPL".
+    func testDiscreteTypesThatSoundCountableAreStillAveraged() {
+        for type in [
+            "HKQuantityTypeIdentifierEnvironmentalSoundReduction",
+            "HKQuantityTypeIdentifierEnvironmentalAudioExposure",
+            "HKQuantityTypeIdentifierUVExposure",
+            "HKQuantityTypeIdentifierAppleSleepingBreathingDisturbances"
+        ] {
+            let measure = HealthMeasure.measure(for: type, storedUnit: "dBASPL")
+            XCTAssertEqual(measure.kind, .average, "\(type) is a measurement")
+            XCTAssertFalse(measure.isSummable, "\(type) must never be summed")
+        }
+    }
+
+    // MARK: - Distribution
+
+    /// A cumulative series sample is one occurrence of its total.
+    ///
+    /// Its value is the sum over its readings, not their mean, so counting it
+    /// once per reading would inflate its bar by the length of the series.
+    func testDistributionDoesNotWeightCumulativeSeriesSamples() async throws {
+        let store = try await store([
+            quantity(
+                "a", "HKQuantityTypeIdentifierDistanceCycling",
+                try local(2026, 5, 4, 9, 0), 1000, "m", readings: 132
+            ),
+            quantity(
+                "b", "HKQuantityTypeIdentifierDistanceCycling",
+                try local(2026, 5, 4, 10, 0), 2000, "m"
+            )
+        ])
+
+        let buckets = try await store.distribution(
+            type: "HKQuantityTypeIdentifierDistanceCycling",
+            from: try local(2026, 5, 4),
+            to: try local(2026, 5, 5)
+        )
+
+        XCTAssertEqual(
+            buckets.reduce(0) { $0 + $1.count },
+            2,
+            "two rides, not 133 — the aggregate is one occurrence of its total"
+        )
+    }
+
+    /// A measured series sample really does stand for many readings.
+    func testDistributionWeightsMeasuredSeriesSamples() async throws {
+        let store = try await store([
+            quantity(
+                "a", "HKQuantityTypeIdentifierEnvironmentalAudioExposure",
+                try local(2026, 5, 4, 9, 0), 50, "dBASPL", readings: 60
+            ),
+            quantity(
+                "b", "HKQuantityTypeIdentifierEnvironmentalAudioExposure",
+                try local(2026, 5, 4, 10, 0), 80, "dBASPL"
+            )
+        ])
+
+        let buckets = try await store.distribution(
+            type: "HKQuantityTypeIdentifierEnvironmentalAudioExposure",
+            from: try local(2026, 5, 4),
+            to: try local(2026, 5, 5)
+        )
+
+        XCTAssertEqual(
+            buckets.reduce(0) { $0 + $1.count },
+            61,
+            "sixty readings averaged into one row, plus one spot measurement"
+        )
+        // The quiet hour is the low band and the loud minute the high one.
+        XCTAssertEqual(buckets.first?.count, 60)
+        XCTAssertEqual(buckets.last?.count, 1)
+    }
+
+    /// A category type has no histogram: its values are an encoding.
+    func testDistributionRefusesCategoryTypes() async throws {
+        let store = try await store([
+            category(
+                "a", "HKCategoryTypeIdentifierSleepAnalysis",
+                try local(2026, 5, 4, 22, 0), 3,
+                end: try local(2026, 5, 5, 6, 0)
+            )
+        ])
+        let buckets = try await store.distribution(
+            type: "HKCategoryTypeIdentifierSleepAnalysis",
+            from: try local(2026, 5, 4),
+            to: try local(2026, 5, 6)
+        )
+        XCTAssertTrue(buckets.isEmpty)
+    }
+
+    /// Every reading identical gives one band, not a division by zero.
+    func testDistributionOfIdenticalReadingsIsOneBand() async throws {
+        let store = try await store([
+            quantity(
+                "a", "HKQuantityTypeIdentifierBodyMass",
+                try local(2026, 5, 4, 9, 0), 80, "kg"
+            ),
+            quantity(
+                "b", "HKQuantityTypeIdentifierBodyMass",
+                try local(2026, 5, 5, 9, 0), 80, "kg"
+            )
+        ])
+        let buckets = try await store.distribution(
+            type: "HKQuantityTypeIdentifierBodyMass",
+            from: try local(2026, 5, 4),
+            to: try local(2026, 5, 6)
+        )
+        XCTAssertEqual(buckets.count, 1)
+        XCTAssertEqual(buckets[0].count, 2)
+        XCTAssertEqual(buckets[0].midpoint, 80)
+    }
+
+    /// Mixed units have no single histogram either.
+    func testDistributionRefusesMixedUnits() async throws {
+        let store = try await store([
+            quantity(
+                "a", "HKQuantityTypeIdentifierBodyMass",
+                try local(2026, 5, 4, 9, 0), 80, "kg"
+            ),
+            quantity(
+                "b", "HKQuantityTypeIdentifierBodyMass",
+                try local(2026, 5, 4, 10, 0), 176, "lb"
+            )
+        ])
+        let buckets = try await store.distribution(
+            type: "HKQuantityTypeIdentifierBodyMass",
+            from: try local(2026, 5, 4),
+            to: try local(2026, 5, 5)
+        )
+        XCTAssertTrue(buckets.isEmpty, "80 kg and 176 lb share no axis")
+    }
+
+    /// A zone that has never changed its offset produces a constant, and the
+    /// constant is right.
+    func testZoneWithNoTransitionsStillGroupsCorrectly() async throws {
+        let store = try await store([
+            quantity(
+                "a", "HKQuantityTypeIdentifierStepCount",
+                try XCTUnwrap(Timestamps.date(from: "2026-06-16T02:00:00.000Z")),
+                40, "count"
+            ),
+            quantity(
+                "b", "HKQuantityTypeIdentifierStepCount",
+                try XCTUnwrap(Timestamps.date(from: "2026-06-16T08:00:00.000Z")),
+                60, "count"
+            )
+        ])
+
+        var phoenix = Calendar(identifier: .gregorian)
+        phoenix.timeZone = TimeZone(identifier: "America/Phoenix")!
+        let plan = TimeBucketPlan.covering(
+            from: try XCTUnwrap(Timestamps.date(from: "2026-06-14T07:00:00.000Z")),
+            to: try XCTUnwrap(Timestamps.date(from: "2026-06-18T07:00:00.000Z")),
+            granularity: .day,
+            calendar: phoenix
+        )
+        let series = try await store.series(
+            type: "HKQuantityTypeIdentifierStepCount",
+            plan: plan
+        )
+
+        // 02:00Z is 19:00 on the 15th in Phoenix; 08:00Z is 01:00 on the 16th.
+        XCTAssertEqual(series.columns.map(\.total), [0, 40, 60, 0])
+        XCTAssertEqual(series.coverage.daysWithData, 2)
+    }
 
     /// Two samples of one type in different units are not added.
     func testMixedUnitsAreRefusedRatherThanAdded() async throws {

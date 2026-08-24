@@ -199,6 +199,17 @@ public struct HealthMeasure: Sendable, Hashable {
     /// averaged, which is the safe direction to be wrong in: averaging something
     /// cumulative understates it visibly, while summing something measured
     /// produces a number nobody can sanity-check.
+    ///
+    /// Checked against `HKQuantityType.aggregationStyle` rather than reasoned
+    /// about. Three plausible-looking entries came out after that check.
+    /// `UVExposure` and `AppleSleepingBreathingDisturbances` are
+    /// `discreteArithmetic` — an index and a per-night level, neither of which
+    /// means anything added up. `EnvironmentalSoundReduction` is
+    /// `discreteEquivalentContinuousLevel` in decibels, where a sum is not
+    /// merely inaccurate but undefined, decibels being logarithmic; that one
+    /// was the tell, because `EnvironmentalAudioExposure` has the identical
+    /// style and unit and was already correctly absent. `HeartbeatSeries` went
+    /// too, as inert: no quantity type identifier ends in it.
     private static let cumulativeSuffixes: Set<String> = [
         "StepCount",
         "PushCount",
@@ -214,11 +225,7 @@ public struct HealthMeasure: Sendable, Hashable {
         "InhalerUsage",
         "InsulinDelivery",
         "NumberOfTimesFallen",
-        "NumberOfAlcoholicBeverages",
-        "UVExposure",
-        "AppleSleepingBreathingDisturbances",
-        "HeartbeatSeries",
-        "EnvironmentalSoundReduction"
+        "NumberOfAlcoholicBeverages"
     ]
 
     /// Category types whose value is an enumeration and whose columns are time.

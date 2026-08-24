@@ -285,6 +285,12 @@ final class MacServices {
 
     // MARK: - Dashboards
 
+    /// The range every dashboard is showing.
+    ///
+    /// Held here rather than in each view so the four screens agree, and so it
+    /// can be chosen once from what the archive actually holds.
+    var range: ChartRange = .month
+
     /// The columns a range asks for, in the viewer's own calendar.
     private func plan(for range: ChartRange) -> TimeBucketPlan {
         TimeBucketPlan.forRange(
@@ -378,12 +384,17 @@ final class MacServices {
     }
 
     func loadComparison(range: ChartRange) async {
-        guard let store, !comparisonTypes.isEmpty else {
+        guard let store else {
             comparison = []
             return
         }
         if archiveSpan == nil {
             archiveSpan = try? await store.archiveSpan()
+        }
+        chooseComparisonDefaults()
+        guard !comparisonTypes.isEmpty else {
+            comparison = []
+            return
         }
         let plan = plan(for: range)
         var lines: [ComparisonSeries] = []
@@ -395,6 +406,31 @@ final class MacServices {
             lines.append(line)
         }
         comparison = lines
+    }
+
+    /// Opens with two types already on the chart.
+    ///
+    /// A comparison screen that starts empty asks the question it exists to
+    /// answer. Steps against resting heart rate is the pairing most people want
+    /// first; if either is missing, the two largest types stand in, because
+    /// whatever this archive holds most of is what it can best show.
+    private func chooseComparisonDefaults() {
+        guard comparisonTypes.isEmpty, !summaries.isEmpty else {
+            return
+        }
+        let preferred = [
+            "HKQuantityTypeIdentifierStepCount",
+            "HKQuantityTypeIdentifierRestingHeartRate"
+        ].filter { type in summaries.contains { $0.type == type } }
+
+        if preferred.count == 2 {
+            comparisonTypes = preferred
+            return
+        }
+        comparisonTypes = comparableTypes
+            .sorted { $0.recordCount > $1.recordCount }
+            .prefix(2)
+            .map(\.type)
     }
 
     func loadWorkouts() async {

@@ -19,12 +19,26 @@ public struct SeriesColumn: Sendable, Hashable, Identifiable {
     public let weight: Double
     public let minimum: Double?
     public let maximum: Double?
-    /// Rows stored. One row can stand for many measurements.
+    /// Rows stored in this column, whatever their value.
+    ///
+    /// Deliberately every row and not only the ones that count towards the
+    /// measure. A day the watch recorded twenty-four *idle* stand hours holds
+    /// plenty of data and the honest answer is "0 stand hours"; counting only
+    /// the stood ones would make that day identical to one the watch was never
+    /// worn, and it is exactly the day worth seeing.
     public let sampleCount: Int
+    /// Rows that count towards the measure — stand hours actually stood, sleep
+    /// samples actually asleep. Equal to `sampleCount` for every type whose
+    /// value is a measurement rather than an enumeration.
+    public let countedCount: Int
     /// Measurements those rows stand for. Equal to `sampleCount` unless the
     /// phone sent aggregated series samples.
     public let readingCount: Int
     /// Local calendar days inside this column that hold at least one sample.
+    ///
+    /// Any sample, not only a counted one, for the same reason `sampleCount`
+    /// is: coverage answers "did anything arrive that day", and a day of
+    /// readings that all happen to be zeroes is a day that arrived.
     public let daysWithData: Int
     /// Local calendar days this column spans.
     public let dayCount: Int
@@ -43,6 +57,7 @@ public struct SeriesColumn: Sendable, Hashable, Identifiable {
         minimum: Double?,
         maximum: Double?,
         sampleCount: Int,
+        countedCount: Int,
         readingCount: Int,
         daysWithData: Int,
         dayCount: Int,
@@ -57,6 +72,7 @@ public struct SeriesColumn: Sendable, Hashable, Identifiable {
         self.minimum = minimum
         self.maximum = maximum
         self.sampleCount = sampleCount
+        self.countedCount = countedCount
         self.readingCount = readingCount
         self.daysWithData = daysWithData
         self.dayCount = dayCount
@@ -174,13 +190,18 @@ public struct TypeSeries: Sendable, Hashable {
         guard !column.isEmpty else { return nil }
         switch measure.kind {
         case .total:
-            return column.total
+            // `weight` is zero only when nothing in the column carried a
+            // number, which is different from carrying zero.
+            return column.weight > 0 ? column.total : nil
         case .average:
             return column.average
         case .duration:
+            // Zero is a real answer here. A night recorded entirely as awake
+            // is nought minutes asleep, and drawing a gap instead would hide
+            // the most interesting night of the month.
             return column.durationSeconds
         case .occurrences:
-            return Double(column.sampleCount)
+            return Double(column.countedCount)
         }
     }
 
@@ -212,8 +233,8 @@ public struct TypeSeries: Sendable, Hashable {
         guard !hasMixedUnits else { return nil }
         switch measure.kind {
         case .total:
-            let populated = columns.filter { !$0.isEmpty }
-            return populated.isEmpty ? nil : populated.reduce(0) { $0 + $1.total }
+            guard columns.contains(where: { $0.weight > 0 }) else { return nil }
+            return columns.reduce(0) { $0 + $1.total }
         case .average:
             let weight = columns.reduce(0) { $0 + $1.weight }
             guard weight > 0 else { return nil }
@@ -224,8 +245,10 @@ public struct TypeSeries: Sendable, Hashable {
                 ? nil
                 : populated.reduce(0) { $0 + $1.durationSeconds }
         case .occurrences:
-            let count = columns.reduce(0) { $0 + $1.sampleCount }
-            return count == 0 ? nil : Double(count)
+            let populated = columns.filter { !$0.isEmpty }
+            return populated.isEmpty
+                ? nil
+                : Double(populated.reduce(0) { $0 + $1.countedCount })
         }
     }
 

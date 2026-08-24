@@ -12,8 +12,7 @@ struct OverviewView: View {
     let services: MacServices
     @Binding var selectedType: String?
     @Binding var section: DataSection
-
-    @State private var range: ChartRange = .month
+    @Binding var range: ChartRange
 
     var body: some View {
         ScrollView {
@@ -182,7 +181,7 @@ struct OverviewView: View {
             title: domain.rawValue,
             subtitle: snapshots.isEmpty
                 ? "Nothing here has arrived yet."
-                : rangeCaption,
+                : domainCaption(snapshots),
             accessory: AnyView(
                 Image(systemName: domain.symbol)
                     .font(.title3)
@@ -216,6 +215,20 @@ struct OverviewView: View {
         case .year: "Past year"
         case .all: "Everything held"
         }
+    }
+
+    /// Says plainly when some of these rows are not from the chosen range.
+    private func domainCaption(_ snapshots: [IngestStore.MetricSnapshot]) -> String {
+        let stale = snapshots.filter(\.isFromEarlierWindow).count
+        guard stale > 0 else {
+            return rangeCaption
+        }
+        if stale == snapshots.count {
+            return "\(rangeCaption) — none of these reach it yet, so each row "
+                + "shows its own most recent stretch."
+        }
+        return "\(rangeCaption) — \(stale) of \(snapshots.count) do not reach it "
+            + "yet and show their own most recent stretch."
     }
 
     private static func year(_ date: Date) -> String {
@@ -284,7 +297,8 @@ private struct MetricRow: View {
         return series.displayUnit.format(value)
     }
 
-    /// Says what the number is and, when the range is empty, why.
+    /// Says what the number is and, when it is not from the range asked for,
+    /// which window it is from instead.
     private var caption: String {
         if series.hasMixedUnits {
             return "Mixed units — not combined"
@@ -293,13 +307,23 @@ private struct MetricRow: View {
             guard let latest = snapshot.latestOverall else {
                 return "No values yet"
             }
-            return "Nothing in range · last \(latest.formatted(.dateTime.month(.abbreviated).year()))"
+            return "Nothing yet · last \(Self.month(latest))"
+        }
+        if snapshot.isFromEarlierWindow, let latest = snapshot.latestOverall {
+            // Never presented as current. The number is real and so is the
+            // fact that it is two years old, and only saying the first half
+            // would be the more comfortable lie.
+            return "as of \(Self.month(latest)) · \(series.measure.kind.noun.lowercased())"
         }
         var text = series.measure.kind.noun.lowercased()
         if !series.coverage.isEveryDay {
             text += " · \(series.coverage.daysWithData)/\(series.coverage.dayCount) days"
         }
         return text
+    }
+
+    private static func month(_ date: Date) -> String {
+        date.formatted(.dateTime.month(.abbreviated).year())
     }
 
     @ViewBuilder

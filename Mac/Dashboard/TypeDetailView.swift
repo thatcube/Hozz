@@ -277,7 +277,7 @@ struct TypeDetailView: View {
 
     /// An empty range is a fact about the sweep, not about the person.
     private func emptyRange(_ series: TypeSeries) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: 8) {
             Text("Nothing in this range yet.")
                 .font(.callout.weight(.medium))
                 .foregroundStyle(HozzPalette.ink)
@@ -291,6 +291,14 @@ struct TypeDetailView: View {
                 .font(.caption)
                 .foregroundStyle(HozzPalette.inkMuted)
                 .fixedSize(horizontal: false, vertical: true)
+                // A way out rather than a dead end: the records are here, and
+                // the only thing between the reader and them is the window.
+                if range != .all {
+                    Button("Show everything held") { range = .all }
+                        .buttonStyle(.borderedProminent)
+                        .tint(HozzPalette.blue)
+                        .padding(.top, 2)
+                }
             }
         }
         .frame(height: 240, alignment: .topLeading)
