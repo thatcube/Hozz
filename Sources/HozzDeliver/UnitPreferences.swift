@@ -100,10 +100,18 @@ public enum UnitFamily: String, CaseIterable, Sendable {
     /// needs and is always present. The type identifier only ever chooses
     /// between two groups that share a dimension, which is length: a distance
     /// and a waist measurement are both metres and want opposite answers.
+    ///
+    /// Matched without regard to case because a grouped payload has already
+    /// replaced the identifier with a short name — `distance_rowing` rather than
+    /// `HKQuantityTypeIdentifierDistanceRowing` — and a case-sensitive test
+    /// against those would call every rowing session a body measurement and
+    /// deliver two thousand metres as seventy-eight thousand inches.
     public static func of(unit: String, typeIdentifier: String) -> UnitFamily? {
         switch HealthUnit.dimension(of: unit) {
         case .length:
-            return typeIdentifier.contains("Distance") ? .distance : .bodyLength
+            return typeIdentifier.range(of: "distance", options: .caseInsensitive) != nil
+                ? .distance
+                : .bodyLength
         case .mass:
             return .mass
         case .energy:

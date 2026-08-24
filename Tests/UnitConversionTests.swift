@@ -469,11 +469,14 @@ final class UnitConversionTests: XCTestCase {
         )
     }
 
-    /// A grouped payload carries the unit twice — on the metric and, in some
-    /// shapes, on every point — and both have to move or they disagree.
+    /// A grouped payload carries the unit **twice** — on the metric and on
+    /// every single point — and both have to move or the point ends up saying
+    /// 154.32 kg. The fixture below therefore carries the per-point `units`
+    /// key, exactly as `CompatiblePayloadBuilder` writes it; a fixture without
+    /// it could not have caught that, and did not.
     func testMetricsJSONConvertsEveryPointAndTheMetricsOwnUnit() throws {
         let metrics = Data(
-            #"{"data":{"metrics":[{"data":[{"date":"2026-08-22T09:00:00.000Z","qty":70},{"date":"2026-08-23T09:00:00.000Z","qty":71}],"name":"weight_body_mass","units":"kg"}]}}"#
+            #"{"data":{"metrics":[{"data":[{"date":"2026-08-22T09:00:00.000Z","qty":70,"units":"kg"},{"date":"2026-08-23T09:00:00.000Z","qty":71,"units":"kg"}],"name":"weight_body_mass","units":"kg"}]}}"#
                 .utf8
         )
 
@@ -502,6 +505,132 @@ final class UnitConversionTests: XCTestCase {
             accuracy: 0.001,
             "71 kg is 156.53 lb."
         )
+        for point in points {
+            XCTAssertEqual(
+                point["units"] as? String,
+                "lb",
+                "A converted number wearing the unit it was converted away from "
+                    + "is the worst outcome available: \(point)"
+            )
+        }
+    }
+
+    /// A point that disagrees with its metric about the unit cannot be assumed
+    /// to be in the metric's unit, and relabelling it would be inventing a
+    /// reading. The whole metric is left alone instead.
+    func testAMetricWithAPointInADifferentUnitIsLeftEntirelyAlone() throws {
+        let mixed = Data(
+            #"{"data":{"metrics":[{"data":[{"date":"2026-08-22T09:00:00.000Z","qty":70,"units":"kg"},{"date":"2026-08-23T09:00:00.000Z","qty":154,"units":"lb"}],"name":"weight_body_mass","units":"kg"}]}}"#
+                .utf8
+        )
+
+        XCTAssertEqual(
+            PayloadUnits.apply(
+                UnitPreferences(units: [.mass: "st"]),
+                to: mixed,
+                format: .metrics
+            ),
+            mixed,
+            "Byte for byte, rather than half converted."
+        )
+    }
+
+    /// A grouped payload has already thrown the type identifier away, so the
+    /// family is worked out from the short metric name. Four distance types are
+    /// not in the name map at all, and a case-sensitive test against a
+    /// snake_case name called every one of them a body measurement — delivering
+    /// a two-kilometre row as seventy-eight thousand inches.
+    func testARowingDistanceIsADistanceAndNotABodyMeasurement() {
+        XCTAssertEqual(
+            UnitFamily.of(unit: "m", typeIdentifier: "distance_rowing"),
+            .distance
+        )
+        XCTAssertEqual(
+            UnitFamily.of(
+                unit: "m",
+                typeIdentifier: "HKQuantityTypeIdentifierDistanceRowing"
+            ),
+            .distance
+        )
+        XCTAssertEqual(
+            UnitFamily.of(unit: "cm", typeIdentifier: "height"),
+            .bodyLength,
+            "And a height is still a height."
+        )
+    }
+
+    /// The same reading must not arrive in different units depending on which
+    /// format it was sent in.
+    func testARowingDistanceGetsTheSameUnitInEveryFormat() throws {
+        let preferences = UnitPreferences(units: [.distance: "mi", .bodyLength: "in"])
+
+        let canonical = Data(
+            (
+                #"{"id":"row","kind":"quantity","quantity":{"unit":"m","value":2000},"startDate":"2026-08-22T09:00:00.000Z","type":"HKQuantityTypeIdentifierDistanceRowing"}"#
+                    + "\n"
+            ).utf8
+        )
+        let grouped = Data(
+            #"{"data":{"metrics":[{"data":[{"date":"2026-08-22T09:00:00.000Z","qty":2000,"units":"m"}],"name":"distance_rowing","units":"m"}]}}"#
+                .utf8
+        )
+
+        let asNDJSON = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: Data(
+                    PayloadUnits.apply(preferences, to: canonical, format: .ndjson)
+                        .dropLast()
+                )
+            ) as? [String: Any]
+        )
+        let quantity = try XCTUnwrap(asNDJSON["quantity"] as? [String: Any])
+
+        let asMetrics = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: PayloadUnits.apply(preferences, to: grouped, format: .metrics)
+            ) as? [String: Any]
+        )
+        let data = try XCTUnwrap(asMetrics["data"] as? [String: Any])
+        let list = try XCTUnwrap(data["metrics"] as? [[String: Any]])
+
+        XCTAssertEqual(quantity["unit"] as? String, "mi")
+        XCTAssertEqual(list[0]["units"] as? String, "mi")
+        // 2000 m is 1.2427 miles, from the exact mile of 1609.344 m.
+        XCTAssertEqual(
+            try XCTUnwrap(quantity["value"] as? Double),
+            1.242742,
+            accuracy: 0.000_001
+        )
+    }
+
+    /// Splitting happens after converting, so a marker added by the conversion
+    /// has to survive being taken apart and put back together.
+    func testSplittingAConvertedMetricsBatchKeepsTheConversionMarker() throws {
+        let converted = PayloadUnits.apply(
+            UnitPreferences(units: [.mass: "lb"]),
+            to: Data(
+                #"{"data":{"metrics":[{"data":[{"date":"2026-08-22T09:00:00.000Z","qty":70,"units":"kg"},{"date":"2026-08-23T09:00:00.000Z","qty":71,"units":"kg"}],"name":"weight_body_mass","units":"kg"}]}}"#
+                    .utf8
+            ),
+            format: .metrics
+        )
+
+        let parts = PayloadDivision.divide(converted, format: .metrics, into: 1)
+        XCTAssertEqual(parts.count, 2)
+
+        for part in parts {
+            let root = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: part) as? [String: Any]
+            )
+            let data = try XCTUnwrap(root["data"] as? [String: Any])
+            let list = try XCTUnwrap(data["metrics"] as? [[String: Any]])
+            XCTAssertEqual(list[0]["units"] as? String, "lb")
+            XCTAssertEqual(
+                list[0]["convertedFrom"] as? String,
+                "kg",
+                "A receiver comparing histories needs to know the column changed."
+            )
+        }
     }
 
     /// The unit is a tag inside a line whose escaping rules differ by position,

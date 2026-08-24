@@ -203,7 +203,14 @@ public enum PayloadUnits {
             let points = (metric["data"] as? [[String: Any]] ?? []).map {
                 point -> [String: Any] in
                 var point = point
+                // Hozz's grouped shape writes the unit on every point as well
+                // as on the metric. Both have to move in this one edit, or the
+                // point ends up saying 154.32 kg — a converted number wearing
+                // the unit it was converted away from, which is the exact
+                // failure this file exists to prevent.
+                let pointUnit = point["units"] as? String
                 guard
+                    pointUnit == nil || pointUnit == unit,
                     let value = number(point["qty"]),
                     let result = HealthUnit.convert(value, from: unit, to: target)
                 else {
@@ -216,6 +223,9 @@ public enum PayloadUnits {
                     return point
                 }
                 point["qty"] = result
+                if pointUnit != nil {
+                    point["units"] = target
+                }
                 return point
             }
 

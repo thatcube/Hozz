@@ -37,10 +37,9 @@ public enum PayloadDivision {
             case .line(let line):
                 // The line, plus a newline or a comma and a newline.
                 line.count + 2
-            case .metricPoint(let name, let units, let point):
-                // The point, plus its share of the metric envelope it may have
-                // to open: {"name":"…","units":"…","data":[]}.
-                point.count + name.count + units.count + 40
+            case .metricPoint(_, let metric, let point):
+                // The point, plus the metric envelope it may have to open.
+                point.count + metric.count + 12
             case .metricWorkout(let object), .metricDeletion(let object):
                 object.count + 2
             }
@@ -50,13 +49,21 @@ public enum PayloadDivision {
             /// A whole line, exactly as the builder wrote it.
             case line(Data)
             /// One point inside a Metrics JSON metric, held as the bytes of its
-            /// own JSON object.
+            /// own JSON object, alongside the bytes of the metric it belongs to
+            /// with its points removed.
+            ///
+            /// The whole envelope rather than just the name and the unit,
+            /// because a metric can carry more than those two — a converted one
+            /// carries `convertedFrom` — and rebuilding it from a fixed list of
+            /// keys would drop anything not on the list. That is how splitting a
+            /// batch quietly loses the marker that says a column's meaning
+            /// changed.
             ///
             /// Bytes rather than a dictionary because a `[String: Any]` is not
             /// `Sendable`, and a batch crosses actors on its way to a channel.
             /// Re-serialising is deterministic — every builder here writes with
             /// sorted keys — so nothing about the payload changes for it.
-            case metricPoint(name: String, units: String, point: Data)
+            case metricPoint(name: String, metric: Data, point: Data)
             case metricWorkout(Data)
             case metricDeletion(Data)
         }
@@ -544,8 +551,13 @@ public enum PayloadDivision {
         for metric in data["metrics"] as? [JSONObject] ?? [] {
             guard
                 let name = metric["name"] as? String,
-                let units = metric["units"] as? String
+                metric["units"] is String
             else {
+                return nil
+            }
+            var envelope = metric
+            envelope["data"] = nil
+            guard let envelopeBytes = encode(envelope) else {
                 return nil
             }
             for point in metric["data"] as? [JSONObject] ?? [] {
@@ -555,7 +567,11 @@ public enum PayloadDivision {
                 records.append(
                     Record(
                         date: metricPointDate(point, style: dateStyle),
-                        content: .metricPoint(name: name, units: units, point: bytes)
+                        content: .metricPoint(
+                            name: name,
+                            metric: envelopeBytes,
+                            point: bytes
+                        )
                     )
                 )
             }
@@ -614,18 +630,18 @@ public enum PayloadDivision {
         // still be valid JSON, but it would no longer be the same payload, and
         // the round-trip check is what makes the split trustworthy.
         var order: [String] = []
-        var grouped: [String: (units: String, points: [JSONObject])] = [:]
+        var grouped: [String: (envelope: JSONObject, points: [JSONObject])] = [:]
         var workouts: [JSONObject] = []
         var deletions: [JSONObject] = []
 
         for record in records {
             switch record.content {
-            case .metricPoint(let name, let units, let point):
-                guard let point = decode(point) else {
+            case .metricPoint(let name, let metric, let point):
+                guard let point = decode(point), let envelope = decode(metric) else {
                     continue
                 }
                 if grouped[name] == nil {
-                    grouped[name] = (units: units, points: [])
+                    grouped[name] = (envelope: envelope, points: [])
                     order.append(name)
                 }
                 grouped[name]?.points.append(point)
@@ -645,8 +661,14 @@ public enum PayloadDivision {
         }
 
         let metrics = order.sorted().map { name -> JSONObject in
-            let value = grouped[name] ?? (units: "count", points: [])
-            return ["name": name, "units": value.units, "data": value.points]
+            guard let value = grouped[name] else {
+                return ["name": name, "units": "count", "data": []]
+            }
+            // Rebuilt from the envelope it arrived in, so every key it carried
+            // is still there — including one this build has never heard of.
+            var metric = value.envelope
+            metric["data"] = value.points
+            return metric
         }
 
         var data: JSONObject = ["metrics": metrics]
