@@ -566,9 +566,15 @@ enum ExportMarkdownWriter {
         var workouts: [WorkoutLine] = []
         var workoutCount = 0
         var workoutSeconds = 0.0
-        var asleepSeconds = 0.0
-        var inBedSeconds = 0.0
+        // Stretches rather than a running total, because two devices describing
+        // one night each write a record, and adding their durations reports that
+        // night twice. The union is taken when the figure is read.
+        var asleepStretches: [DateInterval] = []
+        var inBedStretches: [DateInterval] = []
         var sleepSegments = 0
+
+        var asleepSeconds: Double { TimeUnion.seconds(of: asleepStretches) }
+        var inBedSeconds: Double { TimeUnion.seconds(of: inBedStretches) }
 
         mutating func count(typeID: Int) {
             var entry = totals[typeID] ?? Totals()
@@ -653,14 +659,21 @@ enum ExportMarkdownWriter {
 
         mutating func add(sleep record: ExportRecord) {
             sleepSegments += 1
-            let seconds = Self.seconds(from: record.startDate, to: record.endDate)
+            guard
+                let start = record.startDate,
+                let end = record.endDate,
+                end > start
+            else {
+                return
+            }
+            let stretch = DateInterval(start: start, end: end)
             switch Int(record.value ?? -1) {
             case 0:
-                inBedSeconds += seconds
+                inBedStretches.append(stretch)
             // 1 is the old undifferentiated "asleep"; 3, 4 and 5 are the core,
             // deep and REM stages that replaced it. 2 is awake, and is neither.
             case 1, 3, 4, 5:
-                asleepSeconds += seconds
+                asleepStretches.append(stretch)
             default:
                 break
             }
