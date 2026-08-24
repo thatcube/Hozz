@@ -369,7 +369,6 @@ targets:
       - Sources/HozzDeliver
     dependencies:
       - target: HozzCoreMac
-      - target: HozzUIMac
       - target: HozzStoreMac
     settings:
       base:
@@ -434,6 +433,7 @@ targets:
       - Mac
     dependencies:
       - target: HozzCoreMac
+      - target: HozzUIMac
       - target: HozzStoreMac
       - target: HozzDeliverMac
       - target: HozzReceiveMac
