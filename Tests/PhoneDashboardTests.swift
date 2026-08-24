@@ -5,7 +5,11 @@ import HozzHealth
 import XCTest
 @testable import Hozz
 
-/// The arithmetic behind the charts.
+/// The arithmetic behind the iPhone's charts.
+///
+/// Named for the phone because the Mac dashboards have their own suite under
+/// `HealthDashboardTests`, and two test classes of the same name in one bundle
+/// are one class as far as the runtime is concerned.
 ///
 /// Every expected value here is worked out by hand or by an obviously
 /// different method than the one under test. A test that recomputes the
@@ -15,7 +19,7 @@ import XCTest
 ///
 /// The stakes are why. A chart that renders beautifully and reports the wrong
 /// resting heart rate is worse than no chart, because someone believes it.
-final class HealthDashboardTests: XCTestCase {
+final class PhoneDashboardTests: XCTestCase {
     /// A fixed zone with a daylight-saving change, so "local time" means
     /// something specific rather than whatever the test machine is set to.
     private let newYork = TimeZone(identifier: "America/New_York")!
