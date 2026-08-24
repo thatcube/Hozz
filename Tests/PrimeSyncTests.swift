@@ -132,6 +132,26 @@ final class PrimeSyncTests: XCTestCase {
         Set((0..<180).map { "h\($0)" })
     }
 
+    /// A busier fixture: enough records inside the window that one pass's
+    /// budget cannot finish the backfill.
+    ///
+    /// Needed because most of what the prime does happens *during* a backfill
+    /// that spans passes, and a fixture small enough to finish in one pass
+    /// silently skips that whole state.
+    private func denseHistory() -> [ScriptedDatedSample] {
+        // Fifty a day for ninety days is 4,500 — comfortably past the 3,750 a
+        // single pass will spend on priming.
+        (0..<(90 * 50)).map { index in
+            let date = now.addingTimeInterval(
+                -Double(index + 1) * (86_400 / 50)
+            )
+            return ScriptedDatedSample(
+                change: change("d\(index)", type: steps, at: date),
+                start: date
+            )
+        }
+    }
+
     /// The name inside a scripted sample, read back out of its payload.
     private func name(of sample: ScriptedDatedSample) -> String? {
         guard case .upsert(let object) = sample.change else {
@@ -657,25 +677,45 @@ final class PrimeSyncTests: XCTestCase {
             dated: ScriptedDatedHealthDataSource(samples: [steps: samples])
         )
 
+        let step = PrimePlan.topUpInterval + 60
         for index in 0..<8 {
-            await pass(
-                engine,
-                at: now.addingTimeInterval(Double(index) * (PrimePlan.topUpInterval + 60))
-            )
+            await pass(engine, at: now.addingTimeInterval(Double(index) * step))
         }
+        let lastPass = now.addingTimeInterval(7 * step)
 
         let record = try await XCTUnwrapAsync(
             try await store.primeRecord(scope: scope, type: steps)
         )
         let covered = try XCTUnwrap(record.coveredWindow)
-        let names = Set(await channel.sampleNames(for: destination.id))
 
-        // Worked out from the fixture's own dates, not from what arrived.
+        // Where the claim's edges belong, worked out here. Reading them off the
+        // record and then filtering the fixture by them would check that the
+        // claim has no holes in it — worth checking — while letting the claim
+        // be any size at all, including a second wide.
+        XCTAssertEqual(
+            covered.from,
+            now.addingTimeInterval(-90 * 86_400),
+            "The backfill had eight passes to reach the oldest instant it aims at."
+        )
+        XCTAssertEqual(
+            covered.through,
+            lastPass,
+            """
+            Each pass is more than the staleness interval after the last, so \
+            every one of them tops the edge up to its own idea of now, and the \
+            last one leaves it exactly there.
+            """
+        )
+
         let expected = Set(
             samples
-                .filter { $0.start >= covered.from && $0.start < covered.through }
+                .filter {
+                    $0.start >= now.addingTimeInterval(-90 * 86_400)
+                        && $0.start < lastPass
+                }
                 .compactMap(name(of:))
         )
+        let names = Set(await channel.sampleNames(for: destination.id))
         XCTAssertEqual(
             names,
             expected,
@@ -684,24 +724,78 @@ final class PrimeSyncTests: XCTestCase {
             outside it may have been counted towards the claim.
             """
         )
-        XCTAssertTrue(
-            names.contains("edge0"),
-            """
-            A sample recorded at the exact instant the prime began belongs to \
-            the top-up, whose lower edge is inclusive. If neither walk claimed \
-            it, it would sit in the seam between them.
-            """
-        )
+        for edge in ["edge0", "edge90", "edge200"] {
+            XCTAssertTrue(
+                names.contains(edge),
+                """
+                \(edge) is after the instant the prime began, so only the \
+                top-up can reach it. `edge0` is on that instant exactly: the \
+                backfill's upper edge excludes it and the top-up's lower edge \
+                includes it, so it belongs to precisely one of them rather \
+                than to the seam between them.
+                """
+            )
+        }
     }
 
     /// Freshness is worth a query. Freshness every forty seconds is not.
+    ///
+    /// Deliberately run against a type that is still backfilling, because that
+    /// is the state nearly every type is in for the weeks this feature exists
+    /// for — and a type is selected for a pass by *either* walk having work, so
+    /// a gate that only held for finished types would not hold for anything.
     func testTheLeadingEdgeIsNotCheckedMoreOftenThanItIsWorth() async throws {
         let store = try makeStore()
         let channel = PrimeRecordingChannel()
         let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
         _ = try await makeDestination(delivery)
 
-        // Nothing to backfill, so every query after the first pass is a top-up.
+        let dated = ScriptedDatedHealthDataSource(samples: [steps: denseHistory()])
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            sweep: ScriptedHealthDataSource(streams: [steps: []]),
+            dated: dated
+        )
+
+        // A top-up is any read that starts at or after the instant the prime
+        // began; everything below that is the backfill walking into the past.
+        func topUpWindows() async -> [Range<Date>] {
+            await dated.requestedWindows(for: steps)
+                .filter { $0.lowerBound >= now }
+        }
+
+        await pass(engine, at: now)
+        await pass(engine, at: now.addingTimeInterval(40))
+        await pass(engine, at: now.addingTimeInterval(80))
+
+        let early = await topUpWindows()
+        XCTAssertTrue(
+            early.isEmpty,
+            """
+            Three passes inside a minute, on a type with plenty of backfill \
+            still to do, must not have cost a single query asking whether \
+            anything happened in the last forty seconds.
+            """
+        )
+
+        await pass(engine, at: now.addingTimeInterval(PrimePlan.topUpInterval + 60))
+        let afterInterval = await topUpWindows()
+        XCTAssertFalse(
+            afterInterval.isEmpty,
+            "Once the edge is properly stale it must be looked at."
+        )
+    }
+
+    /// A busy few minutes at the leading edge says nothing about the months
+    /// behind it, and must not be recorded as though it did.
+    func testDensityAtTheLeadingEdgeDoesNotUndoAFinishedBackfill() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = try await makeDestination(delivery)
+        let scope = AnchorScope.destination(destination.id)
+
         let dated = ScriptedDatedHealthDataSource(samples: [steps: []])
         let engine = makeEngine(
             store: store,
@@ -711,25 +805,53 @@ final class PrimeSyncTests: XCTestCase {
         )
 
         await pass(engine, at: now)
-        let afterBackfill = await dated.queryCount(for: steps)
+        let covered = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
+        XCTAssertEqual(covered.state, .covered)
+        let claim = try XCTUnwrap(covered.coveredWindow)
 
-        await pass(engine, at: now.addingTimeInterval(60))
-        let afterSoonAfter = await dated.queryCount(for: steps)
+        // From here on, every read of the leading edge overflows.
+        let backfillQueries = await dated.queryCount(for: steps)
+        await dated.setFaults(
+            Dictionary(
+                uniqueKeysWithValues: (backfillQueries + 1...backfillQueries + 64)
+                    .map { ($0, ScriptedDatedFault.truncate) }
+            ),
+            for: steps
+        )
+        await pass(engine, at: now.addingTimeInterval(PrimePlan.topUpInterval + 60))
+
+        let after = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
         XCTAssertEqual(
-            afterSoonAfter,
-            afterBackfill,
+            after.state,
+            .covered,
             """
-            A hundred types checked on every pass is a hundred queries to \
-            discover that nothing happened in the last minute.
+            The backfill reached the oldest instant it was aiming at. Nothing \
+            that happens at the leading edge later can make that untrue, and \
+            marking the record stalled would freeze it out of every future \
+            pass as well.
             """
         )
+        XCTAssertEqual(
+            after.coveredWindow?.from,
+            claim.from,
+            "The months already delivered are still delivered."
+        )
 
-        await pass(engine, at: now.addingTimeInterval(PrimePlan.topUpInterval + 60))
-        let afterInterval = await dated.queryCount(for: steps)
+        // And it is still being tried, rather than abandoned.
+        let beforeLastPass = await dated.queryCount(for: steps)
+        await pass(
+            engine,
+            at: now.addingTimeInterval(2 * (PrimePlan.topUpInterval + 60))
+        )
+        let afterLastPass = await dated.queryCount(for: steps)
         XCTAssertGreaterThan(
-            afterInterval,
-            afterSoonAfter,
-            "Once the edge is properly stale it must be looked at."
+            afterLastPass,
+            beforeLastPass,
+            "A record frozen by a transient edge condition never recovers."
         )
     }
 
@@ -898,6 +1020,65 @@ final class PrimeSyncTests: XCTestCase {
             queriesAfterFirstPass,
             "A stalled prime stays stopped rather than burning every pass."
         )
+    }
+
+    // MARK: - What a pass says about itself
+
+    /// The pass has to carry the prime's facts up, or nothing downstream can
+    /// say a true sentence about them.
+    ///
+    /// The fields have defaults, so an outcome that dropped them still
+    /// compiled, still looked right, and turned every sentence that depended on
+    /// them into one nobody could ever see. Only a test that goes through the
+    /// same call the app does can tell the difference.
+    func testAPassReportsThePrimingItActuallyDid() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = try await makeDestination(delivery)
+
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            sweep: ScriptedHealthDataSource(streams: [steps: []]),
+            dated: ScriptedDatedHealthDataSource(samples: [steps: denseHistory()])
+        )
+
+        let firstOutcome = await pass(engine, at: now)
+        let first = try XCTUnwrap(firstOutcome)
+        XCTAssertGreaterThan(
+            first.primedRecords,
+            0,
+            "Every record this pass sent came from the dated walk."
+        )
+        XCTAssertEqual(
+            first.primedRecords,
+            first.deliveredRecords,
+            "The sweep had nothing, so the two counts are the same pass."
+        )
+        XCTAssertTrue(
+            first.primingRemains,
+            """
+            Four and a half thousand records do not fit in one pass's budget,             so this pass finished nothing and must not say it did.
+            """
+        )
+
+        var last: SyncOutcome?
+        for index in 1..<12 {
+            last = await pass(engine, at: now.addingTimeInterval(Double(index) * 60))
+        }
+
+        let finished = try XCTUnwrap(last)
+        XCTAssertFalse(
+            finished.primingRemains,
+            "Once every window is walked there is nothing left to be fetching."
+        )
+
+        let record = try await store.primeRecord(
+            scope: .destination(destination.id),
+            type: steps
+        )
+        XCTAssertEqual(record?.state, .covered)
     }
 
     // MARK: - Asking again

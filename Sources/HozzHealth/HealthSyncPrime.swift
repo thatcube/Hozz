@@ -284,8 +284,18 @@ extension HealthSyncEngine {
 
         /// Handles a chunk that came back over capacity. Returns false when the
         /// walk cannot narrow any further and has to stop.
-        func narrow() -> Bool {
-            if PrimePlan.isAtMinimum(seconds) {
+        ///
+        /// Narrows from the chunk's *actual* length rather than the length that
+        /// was asked for, because those differ whenever a chunk was clipped by
+        /// an edge — and asking again for a length that clips to the same
+        /// window produces a byte-identical read and a guaranteed identical
+        /// answer. A sparse type that had settled near the longest chunk and
+        /// then meets a busy five minutes would spend nine reads of its budget
+        /// discovering the same thing nine times.
+        func narrow(_ chunk: Range<Date>) -> Bool {
+            let asked = chunk.upperBound.timeIntervalSince(chunk.lowerBound)
+            let effective = min(seconds, asked)
+            if PrimePlan.isAtMinimum(effective) {
                 // A minute of one type overflowing a five-hundred record bite
                 // is not something the dated reader can page through without
                 // either dropping records or holding more than a background
@@ -293,21 +303,31 @@ extension HealthSyncEngine {
                 // reaches every one of these records, so this costs speed
                 // rather than data — and a stalled prime keeps claiming
                 // exactly the stretch it had already delivered.
-                state = .stalled
                 failureReason =
                     "More records than one read can hold in the shortest window Hozz will ask for."
                 Self.primeLog.notice(
                     "A type is too dense for a dated read at the shortest window."
                 )
+                seconds = PrimePlan.minimumChunk
                 return false
             }
-            seconds = PrimePlan.narrowed(seconds)
+            seconds = PrimePlan.narrowed(effective)
             return true
         }
 
         // The leading edge, walked upwards so a half-finished top-up still
         // abuts what is already covered and can be recorded as it goes.
-        topUp: while state != .stalled {
+        //
+        // The staleness gate lives here rather than only in the selection above,
+        // because a type is also selected for having a backfill to do — and
+        // without this, every type still working through its months would pay a
+        // top-up query on every pass to discover that nothing had happened in
+        // the last forty seconds. That is the cost this interval exists to
+        // avoid, during the weeks when it applies to nearly every type.
+        topUp: while
+            state != .stalled,
+            coveredThrough.addingTimeInterval(PrimePlan.topUpInterval) <= now
+        {
             if Task.isCancelled {
                 walk.wasInterrupted = true
                 break topUp
@@ -343,9 +363,18 @@ extension HealthSyncEngine {
                 break topUp
             }
             if batch.isTruncated {
-                if narrow() {
+                if narrow(chunk) {
                     continue topUp
                 }
+                // Deliberately does *not* mark the record stalled. A stall is a
+                // statement about the backfill — the months this prime set out
+                // to fetch — and a busy few minutes at the leading edge is not
+                // evidence about them. Marking it here would freeze the record
+                // out of every future pass, abandon a backfill that may be
+                // half done, and make `isCovered` start reporting false about a
+                // backfill that genuinely finished. The narrowed length is
+                // committed below, so the next pass rediscovers this in one
+                // query rather than nine.
                 break topUp
             }
 
@@ -395,9 +424,10 @@ extension HealthSyncEngine {
                 break backfill
             }
             if batch.isTruncated {
-                if narrow() {
+                if narrow(chunk) {
                     continue backfill
                 }
+                state = .stalled
                 break backfill
             }
 
@@ -431,7 +461,14 @@ extension HealthSyncEngine {
             )
         }
 
-        guard Self.moved(frontier, coveredThrough, record) || state != record.state else {
+        // A length that was narrowed is worth keeping even when nothing else
+        // moved. Without it a walk that spent nine reads finding out how dense
+        // a stretch is would throw that away and spend them again next pass.
+        guard
+            Self.moved(frontier, coveredThrough, record)
+                || state != record.state
+                || seconds != record.chunkSeconds
+        else {
             return walk
         }
         walk.commit = PendingPrimeCommit(

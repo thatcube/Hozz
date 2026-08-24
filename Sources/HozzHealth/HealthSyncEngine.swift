@@ -184,6 +184,8 @@ public actor HealthSyncEngine {
         }
 
         var deliveredRecords = 0
+        var primedRecords = 0
+        var primingRemains = false
         var typesDrained = 0
         var interrupted = false
         var waitingForUnlock = false
@@ -206,6 +208,13 @@ public actor HealthSyncEngine {
                 continue
             }
             deliveredRecords += result.deliveredRecords
+            // Carried up with the rest, and worth naming because leaving them
+            // out is invisible: the fields have defaults, so an outcome that
+            // dropped them still compiles, still looks right, and quietly turns
+            // every sentence downstream that depends on them into one nobody
+            // can ever see.
+            primedRecords += result.primedRecords
+            primingRemains = primingRemains || result.primingRemains
             typesDrained = max(typesDrained, result.typesDrained)
             interrupted = interrupted || result.wasInterrupted
             waitingForUnlock = waitingForUnlock || result.waitingForUnlock
@@ -226,7 +235,9 @@ public actor HealthSyncEngine {
             destinationCount: destinations.count,
             typesDrained: typesDrained,
             wasInterrupted: interrupted,
-            waitingForUnlock: waitingForUnlock
+            waitingForUnlock: waitingForUnlock,
+            primedRecords: primedRecords,
+            primingRemains: primingRemains
         )
     }
 
