@@ -107,6 +107,166 @@ final class HealthKitQuerySupportTests: XCTestCase {
 
     /// Clinical records read through `HKSampleQuery`, and this proves that
     /// query is constructible for every clinical type.
+
+    // MARK: - The series query behind a quantity aggregate
+
+    /// Runs the real `HKQuantitySeriesSampleQuery` against a real store.
+    ///
+    /// The expansion tests drive a fake backend, which is the only way the
+    /// offset arithmetic can be tested at all — a sample with `count > 1`
+    /// needs `HKQuantitySeriesSampleBuilder` and a writable store. But a fake
+    /// backend can say nothing about whether HealthKit will accept the query,
+    /// and that is precisely the gap two crashes went through today. No
+    /// readings come back here; "does this query run at all" is answerable
+    /// without any.
+    func testTheQuantitySeriesQueryCanBeConstructedAndRunForEveryQuantityType() async throws {
+        try XCTSkipUnless(
+            HKHealthStore.isHealthDataAvailable(),
+            "Needs HealthKit."
+        )
+        let store = HKHealthStore()
+        let backend = HealthKitQuantitySeriesBackend(healthStore: store)
+
+        // Any quantity type at all can hold a series: HealthKit offers no
+        // predicate to tell them apart, which is the whole reason expansion
+        // happens inside the ordinary drain. So the list to check is all of
+        // them, sampled across so this stays a quick test.
+        let quantityTypes = HealthKitTypeRegistry.exportableTypes()
+            .filter { $0.catalogEntry.family == .quantity }
+            .filter { $0.catalogEntry.canonicalUnit != nil }
+        XCTAssertGreaterThan(quantityTypes.count, 50)
+
+        let sampled = stride(from: 0, to: quantityTypes.count, by: 11)
+            .map { quantityTypes[$0] }
+
+        for type in sampled {
+            let key = type.catalogEntry.key
+            let unit = try XCTUnwrap(type.catalogEntry.canonicalUnit)
+
+            // The parent lookup, which decides whether a queued sample is
+            // still in Health.
+            do {
+                _ = try await backend.facts(for: UUID(), type: key)
+            } catch {
+                assertRanButWasNotAuthorised(error, key)
+            }
+
+            // The series query itself.
+            do {
+                for try await _ in backend.readings(
+                    for: UUID(),
+                    type: key,
+                    unit: unit
+                ) {
+                    XCTFail("Nothing is authorised, so nothing should arrive.")
+                }
+            } catch {
+                assertRanButWasNotAuthorised(error, key)
+            }
+        }
+    }
+
+    /// The expansion branch of the drain, driven through the real source with
+    /// a real store.
+    ///
+    /// A cursor carrying a sample to expand takes a different path inside
+    /// ``HealthKitHealthDataSource`` than an ordinary page does, and nothing
+    /// else executes it against HealthKit.
+    func testACursorWithASeriesPendingRunsARealQueryRatherThanCrashing() async throws {
+        try XCTSkipUnless(
+            HKHealthStore.isHealthDataAvailable(),
+            "Needs HealthKit."
+        )
+        let source = HealthKitHealthDataSource(healthStore: HKHealthStore())
+        let type = try XCTUnwrap(
+            HealthKitTypeRegistry.exportableTypes().first {
+                $0.catalogEntry.key.rawValue
+                    == "HKQuantityTypeIdentifierHeartRate"
+            }
+        )
+
+        let cursor = try QuantityAnchor(
+            healthKitAnchor: HealthKitAnchorCoding
+                .token(for: HKQueryAnchor(fromValue: 1)).data,
+            pendingSeries: [UUID()]
+        ).token()
+
+        do {
+            let batch = try await source.changes(
+                for: type.catalogEntry.key,
+                after: cursor,
+                limit: 8
+            )
+            // Reachable if Health answers rather than refusing: the sample is
+            // invented, so it is not there and the page says so.
+            XCTAssertFalse(batch.changes.isEmpty)
+        } catch {
+            assertRanButWasNotAuthorised(error, type.catalogEntry.key)
+        }
+    }
+
+    /// Every canonical unit in the catalogue must be one HealthKit accepts for
+    /// the type it belongs to.
+    ///
+    /// `HKUnit(from:)` raises rather than returning nil, and
+    /// `doubleValue(for:)` raises on an incompatible unit — so a wrong string
+    /// in the catalogue is not a bad number, it is the app disappearing. Until
+    /// now nothing ran this: the encoder only reaches `HKUnit(from:)` when a
+    /// sample of that type actually exists, and a simulator has none. Series
+    /// expansion converts every single reading through the same unit, which
+    /// multiplies the exposure by however long the series is.
+    func testEveryCanonicalUnitIsOneHealthKitAcceptsForItsType() throws {
+        try XCTSkipUnless(
+            HKHealthStore.isHealthDataAvailable(),
+            "Needs HealthKit."
+        )
+        var checked = 0
+        for exportable in HealthKitTypeRegistry.exportableTypes() {
+            guard
+                let unitString = exportable.catalogEntry.canonicalUnit,
+                let quantityType = exportable.sampleType as? HKQuantityType
+            else {
+                continue
+            }
+            // Raises if the string is not a unit HealthKit can parse, which
+            // XCTest reports as a failure naming the type.
+            let unit = HKUnit(from: unitString)
+            XCTAssertTrue(
+                quantityType.is(compatibleWith: unit),
+                """
+                \(exportable.catalogEntry.key.rawValue) is catalogued as \
+                \(unitString), which HealthKit will not convert it into. Every \
+                reading of every series of this type would raise.
+                """
+            )
+            checked += 1
+        }
+        XCTAssertGreaterThan(checked, 100, "The check has to reach the types.")
+    }
+
+    /// An authorisation error means the query ran and Health declined to
+    /// answer, which is the expected simulator outcome. Anything else is the
+    /// class of failure that reached a device untested.
+    private func assertRanButWasNotAuthorised(
+        _ error: any Error,
+        _ key: HealthTypeKey,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        let failure = HealthKitFailure.classify(error)
+        XCTAssertEqual(
+            failure.kind,
+            .authorizationIndeterminate,
+            """
+            \(key.rawValue) failed with \(failure.underlyingDescription) \
+            rather than an authorisation error, which means the query itself \
+            is the problem.
+            """,
+            file: file,
+            line: line
+        )
+    }
+
     func testEveryClinicalTypeCanBeReadWithASampleQuery() async throws {
         try XCTSkipUnless(
             HKHealthStore.isHealthDataAvailable(),

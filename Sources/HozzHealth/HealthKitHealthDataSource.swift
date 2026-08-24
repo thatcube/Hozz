@@ -32,16 +32,33 @@ public actor HealthKitHealthDataSource: HealthDataSource {
     private let typesByKey: [HealthTypeKey: ExportableHealthType]
     private let routes: SeriesReader<HealthKitWorkoutRouteBackend>
     private let electrocardiograms: SeriesReader<HealthKitElectrocardiogramBackend>
+    private let quantitySeries: QuantitySeriesExpander
+    /// Whether a series sample noticed in the ordinary stream is queued for
+    /// expansion.
+    ///
+    /// It governs *queueing*, not draining: a sample already in a cursor's
+    /// queue is always finished, whatever this says. Turning it off mid-series
+    /// would otherwise strand readings whose aggregate has already been
+    /// exported promising them, and leave a cursor that never empties.
+    private let expandsQuantitySeries: Bool
     private var encodingErrors: [HealthTypeKey: Int] = [:]
     private var medicationDirectory: [AnyHashable: MedicationConceptFacts]?
 
     public init(
         healthStore: HKHealthStore = HKHealthStore(),
         encoder: HealthSampleEncoder = HealthSampleEncoder(),
-        types: [ExportableHealthType] = HealthKitTypeRegistry.exportableTypes()
+        types: [ExportableHealthType] = HealthKitTypeRegistry.exportableTypes(),
+        expandsQuantitySeries: Bool = true,
+        quantitySeriesBackend: (any QuantitySeriesBackend)? = nil
     ) {
         self.healthStore = healthStore
         self.encoder = encoder
+        self.expandsQuantitySeries = expandsQuantitySeries
+        self.quantitySeries = QuantitySeriesExpander(
+            backend: quantitySeriesBackend
+                ?? HealthKitQuantitySeriesBackend(healthStore: healthStore),
+            encoder: encoder
+        )
         self.routes = SeriesReader(
             shape: WorkoutRouteEncoding.shape,
             backend: HealthKitWorkoutRouteBackend(
@@ -98,7 +115,34 @@ public actor HealthKitHealthDataSource: HealthDataSource {
             }
         }
 
-        let startAnchor = try HealthKitAnchorCoding.anchor(for: anchor)
+        let cursor = try QuantityAnchor.decode(anchor)
+
+        // Readings owed from an earlier page come before anything new. The
+        // HealthKit anchor has already moved past these samples, so they will
+        // never be offered again — finishing them is the only way they are
+        // ever written.
+        if cursor.pendingSample != nil {
+            guard let unit = exportable.catalogEntry.canonicalUnit else {
+                // Unreachable: nothing without a canonical unit is ever
+                // queued. Failing loudly leaves the cursor where it is, which
+                // keeps the readings, rather than dropping the queue.
+                throw HealthKitSourceError.unsupportedType(type.rawValue)
+            }
+            let expansion = try await quantitySeries.expand(
+                from: cursor,
+                type: type,
+                unit: unit,
+                recordLimit: limit
+            )
+            return HealthChangeBatch(
+                changes: expansion.changes,
+                proposedAnchor: try expansion.anchor.token()
+            )
+        }
+
+        let startAnchor = try HealthKitAnchorCoding.anchor(
+            for: cursor.healthKitAnchor.map { AnchorToken(data: $0) }
+        )
         let page = try await page(
             type: exportable,
             anchor: startAnchor,
@@ -106,12 +150,28 @@ public actor HealthKitHealthDataSource: HealthDataSource {
             medications: try await medications(for: exportable)
         )
         encodingErrors[type, default: 0] += page.encodingErrors
-        return page.batch
+
+        return HealthChangeBatch(
+            changes: page.changes,
+            proposedAnchor: try QuantityAnchor(
+                healthKitAnchor: page.anchor.data,
+                pendingSeries: expandsQuantitySeries ? page.seriesSamples : []
+            ).token()
+        )
     }
 
     private struct Page: Sendable {
-        let batch: HealthChangeBatch
+        let changes: [HealthChange]
+        let anchor: AnchorToken
         let encodingErrors: Int
+        /// Samples this page saw that stand for more than one reading.
+        ///
+        /// They are noticed here and nowhere else. HealthKit has no predicate
+        /// for "samples that are series", so the only way to find one is to
+        /// look at every sample of every type as it goes past — which is why
+        /// this lives in the drain that all of them share rather than in a
+        /// series type of its own.
+        let seriesSamples: [UUID]
     }
 
     /// The medication list, read once and reused.
@@ -180,6 +240,7 @@ public actor HealthKitHealthDataSource: HealthDataSource {
                     (samples?.count ?? 0) + (deletions?.count ?? 0)
                 )
                 var encodingErrors = 0
+                var seriesSamples: [UUID] = []
 
                 for sample in samples ?? [] {
                     do {
@@ -197,6 +258,18 @@ public actor HealthKitHealthDataSource: HealthDataSource {
                                 )
                             )
                         )
+                        // Noticed only after the sample encodes, so a reading
+                        // page is never the only thing an export holds about a
+                        // sample it could not otherwise describe.
+                        if
+                            let quantity = sample as? HKQuantitySample,
+                            QuantitySeriesEncoding.isExpandable(
+                                count: quantity.count,
+                                canonicalUnit: catalogEntry.canonicalUnit
+                            )
+                        {
+                            seriesSamples.append(quantity.uuid)
+                        }
                     } catch {
                         // A sample Hozz cannot encode losslessly is recorded as
                         // an explicit error in the output rather than dropped,
@@ -235,11 +308,10 @@ public actor HealthKitHealthDataSource: HealthDataSource {
                     let token = try HealthKitAnchorCoding.token(for: newAnchor)
                     continuation.resume(
                         returning: Page(
-                            batch: HealthChangeBatch(
-                                changes: changes,
-                                proposedAnchor: token
-                            ),
-                            encodingErrors: encodingErrors
+                            changes: changes,
+                            anchor: token,
+                            encodingErrors: encodingErrors,
+                            seriesSamples: seriesSamples
                         )
                     )
                 } catch {

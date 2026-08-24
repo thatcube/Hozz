@@ -197,9 +197,10 @@ public struct HealthSampleEncoder: Sendable {
     /// readings is indistinguishable from a single measurement, which is a
     /// quiet way of overstating what Hozz actually knows.
     ///
-    /// Hozz does not expand those series yet, so the honest thing is to say
-    /// the detail exists and is not here, rather than to let the aggregate
-    /// pass for a reading.
+    /// The readings themselves follow, as ``QuantitySeriesEncoding`` pages
+    /// naming this sample. This record stays the aggregate rather than
+    /// repeating them: it is what HealthKit itself reports, and it is what a
+    /// reading page's contents are checked against.
     static func quantityObject(
         unit: String,
         value: Double,
