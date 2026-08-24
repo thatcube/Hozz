@@ -2,6 +2,65 @@ import Foundation
 import HozzCore
 import HozzStore
 
+/// One reading from inside a quantity series, back out of the store.
+public struct QuantitySeriesReading: Hashable, Sendable {
+    /// Its absolute position in the sample, which is what makes it the same
+    /// reading across a replay rather than merely another one.
+    public let offset: Int
+    public let value: Double
+    public let unit: String?
+    public let startDate: Date?
+    public let endDate: Date?
+
+    public init(
+        offset: Int,
+        value: Double,
+        unit: String?,
+        startDate: Date?,
+        endDate: Date?
+    ) {
+        self.offset = offset
+        self.value = value
+        self.unit = unit
+        self.startDate = startDate
+        self.endDate = endDate
+    }
+}
+
+/// How much of one expanded sample has actually arrived.
+public struct QuantitySeriesState: Hashable, Sendable {
+    public let sampleID: String
+    public let type: String?
+    /// What the phone said it wrote. `nil` until the end marker arrives, which
+    /// is itself the honest answer to "is this finished": not yet.
+    public let exportedReadings: Int?
+    public let readingsHeld: Int
+
+    public init(
+        sampleID: String,
+        type: String?,
+        exportedReadings: Int?,
+        readingsHeld: Int
+    ) {
+        self.sampleID = sampleID
+        self.type = type
+        self.exportedReadings = exportedReadings
+        self.readingsHeld = readingsHeld
+    }
+
+    /// Whether everything the phone said it sent is here.
+    ///
+    /// False while the end marker is missing, because a series with no end
+    /// marker is one still in flight — calling it complete would be a guess
+    /// dressed as a fact.
+    public var isComplete: Bool {
+        guard let exportedReadings else {
+            return false
+        }
+        return readingsHeld >= exportedReadings
+    }
+}
+
 /// A summary of one type's data, for dashboards and for answering questions.
 public struct TypeSummary: Hashable, Sendable {
     public let type: String
@@ -176,6 +235,13 @@ public struct IngestResult: Hashable, Sendable {
     /// Records stored without being understood. Not a loss — the bytes are on
     /// disk — but a signal that this receiver is behind the phone.
     public let unhandled: Int
+    /// Pages of series readings stored. Counted apart from `stored`, which
+    /// means rows that are samples in their own right — a page is several
+    /// hundred readings belonging to one of those. Reported rather than
+    /// folded in or dropped: during a series backfill a batch is often
+    /// nothing but pages, and calling that "0 records" is as wrong in one
+    /// direction as counting each page as a reading was in the other.
+    public let seriesPages: Int
 
     public init(
         stored: Int,
@@ -183,7 +249,8 @@ public struct IngestResult: Hashable, Sendable {
         duplicate: Bool,
         unreadable: Int,
         characteristics: Int = 0,
-        unhandled: Int = 0
+        unhandled: Int = 0,
+        seriesPages: Int = 0
     ) {
         self.stored = stored
         self.deleted = deleted
@@ -191,6 +258,13 @@ public struct IngestResult: Hashable, Sendable {
         self.unreadable = unreadable
         self.characteristics = characteristics
         self.unhandled = unhandled
+        self.seriesPages = seriesPages
+    }
+
+    /// Everything this batch put on disk, which is what a person means by
+    /// "did it arrive".
+    public var storedAnything: Int {
+        stored + characteristics + unhandled + seriesPages
     }
 }
 
@@ -207,11 +281,13 @@ public actor IngestStore {
     /// live in files of their own. They are still actor-isolated, so every read
     /// is serialised against ingest exactly as it was before.
     let database: SQLiteDatabase
-    private let directory: URL
+    /// Visible to the module for the same reason as `database`: the storage
+    /// report needs to size the files on disk, not only the rows in them.
+    let storeDirectory: URL
 
     public init(directory: URL) throws {
         try StoreLocation.prepareDirectory(directory)
-        self.directory = directory
+        self.storeDirectory = directory
         self.database = try SQLiteDatabase(
             url: directory.appending(path: "hozz-received.sqlite")
         )
@@ -230,7 +306,7 @@ public actor IngestStore {
     private static func migrate(_ database: SQLiteDatabase) throws {
         let version = try database.query("PRAGMA user_version", row: { $0.integer(0) })
             .first ?? 0
-        guard version < 7 else {
+        guard version < 8 else {
             return
         }
         try database.transaction {
@@ -515,6 +591,49 @@ public actor IngestStore {
                 CREATE INDEX IF NOT EXISTS workout_activity_workout
                     ON workout_activity (workout_id, ordinal);
 
+                -- The readings behind a quantity aggregate. Kept out of
+                -- `sample` on purpose: they carry their parent's type
+                -- identifier, so a page stored there counts as a heart-rate
+                -- reading when it is the packaging several hundred of them
+                -- arrived in.
+                --
+                -- Keyed by sequence like the voltage pages, and for the same
+                -- reason: a page replayed byte-for-byte overwrites itself
+                -- rather than appearing twice.
+                CREATE TABLE IF NOT EXISTS quantity_series_page (
+                    sample_id TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    sequence INTEGER NOT NULL,
+                    offset INTEGER NOT NULL,
+                    reading_count INTEGER NOT NULL,
+                    unit TEXT,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT,
+                    readings BLOB NOT NULL,
+                    PRIMARY KEY (sample_id, sequence)
+                );
+
+                CREATE INDEX IF NOT EXISTS quantity_series_page_sample
+                    ON quantity_series_page (sample_id, offset);
+
+                CREATE INDEX IF NOT EXISTS quantity_series_page_type
+                    ON quantity_series_page (type, start_date);
+
+                -- One small row per expanded sample, holding the single fact
+                -- its end marker adds: how many readings the phone actually
+                -- wrote. Compared with what the pages hold, it tells a series
+                -- the phone exported short apart from one where a page went
+                -- missing on the way here. Deliberately narrow — no blob —
+                -- because there is one of these per series and repeating the
+                -- aggregate would cost more rows than the readings do.
+                CREATE TABLE IF NOT EXISTS quantity_series (
+                    sample_id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    exported_readings INTEGER NOT NULL,
+                    start_date TEXT NOT NULL,
+                    end_date TEXT
+                );
+
                 CREATE TABLE IF NOT EXISTS audiogram_point (
                     audiogram_id TEXT NOT NULL,
                     frequency REAL NOT NULL,
@@ -530,8 +649,144 @@ public actor IngestStore {
                 """
             )
 
-            try database.execute("PRAGMA user_version = 7")
+            try Self.rehomeMisfiledSeriesPages(database)
+
+            try database.execute("PRAGMA user_version = 8")
         }
+    }
+
+    /// Moves series pages an earlier build filed as ordinary samples.
+    ///
+    /// A build between quantity series expansion landing and this table
+    /// existing accepted reading pages through the generic path, because they
+    /// parse perfectly well as samples — an id, a type, a start date — and so
+    /// they sit in `sample` under their parent's type, inflating every count
+    /// of it. They are moved rather than deleted: the whole record is in
+    /// `raw`, so nothing has to be asked for again, and the phone would not
+    /// re-send them anyway now its cursor has passed them.
+    private static func rehomeMisfiledSeriesPages(
+        _ database: SQLiteDatabase
+    ) throws {
+        // Read in slices, not all at once. The premise of this migration is
+        // that the table is *full* of these rows, and a misfiled page carries
+        // its whole record — five hundred readings, some forty kilobytes — in
+        // `raw`. Twenty thousand of them is a gigabyte resident, inside
+        // `init`, at app start; failing that allocation rolls the transaction
+        // back and the next launch attempts exactly the same one. Wedged
+        // forever, on precisely the archives most worth protecting.
+        //
+        // Keyed by rowid rather than a bare LIMIT, because a row readable as
+        // neither shape is deliberately left in place and a plain LIMIT would
+        // select it again on every pass and never terminate.
+        var cursor: Int64 = 0
+        let slice = 200
+
+        while true {
+            let misfiled = try database.query(
+                """
+                SELECT rowid, id, type, raw FROM sample
+                WHERE kind IN (?, ?) AND rowid > ?
+                ORDER BY rowid
+                LIMIT \(slice)
+                """,
+                [
+                    .text(QuantitySeriesShape.elementKind),
+                    .text(QuantitySeriesShape.endKind),
+                    .integer(cursor)
+                ],
+                row: { ($0.integer(0), $0.text(1), $0.text(2), $0.blob(3) ?? Data()) }
+            )
+            guard !misfiled.isEmpty else {
+                return
+            }
+
+            for (rowid, id, type, raw) in misfiled {
+                cursor = max(cursor, rowid)
+                guard
+                    let object = try? JSONSerialization.jsonObject(with: raw)
+                        as? [String: Any]
+                else {
+                    continue
+                }
+                if let page = QuantitySeriesShape.page(in: object) {
+                    try insert(page, into: database)
+                } else if let end = QuantitySeriesShape.end(in: object) {
+                    try insert(end, into: database)
+                } else {
+                    // Readable as neither shape. It stays exactly where it is
+                    // rather than being dropped for being inconvenient — a row
+                    // nobody can interpret is still a row somebody sent.
+                    continue
+                }
+                // Removed only once its contents are somewhere else, and
+                // matched on the whole primary key so a row that merely shares
+                // an identifier is untouched.
+                try database.run(
+                    "DELETE FROM sample WHERE id = ? AND type = ?",
+                    [.text(id), .text(type)]
+                )
+            }
+        }
+    }
+
+    static func insert(
+        _ page: ReceivedQuantitySeriesPage,
+        into database: SQLiteDatabase
+    ) throws {
+        try database.run(
+            """
+            INSERT INTO quantity_series_page
+                (sample_id, type, sequence, offset, reading_count, unit,
+                 start_date, end_date, readings)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT (sample_id, sequence) DO UPDATE SET
+                type = excluded.type,
+                offset = excluded.offset,
+                reading_count = excluded.reading_count,
+                unit = excluded.unit,
+                start_date = excluded.start_date,
+                end_date = excluded.end_date,
+                readings = excluded.readings
+            """,
+            [
+                .text(page.sampleID),
+                .text(page.type),
+                .integer(Int64(page.sequence)),
+                .integer(Int64(page.offset)),
+                .integer(Int64(page.count)),
+                page.unit.map { SQLiteValue.text($0) } ?? .null,
+                .text(Timestamps.text(from: page.startDate)),
+                page.endDate.map { SQLiteValue.text(Timestamps.text(from: $0)) }
+                    ?? .null,
+                .blob(page.readings)
+            ]
+        )
+    }
+
+    static func insert(
+        _ end: ReceivedQuantitySeriesEnd,
+        into database: SQLiteDatabase
+    ) throws {
+        try database.run(
+            """
+            INSERT INTO quantity_series
+                (sample_id, type, exported_readings, start_date, end_date)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (sample_id) DO UPDATE SET
+                type = excluded.type,
+                exported_readings = excluded.exported_readings,
+                start_date = excluded.start_date,
+                end_date = excluded.end_date
+            """,
+            [
+                .text(end.sampleID),
+                .text(end.type),
+                .integer(Int64(end.exportedReadings)),
+                .text(Timestamps.text(from: end.startDate)),
+                end.endDate.map { SQLiteValue.text(Timestamps.text(from: $0)) }
+                    ?? .null
+            ]
+        )
     }
 
     /// Stores a batch, ignoring one that has already been stored.
@@ -548,18 +803,24 @@ public actor IngestStore {
                 unreadable: batch.unreadableCount
             )
         }
+        // Checked after the duplicate test, so a batch already on disk is
+        // still answered as stored when the disk is full — it *is* stored, and
+        // refusing it would make the phone keep resending something this Mac
+        // already holds.
+        try checkThereIsRoom()
 
         var stored = 0
         var deleted = 0
         var storedCharacteristics = 0
         var storedUnhandled = 0
+        var storedSeriesPages = 0
         let timestamp = Timestamps.text(from: now)
 
         // One transaction, so a batch is either wholly stored or wholly absent.
         // A half-applied batch would be indistinguishable from a complete one
         // on the next delivery, and the missing half would never be resent.
         try database.transaction {
-            (stored, deleted, storedCharacteristics, storedUnhandled) =
+            (stored, deleted, storedCharacteristics, storedUnhandled, storedSeriesPages) =
                 try Self.write(batch, at: timestamp, into: database)
 
             if let idempotencyKey {
@@ -580,7 +841,8 @@ public actor IngestStore {
             duplicate: false,
             unreadable: batch.unreadableCount,
             characteristics: storedCharacteristics,
-            unhandled: storedUnhandled
+            unhandled: storedUnhandled,
+            seriesPages: storedSeriesPages
         )
     }
 
@@ -592,13 +854,14 @@ public actor IngestStore {
         _ batch: ParsedBatch,
         at timestamp: String,
         into database: SQLiteDatabase
-    ) throws -> (Int, Int, Int, Int) {
+    ) throws -> (Int, Int, Int, Int, Int) {
         var stored = 0
         var deleted = 0
         var storedCharacteristics = 0
         var storedUnhandled = 0
         var storedElectrocardiograms = 0
         var storedVoltagePages = 0
+        var storedQuantitySeriesPages = 0
         var storedAudiograms = 0
 
         for record in batch.records {
@@ -772,6 +1035,17 @@ public actor IngestStore {
                 ]
             )
             storedVoltagePages += 1
+        }
+
+        // Kept out of `sample` entirely, so a page of five hundred readings
+        // never counts as a reading of the type it belongs to.
+        for page in batch.quantitySeriesPages {
+            try Self.insert(page, into: database)
+            storedQuantitySeriesPages += 1
+        }
+
+        for end in batch.quantitySeriesEnds {
+            try Self.insert(end, into: database)
         }
 
         for audiogram in batch.audiograms {
@@ -954,9 +1228,20 @@ public actor IngestStore {
                 ]
             )
         }
-        _ = (storedElectrocardiograms, storedVoltagePages, storedAudiograms)
+        _ = (
+            storedElectrocardiograms,
+            storedVoltagePages,
+            storedQuantitySeriesPages,
+            storedAudiograms
+        )
 
-        return (stored, deleted, storedCharacteristics, storedUnhandled)
+        return (
+            stored,
+            deleted,
+            storedCharacteristics,
+            storedUnhandled,
+            storedQuantitySeriesPages
+        )
     }
 
 
@@ -1040,6 +1325,103 @@ public actor IngestStore {
 
     public func totalRecordCount() throws -> Int {
         Int(try database.query("SELECT COUNT(*) FROM sample", row: { $0.integer(0) }).first ?? 0)
+    }
+
+    /// Every reading held for one expanded sample, in the order they were
+    /// measured.
+    ///
+    /// Ordered by the offset each page carries rather than by when it arrived,
+    /// because pages are delivered independently and a series reassembled in
+    /// arrival order would be a scrambled hour.
+    public func quantitySeriesReadings(
+        forSample sampleID: String
+    ) throws -> [QuantitySeriesReading] {
+        let pages = try database.query(
+            """
+            SELECT offset, unit, readings FROM quantity_series_page
+            WHERE sample_id = ?
+            ORDER BY offset
+            """,
+            [.text(sampleID)],
+            row: { ($0.integer(0), $0.optionalText(1), $0.blob(2) ?? Data()) }
+        )
+
+        var readings: [QuantitySeriesReading] = []
+        for (offset, unit, blob) in pages {
+            guard
+                let array = try? JSONSerialization.jsonObject(with: blob)
+                    as? [[String: Any]]
+            else {
+                continue
+            }
+            for (index, object) in array.enumerated() {
+                guard let value = BatchParser.numeric(object["value"]) else {
+                    continue
+                }
+                readings.append(
+                    QuantitySeriesReading(
+                        offset: Int(offset) + index,
+                        value: value,
+                        unit: unit,
+                        startDate: (object["startDate"] as? String)
+                            .flatMap(Timestamps.date(from:)),
+                        endDate: (object["endDate"] as? String)
+                            .flatMap(Timestamps.date(from:))
+                    )
+                )
+            }
+        }
+        return readings
+    }
+
+    /// What is known about one expanded sample: how many readings the phone
+    /// said it wrote, and how many are actually here.
+    ///
+    /// The two differing is the whole point. Without the phone's number, a
+    /// series with a page lost in transit is indistinguishable from one the
+    /// phone exported short, and the receiver would report a partial hour as
+    /// though it were the whole of it.
+    public func quantitySeriesState(
+        forSample sampleID: String
+    ) throws -> QuantitySeriesState? {
+        let held = Int(
+            try database.query(
+                """
+                SELECT COALESCE(SUM(reading_count), 0)
+                FROM quantity_series_page WHERE sample_id = ?
+                """,
+                [.text(sampleID)],
+                row: { $0.integer(0) }
+            ).first ?? 0
+        )
+        let declared = try database.query(
+            """
+            SELECT type, exported_readings FROM quantity_series
+            WHERE sample_id = ?
+            """,
+            [.text(sampleID)],
+            row: { ($0.text(0), Int($0.integer(1))) }
+        ).first
+
+        guard let declared else {
+            guard held > 0 else {
+                return nil
+            }
+            // Pages but no end marker: the series has not finished arriving,
+            // which is a different thing from being complete.
+            return QuantitySeriesState(
+                sampleID: sampleID,
+                type: nil,
+                exportedReadings: nil,
+                readingsHeld: held
+            )
+        }
+        return QuantitySeriesState(
+            sampleID: sampleID,
+            type: declared.0,
+            exportedReadings: declared.1,
+            readingsHeld: held
+        )
     }
 
     /// Every type that has data, with enough detail to render a list.
@@ -1207,10 +1589,26 @@ public actor IngestStore {
     ///
     /// A batch that comes back with the record still unhandled has not been
     /// understood, however successfully it parsed as JSON.
+    /// Whether a re-read of a quarantined record produced anything this
+    /// receiver can now file properly.
+    ///
+    /// Every shape counts, not only the three the first version knew about.
+    /// A record that now parses into a reading page or an electrocardiogram is
+    /// exactly what promotion exists for, and judging it "still not understood"
+    /// stamps its parser version forward and leaves it in quarantine for good —
+    /// which is the one outcome promotion is meant to prevent.
     private static func understood(_ batch: ParsedBatch) -> Bool {
         !batch.records.isEmpty
             || !batch.deletions.isEmpty
             || !batch.characteristics.isEmpty
+            || !batch.electrocardiograms.isEmpty
+            || !batch.voltagePages.isEmpty
+            || !batch.quantitySeriesPages.isEmpty
+            || !batch.quantitySeriesEnds.isEmpty
+            || !batch.audiograms.isEmpty
+            || !batch.moodEntries.isEmpty
+            || !batch.medicationDoses.isEmpty
+            || !batch.workoutDetails.isEmpty
     }
 
     /// Places a record in quarantine directly, for tests that need to stand in
