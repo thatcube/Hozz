@@ -436,13 +436,18 @@ final class ExportMarkdownTests: XCTestCase {
         ]
 
         // One hour each, back to back from 00:00 on the 3rd, New York time, so
-        // no two of them overlap and each is counted on its own merits.
+        // no two of them overlap and each is counted on its own merits. The
+        // hour is padded because "T010:00" is a malformed timestamp that
+        // Foundation happens to parse leniently — a test whose input is
+        // accidental is not a test.
         var lines: [[String: Any]] = []
         for (index, stage) in stages.enumerated() {
+            let from = String(format: "%02d", 5 + index)
+            let to = String(format: "%02d", 6 + index)
             lines.append(
                 sleepSegment(
-                    start: "2026-01-03T0\(5 + index):00:00.000Z",
-                    end: "2026-01-03T0\(6 + index):00:00.000Z",
+                    start: "2026-01-03T\(from):00:00.000Z",
+                    end: "2026-01-03T\(to):00:00.000Z",
                     value: stage.value
                 )
             )
