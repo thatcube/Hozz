@@ -503,15 +503,9 @@ final class CoverageDeliveryTests: XCTestCase {
     /// The same claim, without waiting for the clock to land badly.
     ///
     /// The test above catches this only when `Date.now` happens to fall on an
-    /// awkward sub-millisecond value, which is why it passed alone and failed
-    /// in a full run. The property underneath is exact and can be checked
-    /// exactly: an instant carries more precision than the text it is stored
-    /// as, and formatting then parsing does not always land back on the same
-    /// double — an instant written as `…57.869Z` can parse to one that formats
-    /// as `…57.868Z`. A batch stamped from the unparsed value and its retry
-    /// stamped from the parsed one then differ by a single character: same
-    /// length, same meaning, different bytes, different identity, and a
-    /// receiver storing a retry a second time.
+    /// awkward sub-millisecond value, which is why it once passed alone and
+    /// failed in a full run. The property underneath is exact and can be swept:
+    /// a moment written down and read back has to render the same bytes.
     func testAnObservedMomentSurvivesBeingWrittenDown() async throws {
         let store = try makeStore()
         let channel = CoverageCapturingChannel()
@@ -519,11 +513,13 @@ final class CoverageDeliveryTests: XCTestCase {
         let destination = makeDestination()
         try await delivery.save(destination)
 
-        // Offsets chosen to land all over the millisecond rather than on it.
-        for (index, offset) in stride(from: 0.0, to: 0.004, by: 0.000_37)
-            .enumerated() {
-            let digest = "digest-\(index)"
-            let observed = Date(timeIntervalSince1970: 1_760_000_000 + offset)
+        // A whole second, finely enough to land all over the millisecond
+        // rather than on it. Coarser steps pass against a broken store.
+        for step in 0..<2_000 {
+            let digest = "digest-\(step)"
+            let observed = Date(
+                timeIntervalSince1970: 1_760_000_000 + Double(step) * 0.000_5
+            )
 
             let stamped = await delivery.coverageObservation(
                 digest: digest,
@@ -531,7 +527,7 @@ final class CoverageDeliveryTests: XCTestCase {
                 for: destination.id
             )
             // The retry: same coverage, later pass, and it must rebuild the
-            // same bytes.
+            // same bytes rather than merely an equivalent instant.
             let retried = await delivery.coverageObservation(
                 digest: digest,
                 now: observed.addingTimeInterval(3_600),
@@ -542,11 +538,56 @@ final class CoverageDeliveryTests: XCTestCase {
                 Timestamps.text(from: stamped),
                 Timestamps.text(from: retried),
                 """
-                An observation stamped at \(observed.timeIntervalSince1970) \
-                must read back as the same text, or the retry is a new batch.
+                An observation at \(observed.timeIntervalSince1970) must read \
+                back as the same text, or the retry is a new batch and the \
+                receiver stores it twice.
                 """
             )
         }
+    }
+
+    /// Why that moment is not stored in the format it is sent in.
+    ///
+    /// This asserts a *defect*, on purpose. `ISO8601FormatStyle` truncates the
+    /// fraction rather than rounding, and almost no millisecond is exactly
+    /// representable as a binary double, so a moment written as `…57.869Z`
+    /// reads back a hair below and renders as `…57.868Z`. Round-tripping a
+    /// moment through the wire format therefore changes it, for most moments —
+    /// which is exactly the reasoning that makes "just store what will be read
+    /// back" so convincing and so wrong.
+    ///
+    /// If this test ever fails, the formatter has changed and the storage
+    /// question is worth reopening. Until then it stands as the reason.
+    func testTheWireFormatIsNotSafeToRoundTripAMomentThrough() {
+        var changed = 0
+        var total = 0
+        for step in 0..<1_000 {
+            let moment = Date(
+                timeIntervalSince1970: 1_760_000_000 + Double(step) * 0.001
+            )
+            let once = Timestamps.text(from: moment)
+            guard let parsed = Timestamps.date(from: once) else {
+                continue
+            }
+            total += 1
+            if Timestamps.text(from: parsed) != once {
+                changed += 1
+            }
+        }
+
+        XCTAssertGreaterThan(total, 0)
+        // Measured at roughly half of them, which is the point: this is the
+        // common case rather than a rare boundary, so a store that relied on
+        // the round trip would be wrong about most of the moments it kept.
+        XCTAssertGreaterThan(
+            changed,
+            total / 4,
+            """
+            Formatting, parsing and formatting again changes a large share of \
+            moments. One the phone must reproduce exactly is therefore stored \
+            as its own value, not as the text it is sent as.
+            """
+        )
     }
 
     /// And the retry must still be a retry of the *records*, not just of the
