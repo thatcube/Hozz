@@ -98,6 +98,13 @@ extension IngestStore {
         /// Whether `series` covers the range that was asked for, or an older
         /// window ending at this type's own last record.
         public let isFromEarlierWindow: Bool
+        /// What the phone has said about how completely this type was read.
+        ///
+        /// Carried on the row rather than looked up by whoever draws it,
+        /// because the question it answers — may this date be presented as the
+        /// person's latest — has to be asked by every surface, and one that
+        /// forgets to ask goes back to guessing.
+        public let standing: TypeCoverageStanding
 
         public var id: String { series.measure.type }
 
@@ -105,12 +112,14 @@ extension IngestStore {
             series: TypeSeries,
             latestOverall: Date?,
             totalRecords: Int,
-            isFromEarlierWindow: Bool = false
+            isFromEarlierWindow: Bool = false,
+            standing: TypeCoverageStanding = .untold
         ) {
             self.series = series
             self.latestOverall = latestOverall
             self.totalRecords = totalRecords
             self.isFromEarlierWindow = isFromEarlierWindow
+            self.standing = standing
         }
     }
 
@@ -133,6 +142,10 @@ extension IngestStore {
         plan: TimeBucketPlan
     ) throws -> [MetricSnapshot] {
         var results: [MetricSnapshot] = []
+        // Read once for the whole overview rather than per row. A row that
+        // silently skipped this lookup would fall back to guessing, which is
+        // the failure the report exists to remove.
+        let reports = try coverage()
         for type in types {
             let bounds = try database.query(
                 """
@@ -145,6 +158,7 @@ extension IngestStore {
                 continue
             }
             let latest = bounds.0.flatMap(Timestamps.date(from:))
+            let standing = TypeCoverageStanding(report: reports[type])
 
             let asked = try series(type: type, plan: plan)
             if !asked.values.isEmpty || latest == nil {
@@ -152,7 +166,8 @@ extension IngestStore {
                     MetricSnapshot(
                         series: asked,
                         latestOverall: latest,
-                        totalRecords: bounds.1
+                        totalRecords: bounds.1,
+                        standing: standing
                     )
                 )
                 continue
@@ -170,7 +185,8 @@ extension IngestStore {
                     series: earlier.values.isEmpty ? asked : earlier,
                     latestOverall: latest,
                     totalRecords: bounds.1,
-                    isFromEarlierWindow: !earlier.values.isEmpty
+                    isFromEarlierWindow: !earlier.values.isEmpty,
+                    standing: standing
                 )
             )
         }

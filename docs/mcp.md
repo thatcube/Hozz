@@ -240,6 +240,24 @@ reached rather than one you have none of. The tools answer "this has not reached
 this Mac yet — it is not evidence that you have no such data" and list what has
 arrived, rather than returning zero or an error.
 
+**A date is only presented as your most recent when the phone has said that
+type is finished.** This is the one that came from a real, cruel mistake. Hozz
+reads Health through an anchored query, which returns samples in the order
+Health *stored* them rather than the order they happened — so for a type still
+being read, what has arrived is an arbitrary subset by date and its newest
+record says nothing whatever about your newest. Nothing on the Mac knew which
+types were finished, so the dashboard picked the reading that sounded like an
+answer and told a housebound person their step count stopped in January 2023.
+It had not; it was three years behind.
+
+The phone now sends, per type, how completely it has been read, and the tools
+distinguish three states that used to look identical: **read to the end**,
+where dates mean what they appear to mean; **still arriving**, where a date is
+a fact about the transfer; and **not reported on**, where this Mac has been
+told nothing and claims nothing in either direction. `list_health_types` marks
+each type, and `summarise_health_data` counts them and says how to read a date
+in each case.
+
 The analysis tools deliberately do **not** repeat the person's characteristics.
 None of them uses age in its computation — a trend is a trend regardless — so
 surfacing age there would imply an age-adjusted clinical judgement that is not
