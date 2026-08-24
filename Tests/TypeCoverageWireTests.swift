@@ -221,11 +221,12 @@ final class TypeCoverageWireTests: XCTestCase {
     func testExactlyOneStateMeansEverythingIsHere() {
         let licensed: Set<CoverageState> = [.anchorClosed]
         XCTAssertEqual(
-            Set(CoverageState.allCoverageStates),
+            Set(CoverageState.allCoverageStates.map(\.rawValue)),
             [
-                .unknown, .draining, .anchorClosed, .authorizationIndeterminate,
-                .limitedAuthorizationWindow, .deviceLockedDeferred,
-                .tombstoneGapSuspected, .unsupported, .unverifiedOnDevice
+                "unknown", "draining", "anchorClosed",
+                "authorizationIndeterminate", "limitedAuthorizationWindow",
+                "deviceLockedDeferred", "tombstoneGapSuspected", "unsupported",
+                "unverifiedOnDevice", "authorizationDismissed", "readFailed"
             ],
             "a state was added without deciding whether it licenses a date"
         )
@@ -261,11 +262,7 @@ final class TypeCoverageWireTests: XCTestCase {
 }
 
 extension CoverageState {
-    /// Every case, listed here rather than by conforming the shipped type to
-    /// `CaseIterable` for a test's convenience.
-    static let allCoverageStates: [CoverageState] = [
-        .unknown, .draining, .anchorClosed, .authorizationIndeterminate,
-        .limitedAuthorizationWindow, .deviceLockedDeferred,
-        .tombstoneGapSuspected, .unsupported, .unverifiedOnDevice
-    ]
+    /// Every case, from the enum. Was a hand-kept copy until a review pointed
+    /// out that a list maintained by hand cannot fail when a case is added.
+    static var allCoverageStates: [CoverageState] { allCases }
 }

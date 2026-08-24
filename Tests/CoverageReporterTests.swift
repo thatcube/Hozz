@@ -294,6 +294,49 @@ final class CoverageReporterTests: XCTestCase {
         XCTAssertTrue(observation.isNew)
     }
 
+    /// A moment in the future is a clock that went backwards. Keeping it would
+    /// freeze the timestamp until the clock caught up, and a receiver
+    /// comparing moments would refuse everything sent in between.
+    ///
+    /// Restored after a review noticed this guard's only test had been deleted
+    /// along with the hunk it sat in — live behaviour with a documented reason
+    /// and nothing exercising it.
+    func testAMomentFromTheFutureIsNotKept() {
+        let now = Self.observed
+        let observation = CoverageReporter.observation(
+            matching: "abc",
+            storedDigest: "abc",
+            storedMoment: now.addingTimeInterval(86_400),
+            now: now
+        )
+        XCTAssertEqual(observation.moment, now)
+        XCTAssertTrue(observation.isNew)
+    }
+
+    /// The bytes, not just the digest: the same facts observed at the same
+    /// moment render identically however the records arrive.
+    func testTheSameFactsAtTheSameMomentProduceTheSameBytes() {
+        let records = [
+            record(
+                "HKQuantityTypeIdentifierStepCount",
+                coverage: .anchorClosed,
+                recordCount: 4
+            ),
+            record("HKQuantityTypeIdentifierHeartRate", coverage: .draining)
+        ]
+        XCTAssertEqual(
+            CoverageReporter.lines(
+                for: CoverageReporter.reports(from: records, observedAt: Self.observed)
+            ),
+            CoverageReporter.lines(
+                for: CoverageReporter.reports(
+                    from: records.reversed(),
+                    observedAt: Self.observed
+                )
+            )
+        )
+    }
+
     /// The case that matters most, because a first sweep is the longest and
     /// most interruption-prone delivery there is: a type nothing has been
     /// recorded for yet.
@@ -308,42 +351,140 @@ final class CoverageReporterTests: XCTestCase {
         XCTAssertTrue(observation.isNew)
     }
 
-    /// A moment in the future is a clock that went backwards. Keeping it would
-    /// freeze the timestamp until the clock caught up, and a receiver
-    /// comparing moments would refuse everything sent in between.
-    func testAMomentFromTheFutureIsNotKept() {
-        let now = Self.observed
-        let observation = CoverageReporter.observation(
-            matching: "abc",
-            storedDigest: "abc",
-            storedMoment: now.addingTimeInterval(86_400),
-            now: now
-        )
-        XCTAssertEqual(observation.moment, now)
-        XCTAssertTrue(observation.isNew)
+    /// The invariant that actually matters: a moment written down and read
+    /// back renders the same bytes as it did before it was stored.
+    ///
+    /// Stated this way rather than as "the timestamp round-trips", because it
+    /// does not and cannot. `Date` holds far more precision than ISO-8601
+    /// millisecond text, `Date.ISO8601FormatStyle` truncates rather than
+    /// rounds, and hardly any millisecond is exactly representable in binary —
+    /// so `format(parse(format(t)))` differs from `format(t)` for most
+    /// instants, and snapping to whole milliseconds first does not help
+    /// because the snapped value is not exactly representable either. Two
+    /// separate attempts to find a fixed point failed here before the actual
+    /// requirement became clear: the retry must format the *same* `Date`, not
+    /// a canonical neighbour of it.
+    ///
+    /// Swept across a whole second rather than at hand-picked instants,
+    /// because the first attempt passed every instant anyone thought to write
+    /// down and still failed about one run in ten against the real clock.
+    func testAStoredMomentRendersTheSameBytesAfterBeingReadBack() throws {
+        var checked = 0
+        for step in 0..<10_000 {
+            let raw = Date(
+                timeIntervalSince1970: 1_772_600_767 + Double(step) / 10_000
+            )
+            let first = CoverageReporter.observation(
+                matching: "abc",
+                storedDigest: nil,
+                storedMoment: nil,
+                now: raw
+            )
+            XCTAssertTrue(first.isNew)
+
+            // Exactly what the engine writes into the destination and reads
+            // back out of it on the next pass.
+            let written = Destination.observedCoverageText(first.moment)
+            var destination = Destination(
+                name: "Mac",
+                kind: .folder,
+                cadence: .whenDataArrives,
+                folderBookmark: Data("a".utf8)
+            )
+            destination.options[Destination.coverageObservedDigestKey] = "abc"
+            destination.options[Destination.coverageObservedAtKey] = written
+            let recovered = try XCTUnwrap(destination.observedCoverageMoment)
+
+            let reused = CoverageReporter.observation(
+                matching: "abc",
+                storedDigest: destination.observedCoverageDigest,
+                storedMoment: recovered,
+                now: raw.addingTimeInterval(3_600)
+            )
+            XCTAssertFalse(reused.isNew, "step \(step)")
+            XCTAssertEqual(
+                Timestamps.text(from: reused.moment),
+                Timestamps.text(from: first.moment),
+                "step \(step): the retry would render a different byte"
+            )
+            checked += 1
+        }
+        XCTAssertEqual(checked, 10_000)
     }
 
-    /// The whole point, in bytes: the same facts observed at the same moment
-    /// produce the same payload, whatever the clock says when it is rebuilt.
-    func testTheSameFactsAtTheSameMomentProduceTheSameBytes() {
-        let records = [
-            record(
-                "HKQuantityTypeIdentifierStepCount",
-                coverage: .anchorClosed,
-                recordCount: 4
-            ),
-            record("HKQuantityTypeIdentifierHeartRate", coverage: .draining)
-        ]
-        let first = CoverageReporter.lines(
-            for: CoverageReporter.reports(from: records, observedAt: Self.observed)
-        )
-        let rebuilt = CoverageReporter.lines(
-            for: CoverageReporter.reports(
-                from: records.reversed(),
-                observedAt: Self.observed
+    /// The property the previous two fixes assumed and that does not hold,
+    /// written down so nobody reaches for it again.
+    func testTheWiresTimestampFormatIsNotARoundTrip() {
+        var drifted = 0
+        for step in 0..<1_000 {
+            let raw = Date(
+                timeIntervalSince1970: 1_772_600_767 + Double(step) / 1_000
             )
+            let once = Timestamps.text(from: raw)
+            guard let reread = Timestamps.date(from: once) else { continue }
+            if Timestamps.text(from: reread) != once {
+                drifted += 1
+            }
+        }
+        XCTAssertGreaterThan(
+            drifted,
+            0,
+            "if this ever becomes zero the format changed, and the lossless "
+                + "storage below may no longer be needed"
         )
-        XCTAssertEqual(first, rebuilt)
+    }
+
+    /// A destination written by the build already on the maintainer's phone
+    /// holds an ISO-8601 timestamp in this option, not a number.
+    ///
+    /// That build is shipped, so this is a live path rather than a
+    /// hypothetical. It has to degrade to "no moment recorded" — which costs
+    /// one batch stamped afresh and then settles — rather than to a wrong
+    /// instant or a crash.
+    func testAMomentLeftByTheEarlierBuildIsIgnoredRatherThanMisread() {
+        var destination = Destination(
+            name: "Mac",
+            kind: .folder,
+            cadence: .whenDataArrives,
+            folderBookmark: Data("a".utf8)
+        )
+        destination.options[Destination.coverageObservedDigestKey] = "abc"
+        destination.options[Destination.coverageObservedAtKey] =
+            "2026-08-24T21:54:15.118Z"
+
+        XCTAssertNil(
+            destination.observedCoverageMoment,
+            "an ISO-8601 string is not a number and must not be guessed at"
+        )
+
+        let observation = CoverageReporter.observation(
+            matching: "abc",
+            storedDigest: destination.observedCoverageDigest,
+            storedMoment: destination.observedCoverageMoment,
+            now: Self.observed
+        )
+        XCTAssertEqual(observation.moment, Self.observed)
+        XCTAssertTrue(
+            observation.isNew,
+            "so the next pass writes it in the form that survives"
+        )
+    }
+
+    /// The value really is lossless, which is the whole reason for storing a
+    /// number rather than a timestamp.
+    func testAMomentWrittenAsANumberComesBackExactly() {
+        for step in 0..<5_000 {
+            let moment = Date(
+                timeIntervalSince1970: 1_772_600_767 + Double(step) / 5_000
+            )
+            let text = Destination.observedCoverageText(moment)
+            let recovered = Double(text).map(Date.init(timeIntervalSince1970:))
+            XCTAssertEqual(
+                recovered?.timeIntervalSince1970,
+                moment.timeIntervalSince1970,
+                "step \(step) did not survive"
+            )
+        }
     }
 
     // MARK: - Which formats carry it at all

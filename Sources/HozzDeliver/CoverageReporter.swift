@@ -115,6 +115,21 @@ public enum CoverageReporter {
     ///   an observation rather than a claim about what a destination received
     ///   — and recording it after would leave a refused batch's retry looking
     ///   for a moment that was never written down.
+    ///
+    /// The moment is returned exactly as given. Every attempt to "canonicalise"
+    /// it first was wrong, and instructively so: `Date` holds far more
+    /// precision than an ISO-8601 timestamp with milliseconds, the formatter
+    /// *truncates* rather than rounds, and almost no millisecond is exactly
+    /// representable as a binary `Double` — so `format(parse(format(t)))` is
+    /// not `format(t)`, and snapping to whole milliseconds first does not help
+    /// because the snapped value is not exactly representable either. There is
+    /// no fixed point to find.
+    ///
+    /// What actually matters is narrower: the first attempt and its retry must
+    /// render the *same* text. That is guaranteed by storing the moment
+    /// losslessly, so the retry formats the identical `Date` rather than a
+    /// near neighbour of it. The wire stays millisecond text; only the phone's
+    /// own note-to-self is exact. See ``Destination/observedCoverageMoment``.
     public static func observation(
         matching digest: String,
         storedDigest: String?,
@@ -233,8 +248,30 @@ extension Destination {
         options[Destination.coverageObservedDigestKey]
     }
 
+    /// When this destination's current coverage was observed.
+    ///
+    /// Stored as a bare `timeIntervalSince1970`, not as a timestamp, and that
+    /// is deliberate. This value's whole job is to let a retry rebuild the
+    /// bytes a refused attempt sent, which means the retry has to format the
+    /// *identical* `Date` — not a near neighbour of it. A `Date` carries far
+    /// more precision than the ISO-8601 millisecond text on the wire, the
+    /// formatter truncates rather than rounds, and hardly any millisecond is
+    /// exactly representable in binary, so a moment written as a timestamp and
+    /// read back can render one millisecond earlier than it did the first
+    /// time. One character, a different hash, a different batch, and a
+    /// receiver stores it twice.
+    ///
+    /// `Double`'s own description round-trips exactly, so this does not. The
+    /// wire is unaffected — it still carries millisecond text; only the
+    /// phone's private note to itself is exact.
     public var observedCoverageMoment: Date? {
         options[Destination.coverageObservedAtKey]
-            .flatMap(Timestamps.date(from:))
+            .flatMap(Double.init)
+            .map(Date.init(timeIntervalSince1970:))
+    }
+
+    /// How that moment is written down.
+    static func observedCoverageText(_ moment: Date) -> String {
+        String(moment.timeIntervalSince1970)
     }
 }

@@ -9,7 +9,10 @@ import HozzCore
 /// common background failure — indistinguishable from a permanent one, so Hozz
 /// keeps the distinction and reports it.
 public struct HealthKitFailure: Error, Equatable, Sendable {
-    public enum Kind: Equatable, Sendable {
+    /// `CaseIterable` for the same reason as ``CoverageState``: the test that
+    /// checks every kind lands on the state it should has to be able to fail
+    /// when a kind is added, and a hand-written list cannot.
+    public enum Kind: Equatable, Sendable, CaseIterable {
         /// The Health database is locked. Retrying after unlock usually works.
         case deviceLocked
         /// Read access was not granted, or there is genuinely nothing to read.
@@ -23,7 +26,17 @@ public struct HealthKitFailure: Error, Equatable, Sendable {
         case nonAdvancingAnchor
         /// A type exceeded its pagination budget without reaching an empty page.
         case exceededQueryBudget
-        /// Anything Hozz has not classified.
+        /// A read failed inside Hozz rather than inside HealthKit: a missing
+        /// continuation cursor, a type the reader cannot handle, an encoding
+        /// step that threw.
+        ///
+        /// Separated from ``unclassified`` because the two need opposite
+        /// responses. An unrecognised HealthKit error may be transient, or may
+        /// be something about the person's own device; one of these is a bug
+        /// in Hozz, and it stays invisible for exactly as long as it is
+        /// reported as a puzzle about Health.
+        case internalInconsistency
+        /// A HealthKit error Hozz has not classified.
         case unclassified
 
         public var coverageState: CoverageState {
@@ -35,9 +48,11 @@ public struct HealthKitFailure: Error, Equatable, Sendable {
             case .healthDataUnavailable:
                 .unsupported
             case .userCancelled:
-                .unknown
+                .authorizationDismissed
             case .nonAdvancingAnchor, .exceededQueryBudget:
                 .tombstoneGapSuspected
+            case .internalInconsistency:
+                .readFailed
             case .unclassified:
                 .unknown
             }
@@ -53,6 +68,7 @@ public struct HealthKitFailure: Error, Equatable, Sendable {
                  .userCancelled,
                  .nonAdvancingAnchor,
                  .exceededQueryBudget,
+                 .internalInconsistency,
                  .unclassified:
                 false
             }
@@ -92,6 +108,20 @@ public struct HealthKitFailure: Error, Equatable, Sendable {
 
         let description = (error as any CustomStringConvertible).description
         let nsError = error as NSError
+
+        // Hozz's own errors are recognised before the domain check, because
+        // none of them is in `HKError.errorDomain` and every one of them would
+        // otherwise be filed as an unclassified HealthKit error. That is how a
+        // missing continuation cursor — a fault in this app — came to be
+        // reported as a puzzle about Health, and stayed one.
+        if error is HealthKitSourceError || error is HealthSampleEncodingError {
+            return HealthKitFailure(
+                kind: .internalInconsistency,
+                typeIdentifier: typeIdentifier,
+                underlyingDescription: description
+            )
+        }
+
         guard nsError.domain == HKError.errorDomain else {
             return HealthKitFailure(
                 kind: .unclassified,
@@ -139,6 +169,11 @@ extension HealthKitFailure: LocalizedError {
             return "Health stopped advancing while reading\(subject)."
         case .exceededQueryBudget:
             return "Reading\(subject) exceeded its safety limit."
+        case .internalInconsistency:
+            // Named as Hozz's own fault rather than Health's, because it is.
+            // Reported as a puzzle about Health it would sit unfixed for as
+            // long as it took someone to read the string.
+            return "Hozz's own reading\(subject) failed: \(underlyingDescription)"
         case .unclassified:
             return "Hozz could not read Health data\(subject): \(underlyingDescription)"
         }
