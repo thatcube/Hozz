@@ -16,45 +16,67 @@ import Foundation
 /// all. It is the absence of a filter: everything the anchors have not yet
 /// delivered, however old, however lately it was written. The competitor's
 /// setting of the same name is a date cursor from the last run to now, and it
-/// silently skips retroactive writes. Hozz's is strictly stronger, and the
-/// wording in the interface says so.
+/// silently skips retroactive writes. Hozz's is strictly stronger.
+///
+/// ## Why every other case is a floor and never a range
 ///
 /// The bounded cases exist for the other half of the request: someone pointing
-/// Hozz at a home-automation dashboard wants recent data, not a decade of step
-/// counts. They are a **filter over records already drained**, applied once the
-/// batch is built. That has a consequence which is stated plainly rather than
-/// hidden: a record older than the window is not delivered, and the anchor moves
-/// past it, so it will not come round again on its own.
+/// Hozz at a new home-automation dashboard wants recent readings, not a decade
+/// of step counts. Each one is a **floor** — an oldest date, with no upper bound
+/// at all — and that shape is a correctness requirement rather than a
+/// simplification.
 ///
-/// One record can therefore be excluded, but no record can be skipped *forever*,
-/// because widening a destination's window resets that destination's anchors and
-/// replays everything from the start. See
-/// ``DeliveryWindow/covers(_:)`` and `DeliveryEngine.save(_:)`.
+/// A window with an upper bound loses records, permanently and invisibly, for
+/// two separate reasons:
+///
+/// - **A reading newer than the window is gone.** A sample HealthKit gains while
+///   a sync is already running comes back from the anchored query dated after
+///   the moment the pass started. An upper bound at "now" excludes it, and the
+///   anchor then commits past it. There is no reason for "the last seven days"
+///   to reject a reading for being too *new*, and every reason not to.
+/// - **A range that ends before today delivers almost nothing, for ever.** A
+///   "Yesterday" window rejects everything dated today — but readings dated
+///   today are drained today, and by the time they would fall inside
+///   "yesterday" the cursor is long past them. The steady state is a destination
+///   that receives nothing while reporting success. That case is not offered
+///   here at all.
+///
+/// A floor has neither problem. It can still exclude a reading — one older than
+/// the floor — and the anchor still moves past it, so that exclusion is
+/// permanent on its own. Two things make it safe to offer anyway: it is counted
+/// and reported rather than silent, and **lowering the floor replays the
+/// destination's whole history**, so nothing is unreachable for ever. See
+/// ``covers(_:)`` and `DeliveryEngine.save(_:)`.
+///
+/// One honest residue remains, and the interface says so: a floor moves with the
+/// clock, so which readings it excludes depends on when iOS happened to let Hozz
+/// run. A reading from late last night can fall outside "nothing older than
+/// today" if the sync lands after midnight.
 public enum DeliveryWindow: String, Codable, CaseIterable, Sendable {
     /// No date filter at all. The anchors decide, which is the only setting
     /// that cannot exclude a record.
     case sinceLastDelivery
-    /// Midnight this morning until now.
-    case today
-    /// The whole of the previous day, and nothing since.
-    case yesterday
-    /// The whole of the previous day, plus today so far.
-    case previousDayAndToday
-    /// The seven days before today, plus today so far.
-    case previous7Days
+    /// Nothing dated before midnight this morning.
+    case sinceStartOfToday
+    /// Nothing dated before midnight yesterday.
+    case sinceStartOfYesterday
+    /// Nothing dated before midnight seven days ago.
+    case sinceSevenDaysAgo
+    /// Nothing dated before midnight thirty days ago.
+    case sinceThirtyDaysAgo
 
     public var displayName: String {
         switch self {
         case .sinceLastDelivery:
             "Everything not yet sent"
-        case .today:
-            "Today"
-        case .yesterday:
-            "Yesterday"
-        case .previousDayAndToday:
-            "Yesterday and today"
-        case .previous7Days:
-            "The last 7 days"
+        case .sinceStartOfToday:
+            "Nothing older than today"
+        case .sinceStartOfYesterday:
+            "Nothing older than yesterday"
+        case .sinceSevenDaysAgo:
+            "Nothing older than 7 days"
+        case .sinceThirtyDaysAgo:
+            "Nothing older than 30 days"
         }
     }
 
@@ -65,18 +87,18 @@ public enum DeliveryWindow: String, Codable, CaseIterable, Sendable {
             "Everything Hozz has read from Health and not yet delivered here, "
             + "however old it is. A reading the Health app filed under last "
             + "Tuesday this morning still gets sent. Nothing is left out."
-        case .today:
-            "Only readings dated since midnight. Anything older is not sent, "
+        case .sinceStartOfToday:
+            "Readings dated before midnight this morning are not sent here, "
             + "and will not be sent later."
-        case .yesterday:
-            "Only readings dated to the whole of yesterday. Today's are not "
-            + "sent, and neither is anything older."
-        case .previousDayAndToday:
-            "Readings dated to yesterday or today. Anything older is not sent, "
-            + "and will not be sent later."
-        case .previous7Days:
-            "Readings dated within the last seven days and today. Anything "
-            + "older is not sent, and will not be sent later."
+        case .sinceStartOfYesterday:
+            "Readings dated before midnight yesterday are not sent here, and "
+            + "will not be sent later."
+        case .sinceSevenDaysAgo:
+            "Readings dated more than seven days ago are not sent here, and "
+            + "will not be sent later."
+        case .sinceThirtyDaysAgo:
+            "Readings dated more than thirty days ago are not sent here, and "
+            + "will not be sent later."
         }
     }
 
@@ -85,37 +107,40 @@ public enum DeliveryWindow: String, Codable, CaseIterable, Sendable {
         self != .sinceLastDelivery
     }
 
-    /// The span of time this window admits, or nil when it admits everything.
+    /// How many whole days back the floor sits, or nil when there is no floor.
+    ///
+    /// The single source of every date and every ordering below, so the picker,
+    /// the filter, and the decision to replay history cannot drift apart.
+    var daysBack: Int? {
+        switch self {
+        case .sinceLastDelivery:
+            nil
+        case .sinceStartOfToday:
+            0
+        case .sinceStartOfYesterday:
+            1
+        case .sinceSevenDaysAgo:
+            7
+        case .sinceThirtyDaysAgo:
+            30
+        }
+    }
+
+    /// The oldest date this window will deliver, or nil when it has no floor.
     ///
     /// Days are the user's own calendar days, because that is what a person
     /// means by "today". A device in Auckland and one in Los Angeles agreeing on
     /// a UTC boundary would put half of somebody's evening in the wrong day.
-    public func range(
-        now: Date,
-        calendar: Calendar = .current
-    ) -> DateInterval? {
-        let startOfToday = calendar.startOfDay(for: now)
-        switch self {
-        case .sinceLastDelivery:
+    public func floor(now: Date, calendar: Calendar = .current) -> Date? {
+        guard let daysBack else {
             return nil
-        case .today:
-            return DateInterval(start: startOfToday, end: max(now, startOfToday))
-        case .yesterday:
-            let startOfYesterday = calendar.date(
-                byAdding: .day,
-                value: -1,
-                to: startOfToday
-            ) ?? startOfToday.addingTimeInterval(-86_400)
-            return DateInterval(start: startOfYesterday, end: startOfToday)
-        case .previousDayAndToday:
-            let start = calendar.date(byAdding: .day, value: -1, to: startOfToday)
-                ?? startOfToday.addingTimeInterval(-86_400)
-            return DateInterval(start: start, end: max(now, start))
-        case .previous7Days:
-            let start = calendar.date(byAdding: .day, value: -7, to: startOfToday)
-                ?? startOfToday.addingTimeInterval(-7 * 86_400)
-            return DateInterval(start: start, end: max(now, start))
         }
+        let startOfToday = calendar.startOfDay(for: now)
+        guard daysBack > 0 else {
+            return startOfToday
+        }
+        return calendar.date(byAdding: .day, value: -daysBack, to: startOfToday)
+            ?? startOfToday.addingTimeInterval(-Double(daysBack) * 86_400)
     }
 
     /// Whether a record with this date belongs in this window.
@@ -125,55 +150,52 @@ public enum DeliveryWindow: String, Codable, CaseIterable, Sendable {
     /// tombstone held back leaves a receiver showing a reading the user
     /// deliberately removed from Health. Excluding a record needs positive
     /// evidence that it falls outside, and an absent date is not evidence.
+    ///
+    /// There is no upper bound, so a reading recorded while the sync was already
+    /// running is never rejected for being too new.
     public func admits(
         _ date: Date?,
         now: Date,
         calendar: Calendar = .current
     ) -> Bool {
-        guard let range = range(now: now, calendar: calendar), let date else {
+        guard let floor = floor(now: now, calendar: calendar), let date else {
             return true
         }
-        // Half open at the end so a record at exactly midnight belongs to the
-        // day starting there and to only one of two adjacent windows.
-        return date >= range.start && date <= range.end
+        return date >= floor
     }
 
     /// Whether every record this window admits is also admitted by the receiver.
     ///
     /// Used for one purpose: deciding whether changing a destination's window
-    /// has to replay its history. If the window in force until now covered
-    /// everything the new one wants, then nothing the new one wants was ever
-    /// dropped, and the anchors can carry on. If it did not — going from
-    /// "Today" to "The last 7 days", or from "Today" to "Yesterday" — then
-    /// records the new setting wants have already been passed over, and the
-    /// only way they are ever sent is to start the destination again.
+    /// has to replay its history. If the window in force until now admitted
+    /// everything the new one wants, nothing the new one wants was ever dropped,
+    /// and the cursors can carry on. If it did not — going from "Nothing older
+    /// than today" to "Nothing older than 7 days" — then readings the new
+    /// setting wants have already been passed over, and the only way they are
+    /// ever sent is to start the destination again.
     ///
-    /// Deliberately a partial order rather than a size comparison. "Today" and
-    /// "Yesterday" do not overlap at all, so neither covers the other, and
-    /// moving between them in either direction has to replay.
+    /// Floors are totally ordered, and the ordering holds whenever it is
+    /// evaluated, because every floor is a fixed number of days back from the
+    /// user's own midnight. That is what makes this a sound basis for the
+    /// decision even though the old window was in force over past days while the
+    /// new one is being judged today.
     public func covers(_ other: DeliveryWindow) -> Bool {
-        switch self {
-        case .sinceLastDelivery:
+        guard let mine = daysBack else {
+            // No floor admits everything.
             return true
-        case .previous7Days:
-            return other != .sinceLastDelivery
-        case .previousDayAndToday:
-            return other == .previousDayAndToday
-                || other == .today
-                || other == .yesterday
-        case .today:
-            return other == .today
-        case .yesterday:
-            return other == .yesterday
         }
+        guard let theirs = other.daysBack else {
+            return false
+        }
+        return mine >= theirs
     }
 }
 
 /// What applying a window to one batch did.
 public struct WindowedBatch: Sendable {
-    /// The batch to send, already rebuilt if anything was excluded. Nil when
-    /// the window excluded every record, which is a complete delivery of
-    /// nothing rather than a failure.
+    /// The batch to send, already rebuilt if anything was excluded. Nil when the
+    /// window excluded every record, which is a complete delivery of nothing
+    /// rather than a failure.
     public let batch: DeliveryBatch?
     public let excludedRecords: Int
 

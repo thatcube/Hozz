@@ -91,7 +91,6 @@ public enum PayloadDivision {
 
         case .csv:
             return csvDivision(payload)
-
         case .influx:
             let lines = payload.split(separator: 0x0A, omittingEmptySubsequences: true)
             return Division(
@@ -264,24 +263,58 @@ public enum PayloadDivision {
     static let csvStartDateColumn = 3
 
     private static func csvDivision(_ payload: Data) -> Division? {
-        var rows = payload.split(separator: 0x0A, omittingEmptySubsequences: true)
+        var rows = csvRows(payload)
         guard let header = rows.first else {
             return nil
         }
         rows.removeFirst()
 
-        var headerData = Data(header)
+        var headerData = header
         headerData.append(0x0A)
         return Division(
             format: .csv,
             records: rows.map { row in
-                Record(
-                    date: csvDate(of: Data(row)),
-                    content: .line(Data(row))
-                )
+                Record(date: csvDate(of: row), content: .line(row))
             },
             header: headerData
         )
+    }
+
+    /// Splits a CSV payload into rows, ignoring newlines inside quotes.
+    ///
+    /// The writer quotes any field containing a newline, so a source name with
+    /// one in it produces a record that spans two lines. Splitting on every
+    /// newline would tear that record in half, and the halves would then be
+    /// filtered or batched independently — one record silently becoming two,
+    /// both malformed. Rare, but the failure is corruption rather than an error,
+    /// so it is worth the dozen lines to be right.
+    static func csvRows(_ payload: Data) -> [Data] {
+        var rows: [Data] = []
+        var current = Data()
+        var isQuoted = false
+
+        for byte in payload {
+            if byte == 0x22 {
+                // A doubled quote inside a quoted field is an escaped quote, and
+                // flipping twice leaves the state where it started, so it needs
+                // no special case here.
+                isQuoted.toggle()
+                current.append(byte)
+                continue
+            }
+            if byte == 0x0A, !isQuoted {
+                if !current.isEmpty {
+                    rows.append(current)
+                }
+                current = Data()
+                continue
+            }
+            current.append(byte)
+        }
+        if !current.isEmpty {
+            rows.append(current)
+        }
+        return rows
     }
 
     private static func csvDate(of row: Data) -> Date? {

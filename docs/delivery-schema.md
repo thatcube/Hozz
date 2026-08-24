@@ -12,8 +12,8 @@ differently; the [README](../README.md#formats) covers those.
 - [NDJSON](#ndjson) · [JSON](#json) · [CSV](#csv) ·
   [Metrics JSON](#metrics-json) · [InfluxDB line protocol](#influxdb-line-protocol)
 - [Health Auto Export compatibility](#health-auto-export-compatibility)
-- [Delivery mechanics](#delivery-mechanics) — date range, headers, idempotency,
-  retries
+- [Delivery mechanics](#delivery-mechanics) — how far back, timeouts, headers,
+  idempotency, retries
 
 ## Conventions
 
@@ -564,41 +564,69 @@ format does not document.
 
 ## Delivery mechanics
 
-### Date range
+### How far back
 
 Each destination has a **delivery window**, which is separate from how often it
 syncs. The default, "Everything not yet sent", applies no date filter at all.
 
-This is worth being precise about, because the name matches a setting in other
-exporters that means something weaker. Hozz reads Health through opaque,
-type-scoped anchors rather than date windows, because Health accepts samples
-written retroactively — a workout imported this morning can carry yesterday's
-date. A cursor of "everything since the last run" never sees those. An anchor
-does: a record that appears is a record Hozz has not read before, whenever it
-claims to have happened. So the default window is not a date range, it is the
-*absence* of one.
+That name matches a setting in other exporters which means something weaker, so
+it is worth being precise. Hozz reads Health through opaque, type-scoped anchors
+rather than date windows, because Health accepts samples written retroactively —
+a workout imported this morning can carry yesterday's date. A cursor of
+"everything since the last run" never sees those. An anchor does: a record that
+appears is a record Hozz has not read before, whenever it claims to have
+happened. So the default window is not a date range, it is the *absence* of one.
 
-The bounded ranges — Today, Yesterday, Yesterday and today, The last 7 days —
-are a filter over records that have already been read, applied when the batch is
-built. Days are the user's own calendar days, not UTC's. A record dated outside
-the range is not delivered, and the acquisition cursor moves past it, so it does
-not come round again on its own.
+Every other choice is a **floor**: an oldest date, with no upper bound.
 
-That has one safeguard, and it is the reason a bounded range is offered at all:
-**widening a destination's range replays its whole history.** Going from Today to
-The last 7 days, or from Today to Yesterday, clears that destination's cursors
-and re-reads Health from the start. Every record carries the identifier HealthKit
-gave it, so a receiver that stores by identifier keeps one copy of each. A
-reading can therefore be excluded, but no reading is unreachable for ever.
+| Setting | Delivers |
+| --- | --- |
+| Everything not yet sent | Everything the anchors have not delivered here. |
+| Nothing older than today | Nothing dated before local midnight this morning. |
+| Nothing older than yesterday | Nothing dated before local midnight yesterday. |
+| Nothing older than 7 days | Nothing dated before local midnight 7 days ago. |
+| Nothing older than 30 days | Nothing dated before local midnight 30 days ago. |
 
-Narrowing a range does not replay, because it excludes nothing that was already
+Days are the user's own calendar days, not UTC's. There is deliberately no
+option with an *upper* bound — no "Yesterday only" — because such a window loses
+records twice over: a sample HealthKit gains while a sync is already running is
+dated after the pass began and would be excluded for being too new, and a range
+ending before today rejects everything dated today, which is exactly when
+today's readings are drained. Either way the anchor commits past them and they
+are gone. A floor has neither problem.
+
+A floor can still exclude a reading — one older than it — and the anchor moves
+past that reading, so the exclusion is permanent on its own. Two things make it
+safe:
+
+- **It is counted.** Receipts carry "3 readings were older than this
+  destination's limit and were not sent", including on a pass where everything
+  was excluded. Nothing arriving and nothing arriving *because you asked for
+  today only* look identical from the receiving end, and only one is worth
+  investigating.
+- **Lowering the floor replays the destination's whole history.** Going from
+  "Nothing older than today" to "Nothing older than 7 days" clears that
+  destination's cursors and re-reads Health from the start. Every record carries
+  the identifier HealthKit gave it, so a receiver that stores by identifier
+  keeps one copy of each. A reading can be excluded; no reading is unreachable
+  for ever.
+
+Raising the floor does not replay, because it excludes nothing already
 delivered.
 
-Records the range left out are counted on the receipt — "3 readings were outside
-this destination's date range and were not sent" — including on a pass where
-every record was excluded. Nothing arriving and nothing arriving *because you
-asked for today only* look identical from the receiving end, and only one of them
-is worth investigating.
+One honest residue: a floor moves with the clock, so which readings it excludes
+depends on when iOS let Hozz run. A reading from late last night can fall
+outside "nothing older than today" if the sync lands after midnight. The app
+says so on the same screen as the setting.
+
+### Timeout
+
+REST destinations carry a request timeout, chosen per destination, defaulting to
+the 60 seconds `URLSession` would use anyway. A large batch posted to a small
+computer — a Home Assistant on a Raspberry Pi writing to an SD card — can take
+minutes to be accepted, and giving up early reports a working server as a broken
+one. The batch is retried either way, so a long timeout costs time rather than
+data.
 
 ### Endpoints
 

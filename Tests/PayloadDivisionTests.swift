@@ -301,3 +301,26 @@ private func identifiers(inNDJSON payload: Data) -> [String] {
             return object["id"] as? String
         }
 }
+
+/// A CSV field is allowed to contain a newline if it is quoted, and the writer
+/// quotes it. Splitting on every newline would tear one record into two
+/// malformed halves, which the filter and the batcher would then treat as
+/// separate records.
+extension PayloadDivisionTests {
+    func testACSVRowWithANewlineInsideQuotesIsOneRecordNotTwo() throws {
+        let text = "id,type,kind,startDate,endDate,value,unit,sourceName,deleted\n"
+            + "a,HKQuantityTypeIdentifierStepCount,quantity,"
+            + "2026-08-20T09:00:00.000Z,2026-08-20T09:00:00.000Z,120,count,"
+            + "\"Brandon's\niPhone\",false\n"
+        let awkward = Data(text.utf8)
+
+        let division = try XCTUnwrap(PayloadDivision.decompose(awkward, format: .csv))
+
+        XCTAssertEqual(division.count, 1, "One reading, however it is spelled.")
+        XCTAssertNotNil(division.records[0].date, "And it is still dated.")
+        XCTAssertTrue(
+            PayloadDivision.roundTripsExactly(awkward, format: .csv),
+            "It has to come back the way it went in, too."
+        )
+    }
+}

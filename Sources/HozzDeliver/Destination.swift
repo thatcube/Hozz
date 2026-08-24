@@ -446,7 +446,7 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
         case CodingKeys.payloadSchema.stringValue:
             "a field-name scheme"
         case CodingKeys.deliveryWindow.stringValue:
-            "a delivery window"
+            "a limit on how far back to send"
         case Destination.precisionKey:
             "a timestamp precision"
         default:
@@ -466,6 +466,55 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
 
     public static let measurementKey = "influxMeasurement"
     public static let precisionKey = "influxPrecision"
+    public static let timeoutKey = "requestTimeout"
+    /// Set while this destination is owed a replay of its whole history.
+    ///
+    /// Widening a delivery window has to do two things — write the new window,
+    /// and clear the cursors so the readings the narrower one skipped are read
+    /// again — and they are two separate writes to two separate tables. If the
+    /// second never happens, because the process was killed or the write failed,
+    /// nothing afterwards can tell: the destination already holds the wider
+    /// window, so comparing old against new says no replay is due, and the
+    /// readings are lost for good.
+    ///
+    /// The marker is written *with* the new window, in the same record, before
+    /// the cursors are touched. Whatever happens next, the fact that a replay is
+    /// owed is on disk, and it is acted on and cleared the next time the engine
+    /// loads or saves. Clearing cursors twice does nothing, so acting on it more
+    /// often than necessary is harmless; acting on it less often is the failure
+    /// this exists to prevent.
+    public static let pendingReplayKey = "pendingReplay"
+
+    /// Whether this destination still owes its history a replay.
+    public var isReplayPending: Bool {
+        options[Destination.pendingReplayKey] != nil
+    }
+
+    /// How long to wait for a destination to answer before giving up.
+    ///
+    /// A fixed timeout strands the people this app is for. A Raspberry Pi
+    /// running Home Assistant on an SD card can take minutes to accept a large
+    /// batch, and `URLSession`'s default of sixty seconds turns that into a
+    /// permanent, unexplained failure. Equally, a phone waiting an hour on a
+    /// server that is switched off is a phone spending battery on nothing, so
+    /// the choice belongs to the person who knows which of the two they have.
+    ///
+    /// Stored as a string in ``options`` rather than as a number, because that
+    /// is the only shape `options` has. An unreadable or out-of-range value
+    /// falls back to the default rather than being treated as unsupported: a
+    /// timeout cannot silently change the *meaning* of what is delivered, only
+    /// how long Hozz waits, so parking the destination over it would cost the
+    /// user their data to protect them from nothing.
+    public var requestTimeout: TimeInterval {
+        guard
+            let raw = options[Destination.timeoutKey],
+            let seconds = TimeInterval(raw),
+            RequestTimeout.range.contains(seconds)
+        else {
+            return RequestTimeout.default
+        }
+        return seconds
+    }
 
     /// Keychain account name for this destination's secret.
     public var credentialKey: String {
@@ -640,9 +689,9 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
         case .unsupportedSettings(let detail):
             detail
         case .windowNotApplicable:
-            "Hozz could not tell which readings fell inside this destination's "
-                + "date range, so it sent nothing rather than send readings you "
-                + "asked it to leave out."
+            "Hozz could not tell how old the readings in this batch were, so "
+                + "it sent nothing rather than send readings you asked it to "
+                + "leave out."
         case .folderUnavailable:
             "Hozz could not reach that folder. It may have been moved, renamed, or signed out."
         case .accessDenied:

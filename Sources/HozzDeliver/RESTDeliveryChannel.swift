@@ -10,18 +10,62 @@ import UIKit
 /// server already committed — can recognise and discard the repeat. That, plus
 /// stable per-record identifiers, is what lets a retry be safe.
 public struct RESTDeliveryChannel: DeliveryChannel {
-    private let session: URLSession
+    private let sessions: SessionPool
     private let credentials: DestinationCredentials
     private let deviceName: String
 
     public init(
-        session: URLSession = .shared,
+        session: URLSession? = nil,
         credentials: DestinationCredentials = DestinationCredentials(),
         deviceName: String = RESTDeliveryChannel.defaultDeviceName()
     ) {
-        self.session = session
+        self.sessions = SessionPool(fixed: session)
         self.credentials = credentials
         self.deviceName = deviceName
+    }
+
+    /// Keeps one `URLSession` per timeout the user has chosen.
+    ///
+    /// Setting `URLRequest.timeoutInterval` alone is not enough. A session
+    /// carries its own `timeoutIntervalForRequest`, `URLSession.shared` sets it
+    /// to sixty seconds, and a request asking for half an hour inside that
+    /// session does not get half an hour. The whole point of the setting is the
+    /// user with a slow home server, so it has to be the session that is
+    /// configured, not only the request.
+    ///
+    /// There are six choices, so the pool is at most six sessions and they live
+    /// as long as the app does — which is what a `URLSession` is for. A session
+    /// per request would open a new connection pool every time and lose keep
+    /// alive on exactly the slow servers this exists to help.
+    private actor SessionPool {
+        private let fixed: URLSession?
+        private var sessions: [Int: URLSession] = [:]
+
+        init(fixed: URLSession?) {
+            self.fixed = fixed
+        }
+
+        func session(timeout: TimeInterval) -> URLSession {
+            // An injected session is used exactly as given. A test that stubs
+            // the network must not have its stub swapped out from under it.
+            if let fixed {
+                return fixed
+            }
+            let key = Int(timeout.rounded())
+            if let existing = sessions[key] {
+                return existing
+            }
+            let configuration = URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = timeout
+            // How long the transfer as a whole may take. Left generous: the
+            // per-request timeout is the one the user chose, and clamping the
+            // resource timeout to the same number would abandon a large upload
+            // that is making steady progress.
+            configuration.timeoutIntervalForResource = max(timeout * 4, 600)
+            let session = URLSession(configuration: configuration)
+            sessions[key] = session
+            return session
+        }
     }
 
     /// What this device calls itself, so a receiver can say which phone is
@@ -44,6 +88,10 @@ public struct RESTDeliveryChannel: DeliveryChannel {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // The destination's own timeout. `URLSession` applies its default of
+        // sixty seconds otherwise, which turns a slow-but-working home server
+        // into a transport failure the user reads as "my server is broken".
+        request.timeoutInterval = destination.requestTimeout
         // Names this phone so a receiver can show which device is connected.
         request.setValue(deviceName, forHTTPHeaderField: "X-Hozz-Device")
         request.setValue(batch.format.contentType, forHTTPHeaderField: "Content-Type")
@@ -84,6 +132,7 @@ public struct RESTDeliveryChannel: DeliveryChannel {
 
         let data: Data
         let response: URLResponse
+        let session = await sessions.session(timeout: destination.requestTimeout)
         do {
             (data, response) = try await session.data(for: request)
         } catch is CancellationError {

@@ -31,6 +31,7 @@ struct DestinationEditorView: View {
     @State private var measurement: String
     @State private var precision: InfluxLineProtocol.Precision
     @State private var payloadSchema: PayloadSchema
+    @State private var requestTimeout: TimeInterval
     @State private var discovered: [DiscoveredReceiver] = []
     @State private var isBrowsing = false
 
@@ -68,6 +69,9 @@ struct DestinationEditorView: View {
         _measurement = State(initialValue: options.measurement)
         _precision = State(initialValue: options.precision)
         _payloadSchema = State(initialValue: destination?.payloadSchema ?? .hozz)
+        _requestTimeout = State(
+            initialValue: destination?.requestTimeout ?? RequestTimeout.default
+        )
     }
 
     var body: some View {
@@ -196,6 +200,10 @@ struct DestinationEditorView: View {
                 influxSection
             }
 
+            if kind == .restAPI {
+                timeoutSection
+            }
+
             if PayloadSchema.applies(to: format), kind != .folder {
                 compatibilitySection
             }
@@ -285,7 +293,7 @@ struct DestinationEditorView: View {
     /// "How often" is when Hozz tries; this is what it is allowed to send.
     private var windowSection: some View {
         Section {
-            Picker("Date range", selection: $deliveryWindow) {
+            Picker("How far back", selection: $deliveryWindow) {
                 ForEach(DeliveryWindow.allCases, id: \.self) { window in
                     Text(window.displayName).tag(window)
                 }
@@ -299,8 +307,8 @@ struct DestinationEditorView: View {
                 HozzLabel(.infoCircle, size: 16) {
                     Text(
                         "Saving this will send everything again from the "
-                        + "beginning. Readings the narrower range skipped are "
-                        + "still on this iPhone's Health, so widening it does "
+                        + "beginning. Readings the higher floor skipped are "
+                        + "still in this iPhone's Health, so lowering it does "
                         + "not leave them behind — but the destination will "
                         + "receive a lot at once. Each one carries the same "
                         + "identifier as before, so anything that stores them "
@@ -311,22 +319,27 @@ struct DestinationEditorView: View {
                 }
             }
         } header: {
-            Text("Date range")
+            Text("How far back")
         } footer: {
             Text(
                 "Separate from how often Hozz syncs. Hozz reads Health with a "
                 + "bookmark rather than a date, so a reading the Health app "
-                + "files under last week is still noticed — but a date range "
-                + "narrower than \u{201C}Everything not yet sent\u{201D} means "
-                + "readings older than it are not delivered here."
+                + "files under last week is still noticed — but anything older "
+                + "than the limit set here is not delivered to this "
+                + "destination, and is not delivered later either. The limit "
+                + "moves with the clock, so a reading from late last night can "
+                + "fall outside \u{201C}nothing older than today\u{201D} if the "
+                + "sync happens after midnight. Choosing a longer limit later "
+                + "sends everything again from the start, so nothing is out of "
+                + "reach for good."
             )
         }
     }
 
-    /// Whether saving would widen the window and therefore replay everything.
+    /// Whether saving would lower the floor and therefore replay everything.
     ///
-    /// Worth saying before the fact rather than after. Widening is the right
-    /// thing to allow — it is the only way readings a narrow range skipped are
+    /// Worth saying before the fact rather than after. Lowering it is the right
+    /// thing to allow — it is the only way readings a higher floor skipped are
     /// ever sent — but somebody pointing this at a home server should know a
     /// backlog is about to arrive.
     private var willReplayHistory: Bool {
@@ -380,7 +393,35 @@ struct DestinationEditorView: View {
         }
     }
 
-    /// Matching another exporter's field names, for pipelines already built.
+    /// How long to wait for the endpoint to answer.
+    ///
+    /// Offered for endpoints only. A folder is the file system and an MQTT
+    /// broker answers in milliseconds or not at all; the request that hangs is
+    /// always the HTTP one to somebody's own computer.
+    private var timeoutSection: some View {
+        Section {
+            Picker("Wait for a reply", selection: $requestTimeout) {
+                ForEach(RequestTimeout.choices, id: \.self) { seconds in
+                    Text(RequestTimeout.displayName(for: seconds)).tag(seconds)
+                }
+            }
+
+            Text(RequestTimeout.explanation(for: requestTimeout))
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+        } header: {
+            Text("Timeout")
+        } footer: {
+            Text(
+                "A large batch posted to a small computer can take minutes to "
+                + "be accepted. Giving up too early reports a server that is "
+                + "working as one that is broken, and the batch is retried "
+                + "anyway, so nothing is lost either way \u{2014} only time."
+            )
+        }
+    }
+
+
     private var compatibilitySection: some View {
         Section {
             Picker("Field names", selection: $payloadSchema) {
@@ -589,6 +630,9 @@ struct DestinationEditorView: View {
     /// and back does not lose a measurement name that was typed once.
     private var options: [String: String] {
         var options = existing?.options ?? [:]
+        if kind == .restAPI {
+            options[Destination.timeoutKey] = String(Int(requestTimeout))
+        }
         guard format == .influx || options[Destination.measurementKey] != nil else {
             // A folder has no measurement name, and stamping one on it would
             // put settings in the record that mean nothing there.

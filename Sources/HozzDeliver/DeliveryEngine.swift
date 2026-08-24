@@ -56,31 +56,37 @@ public actor DeliveryEngine {
     public func save(_ destination: Destination) async throws {
         try await loadIfNeeded()
         let previous = cache[destination.id]
-        let payload = try JSONEncoder().encode(destination)
-        try await store.saveDestination(
-            id: destination.id,
-            payload: payload,
-            createdAt: destination.createdAt
-        )
-        cache[destination.id] = destination
 
-        // Widening a destination's date range replays its whole history.
+        // Lowering a destination's floor replays its whole history.
         //
         // This is the guarantee that stops a bounded window from losing records
-        // permanently. A window narrower than the new one has already let
-        // batches go by with readings the new setting wants, and the anchors
-        // moved past them, so they are not coming round again on their own.
-        // Clearing this destination's cursors makes it read Health from the
-        // start; every record carries the identifier HealthKit gave it, so a
-        // receiver recognises the repeats and keeps one of each.
+        // permanently. A higher floor has already let batches go by with
+        // readings the new setting wants, and the cursors moved past them, so
+        // they are not coming round again on their own. Clearing this
+        // destination's cursors makes it read Health from the start; every
+        // record carries the identifier HealthKit gave it, so a receiver
+        // recognises the repeats and keeps one of each.
         //
-        // Re-reading is the cheap side of this trade and losing a reading is
-        // the expensive one. Note this is only needed for the *window*: a data
-        // type that was excluded was never drained at all, so its cursor never
-        // moved, and switching it back on needs nothing.
-        if let previous, !previous.deliveryWindow.covers(destination.deliveryWindow) {
-            Self.log.info("A destination's date range widened; its history will replay.")
-            try await store.deleteStreamState(scope: .destination(destination.id))
+        // Re-reading is the cheap side of this trade and losing a reading is the
+        // expensive one. Note this is only needed for the *window*: a data type
+        // that was excluded was never drained at all, so its cursor never moved,
+        // and switching it back on needs nothing.
+        //
+        // The marker is written first and cleared last, because the two writes
+        // this needs cannot be made atomic from here. A crash between them would
+        // otherwise leave the wider window on disk with the cursors intact and
+        // nothing left to notice, which is exactly the loss being guarded
+        // against.
+        var destination = destination
+        let owesReplay = previous.map { !$0.deliveryWindow.covers(destination.deliveryWindow) }
+            ?? false
+        if owesReplay {
+            destination.options[Destination.pendingReplayKey] = "1"
+        }
+
+        try await write(destination)
+        if destination.isReplayPending {
+            try await settleReplay(for: destination)
         }
 
         // Re-saving a destination is how the user says "I fixed it", so a
@@ -99,6 +105,31 @@ public actor DeliveryEngine {
                 )
             )
         }
+    }
+
+    /// Persists a destination and keeps the in-memory copy in step.
+    private func write(_ destination: Destination) async throws {
+        let payload = try JSONEncoder().encode(destination)
+        try await store.saveDestination(
+            id: destination.id,
+            payload: payload,
+            createdAt: destination.createdAt
+        )
+        cache[destination.id] = destination
+    }
+
+    /// Carries out a replay this destination is owed, and only then forgets it.
+    ///
+    /// Safe to call more than once: clearing cursors that are already cleared
+    /// does nothing, and the marker is removed last so an interruption leaves
+    /// the work still owed rather than silently done.
+    private func settleReplay(for destination: Destination) async throws {
+        Self.log.info("A destination's date range widened; its history will replay.")
+        try await store.deleteStreamState(scope: .destination(destination.id))
+
+        var settled = destination
+        settled.options[Destination.pendingReplayKey] = nil
+        try await write(settled)
     }
 
     /// Removes a destination and the secret that belonged to it.
@@ -436,8 +467,8 @@ public actor DeliveryEngine {
     /// receiving end, and only one of them is worth investigating.
     static func windowDetail(excluded: Int) -> String {
         excluded == 1
-            ? "1 reading was outside this destination's date range and was not sent."
-            : "\(excluded) readings were outside this destination's date range "
+            ? "1 reading was older than this destination's limit and was not sent."
+            : "\(excluded) readings were older than this destination's limit "
                 + "and were not sent."
     }
 
@@ -603,5 +634,14 @@ public actor DeliveryEngine {
             }
         }
         isLoaded = true
+
+        // A replay that was written down but never carried out is finished here,
+        // on the first load after whatever interrupted it. Doing this at load
+        // rather than only at save is what makes the marker worth having: a
+        // destination whose window was widened just before the app was killed
+        // gets its history back without the user having to touch it again.
+        for destination in cache.values where destination.isReplayPending {
+            try? await settleReplay(for: destination)
+        }
     }
 }

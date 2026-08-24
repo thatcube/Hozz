@@ -1,6 +1,6 @@
 import Foundation
-@testable import HozzDeliver
 import HozzCore
+@testable import HozzDeliver
 import HozzStore
 import XCTest
 
@@ -9,7 +9,7 @@ import XCTest
 ///
 /// The dangerous case here is not a window that excludes too much. It is a
 /// window that excludes a reading quietly, reports the delivery as complete, and
-/// leaves that reading unreachable for ever, because the acquisition cursor has
+/// leaves that reading unreachable for ever because the acquisition cursor has
 /// moved past it. Most of this file is about that.
 final class DeliveryWindowTests: XCTestCase {
     private var directory: TemporaryDirectory!
@@ -28,20 +28,10 @@ final class DeliveryWindowTests: XCTestCase {
         )!
     }
 
-    private func local(
-        _ day: Int,
-        _ hour: Int = 0,
-        _ minute: Int = 0
-    ) -> Date {
-        calendar.date(
-            from: DateComponents(
-                year: 2026,
-                month: 8,
-                day: day,
-                hour: hour,
-                minute: minute
-            )
-        )!
+    /// Local midnight on the given August day in 2026, worked out from
+    /// components rather than by asking the code under test.
+    private func midnight(august day: Int) -> Date {
+        calendar.date(from: DateComponents(year: 2026, month: 8, day: day))!
     }
 
     override func setUpWithError() throws {
@@ -52,70 +42,97 @@ final class DeliveryWindowTests: XCTestCase {
         directory = nil
     }
 
-    // MARK: - The ranges are the ones a person would draw
+    // MARK: - The floors are the dates their names claim
 
-    /// Every boundary below is written as a date in its own right, not derived
-    /// from the range being tested.
-    func testEachWindowCoversTheDaysItsNameClaims() {
+    func testEachWindowsFloorIsTheMidnightItsNameClaims() {
         XCTAssertNil(
-            DeliveryWindow.sinceLastDelivery.range(now: now, calendar: calendar),
-            "The default is the absence of a range, not a very wide one."
-        )
-
-        XCTAssertEqual(
-            DeliveryWindow.today.range(now: now, calendar: calendar),
-            DateInterval(start: local(22), end: now)
+            DeliveryWindow.sinceLastDelivery.floor(now: now, calendar: calendar),
+            "The default is the absence of a floor, not a very old one."
         )
         XCTAssertEqual(
-            DeliveryWindow.yesterday.range(now: now, calendar: calendar),
-            DateInterval(start: local(21), end: local(22))
+            DeliveryWindow.sinceStartOfToday.floor(now: now, calendar: calendar),
+            midnight(august: 22)
         )
         XCTAssertEqual(
-            DeliveryWindow.previousDayAndToday.range(now: now, calendar: calendar),
-            DateInterval(start: local(21), end: now)
+            DeliveryWindow.sinceStartOfYesterday.floor(now: now, calendar: calendar),
+            midnight(august: 21)
         )
         XCTAssertEqual(
-            DeliveryWindow.previous7Days.range(now: now, calendar: calendar),
-            DateInterval(start: local(15), end: now)
+            DeliveryWindow.sinceSevenDaysAgo.floor(now: now, calendar: calendar),
+            midnight(august: 15)
+        )
+        XCTAssertEqual(
+            DeliveryWindow.sinceThirtyDaysAgo.floor(now: now, calendar: calendar),
+            calendar.date(from: DateComponents(year: 2026, month: 7, day: 23))
         )
     }
 
     /// A day boundary is the user's midnight, not UTC's. On this date New York
     /// is four hours behind UTC, so local midnight is 04:00 UTC — and a reading
-    /// at 02:00 UTC belongs to yesterday, not today.
+    /// at 02:00 UTC on the 22nd is still the 21st where the user lives.
     func testDaysAreTheUsersDaysRatherThanUTCDays() {
-        let twoAMUTC = Date(timeIntervalSince1970: 1_787_364_000)
+        // 2026-08-22T02:00:00Z, computed from components in UTC.
+        var utc = Calendar(identifier: .gregorian)
+        utc.timeZone = TimeZone(identifier: "UTC")!
+        let twoAMUTC = utc.date(
+            from: DateComponents(year: 2026, month: 8, day: 22, hour: 2)
+        )!
 
         XCTAssertFalse(
-            DeliveryWindow.today.admits(twoAMUTC, now: now, calendar: calendar),
+            DeliveryWindow.sinceStartOfToday.admits(
+                twoAMUTC,
+                now: now,
+                calendar: calendar
+            ),
             "02:00 UTC on the 22nd is still the 21st in New York."
         )
         XCTAssertTrue(
-            DeliveryWindow.yesterday.admits(twoAMUTC, now: now, calendar: calendar)
+            DeliveryWindow.sinceStartOfYesterday.admits(
+                twoAMUTC,
+                now: now,
+                calendar: calendar
+            )
         )
     }
 
-    func testAReadingOnEitherSideOfTheBoundaryLandsInOneWindowOnly() {
-        let justBeforeMidnight = local(21, 23, 59)
-        let midnight = local(22)
+    func testAReadingExactlyOnTheFloorIsAdmittedAndOneAnInstantEarlierIsNot() {
+        let floor = midnight(august: 22)
 
         XCTAssertTrue(
-            DeliveryWindow.yesterday.admits(
-                justBeforeMidnight,
+            DeliveryWindow.sinceStartOfToday.admits(
+                floor,
                 now: now,
                 calendar: calendar
-            )
+            ),
+            "Midnight belongs to the day that starts at it."
         )
         XCTAssertFalse(
-            DeliveryWindow.today.admits(
-                justBeforeMidnight,
+            DeliveryWindow.sinceStartOfToday.admits(
+                floor.addingTimeInterval(-0.001),
                 now: now,
                 calendar: calendar
+            ),
+            "A millisecond before midnight is the previous day."
+        )
+    }
+
+    /// A floor has no upper bound, on purpose. A sample HealthKit gains while a
+    /// sync is already running is dated after the moment the pass started, and
+    /// an upper bound would exclude it and let the cursor commit past it.
+    func testAReadingNewerThanTheSyncItselfIsNeverExcluded() {
+        let duringTheSync = now.addingTimeInterval(90)
+        let tomorrow = now.addingTimeInterval(86_400)
+
+        for window in DeliveryWindow.allCases {
+            XCTAssertTrue(
+                window.admits(duringTheSync, now: now, calendar: calendar),
+                "\(window.rawValue) must not reject a reading for being too new."
             )
-        )
-        XCTAssertTrue(
-            DeliveryWindow.today.admits(midnight, now: now, calendar: calendar)
-        )
+            XCTAssertTrue(
+                window.admits(tomorrow, now: now, calendar: calendar),
+                "\(window.rawValue) must not reject a reading dated ahead."
+            )
+        }
     }
 
     /// The one record shape that carries no date is a tombstone. Holding one
@@ -129,23 +146,34 @@ final class DeliveryWindowTests: XCTestCase {
         }
     }
 
+    /// A floor that ends before today would deliver nothing at all, for ever:
+    /// readings dated today are drained today, and by the time they fell inside
+    /// such a window the cursor would be past them.
+    func testNoWindowEverExcludesTodaysReadings() {
+        let thisMorning = calendar.date(
+            from: DateComponents(year: 2026, month: 8, day: 22, hour: 8)
+        )!
+        for window in DeliveryWindow.allCases {
+            XCTAssertTrue(
+                window.admits(thisMorning, now: now, calendar: calendar),
+                "\(window.rawValue) would starve a destination permanently."
+            )
+        }
+    }
+
     // MARK: - Coverage, which is what decides whether history replays
 
-    func testCoverageIsThePartialOrderTheWindowsActuallyHave() {
+    func testCoverageIsTheOrderTheFloorsActuallyHave() {
         let cases: [(DeliveryWindow, DeliveryWindow, Bool)] = [
-            (.sinceLastDelivery, .previous7Days, true),
-            (.sinceLastDelivery, .today, true),
-            (.previous7Days, .previousDayAndToday, true),
-            (.previous7Days, .today, true),
-            (.previous7Days, .yesterday, true),
-            (.previous7Days, .sinceLastDelivery, false),
-            (.previousDayAndToday, .today, true),
-            (.previousDayAndToday, .yesterday, true),
-            (.previousDayAndToday, .previous7Days, false),
-            (.today, .today, true),
-            (.today, .yesterday, false),
-            (.yesterday, .today, false),
-            (.today, .previousDayAndToday, false)
+            (.sinceLastDelivery, .sinceThirtyDaysAgo, true),
+            (.sinceLastDelivery, .sinceStartOfToday, true),
+            (.sinceThirtyDaysAgo, .sinceSevenDaysAgo, true),
+            (.sinceThirtyDaysAgo, .sinceLastDelivery, false),
+            (.sinceSevenDaysAgo, .sinceStartOfYesterday, true),
+            (.sinceSevenDaysAgo, .sinceThirtyDaysAgo, false),
+            (.sinceStartOfYesterday, .sinceStartOfToday, true),
+            (.sinceStartOfToday, .sinceStartOfYesterday, false),
+            (.sinceStartOfToday, .sinceStartOfToday, true)
         ]
         for (wider, narrower, expected) in cases {
             XCTAssertEqual(
@@ -157,26 +185,56 @@ final class DeliveryWindowTests: XCTestCase {
     }
 
     /// Not a restatement of the table above: this checks the property the table
-    /// is supposed to encode, against ranges computed from the calendar.
-    func testCoverageAgreesWithTheRangesThemselves() {
-        let bounded: [DeliveryWindow] = [
-            .today, .yesterday, .previousDayAndToday, .previous7Days
+    /// is supposed to encode, against floors computed from the calendar, and at
+    /// two different moments — because the old window was in force over past
+    /// days while the new one is judged today.
+    func testCoverageAgreesWithTheFloorsAtAnyMoment() {
+        let bounded = DeliveryWindow.allCases.filter(\.isBounded)
+        let moments = [
+            now,
+            now.addingTimeInterval(-40 * 86_400),
+            // Across a daylight-saving change, where a day is not 86,400
+            // seconds long.
+            calendar.date(from: DateComponents(year: 2026, month: 11, day: 2, hour: 9))!
         ]
-        for wider in bounded {
-            for narrower in bounded {
-                guard let a = wider.range(now: now, calendar: calendar),
-                      let b = narrower.range(now: now, calendar: calendar)
-                else {
-                    continue
+
+        for moment in moments {
+            for wider in bounded {
+                for narrower in bounded {
+                    guard
+                        let a = wider.floor(now: moment, calendar: calendar),
+                        let b = narrower.floor(now: moment, calendar: calendar)
+                    else {
+                        continue
+                    }
+                    XCTAssertEqual(
+                        wider.covers(narrower),
+                        a <= b,
+                        "\(wider.rawValue) vs \(narrower.rawValue) disagrees with "
+                            + "the dates at \(moment)."
+                    )
                 }
-                let containsRange = a.start <= b.start && a.end >= b.end
-                XCTAssertEqual(
-                    wider.covers(narrower),
-                    containsRange,
-                    "\(wider.rawValue) vs \(narrower.rawValue) disagrees with the dates."
-                )
             }
         }
+    }
+
+    /// Crossing a daylight-saving boundary must still land on local midnight,
+    /// not on a time shifted by an hour.
+    func testAFloorLandsOnLocalMidnightAcrossADaylightSavingChange() {
+        // In New York, clocks go back on 1 November 2026.
+        let afterTheChange = calendar.date(
+            from: DateComponents(year: 2026, month: 11, day: 2, hour: 9)
+        )!
+        let floor = DeliveryWindow.sinceStartOfYesterday.floor(
+            now: afterTheChange,
+            calendar: calendar
+        )
+
+        XCTAssertEqual(
+            floor,
+            calendar.date(from: DateComponents(year: 2026, month: 11, day: 1)),
+            "A day back has to be the previous midnight, not 23 or 25 hours."
+        )
     }
 
     // MARK: - Applying a window to a batch
@@ -238,8 +296,8 @@ final class DeliveryWindowTests: XCTestCase {
         )
     }
 
-    func testABoundedWindowKeepsExactlyTheRecordsInsideIt() throws {
-        let result = try DeliveryWindow.previousDayAndToday.apply(
+    func testAFloorKeepsExactlyTheRecordsAtOrAfterIt() throws {
+        let result = try DeliveryWindow.sinceStartOfYesterday.apply(
             to: batch(fourDays),
             destination: Destination(name: "n", kind: .restAPI),
             now: now,
@@ -257,7 +315,7 @@ final class DeliveryWindowTests: XCTestCase {
     /// never seen.
     func testAFilteredBatchGetsANewIdentifierDerivedFromItsNewBytes() throws {
         let original = batch(fourDays)
-        let result = try DeliveryWindow.today.apply(
+        let result = try DeliveryWindow.sinceStartOfToday.apply(
             to: original,
             destination: Destination(name: "n", kind: .restAPI),
             now: now,
@@ -274,13 +332,7 @@ final class DeliveryWindowTests: XCTestCase {
     }
 
     func testAWindowThatExcludesEverythingProducesNoBatchRatherThanAnEmptyOne() throws {
-        let onlyOld = Data(
-            """
-            {"id":"old","kind":"quantity","startDate":"2020-01-01T12:00:00.000Z"}
-
-            """.utf8
-        )
-        let result = try DeliveryWindow.today.apply(
+        let result = try DeliveryWindow.sinceStartOfToday.apply(
             to: batch(onlyOld),
             destination: Destination(name: "n", kind: .restAPI),
             now: now,
@@ -291,13 +343,20 @@ final class DeliveryWindowTests: XCTestCase {
         XCTAssertEqual(result.excludedRecords, 1)
     }
 
+    private let onlyOld = Data(
+        """
+        {"id":"old","kind":"quantity","startDate":"2020-01-01T12:00:00.000Z"}
+
+        """.utf8
+    )
+
     /// A payload this build cannot take apart must not be delivered whole. That
     /// would send readings the user asked to leave out and call it a success.
     func testAnUnreadablePayloadIsRefusedRatherThanSentUnfiltered() {
         let opaque = Data("not a record at all\n".utf8)
 
         XCTAssertThrowsError(
-            try DeliveryWindow.today.apply(
+            try DeliveryWindow.sinceStartOfToday.apply(
                 to: batch(opaque),
                 destination: Destination(name: "n", kind: .restAPI),
                 now: now,
@@ -310,17 +369,20 @@ final class DeliveryWindowTests: XCTestCase {
 
     // MARK: - Through the engine
 
+    private func endpoint(_ window: DeliveryWindow) -> Destination {
+        Destination(
+            name: "Home server",
+            kind: .restAPI,
+            endpointURL: URL(string: "https://example.com/health"),
+            deliveryWindow: window
+        )
+    }
+
     func testTheChannelNeverSeesRecordsTheWindowExcluded() async throws {
         let store = try HozzStore(directory: directory.url.appending(path: "store"))
         let channel = CapturingChannel()
         let engine = DeliveryEngine(store: store, channels: [.restAPI: channel])
-        var destination = Destination(
-            name: "Home server",
-            kind: .restAPI,
-            endpointURL: URL(string: "https://example.com/health"),
-            deliveryWindow: .today
-        )
-        destination.deliveryWindow = .today
+        let destination = endpoint(.sinceStartOfToday)
         try await engine.save(destination)
 
         _ = try await engine.deliver(batch(fourDays), to: destination, now: now)
@@ -333,12 +395,7 @@ final class DeliveryWindowTests: XCTestCase {
     func testTheReceiptSaysHowManyReadingsTheWindowLeftOut() async throws {
         let store = try HozzStore(directory: directory.url.appending(path: "store"))
         let engine = DeliveryEngine(store: store, channels: [.restAPI: CapturingChannel()])
-        let destination = Destination(
-            name: "Home server",
-            kind: .restAPI,
-            endpointURL: URL(string: "https://example.com/health"),
-            deliveryWindow: .today
-        )
+        let destination = endpoint(.sinceStartOfToday)
         try await engine.save(destination)
 
         _ = try await engine.deliver(batch(fourDays), to: destination, now: now)
@@ -356,21 +413,10 @@ final class DeliveryWindowTests: XCTestCase {
         let store = try HozzStore(directory: directory.url.appending(path: "store"))
         let channel = CapturingChannel()
         let engine = DeliveryEngine(store: store, channels: [.restAPI: channel])
-        let destination = Destination(
-            name: "Home server",
-            kind: .restAPI,
-            endpointURL: URL(string: "https://example.com/health"),
-            deliveryWindow: .today
-        )
+        let destination = endpoint(.sinceStartOfToday)
         try await engine.save(destination)
 
-        let old = Data(
-            """
-            {"id":"old","kind":"quantity","startDate":"2020-01-01T12:00:00.000Z"}
-
-            """.utf8
-        )
-        let receipt = try await engine.deliver(batch(old), to: destination, now: now)
+        let receipt = try await engine.deliver(batch(onlyOld), to: destination, now: now)
 
         XCTAssertEqual(receipt.recordCount, 0)
         XCTAssertEqual(receipt.state, .delivered)
@@ -389,91 +435,54 @@ final class DeliveryWindowTests: XCTestCase {
 
     // MARK: - No record is skipped for ever
 
-    /// The guarantee that makes a bounded window safe to offer at all.
+    /// The guarantee that makes a floor safe to offer at all.
     ///
-    /// A narrow window excludes old readings and the cursor moves past them.
-    /// Widening it clears the cursors, so those readings are read again and
-    /// delivered. Without this, choosing "Today" once would silently make every
-    /// earlier reading unreachable for that destination for good.
-    func testWideningTheWindowClearsTheCursorsSoSkippedReadingsComeBack() async throws {
+    /// A high floor excludes old readings and the cursor moves past them.
+    /// Lowering it clears the cursors, so those readings are read again and
+    /// delivered. Without this, choosing "Nothing older than today" once would
+    /// silently make every earlier reading unreachable for that destination.
+    func testLoweringTheFloorClearsTheCursorsSoSkippedReadingsComeBack() async throws {
         let store = try HozzStore(directory: directory.url.appending(path: "store"))
         let engine = DeliveryEngine(store: store, channels: [:])
-        var destination = Destination(
-            name: "Home server",
-            kind: .restAPI,
-            endpointURL: URL(string: "https://example.com/health"),
-            deliveryWindow: .today
-        )
+        var destination = endpoint(.sinceStartOfToday)
         try await engine.save(destination)
         try await commitACursor(store, for: destination.id)
         let before = try await store.streamRecords(scope: .destination(destination.id))
         XCTAssertFalse(before.isEmpty)
 
-        destination.deliveryWindow = .previous7Days
+        destination.deliveryWindow = .sinceSevenDaysAgo
         try await engine.save(destination)
 
         let after = try await store.streamRecords(scope: .destination(destination.id))
         XCTAssertTrue(
             after.isEmpty,
-            "Widening has to replay, or the skipped readings never arrive."
+            "Lowering the floor has to replay, or the skipped readings never arrive."
         )
     }
 
-    func testMovingBetweenTwoWindowsThatDoNotOverlapAlsoReplays() async throws {
+    /// Raising the floor throws nothing away that was already delivered, so
+    /// re-reading years of Health would be a cost with no benefit.
+    func testRaisingTheFloorLeavesTheCursorsWhereTheyAre() async throws {
         let store = try HozzStore(directory: directory.url.appending(path: "store"))
         let engine = DeliveryEngine(store: store, channels: [:])
-        var destination = Destination(
-            name: "Home server",
-            kind: .restAPI,
-            endpointURL: URL(string: "https://example.com/health"),
-            deliveryWindow: .today
-        )
+        var destination = endpoint(.sinceLastDelivery)
         try await engine.save(destination)
         try await commitACursor(store, for: destination.id)
 
-        destination.deliveryWindow = .yesterday
-        try await engine.save(destination)
-
-        let after = try await store.streamRecords(scope: .destination(destination.id))
-        XCTAssertTrue(
-            after.isEmpty,
-            "Yesterday's readings were skipped while the window said today."
-        )
-    }
-
-    /// Narrowing throws nothing away that was already delivered, so re-reading
-    /// years of Health for no reason would be a cost with no benefit.
-    func testNarrowingTheWindowLeavesTheCursorsWhereTheyAre() async throws {
-        let store = try HozzStore(directory: directory.url.appending(path: "store"))
-        let engine = DeliveryEngine(store: store, channels: [:])
-        var destination = Destination(
-            name: "Home server",
-            kind: .restAPI,
-            endpointURL: URL(string: "https://example.com/health"),
-            deliveryWindow: .sinceLastDelivery
-        )
-        try await engine.save(destination)
-        try await commitACursor(store, for: destination.id)
-
-        destination.deliveryWindow = .today
+        destination.deliveryWindow = .sinceStartOfToday
         try await engine.save(destination)
 
         let after = try await store.streamRecords(scope: .destination(destination.id))
         XCTAssertFalse(
             after.isEmpty,
-            "Narrowing excludes nothing that was already sent."
+            "Raising the floor excludes nothing that was already sent."
         )
     }
 
     func testAnOrdinaryReSaveDoesNotThrowAwayTheCursors() async throws {
         let store = try HozzStore(directory: directory.url.appending(path: "store"))
         let engine = DeliveryEngine(store: store, channels: [:])
-        var destination = Destination(
-            name: "Home server",
-            kind: .restAPI,
-            endpointURL: URL(string: "https://example.com/health"),
-            deliveryWindow: .today
-        )
+        var destination = endpoint(.sinceStartOfToday)
         try await engine.save(destination)
         try await commitACursor(store, for: destination.id)
 
@@ -485,6 +494,53 @@ final class DeliveryWindowTests: XCTestCase {
             after.isEmpty,
             "Renaming a destination must not restart it."
         )
+    }
+
+    /// The replay is two writes to two tables and cannot be made atomic from
+    /// here, so it is written down before it is carried out. A crash in between
+    /// must leave the work owed rather than silently done — otherwise the wider
+    /// window is on disk, nothing can tell a replay was due, and the readings
+    /// are gone for good.
+    func testAReplayInterruptedBeforeItRanIsStillCarriedOutOnTheNextLaunch() async throws {
+        let store = try HozzStore(directory: directory.url.appending(path: "store"))
+        var destination = endpoint(.sinceStartOfToday)
+
+        // Exactly the state a crash between the two writes would leave: the
+        // wider window saved, the marker set, the cursors untouched.
+        destination.deliveryWindow = .sinceLastDelivery
+        destination.options[Destination.pendingReplayKey] = "1"
+        try await store.saveDestination(
+            id: destination.id,
+            payload: try JSONEncoder().encode(destination),
+            createdAt: destination.createdAt
+        )
+        try await commitACursor(store, for: destination.id)
+
+        // A fresh engine, as after a relaunch.
+        let engine = DeliveryEngine(store: store, channels: [:])
+        let loaded = try await engine.destinations()
+
+        let after = try await store.streamRecords(scope: .destination(destination.id))
+        XCTAssertTrue(after.isEmpty, "The owed replay has to happen eventually.")
+        XCTAssertEqual(loaded.count, 1)
+        XCTAssertFalse(
+            loaded[0].isReplayPending,
+            "And it must be forgotten once it has, or it replays for ever."
+        )
+    }
+
+    func testTheMarkerIsClearedOnceTheReplayHasHappened() async throws {
+        let store = try HozzStore(directory: directory.url.appending(path: "store"))
+        let engine = DeliveryEngine(store: store, channels: [:])
+        var destination = endpoint(.sinceStartOfToday)
+        try await engine.save(destination)
+
+        destination.deliveryWindow = .sinceThirtyDaysAgo
+        try await engine.save(destination)
+
+        let saved = try await engine.destination(id: destination.id)
+        XCTAssertEqual(saved?.isReplayPending, false)
+        XCTAssertEqual(saved?.deliveryWindow, .sinceThirtyDaysAgo)
     }
 
     private func commitACursor(_ store: HozzStore, for id: UUID) async throws {
@@ -526,10 +582,6 @@ final class DeliveryWindowTests: XCTestCase {
         XCTAssertEqual(
             destination.unsupportedSettings["deliveryWindow"],
             "sinceTheDawnOfTime"
-        )
-        XCTAssertTrue(
-            try XCTUnwrap(destination.unsupportedDescription).contains("date")
-                || XCTUnwrap(destination.unsupportedDescription).contains("window")
         )
 
         let object = try XCTUnwrap(
