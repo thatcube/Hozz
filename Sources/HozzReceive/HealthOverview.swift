@@ -92,21 +92,25 @@ extension IngestStore {
     public struct MetricSnapshot: Sendable, Hashable, Identifiable {
         public let series: TypeSeries
         /// When this type was last seen at all, which may be long before the
-        /// range being charted. Shown so an empty chart is legible as "the
-        /// sweep has not reached here" rather than "this never happened".
+        /// range being charted.
         public let latestOverall: Date?
         public let totalRecords: Int
+        /// Whether `series` covers the range that was asked for, or an older
+        /// window ending at this type's own last record.
+        public let isFromEarlierWindow: Bool
 
         public var id: String { series.measure.type }
 
         public init(
             series: TypeSeries,
             latestOverall: Date?,
-            totalRecords: Int
+            totalRecords: Int,
+            isFromEarlierWindow: Bool = false
         ) {
             self.series = series
             self.latestOverall = latestOverall
             self.totalRecords = totalRecords
+            self.isFromEarlierWindow = isFromEarlierWindow
         }
     }
 
@@ -115,6 +119,15 @@ extension IngestStore {
     /// Types absent from the archive are dropped rather than drawn empty: a row
     /// reading "—" for something the phone has never sent is noise, and the
     /// point of an overview is that everything on it means something.
+    ///
+    /// A type that *is* held but has nothing in the requested range falls back
+    /// to the same-shaped window ending at its own most recent record, marked
+    /// so the row can say when it is from. Without that, an archive still being
+    /// swept opens on a screen where every line reads "nothing in range" — each
+    /// one true, the whole thing useless, and the honest explanation nowhere in
+    /// sight. A range picker cannot fix it either, because the types are not
+    /// all stale by the same amount: this archive's newest step count is from
+    /// January 2023 and its newest wrist temperature is from yesterday.
     public func snapshots(
         types: [String],
         plan: TimeBucketPlan
@@ -131,11 +144,33 @@ extension IngestStore {
             guard bounds.1 > 0 else {
                 continue
             }
+            let latest = bounds.0.flatMap(Timestamps.date(from:))
+
+            let asked = try series(type: type, plan: plan)
+            if !asked.values.isEmpty || latest == nil {
+                results.append(
+                    MetricSnapshot(
+                        series: asked,
+                        latestOverall: latest,
+                        totalRecords: bounds.1
+                    )
+                )
+                continue
+            }
+
+            let fallbackPlan = TimeBucketPlan.trailing(
+                max(plan.columns.count, 1),
+                granularity: plan.granularity,
+                endingAt: latest ?? .now,
+                calendar: plan.calendar
+            )
+            let earlier = try series(type: type, plan: fallbackPlan)
             results.append(
                 MetricSnapshot(
-                    series: try series(type: type, plan: plan),
-                    latestOverall: bounds.0.flatMap(Timestamps.date(from:)),
-                    totalRecords: bounds.1
+                    series: earlier.values.isEmpty ? asked : earlier,
+                    latestOverall: latest,
+                    totalRecords: bounds.1,
+                    isFromEarlierWindow: !earlier.values.isEmpty
                 )
             )
         }

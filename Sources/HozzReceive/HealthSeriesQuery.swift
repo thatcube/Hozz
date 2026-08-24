@@ -163,6 +163,7 @@ extension IngestStore {
         let sql = """
             WITH b(idx, lo, hi) AS (VALUES \(values))
             SELECT b.idx,
+                   COUNT(*),
                    SUM(\(counted)),
                    SUM(CASE WHEN s.value IS NULL THEN 0
                             ELSE s.value * \(counted) END),
@@ -172,9 +173,8 @@ extension IngestStore {
                             ELSE \(readings) * \(counted) END),
                    MIN(CASE WHEN \(counted) = 1 THEN s.value END),
                    MAX(CASE WHEN \(counted) = 1 THEN s.value END),
-                   SUM(CASE WHEN \(counted) = 1 THEN \(readings) ELSE 0 END),
-                   COUNT(DISTINCT CASE WHEN \(counted) = 1
-                                       THEN \(dayExpression) END),
+                   SUM(\(readings)),
+                   COUNT(DISTINCT \(dayExpression)),
                    SUM(CASE WHEN \(counted) = 1 THEN
                             MAX(0.0, (julianday(s.end_date)
                                       - julianday(s.start_date)) * 86400.0)
@@ -192,15 +192,16 @@ extension IngestStore {
         let fetched = try database.query(sql, [.text(type)]) { row in
             (
                 index: Int(row.integer(0)),
-                samples: Int(row.optionalReal(1) ?? 0),
-                total: row.optionalReal(2) ?? 0,
-                weightedSum: row.optionalReal(3) ?? 0,
-                weight: row.optionalReal(4) ?? 0,
-                minimum: row.optionalReal(5),
-                maximum: row.optionalReal(6),
-                readings: Int(row.optionalReal(7) ?? 0),
-                days: Int(row.integer(8)),
-                duration: row.optionalReal(9) ?? 0
+                samples: Int(row.integer(1)),
+                counted: Int(row.optionalReal(2) ?? 0),
+                total: row.optionalReal(3) ?? 0,
+                weightedSum: row.optionalReal(4) ?? 0,
+                weight: row.optionalReal(5) ?? 0,
+                minimum: row.optionalReal(6),
+                maximum: row.optionalReal(7),
+                readings: Int(row.optionalReal(8) ?? 0),
+                days: Int(row.integer(9)),
+                duration: row.optionalReal(10) ?? 0
             )
         }
         let rows = Dictionary(
@@ -219,6 +220,7 @@ extension IngestStore {
                 minimum: row?.minimum,
                 maximum: row?.maximum,
                 sampleCount: row?.samples ?? 0,
+                countedCount: row?.counted ?? 0,
                 readingCount: row?.readings ?? 0,
                 daysWithData: row?.days ?? 0,
                 dayCount: column.dayCount(in: plan.calendar),

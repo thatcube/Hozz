@@ -32,7 +32,6 @@ struct DataView: View {
     let services: MacServices
     @State private var section: DataSection = .overview
     @State private var selectedType: String?
-    @State private var range: ChartRange = .month
     @State private var isExporting = false
 
     var body: some View {
@@ -106,6 +105,15 @@ struct DataView: View {
         .padding(.vertical, 9)
     }
 
+    /// One range for every dashboard, owned by the services object so the
+    /// screens agree and so it can be chosen from what the archive holds.
+    private var rangeBinding: Binding<ChartRange> {
+        Binding(
+            get: { services.range },
+            set: { services.range = $0 }
+        )
+    }
+
     @ViewBuilder
     private var content: some View {
         switch section {
@@ -113,12 +121,13 @@ struct DataView: View {
             OverviewView(
                 services: services,
                 selectedType: $selectedType,
-                section: $section
+                section: $section,
+                range: rangeBinding
             )
         case .types:
             typesPane
         case .compare:
-            CompareView(services: services, range: $range)
+            CompareView(services: services, range: rangeBinding)
         case .workouts:
             WorkoutsView(services: services)
         case .heart:
@@ -231,7 +240,7 @@ struct DataView: View {
             TypeDetailView(
                 services: services,
                 type: selectedType,
-                range: $range
+                range: rangeBinding
             )
         } else {
             ContentUnavailableView(

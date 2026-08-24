@@ -31,10 +31,17 @@ struct CompareView: View {
                 picker
                 if services.comparison.isEmpty {
                     Card {
-                        Text("Choose two or more types above to see them together.")
-                            .font(.callout)
-                            .foregroundStyle(HozzPalette.inkMuted)
-                            .frame(maxWidth: .infinity, minHeight: 160)
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(emptyReason)
+                                .font(.callout)
+                                .foregroundStyle(HozzPalette.inkSoft)
+                            if !services.comparisonTypes.isEmpty, range != .all {
+                                Button("Show everything held") { range = .all }
+                                    .buttonStyle(.borderedProminent)
+                                    .tint(HozzPalette.blue)
+                            }
+                        }
+                        .frame(maxWidth: .infinity, minHeight: 140, alignment: .leading)
                     }
                 } else {
                     chartCard
@@ -43,7 +50,17 @@ struct CompareView: View {
             }
             .dashboardPage()
         }
-        .task(id: TaskKey(types: services.comparisonTypes, range: range)) {
+        .task(
+            id: TaskKey(
+                types: services.comparisonTypes,
+                range: range,
+                // Included so the defaults get chosen once the type list has
+                // actually arrived. Without it, opening this screen before the
+                // first refresh finishes leaves nothing selected and nothing to
+                // change, because the key never moves again.
+                knownTypes: services.summaries.count
+            )
+        ) {
             await services.loadComparison(range: range)
         }
     }
@@ -51,6 +68,18 @@ struct CompareView: View {
     private struct TaskKey: Equatable {
         let types: [String]
         let range: ChartRange
+        let knownTypes: Int
+    }
+
+    /// Says which of the two reasons the chart is blank, because "pick
+    /// something" and "nothing in this window" call for different actions.
+    private var emptyReason: String {
+        if services.comparisonTypes.isEmpty {
+            return "Choose two or more types above to see them together."
+        }
+        return "Nothing chosen here reaches this range yet. A phone works back "
+            + "through history one type at a time, so the newest weeks are "
+            + "often the last to arrive."
     }
 
     private var header: some View {

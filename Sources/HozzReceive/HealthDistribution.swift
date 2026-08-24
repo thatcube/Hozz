@@ -29,9 +29,10 @@ extension IngestStore {
     /// heart rate is 55 asleep and 150 running has a daily average of about 70
     /// and spends almost no time there.
     ///
-    /// A sample that stands for many readings contributes that many, for the
-    /// same reason its average is weighted — otherwise an hour compressed into
-    /// one row counts once against a single spot measurement.
+    /// A sample that stands for many readings contributes that many when its
+    /// value is their mean, for the same reason its average is weighted —
+    /// otherwise an hour compressed into one row counts once against a single
+    /// spot measurement.
     public func distribution(
         type: String,
         from start: Date,
@@ -47,6 +48,16 @@ extension IngestStore {
         guard measure.kind == .total || measure.kind == .average else {
             return []
         }
+
+        // A row standing for many readings contributes that many — but only
+        // when its value is their *mean*. A cumulative series sample already
+        // holds the sum over its readings, so a single 1,000 m cycling row
+        // covering 132 of them is one occurrence of 1,000 m, not 132. Weighting
+        // it would inflate the bar by roughly the length of the series, which
+        // is the same mistake `series()` is careful not to make.
+        let weight = measure.kind == .average
+            ? "COALESCE(json_extract(CAST(raw AS TEXT), '$.quantity.count'), 1)"
+            : "1"
 
         let parameters: [SQLiteValue] = [
             .text(type),
@@ -74,8 +85,7 @@ extension IngestStore {
         guard high > low else {
             let count = try database.query(
                 """
-                SELECT SUM(COALESCE(
-                           json_extract(CAST(raw AS TEXT), '$.quantity.count'), 1))
+                SELECT SUM(\(weight))
                   FROM sample
                  WHERE type = ? AND start_date >= ? AND start_date < ?
                    AND value IS NOT NULL
@@ -97,8 +107,7 @@ extension IngestStore {
         let rows = try database.query(
             """
             SELECT MIN(CAST((value - ?) / ? AS INTEGER), ?),
-                   SUM(COALESCE(
-                       json_extract(CAST(raw AS TEXT), '$.quantity.count'), 1))
+                   SUM(\(weight))
               FROM sample
              WHERE type = ? AND start_date >= ? AND start_date < ?
                AND value IS NOT NULL

@@ -136,11 +136,23 @@ public struct TimeBucketPlan: Sendable, Equatable {
         // which on a chart redraw is indistinguishable from a hang.
         let ceiling = 100_000
         while cursor < end, index < ceiling {
-            guard let next = calendar.date(
+            // Re-aligned every step rather than accumulated. Adding a day to a
+            // date preserves the wall clock, so in a zone whose clocks go
+            // forward at midnight — Santiago does, and Havana, Asunción and
+            // Tehran have — the day with no 00:00 starts at 01:00, and every
+            // column after it inherits that hour. The bars would then straddle
+            // two local days each while the SQL kept counting true midnights,
+            // so a 30-day window could report 44 days with data and cheerfully
+            // announce that every one of them was covered.
+            guard let advanced = calendar.date(
                 byAdding: granularity.component,
                 value: 1,
                 to: cursor
-            ), next > cursor else {
+            ) else {
+                break
+            }
+            let next = align(advanced, to: granularity, calendar: calendar)
+            guard next > cursor else {
                 break
             }
             columns.append(Column(index: index, start: cursor, end: next))
@@ -172,13 +184,14 @@ public struct TimeBucketPlan: Sendable, Equatable {
             return TimeBucketPlan(columns: [], granularity: granularity, calendar: calendar)
         }
         let lastStart = align(now, to: granularity, calendar: calendar)
-        guard let end = calendar.date(
+        guard let advanced = calendar.date(
             byAdding: granularity.component,
             value: 1,
             to: lastStart
         ) else {
             return TimeBucketPlan(columns: [], granularity: granularity, calendar: calendar)
         }
+        let end = align(advanced, to: granularity, calendar: calendar)
         guard let start = calendar.date(
             byAdding: granularity.component,
             value: -(count - 1),
