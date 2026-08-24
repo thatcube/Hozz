@@ -108,6 +108,29 @@ public struct SeriesFacts: Sendable {
 
 /// Builds the records one series sample contributes to an export.
 public enum SeriesEncoding {
+    /// Whether a record kind is a page of a series' detail rather than a
+    /// reading in its own right.
+    ///
+    /// All three series families write elements and an end marker beside the
+    /// sample they belong to, carrying that sample's type identifier and a
+    /// date range inside it. Anything that reduces a record to one number, or
+    /// counts records of a type, has to know these are neither: a page of five
+    /// hundred readings is not a measurement, and counting it as one inflates
+    /// a type by the amount of detail Hozz managed to export.
+    public static func isDetailKind(_ kind: String) -> Bool {
+        switch kind {
+        case WorkoutRouteEncoding.shape.elementKind,
+            WorkoutRouteEncoding.shape.endKind,
+            ElectrocardiogramEncoding.shape.elementKind,
+            ElectrocardiogramEncoding.shape.endKind,
+            QuantitySeriesEncoding.elementKind,
+            QuantitySeriesEncoding.endKind:
+            true
+        default:
+            false
+        }
+    }
+
     public static func headerChange(
         shape: SeriesShape,
         header: SeriesHeader

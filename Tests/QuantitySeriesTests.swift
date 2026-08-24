@@ -1,6 +1,7 @@
 import HealthKit
 import HozzCatalog
 import HozzCore
+import HozzDeliver
 import XCTest
 @testable import HozzHealth
 
@@ -1228,6 +1229,180 @@ final class QuantitySeriesTests: XCTestCase {
             values[500],
             "Re-opened from the backend, so it starts at the recorded offset."
         )
+    }
+
+    // MARK: - Not adding a number to the numbers it is the average of
+
+    /// The aggregate has to say its readings are here too.
+    ///
+    /// `aggregatesSeries` says "there is more detail than this number". It
+    /// does not say "and it is in this export, keyed to this record's id",
+    /// which is the fact that stops a consumer adding an hour of heart rate to
+    /// itself — once as an average, once as three hundred readings.
+    func testAnExpandedAggregateSaysItsReadingsAreAlsoHere() {
+        let expanded = HealthSampleEncoder.quantityObject(
+            unit: unit,
+            value: 72.4,
+            description: "72.4 count/min",
+            count: 300,
+            expandsSeries: true
+        )
+        XCTAssertEqual(expanded["aggregatesSeries"] as? Bool, true)
+        XCTAssertEqual(
+            expanded["seriesReadingsExported"] as? Bool,
+            true,
+            "The mark that means: do not add this to its own children."
+        )
+
+        // With expansion off the readings are not in the export, so claiming
+        // they are would send a consumer looking for records that do not exist.
+        let unexpanded = HealthSampleEncoder.quantityObject(
+            unit: unit,
+            value: 72.4,
+            description: "72.4 count/min",
+            count: 300,
+            expandsSeries: false
+        )
+        XCTAssertEqual(unexpanded["aggregatesSeries"] as? Bool, true)
+        XCTAssertNil(unexpanded["seriesReadingsExported"])
+
+        // An ordinary measurement has no children at all.
+        let single = HealthSampleEncoder.quantityObject(
+            unit: unit,
+            value: 72,
+            description: "72 count/min",
+            count: 1,
+            expandsSeries: true
+        )
+        XCTAssertNil(single["aggregatesSeries"])
+        XCTAssertNil(single["seriesReadingsExported"])
+    }
+
+    func testEverySeriesFamilysDetailIsRecognisedAsDetail() {
+        for kind in [
+            QuantitySeriesEncoding.elementKind,
+            QuantitySeriesEncoding.endKind,
+            WorkoutRouteEncoding.shape.elementKind,
+            WorkoutRouteEncoding.shape.endKind,
+            ElectrocardiogramEncoding.shape.elementKind,
+            ElectrocardiogramEncoding.shape.endKind
+        ] {
+            XCTAssertTrue(SeriesEncoding.isDetailKind(kind), kind)
+        }
+        for kind in ["quantity", "category", "workout", "deletion", "audiogram"] {
+            XCTAssertFalse(SeriesEncoding.isDetailKind(kind), kind)
+        }
+    }
+
+    /// A reading page must not be filed inside a real metric.
+    ///
+    /// The metrics and InfluxDB shapes reduce a record to one number, and a
+    /// page of five hundred readings is not one number. Sent anyway, it landed
+    /// under "heart rate" as an extra point with no quantity, dated to the page
+    /// rather than the reading, with a unit of "count" — so anything counting
+    /// points per metric counted pages as readings.
+    func testMetricsAndInfluxDestinationsAreNotGivenSeriesPages() throws {
+        let sample = UUID()
+        let shape = QuantitySeriesEncoding.shape(for: heartRate.rawValue)
+        let aggregate = HealthChange.upsert(
+            CapturedHealthObject(
+                id: sample,
+                type: heartRate,
+                canonicalPayload: try SeriesEncoding.serialize([
+                    "kind": "quantity",
+                    "id": sample.uuidString.lowercased(),
+                    "type": heartRate.rawValue,
+                    "startDate": SeriesEncoding.timestamp(base),
+                    "endDate": SeriesEncoding.timestamp(base),
+                    "quantity": HealthSampleEncoder.quantityObject(
+                        unit: unit,
+                        value: 72.4,
+                        description: "72.4 count/min",
+                        count: 3,
+                        expandsSeries: true
+                    )
+                ])
+            )
+        )
+        let page = try SeriesEncoding.elementsChange(
+            shape: shape,
+            sample: sample,
+            offset: 0,
+            elements: readings([70, 72, 75]),
+            sampleStart: base,
+            sampleEnd: base.addingTimeInterval(3),
+            extra: ["unit": unit]
+        )
+        let end = try SeriesEncoding.endChange(
+            shape: shape,
+            sample: sample,
+            elementCount: 3,
+            sampleStart: base,
+            sampleEnd: base.addingTimeInterval(3)
+        )
+        let records = [aggregate, page, end]
+
+        for format in [DeliveryFormat.metrics, .influx] {
+            let payload = try DeliveryPayloadBuilder.build(
+                records: records,
+                destination: Destination(
+                    name: "Test",
+                    kind: .restAPI,
+                    format: format,
+                    endpointURL: URL(string: "https://example.invalid")
+                )
+            )
+            let text = String(decoding: payload, as: UTF8.self)
+            XCTAssertFalse(
+                text.contains(QuantitySeriesEncoding.elementKind),
+                "\(format) must not carry reading pages."
+            )
+            XCTAssertFalse(
+                text.contains(
+                    SeriesEncoding.identifier(
+                        shape: shape,
+                        sample: sample,
+                        suffix: "\(QuantitySeriesEncoding.elementsKey)-0"
+                    ).uuidString.lowercased()
+                ),
+                "\(format) must not carry a reading page under any name."
+            )
+            XCTAssertTrue(
+                text.contains("72.4"),
+                "\(format) must still carry the aggregate, exactly as before."
+            )
+        }
+    }
+
+    /// The lossless formats carry everything, which is the other half of the
+    /// same decision: nothing is dropped, it is only kept out of the shapes
+    /// that cannot represent it.
+    func testTheLosslessFormatsStillCarryEveryReading() throws {
+        let sample = UUID()
+        let page = try SeriesEncoding.elementsChange(
+            shape: QuantitySeriesEncoding.shape(for: heartRate.rawValue),
+            sample: sample,
+            offset: 0,
+            elements: readings([70, 72, 75]),
+            sampleStart: base,
+            sampleEnd: base.addingTimeInterval(3),
+            extra: ["unit": unit]
+        )
+
+        let payload = try DeliveryPayloadBuilder.build(
+            records: [page],
+            destination: Destination(
+                name: "Test",
+                kind: .folder,
+                format: .ndjson,
+                folderBookmark: Data("bookmark".utf8)
+            )
+        )
+        let text = String(decoding: payload, as: UTF8.self)
+        XCTAssertTrue(text.contains(QuantitySeriesEncoding.elementKind))
+        for value in ["70", "72", "75"] {
+            XCTAssertTrue(text.contains(value))
+        }
     }
 
     // MARK: - The shared encoding stays as it was
