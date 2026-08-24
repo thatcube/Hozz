@@ -397,6 +397,13 @@ public actor HealthSyncEngine {
                     return result
                 }
             } catch {
+                if error is CancellationError || Task.isCancelled {
+                    // The ordinary background case: iOS took its time back and
+                    // the pass is checkpointing. Recording a coverage failure
+                    // would report a healthy type as broken.
+                    result.wasInterrupted = true
+                    return result
+                }
                 let failure = HealthKitFailure.classify(
                     error,
                     typeIdentifier: type.rawValue
@@ -496,6 +503,21 @@ public actor HealthSyncEngine {
 
 /// Turns drained records into the bytes a destination expects.
 enum DeliveryPayloadBuilder {
+    /// Turns a pass's records into the destination's own format.
+    ///
+    /// The metrics and InfluxDB shapes reduce a record to one number, and a
+    /// page of five hundred readings is not one number. Sent anyway, a reading
+    /// page landed *inside the real metric* — an extra point under "heart
+    /// rate", dated to the page rather than the reading, carrying no quantity
+    /// and a unit of "count" — so anything counting points per metric counted
+    /// pages as readings. They are left out of those two formats instead,
+    /// which leaves a metrics destination exactly as it was before series
+    /// expansion existed. Publishing the readings themselves as points is
+    /// worth doing and is a change of its own: it needs the aggregate excluded
+    /// in the same breath, or a mean over the measurement averages a number
+    /// together with the numbers it is the average of.
+    ///
+    /// The lossless formats carry everything, unchanged.
     static func build(
         records: [HealthChange],
         destination: Destination
@@ -543,7 +565,9 @@ enum DeliveryPayloadBuilder {
             return try csv(from: lines)
 
         case .metrics:
-            let decoded = lines.compactMap(CompatiblePayloadBuilder.record(from:))
+            let decoded = lines
+                .compactMap(CompatiblePayloadBuilder.record(from:))
+                .filter { !SeriesEncoding.isDetailKind($0.kind) }
             switch destination.payloadSchema {
             case .hozz:
                 return try CompatiblePayloadBuilder.build(records: decoded)
@@ -553,7 +577,9 @@ enum DeliveryPayloadBuilder {
 
         case .influx:
             return InfluxLineProtocol.build(
-                records: lines.compactMap(CompatiblePayloadBuilder.record(from:)),
+                records: lines
+                    .compactMap(CompatiblePayloadBuilder.record(from:))
+                    .filter { !SeriesEncoding.isDetailKind($0.kind) },
                 options: destination.influxOptions
             )
         }

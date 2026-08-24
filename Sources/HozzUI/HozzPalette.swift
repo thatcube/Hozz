@@ -89,6 +89,27 @@ public enum HozzPalette {
             endPoint: .bottom
         )
     }
+
+    /// Tones for telling several series apart on one chart.
+    ///
+    /// Added because comparing types is the thing a desktop screen is for, and
+    /// one blue cannot carry four lines. They are deliberately close in weight
+    /// and saturation to the brand blue rather than a bright categorical set:
+    /// the page stays quiet, and no single series shouts louder than the others
+    /// for a reason that has nothing to do with the data.
+    ///
+    /// The first is `blue` itself, so a chart with one series is unchanged.
+    public static let series: [Color] = [
+        blue,
+        Color(light: 0x4E9A93, dark: 0x86C9C1),
+        Color(light: 0x8A7FB2, dark: 0xB9AEDC),
+        Color(light: 0xC08B62, dark: 0xE0B48C)
+    ]
+
+    /// A stable colour for the nth series on a chart.
+    public static func series(_ index: Int) -> Color {
+        series[abs(index) % series.count]
+    }
 }
 
 extension Color {

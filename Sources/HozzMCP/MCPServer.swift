@@ -192,7 +192,9 @@ public actor MCPServer {
         )
         return buckets.map { bucket in
             HealthStatistics.DailyValue(
-                day: (bucket.start.timeIntervalSince1970 / 86_400).rounded(.down),
+                day: Double(
+                    LocalDayExpression.day(for: bucket.start, timeZone: .current)
+                ),
                 value: Self.isAccumulated(type) ? bucket.sum : bucket.average,
                 recordCount: bucket.count
             )
@@ -293,6 +295,7 @@ public actor MCPServer {
                 is supportable; describing it as pronounced is not.
                 """
         }
+        text += "\n\n\(Self.dayBasis)"
         return text
     }
 
@@ -374,6 +377,7 @@ public actor MCPServer {
             \n\nThis is association, not cause. Nothing here shows one \
             affects the other, and an unmeasured third thing may drive both.
             """
+        text += "\n\n\(Self.dayBasis)"
         return text
     }
 
@@ -409,7 +413,10 @@ public actor MCPServer {
             text += "Unusual days:\n"
             text += report.outliers.prefix(20)
                 .map { outlier in
-                    let day = Date(timeIntervalSince1970: outlier.day * 86_400)
+                    let day = LocalDayExpression.date(
+                        forDay: Int(outlier.day),
+                        timeZone: .current
+                    )
                     return "- \(Self.day(day)): \(Self.number(outlier.value)) "
                         + "\(unit), \(Self.number(abs(outlier.deviations))) "
                         + "deviations \(outlier.isHigh ? "above" : "below") usual "
@@ -429,10 +436,18 @@ public actor MCPServer {
             text += "measurements, not low readings, and must not be reported "
             text += "as unusual values: "
             text += report.lowCoverageDays.sorted().prefix(10)
-                .map { Self.day(Date(timeIntervalSince1970: $0 * 86_400)) }
+                .map {
+                    Self.day(
+                        LocalDayExpression.date(
+                            forDay: Int($0),
+                            timeZone: .current
+                        )
+                    )
+                }
                 .joined(separator: ", ")
             text += "."
         }
+        text += "\n\n\(Self.dayBasis)"
         return text
     }
 
@@ -930,6 +945,7 @@ public actor MCPServer {
             meaningless, and averaging a cumulative one like step count \
             understates the period.
             """
+        text += "\n\n\(Self.dayBasis)"
         return text
     }
 
@@ -969,10 +985,31 @@ public actor MCPServer {
     // MARK: - Formatting
 
     private static func day(_ date: Date) -> String {
+        // Local, not GMT. Buckets are now local days, so a local midnight
+        // formatted in GMT would print the previous date for anyone ahead of
+        // UTC — the same off-by-one this change exists to remove, just moved
+        // from the grouping to the label.
         date.formatted(
-            Date.ISO8601FormatStyle(timeZone: .gmt)
+            Date.ISO8601FormatStyle(timeZone: .current)
                 .year().month().day()
         )
+    }
+
+    /// The zone the buckets were built in, said plainly wherever days are
+    /// reported.
+    ///
+    /// Samples carry no record of the zone they were taken in — `raw` has the
+    /// timestamps, the quantity, the device and the source, and its `metadata`
+    /// is empty — so a reading taken while travelling cannot be attributed to
+    /// the local day it actually happened on. Grouping in the reader's current
+    /// zone is the best available answer and the one somebody means by "my
+    /// Tuesday", but it is an assumption, and an assistant relaying a daily
+    /// total should be able to say which day it meant.
+    private static var dayBasis: String {
+        "Days are calendar days in \(TimeZone.current.identifier), the time "
+            + "zone this computer is set to. Samples do not record the zone "
+            + "they were taken in, so readings from elsewhere are filed under "
+            + "the local day they correspond to here."
     }
 
     private static func number(_ value: Double) -> String {
@@ -1055,7 +1092,12 @@ enum Tools {
                 Aggregate one Health type into time buckets, returning sum, \
                 average, minimum, maximum and count for each. This is the right \
                 tool for questions about trends over time. Prefer it over \
-                fetching raw samples.
+                fetching raw samples. Buckets are local calendar days, weeks \
+                and months in the time zone this computer is set to, not UTC — \
+                an evening reading belongs to that evening. Samples do not \
+                record the zone they were taken in, so a reading from a trip \
+                abroad is filed under the local day it corresponds to here; \
+                the reply states which zone was used.
                 """,
             "inputSchema": [
                 "type": "object",

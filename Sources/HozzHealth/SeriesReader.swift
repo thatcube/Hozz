@@ -168,6 +168,14 @@ public actor SeriesReader<Backend: SeriesBackend> {
             }
             sample = reopened
         }
+        // Dropped before a single element is pulled, and only put back once
+        // the page is built. The stream is a reference: reading from the local
+        // copy advances the one the actor is holding, so a throw part-way
+        // through would leave a cursor that says offset 500 pointing at a
+        // stream already past 1,000 — and the next page would skip the
+        // difference without anything noticing. Forgetting it costs a re-open
+        // after a failure and cannot lose an element.
+        live = nil
 
         var changes: [HealthChange] = []
         while changes.count < shape.recordsPerPage {
@@ -223,10 +231,21 @@ public actor SeriesReader<Backend: SeriesBackend> {
     }
 
     /// Pulls from the stream until the buffer can fill a record, or the sample
-    /// runs out. Never holds more than one record's worth plus one batch.
+    /// runs out.
+    ///
+    /// The cancellation check is the difference between a checkpoint and a
+    /// truncation. `AsyncThrowingStream` answers a cancelled read by *ending
+    /// the stream* rather than by throwing, so a `nil` here means either "the
+    /// sample is finished" or "this task was cancelled", and the two lead
+    /// opposite ways: one seals the sample with an end marker and moves the
+    /// cursor past it, the other must leave the cursor exactly where it was.
+    /// Cancellation is not an edge case — the background scheduler cancels on
+    /// purpose when iOS takes its time back, precisely so the next attempt
+    /// resumes rather than starting over.
     private func fill(_ sample: inout LiveSample, upTo count: Int) async throws {
         while sample.buffer.count < count, !sample.isExhausted {
             guard let batch = try await sample.stream.next() else {
+                try Task.checkCancellation()
                 sample.isExhausted = true
                 return
             }
@@ -256,6 +275,10 @@ public actor SeriesReader<Backend: SeriesBackend> {
         // stays open across pages.
         while sample.offset < delivered, !sample.isExhausted {
             guard let batch = try await sample.stream.next() else {
+                // Cancellation ends the stream rather than throwing, and
+                // mistaking it for the end of the sample here would report a
+                // sample that shrank when nothing shrank.
+                try Task.checkCancellation()
                 sample.isExhausted = true
                 break
             }

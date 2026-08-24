@@ -10,18 +10,62 @@ import UIKit
 /// server already committed — can recognise and discard the repeat. That, plus
 /// stable per-record identifiers, is what lets a retry be safe.
 public struct RESTDeliveryChannel: DeliveryChannel {
-    private let session: URLSession
+    private let sessions: SessionPool
     private let credentials: DestinationCredentials
     private let deviceName: String
 
     public init(
-        session: URLSession = .shared,
+        session: URLSession? = nil,
         credentials: DestinationCredentials = DestinationCredentials(),
         deviceName: String = RESTDeliveryChannel.defaultDeviceName()
     ) {
-        self.session = session
+        self.sessions = SessionPool(fixed: session)
         self.credentials = credentials
         self.deviceName = deviceName
+    }
+
+    /// Keeps one `URLSession` per timeout the user has chosen.
+    ///
+    /// Setting `URLRequest.timeoutInterval` alone is not enough. A session
+    /// carries its own `timeoutIntervalForRequest`, `URLSession.shared` sets it
+    /// to sixty seconds, and a request asking for half an hour inside that
+    /// session does not get half an hour. The whole point of the setting is the
+    /// user with a slow home server, so it has to be the session that is
+    /// configured, not only the request.
+    ///
+    /// There are six choices, so the pool is at most six sessions and they live
+    /// as long as the app does — which is what a `URLSession` is for. A session
+    /// per request would open a new connection pool every time and lose keep
+    /// alive on exactly the slow servers this exists to help.
+    private actor SessionPool {
+        private let fixed: URLSession?
+        private var sessions: [Int: URLSession] = [:]
+
+        init(fixed: URLSession?) {
+            self.fixed = fixed
+        }
+
+        func session(timeout: TimeInterval) -> URLSession {
+            // An injected session is used exactly as given. A test that stubs
+            // the network must not have its stub swapped out from under it.
+            if let fixed {
+                return fixed
+            }
+            let key = Int(timeout.rounded())
+            if let existing = sessions[key] {
+                return existing
+            }
+            let configuration = URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = timeout
+            // How long the transfer as a whole may take. Left generous: the
+            // per-request timeout is the one the user chose, and clamping the
+            // resource timeout to the same number would abandon a large upload
+            // that is making steady progress.
+            configuration.timeoutIntervalForResource = max(timeout * 4, 600)
+            let session = URLSession(configuration: configuration)
+            sessions[key] = session
+            return session
+        }
     }
 
     /// What this device calls itself, so a receiver can say which phone is
@@ -42,46 +86,217 @@ public struct RESTDeliveryChannel: DeliveryChannel {
             throw DeliveryError.notConfigured
         }
 
+        // A batch too large for the destination's own limit is sent as several
+        // smaller requests instead of one the server will refuse. Every record
+        // lands in exactly one part, and the parts go in order.
+        let parts = destination.maxRequestBytes.map { limit in
+            PayloadDivision.divide(
+                batch.payload,
+                format: batch.format,
+                maxBytes: limit,
+                influxPrecision: destination.influxOptions.precision,
+                dateStyle: destination.pointDateStyle
+            )
+        } ?? [batch.payload]
+
+        let secret = try authorization(for: destination)
+        let session = await sessions.session(timeout: destination.requestTimeout)
+        var statusCode = 0
+
+        for (index, part) in parts.enumerated() {
+            let request = self.request(
+                url: url,
+                part: part,
+                index: index,
+                of: parts.count,
+                batch: batch,
+                destination: destination,
+                secret: secret
+            )
+            do {
+                statusCode = try await send(request, on: session)
+            } catch let failure as DeliveryError {
+                guard parts.count > 1 else {
+                    throw failure
+                }
+                // Stopping here rather than trying the rest is deliberate.
+                // Sending part five after part three was refused would leave a
+                // hole in the middle that the receiving end has no way to
+                // notice, and a gap nobody can see is worse than a failure
+                // everybody can.
+                throw DeliveryError.incompleteBatch(
+                    accepted: index,
+                    total: parts.count,
+                    detail: failure.errorDescription ?? "",
+                    isTransient: failure.isTransient
+                )
+            }
+        }
+
+        return DeliveryReceipt(
+            destinationID: destination.id,
+            attemptedAt: .now,
+            recordCount: batch.recordCount,
+            byteCount: UInt64(batch.payload.count),
+            state: .delivered,
+            detail: parts.count > 1
+                ? "HTTP \(statusCode), sent in \(parts.count) requests"
+                : "HTTP \(statusCode)"
+        )
+    }
+
+    /// Makes a value safe to put in an HTTP header, or nil when there is
+    /// nothing left worth sending.
+    ///
+    /// A header value is defined as ASCII. Anything else is sent as raw bytes
+    /// that a server is entitled to reject and that most frameworks decode as
+    /// Latin-1 — so "Brandon’s iPhone" arrives as "Brandonâ€™s iPhone", if it
+    /// arrives at all. That is not a hypothetical: iOS names a phone with a
+    /// typographic apostrophe by default, so it is the *common* case, and it
+    /// applies equally to a destination someone named in their own language.
+    ///
+    /// Percent-encoding is the fix, and the percent sign is encoded too, so a
+    /// name that genuinely contains one cannot be decoded into something else.
+    /// A plain ASCII name is left exactly as it was, which is what keeps this
+    /// from changing anything for anyone whose headers were already correct.
+    ///
+    /// The length cap is not aesthetic: a server or proxy with a header limit
+    /// rejects the whole request, and losing a batch over a long name would be
+    /// a poor trade for a label.
+    static func headerSafe(_ value: String, limit: Int = 200) -> String? {
+        var encoded = ""
+        for byte in value.utf8 {
+            // Printable ASCII, minus the percent sign, which is the escape.
+            if byte >= 0x20, byte < 0x7F, byte != 0x25 {
+                encoded.append(Character(UnicodeScalar(byte)))
+            } else {
+                encoded += String(format: "%%%02X", byte)
+            }
+            if encoded.count >= limit {
+                break
+            }
+        }
+        let trimmed = encoded.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// One request carrying one part.
+    private func request(
+        url: URL,
+        part: Data,
+        index: Int,
+        of total: Int,
+        batch: DeliveryBatch,
+        destination: Destination,
+        secret: String?
+    ) -> URLRequest {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        // The destination's own timeout. `URLSession` applies its default of
+        // sixty seconds otherwise, which turns a slow-but-working home server
+        // into a transport failure the user reads as "my server is broken".
+        request.timeoutInterval = destination.requestTimeout
         // Names this phone so a receiver can show which device is connected.
-        request.setValue(deviceName, forHTTPHeaderField: "X-Hozz-Device")
+        if let device = Self.headerSafe(deviceName) {
+            request.setValue(device, forHTTPHeaderField: "X-Hozz-Device")
+        }
         request.setValue(batch.format.contentType, forHTTPHeaderField: "Content-Type")
         request.setValue(
             batch.id.uuidString.lowercased(),
             forHTTPHeaderField: "Hozz-Batch-Id"
         )
         request.setValue(String(batch.sequence), forHTTPHeaderField: "Hozz-Batch-Sequence")
-        request.setValue(String(batch.recordCount), forHTTPHeaderField: "Hozz-Record-Count")
+
+        // Enough for a server to route a payload without opening it: which
+        // destination this is, in what shape, and how far back it was allowed
+        // to reach. All of it is configuration rather than health data — no
+        // header here says anything about what is inside the body.
+        request.setValue(
+            destination.id.uuidString.lowercased(),
+            forHTTPHeaderField: "Hozz-Destination-Id"
+        )
+        if let name = Self.headerSafe(destination.name) {
+            request.setValue(name, forHTTPHeaderField: "Hozz-Destination-Name")
+        }
+        request.setValue(batch.format.rawValue, forHTTPHeaderField: "Hozz-Format")
+        request.setValue(
+            destination.payloadSchema.rawValue,
+            forHTTPHeaderField: "Hozz-Schema"
+        )
+        request.setValue(
+            destination.deliveryWindow.rawValue,
+            forHTTPHeaderField: "Hozz-Window"
+        )
+
+        // The record count is this part's, not the whole batch's, because it
+        // describes the body it arrives with. A receiver checking that it read
+        // as many records as it was promised must not be told about records
+        // that are in a different request.
+        let records = PayloadDivision.decompose(
+            part,
+            format: batch.format,
+            influxPrecision: destination.influxOptions.precision,
+            dateStyle: destination.pointDateStyle
+        )?.count
+        request.setValue(
+            String(records ?? batch.recordCount),
+            forHTTPHeaderField: "Hozz-Record-Count"
+        )
+
+        if total > 1 {
+            request.setValue(String(index + 1), forHTTPHeaderField: "Hozz-Part")
+            request.setValue(String(total), forHTTPHeaderField: "Hozz-Part-Count")
+        }
+
         // An idempotency key by its conventional name, so receivers that
         // already understand the pattern need no special handling.
+        //
+        // Derived from **this part's** bytes rather than the batch's. Giving
+        // every part the batch's key would make a correct receiver treat parts
+        // two onwards as repeats of part one and discard them — the batch would
+        // arrive one fifth complete and look perfect from both ends.
         request.setValue(
-            batch.id.uuidString.lowercased(),
+            (total > 1 ? DeliveryBatch.identifier(for: part) : batch.id)
+                .uuidString.lowercased(),
             forHTTPHeaderField: "Idempotency-Key"
         )
 
         for (name, value) in destination.headers {
             request.setValue(value, forHTTPHeaderField: name)
         }
-        // A Keychain read can fail transiently, most often because the device
-        // has not been unlocked since boot. Sending the batch unauthenticated
-        // in that case would turn a wait into a 401 the user has to diagnose,
-        // so it is reported as transient instead.
+        if let secret {
+            request.setValue(secret, forHTTPHeaderField: destination.authorizationHeader)
+        }
+        request.httpBody = part
+        return request
+    }
+
+    /// The stored secret, or nil when there is none.
+    ///
+    /// A Keychain read can fail transiently, most often because the device has
+    /// not been unlocked since boot. Sending the batch unauthenticated in that
+    /// case would turn a wait into a 401 the user has to diagnose, so it is
+    /// reported as transient instead. Read once per delivery rather than once
+    /// per part, so a split batch cannot start authenticated and finish
+    /// otherwise.
+    private func authorization(for destination: Destination) throws -> String? {
         do {
-            if let secret = try credentials.secret(for: destination.credentialKey),
-               !secret.isEmpty {
-                request.setValue(
-                    secret,
-                    forHTTPHeaderField: destination.authorizationHeader
-                )
+            guard
+                let secret = try credentials.secret(for: destination.credentialKey),
+                !secret.isEmpty
+            else {
+                return nil
             }
+            return secret
         } catch {
             throw DeliveryError.transport(
                 "Hozz could not read this destination's saved credential yet."
             )
         }
-        request.httpBody = batch.payload
+    }
 
+    /// Sends one request and returns its status code, or throws.
+    private func send(_ request: URLRequest, on session: URLSession) async throws -> Int {
         let data: Data
         let response: URLResponse
         do {
@@ -104,14 +319,6 @@ public struct RESTDeliveryChannel: DeliveryChannel {
             _ = data
             throw DeliveryError.rejected(statusCode: http.statusCode, body: nil)
         }
-
-        return DeliveryReceipt(
-            destinationID: destination.id,
-            attemptedAt: .now,
-            recordCount: batch.recordCount,
-            byteCount: UInt64(batch.payload.count),
-            state: .delivered,
-            detail: "HTTP \(http.statusCode)"
-        )
+        return http.statusCode
     }
 }

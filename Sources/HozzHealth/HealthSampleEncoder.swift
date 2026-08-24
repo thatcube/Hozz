@@ -14,7 +14,8 @@ public struct HealthSampleEncoder: Sendable {
     public func encode(
         sample: HKSample,
         catalogEntry: HealthCatalogEntry,
-        medications: [AnyHashable: MedicationConceptFacts] = [:]
+        medications: [AnyHashable: MedicationConceptFacts] = [:],
+        expandsSeries: Bool = false
     ) throws -> Data {
         var object = baseObject(sample: sample)
 
@@ -68,7 +69,15 @@ public struct HealthSampleEncoder: Sendable {
                 unit: unitString,
                 value: quantity.quantity.doubleValue(for: unit),
                 description: quantity.quantity.description,
-                count: quantity.count
+                count: quantity.count,
+                // The same rule the drain uses to decide whether to queue the
+                // sample, so the record's claim and the drain's behaviour can
+                // never disagree.
+                expandsSeries: expandsSeries
+                    && QuantitySeriesEncoding.isExpandable(
+                        count: quantity.count,
+                        canonicalUnit: catalogEntry.canonicalUnit
+                    )
             )
         case let category as HKCategorySample:
             object["kind"] = "category"
@@ -197,14 +206,20 @@ public struct HealthSampleEncoder: Sendable {
     /// readings is indistinguishable from a single measurement, which is a
     /// quiet way of overstating what Hozz actually knows.
     ///
-    /// Hozz does not expand those series yet, so the honest thing is to say
-    /// the detail exists and is not here, rather than to let the aggregate
-    /// pass for a reading.
+    /// When those readings are also in the export, this record has to say so.
+    /// `aggregatesSeries` alone says "there is more detail than this number";
+    /// it does not say "and it is in here too, keyed to this record's id".
+    /// Without that, anything that learns to read reading pages into the same
+    /// column would add a value to the very readings it is the aggregate of —
+    /// counting an hour of heart rate twice, once as an average and once as
+    /// three hundred readings. `seriesReadingsExported` is the mark that says:
+    /// do not add this to its own children.
     static func quantityObject(
         unit: String,
         value: Double,
         description: String,
-        count: Int
+        count: Int,
+        expandsSeries: Bool = false
     ) -> [String: Any] {
         var object: [String: Any] = [
             "unit": unit,
@@ -214,6 +229,9 @@ public struct HealthSampleEncoder: Sendable {
         ]
         if count > 1 {
             object["aggregatesSeries"] = true
+            if expandsSeries {
+                object["seriesReadingsExported"] = true
+            }
         }
         return object
     }

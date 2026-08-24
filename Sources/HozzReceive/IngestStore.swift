@@ -58,13 +58,14 @@ public enum BucketSize: String, CaseIterable, Sendable {
     case week
     case month
 
-    /// SQLite `strftime` pattern that collapses a timestamp to its bucket.
-    var format: String {
+    /// The chart granularity this bucket is, so there is one set of rules about
+    /// where a day begins rather than two that can drift apart.
+    var granularity: ChartGranularity {
         switch self {
-        case .hour: "%Y-%m-%dT%H:00:00Z"
-        case .day: "%Y-%m-%dT00:00:00Z"
-        case .week: "%Y-W%W"
-        case .month: "%Y-%m-01T00:00:00Z"
+        case .hour: .hour
+        case .day: .day
+        case .week: .week
+        case .month: .month
         }
     }
 }
@@ -202,7 +203,10 @@ public struct IngestResult: Hashable, Sendable {
 ///
 /// Nothing here ever leaves the machine.
 public actor IngestStore {
-    private let database: SQLiteDatabase
+    /// Visible to the module rather than this file so the dashboard queries can
+    /// live in files of their own. They are still actor-isolated, so every read
+    /// is serialised against ingest exactly as it was before.
+    let database: SQLiteDatabase
     private let directory: URL
 
     public init(directory: URL) throws {
@@ -1697,41 +1701,31 @@ public actor IngestStore {
     /// meaningless, and averaging step count understates a day. The caller — or
     /// the person reading it — has to choose, so hiding one of them would
     /// invite a confidently wrong answer.
+    ///
+    /// Buckets are local time. This used to group on
+    /// `strftime('%Y-%m-%dT00:00:00Z', start_date)`, which is a *UTC* day, and
+    /// that quietly misfiled every evening sample in a zone behind UTC: on the
+    /// maintainer's own archive it moved 27,858 of 147,330 records — nineteen
+    /// percent — to the following day. An assistant asked how many steps
+    /// somebody did on Tuesday was answering with part of Monday.
+    ///
+    /// The implementation is deliberately shared with the dashboards' one, in
+    /// ``series(type:plan:)``: two local-day implementations in one codebase is
+    /// a future bug, and this one has been checked against the real archive.
     public func aggregate(
         type: String,
         bucket: BucketSize,
         from start: Date? = nil,
-        to end: Date? = nil
+        to end: Date? = nil,
+        timeZone: TimeZone = .current
     ) throws -> [AggregateBucket] {
-        var sql = """
-            SELECT strftime('\(bucket.format)', start_date) AS bucket,
-                   SUM(value), AVG(value), MIN(value), MAX(value), COUNT(*)
-            FROM sample
-            WHERE type = ? AND value IS NOT NULL
-            """
-        var parameters: [SQLiteValue] = [.text(type)]
-        if let start {
-            sql += " AND start_date >= ?"
-            parameters.append(.text(Timestamps.text(from: start)))
-        }
-        if let end {
-            sql += " AND start_date <= ?"
-            parameters.append(.text(Timestamps.text(from: end)))
-        }
-        sql += " GROUP BY bucket ORDER BY bucket"
-
-        return try database.query(sql, parameters) { row in
-            AggregateBucket(
-                start: Timestamps.date(from: row.text(0))
-                    ?? Self.weekBucketDate(row.text(0))
-                    ?? .distantPast,
-                sum: row.real(1),
-                average: row.real(2),
-                minimum: row.real(3),
-                maximum: row.real(4),
-                count: Int(row.integer(5))
-            )
-        }
+        try localAggregate(
+            type: type,
+            bucket: bucket,
+            from: start,
+            to: end,
+            timeZone: timeZone
+        )
     }
 
     /// Raw samples, newest first, for inspection and export.
@@ -1774,22 +1768,5 @@ public actor IngestStore {
                 raw: row.blob(8) ?? Data()
             )
         }
-    }
-
-    /// `%Y-W%W` is not a timestamp, so it needs converting back separately.
-    private static func weekBucketDate(_ text: String) -> Date? {
-        let parts = text.split(separator: "-W")
-        guard parts.count == 2,
-              let year = Int(parts[0]),
-              let week = Int(parts[1]) else {
-            return nil
-        }
-        var components = DateComponents()
-        components.yearForWeekOfYear = year
-        components.weekOfYear = max(week, 1)
-        components.weekday = 2
-        var calendar = Calendar(identifier: .iso8601)
-        calendar.timeZone = TimeZone(identifier: "UTC") ?? .gmt
-        return calendar.date(from: components)
     }
 }

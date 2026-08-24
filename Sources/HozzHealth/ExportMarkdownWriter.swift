@@ -14,6 +14,15 @@ struct ExportMarkdownStatistics: Equatable {
     var encodingIssues = 0
     var undatedRecords = 0
     var unreadableLines = 0
+    /// Pages of series detail — a route's points, a recording's voltages, a
+    /// quantity series' readings — kept out of the day totals.
+    ///
+    /// A daily note answers "how much did I record that day", and a page is
+    /// not a measurement: counting the four pages a heart-rate series arrives
+    /// in as four heart-rate readings would inflate the day by exactly the
+    /// amount of detail Hozz got better at exporting, which is the wrong
+    /// direction for a number to move.
+    var seriesPagesSkipped = 0
     /// Days the pass was holding a summary for. This grows with how much
     /// calendar an export covers, never with how many records it contains,
     /// which is the whole claim that this streams.
@@ -121,6 +130,18 @@ enum ExportMarkdownWriter {
                 // It is counted and reported rather than pretended away.
                 statistics.deletionsSeen += 1
                 runRecords.append(line)
+                continue
+            }
+            if Self.isSeriesDetail(record.kind) {
+                // The elements of a series carry the type identifier of the
+                // sample they belong to and a date range inside it, so without
+                // this they would be summarised as if each page were a reading
+                // of that type. A day with one cycling power series would
+                // report several hundred "power readings" that are really the
+                // pages one reading arrived in. The detail itself belongs in
+                // the lossless formats; a daily note keeps the aggregate,
+                // which is the one number a day has an answer for.
+                statistics.seriesPagesSkipped += 1
                 continue
             }
 
@@ -794,6 +815,12 @@ enum ExportMarkdownWriter {
     static let averagedIdentifiers: Set<String> = Set(
         highlights.filter { $0.aggregation == .mean }.map(\.identifier)
     )
+
+    /// Whether a record is a page of a series' detail rather than a reading in
+    /// its own right.
+    static func isSeriesDetail(_ kind: String) -> Bool {
+        SeriesEncoding.isDetailKind(kind)
+    }
 
     /// A workout's activity, named where Hozz knows the name and numbered
     /// honestly where it does not.

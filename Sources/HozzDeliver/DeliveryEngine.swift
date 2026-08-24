@@ -53,15 +53,43 @@ public actor DeliveryEngine {
         return cache[id]
     }
 
-    public func save(_ destination: Destination) async throws {
+    public func save(_ destination: Destination, now: Date = .now) async throws {
         try await loadIfNeeded()
-        let payload = try JSONEncoder().encode(destination)
-        try await store.saveDestination(
-            id: destination.id,
-            payload: payload,
-            createdAt: destination.createdAt
-        )
-        cache[destination.id] = destination
+        let previous = cache[destination.id]
+
+        // Moving a destination's starting point earlier replays its history.
+        //
+        // This is the guarantee that stops a bounded window from losing records
+        // permanently. An later starting point has already let batches go by
+        // with readings the new setting wants, and the cursors moved past them,
+        // so they are not coming round again on their own. Clearing this
+        // destination's cursors makes it read Health from the start; every
+        // record carries the identifier HealthKit gave it, so a receiver
+        // recognises the repeats and keeps one of each.
+        //
+        // Re-reading is the cheap side of this trade and losing a reading is the
+        // expensive one. Note this is only needed for the *window*: a data type
+        // that was excluded was never drained at all, so its cursor never moved,
+        // and switching it back on needs nothing.
+        //
+        // The marker is written first and cleared last, because the two writes
+        // this needs cannot be made atomic from here. A crash between them would
+        // otherwise leave the earlier starting point on disk with the cursors
+        // intact and nothing left to notice, which is exactly the loss being
+        // guarded against.
+        var destination = destination
+        Self.resolveFloor(&destination, previous: previous, now: now)
+        let owesReplay = previous.map {
+            !$0.deliveryFloor.covers(destination.deliveryFloor)
+        } ?? false
+        if owesReplay {
+            destination.options[Destination.pendingReplayKey] = "1"
+        }
+
+        try await write(destination)
+        if destination.isReplayPending {
+            try await settleReplay(for: destination)
+        }
 
         // Re-saving a destination is how the user says "I fixed it", so a
         // parked destination is released. Without this, re-picking a moved
@@ -79,6 +107,62 @@ public actor DeliveryEngine {
                 )
             )
         }
+    }
+
+    /// Pins a bounded window to a concrete date, once.
+    ///
+    /// The date is worked out only when the choice itself changes, or when a
+    /// bounded window has none yet. Re-picking the same option keeps the date
+    /// already in force: moving it forward would quietly exclude readings that
+    /// were being delivered a moment earlier, which is the failure this whole
+    /// arrangement exists to remove.
+    static func resolveFloor(
+        _ destination: inout Destination,
+        previous: Destination?,
+        now: Date
+    ) {
+        guard destination.deliveryWindow.isBounded else {
+            // Nothing is excluded, so a stored date would only be misleading.
+            destination.options[Destination.windowFloorKey] = nil
+            return
+        }
+        if previous?.deliveryWindow == destination.deliveryWindow,
+           let inForce = previous?.options[Destination.windowFloorKey] {
+            destination.options[Destination.windowFloorKey] = inForce
+            return
+        }
+        guard let floor = destination.deliveryWindow.floor(now: now) else {
+            return
+        }
+        destination.options[Destination.windowFloorKey] = Date.ISO8601FormatStyle(
+            includingFractionalSeconds: true,
+            timeZone: .gmt
+        ).format(floor)
+    }
+
+    /// Persists a destination and keeps the in-memory copy in step.
+    private func write(_ destination: Destination) async throws {
+        let payload = try JSONEncoder().encode(destination)
+        try await store.saveDestination(
+            id: destination.id,
+            payload: payload,
+            createdAt: destination.createdAt
+        )
+        cache[destination.id] = destination
+    }
+
+    /// Carries out a replay this destination is owed, and only then forgets it.
+    ///
+    /// Safe to call more than once: clearing cursors that are already cleared
+    /// does nothing, and the marker is removed last so an interruption leaves
+    /// the work still owed rather than silently done.
+    private func settleReplay(for destination: Destination) async throws {
+        Self.log.info("A destination's date range widened; its history will replay.")
+        try await store.deleteStreamState(scope: .destination(destination.id))
+
+        var settled = destination
+        settled.options[Destination.pendingReplayKey] = nil
+        try await write(settled)
     }
 
     /// Removes a destination and the secret that belonged to it.
@@ -192,6 +276,55 @@ public actor DeliveryEngine {
             throw DeliveryError.notConfigured
         }
 
+        // The destination's starting point is applied here rather than while
+        // reading Health, and that separation is deliberate: acquisition stays
+        // anchor-driven so a retroactively written sample is never missed, and
+        // only the *sending* is narrowed. The date comes from the destination
+        // rather than from `now`, so a retry an hour later — or a day later —
+        // judges the same readings by the same line. See `DeliveryWindow`.
+        let windowed: WindowedBatch
+        do {
+            windowed = try destination.deliveryWindow.apply(
+                to: batch,
+                destination: destination
+            )
+        } catch let error as DeliveryError {
+            try await recordFailure(
+                error,
+                destination: destination,
+                batch: batch,
+                now: now
+            )
+            throw error
+        }
+
+        guard let windowedBatch = windowed.batch else {
+            // Every record fell outside the window the user chose. Nothing was
+            // sent, and that is a complete delivery of nothing rather than a
+            // failure — but it is written down with the count, because a person
+            // watching a destination receive nothing deserves to be told why.
+            try await recordEmptyWindow(
+                destination,
+                excluded: windowed.excludedRecords,
+                sequence: batch.sequence,
+                now: now
+            )
+            return DeliveryReceipt(
+                destinationID: destination.id,
+                attemptedAt: now,
+                recordCount: 0,
+                byteCount: 0,
+                state: .delivered,
+                detail: Self.windowDetail(excluded: windowed.excludedRecords)
+            )
+        }
+
+        // Values are converted into the destination's chosen units last, once
+        // what is being sent has been settled. Nothing about the conversion can
+        // add or remove a record — it only ever rewrites a number and the unit
+        // beside it, together — so it cannot affect anything decided above.
+        let batch = Self.inChosenUnits(windowedBatch, for: destination)
+
         let previous = try await store.deliveryState(for: destination.id)
         try await store.saveDeliveryState(
             DeliveryStateRecord(
@@ -219,15 +352,35 @@ public actor DeliveryEngine {
         }
 
         do {
-            let receipt = try await channel.deliver(batch, to: destination)
+            let delivered = try await channel.deliver(batch, to: destination)
 
             // Persist a refreshed folder bookmark so an ordinary folder move
             // does not decay into a permanent failure later.
-            if let refreshed = receipt.refreshedBookmark {
+            if let refreshed = delivered.refreshedBookmark {
                 var updated = destination
                 updated.folderBookmark = refreshed
                 try? await save(updated)
             }
+
+            // What the window left out is carried on the successful receipt as
+            // well as the empty one. A destination that receives eleven of two
+            // hundred readings has succeeded, and the other hundred and
+            // eighty-nine are still a fact the user is entitled to.
+            let receipt = windowed.excludedRecords > 0
+                ? DeliveryReceipt(
+                    destinationID: delivered.destinationID,
+                    attemptedAt: delivered.attemptedAt,
+                    recordCount: delivered.recordCount,
+                    byteCount: delivered.byteCount,
+                    state: delivered.state,
+                    detail: [
+                        delivered.detail,
+                        Self.windowDetail(excluded: windowed.excludedRecords)
+                    ].compactMap { $0 }.joined(separator: " "),
+                    artifactName: delivered.artifactName,
+                    refreshedBookmark: delivered.refreshedBookmark
+                )
+                : delivered
 
             try await store.saveDeliveryState(
                 DeliveryStateRecord(
@@ -248,42 +401,145 @@ public actor DeliveryEngine {
         } catch {
             let failure = error as? DeliveryError
                 ?? .transport(error.localizedDescription)
-            let failures = (previous?.consecutiveFailures ?? 0) + 1
-            let state = failure.deliveryState
-
-            try await store.saveDeliveryState(
-                DeliveryStateRecord(
-                    destinationID: destination.id,
-                    state: state.rawValue,
-                    lastAttemptAt: now,
-                    lastSuccessAt: previous?.lastSuccessAt,
-                    nextAttemptAt: Self.nextAttempt(
-                        after: failures,
-                        from: now,
-                        isTransient: failure.isTransient
-                    ),
-                    consecutiveFailures: failures,
-                    // The batch is kept so the same identifier is reused on the
-                    // next attempt, which is what makes a retry idempotent.
-                    pendingBatchID: batch.id,
-                    nextSequence: previous?.nextSequence ?? batch.sequence,
-                    deliveredRecords: previous?.deliveredRecords ?? 0,
-                    detail: failure.errorDescription
-                )
-            )
-            try await store.appendReceipt(
-                DeliveryReceiptRecord(
-                    destinationID: destination.id,
-                    attemptedAt: now,
-                    recordCount: batch.recordCount,
-                    byteCount: UInt64(batch.payload.count),
-                    state: state.rawValue,
-                    detail: failure.errorDescription,
-                    artifactName: nil
-                )
+            try await recordFailure(
+                failure,
+                destination: destination,
+                batch: batch,
+                now: now
             )
             throw failure
         }
+    }
+
+    /// Rewrites a batch into the destination's chosen units.
+    ///
+    /// The record count is carried across untouched, because a conversion never
+    /// changes it — and the identifier is re-derived from the new bytes,
+    /// because it must. Two batches holding the same readings in different
+    /// units are different bytes and have to be different batches, or a
+    /// receiver honouring the idempotency key would keep whichever arrived
+    /// first and silently discard the other.
+    static func inChosenUnits(
+        _ batch: DeliveryBatch,
+        for destination: Destination
+    ) -> DeliveryBatch {
+        let converted = PayloadUnits.apply(
+            destination.unitPreferences,
+            to: batch.payload,
+            format: batch.format
+        )
+        guard converted != batch.payload else {
+            return batch
+        }
+        return DeliveryBatch(
+            id: DeliveryBatch.identifier(for: converted),
+            sequence: batch.sequence,
+            createdAt: batch.createdAt,
+            recordCount: batch.recordCount,
+            payload: converted,
+            format: batch.format
+        )
+    }
+
+    /// Writes an honest record of a delivery that did not happen.
+    ///
+    /// Shared by every failure path, including the one where a delivery window
+    /// could not be applied, so that no route out of `deliver` can return
+    /// without the attempt appearing in the destination's history.
+    private func recordFailure(
+        _ failure: DeliveryError,
+        destination: Destination,
+        batch: DeliveryBatch,
+        now: Date
+    ) async throws {
+        let previous = try await store.deliveryState(for: destination.id)
+        let failures = (previous?.consecutiveFailures ?? 0) + 1
+        let state = failure.deliveryState
+
+        try await store.saveDeliveryState(
+            DeliveryStateRecord(
+                destinationID: destination.id,
+                state: state.rawValue,
+                lastAttemptAt: now,
+                lastSuccessAt: previous?.lastSuccessAt,
+                nextAttemptAt: Self.nextAttempt(
+                    after: failures,
+                    from: now,
+                    isTransient: failure.isTransient
+                ),
+                consecutiveFailures: failures,
+                // The batch is kept so the same identifier is reused on the
+                // next attempt, which is what makes a retry idempotent.
+                pendingBatchID: batch.id,
+                nextSequence: previous?.nextSequence ?? batch.sequence,
+                deliveredRecords: previous?.deliveredRecords ?? 0,
+                detail: failure.errorDescription
+            )
+        )
+        try await store.appendReceipt(
+            DeliveryReceiptRecord(
+                destinationID: destination.id,
+                attemptedAt: now,
+                recordCount: batch.recordCount,
+                byteCount: UInt64(batch.payload.count),
+                state: state.rawValue,
+                detail: failure.errorDescription,
+                artifactName: nil
+            )
+        )
+    }
+
+    /// Records a pass where the destination's window excluded everything.
+    ///
+    /// Counted as a success, because it is one: Hozz read Health, found nothing
+    /// the user asked this destination to receive, and sent nothing. Treating
+    /// it as a failure would put a permanent warning on a destination that is
+    /// working exactly as configured.
+    private func recordEmptyWindow(
+        _ destination: Destination,
+        excluded: Int,
+        sequence: Int,
+        now: Date
+    ) async throws {
+        let previous = try await store.deliveryState(for: destination.id)
+        let detail = Self.windowDetail(excluded: excluded)
+        try await store.saveDeliveryState(
+            DeliveryStateRecord(
+                destinationID: destination.id,
+                state: DeliveryState.delivered.rawValue,
+                lastAttemptAt: now,
+                lastSuccessAt: now,
+                nextAttemptAt: nil,
+                consecutiveFailures: 0,
+                pendingBatchID: nil,
+                nextSequence: max(previous?.nextSequence ?? 0, sequence + 1),
+                deliveredRecords: previous?.deliveredRecords ?? 0,
+                detail: detail
+            )
+        )
+        try await store.appendReceipt(
+            DeliveryReceiptRecord(
+                destinationID: destination.id,
+                attemptedAt: now,
+                recordCount: 0,
+                byteCount: 0,
+                state: DeliveryState.delivered.rawValue,
+                detail: detail,
+                artifactName: nil
+            )
+        )
+    }
+
+    /// What to say about records a window left out.
+    ///
+    /// Said plainly and with a number, because "nothing arrived" and "nothing
+    /// arrived because you asked for today only" look identical from the
+    /// receiving end, and only one of them is worth investigating.
+    static func windowDetail(excluded: Int) -> String {
+        excluded == 1
+            ? "1 reading was older than this destination's limit and was not sent."
+            : "\(excluded) readings were older than this destination's limit "
+                + "and were not sent."
     }
 
     /// Sends a batch without touching the destination's recorded state.
@@ -448,5 +704,14 @@ public actor DeliveryEngine {
             }
         }
         isLoaded = true
+
+        // A replay that was written down but never carried out is finished here,
+        // on the first load after whatever interrupted it. Doing this at load
+        // rather than only at save is what makes the marker worth having: a
+        // destination whose window was widened just before the app was killed
+        // gets its history back without the user having to touch it again.
+        for destination in cache.values where destination.isReplayPending {
+            try? await settleReplay(for: destination)
+        }
     }
 }
