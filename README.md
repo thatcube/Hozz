@@ -78,6 +78,18 @@ An automatic sync pass gives every selected type a small share before spending w
 
 Automatic sync uses the same anchor rule per destination. Each destination has its own cursor, so a failed destination cannot advance past data it did not accept, and one broken destination does not block a healthy one. Batches use stable content-derived identifiers and `Idempotency-Key` headers so a retry can be accepted safely.
 
+### The recent-first prime
+
+An anchored sweep returns records in the order Health *stored* them, which is not the order they happened, and no rearranging of it can change that without giving up the property that makes it worth having. Two consequences follow, and the second one surprises people: a phone part-way through a large archive holds an arbitrary subset by date, and data recorded *this morning* is at the end of the queue behind the entire backlog. The sweep is no more current than it is complete.
+
+So a second reader runs alongside it. `HKSampleQuery` over a bounded date window — ninety days by default, not a choice put to the user — feeds the same delivery path, walking a window in chunks whose length adapts to how dense the type turns out to be. It keeps two cursors, both of which are things that have happened rather than things intended: a frontier walking back towards the oldest instant aimed at, and a covered edge walking forward towards now, checked every five minutes. Between them lies one contiguous stretch, every second of which has been delivered and accepted.
+
+It never touches an anchor. If it did, every record older than the primed window would be skipped by the sweep permanently, which is the exact loss anchors exist to prevent. The defence is structural: the dated protocol has no anchor in it, the frontier lives in its own table, and there is no expressible way to advance one from a dated read. Cursors move only inside the transaction that records the delivery, so an interrupted prime repeats a chunk rather than skipping one — the receiver upserts on `(id, type)`, so a repeat costs bytes and nothing else.
+
+Two things a prime deliberately cannot do, and reports rather than papers over. It never sees a deletion, because a dated query has no tombstone channel; and it delivers a series sample's aggregate without the readings inside it, because paging those needs a position inside the sample that a date range cannot carry — so those records omit the mark that says the readings travelled with them. Series types are not primed at all and have no primed window, which is the truth about them. A type whose data is too dense to read at the shortest window Hozz will ask for stops and says so rather than delivering a partial read as though it were the window's contents.
+
+The result is data with a hole in the middle: recent months, then a gap, then however far the sweep has walked. That is a real state and it is carried as one, rather than being presented as a continuous history that happens to start in 2023.
+
 Apple does not let apps distinguish “the user denied this Health type” from “there is no matching data.” Hozz therefore reports authorization-scoped coverage and keeps denied-or-empty, unavailable, unsupported, and failed states visible.
 
 ## Health data coverage
@@ -227,7 +239,7 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
-The current XCTest suite contains 520 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, the export writer lease, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, unfinished-export recovery, widgets/storage migration, and privacy invariants.
+The current XCTest suite contains 926 tests covering anchors, transaction boundaries, cancellation, retries, tombstones, deterministic encoding, the export writer lease, characteristics, series streaming for routes and ECG, audiograms, State of Mind, medications, workout statistics, clinical records, aggregate sample counts, fair-share acquisition, the recent-first prime and its separation from the anchors, restricted exports, export formats, GPX track assembly, line protocol escaping, receiver ingestion, quarantine and promotion, backfill progress, MCP analysis, delivery, unrecognised stored settings, unfinished-export recovery, widgets/storage migration, and privacy invariants.
 
 ## Notes for anyone working on the Mac app
 
