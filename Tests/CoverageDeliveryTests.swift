@@ -506,6 +506,14 @@ final class CoverageDeliveryTests: XCTestCase {
     /// awkward sub-millisecond value, which is why it once passed alone and
     /// failed in a full run. The property underneath is exact and can be swept:
     /// a moment written down and read back has to render the same bytes.
+    ///
+    /// **Breadth, where `testTheObservedMomentSurvivesGoingToDiskAndBack` is
+    /// depth. Do not collapse the two.** This one sweeps two thousand instants
+    /// through a single engine, so every awkward fraction is covered but the
+    /// value never leaves memory. That one takes a single instant through a
+    /// *second* engine over the same store, so it comes back through the text
+    /// on disk — the step that made the original failure invisible, and the
+    /// one this test cannot reach.
     func testAnObservedMomentSurvivesBeingWrittenDown() async throws {
         let store = try makeStore()
         let channel = CoverageCapturingChannel()
@@ -630,6 +638,20 @@ final class CoverageDeliveryTests: XCTestCase {
     /// back unreadable looks exactly like coverage nobody has observed, so the
     /// clock gets used instead and the retry this exists to keep identical
     /// quietly stops being identical. Nothing else would complain.
+    ///
+    /// **Depth, where `testAnObservedMomentSurvivesBeingWrittenDown` is
+    /// breadth. Do not collapse the two.** This one builds a *second*
+    /// `DeliveryEngine` over the same store, so the value returns through the
+    /// text on disk rather than out of the first engine's cache, and it covers
+    /// the changed-digest case. That one sweeps two thousand instants through
+    /// a single engine and never leaves memory. Each is blind to what the
+    /// other sees: this test samples one instant, and that test never
+    /// exercises the disk round trip — which is the step that made the
+    /// original failure invisible.
+    ///
+    /// They look alike, which is why this paragraph exists. Somebody with the
+    /// whole history in mind proposed deleting one of them within an hour of
+    /// writing it.
     func testTheObservedMomentSurvivesGoingToDiskAndBack() async throws {
         let store = try makeStore()
         let delivery = DeliveryEngine(
