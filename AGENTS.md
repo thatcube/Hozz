@@ -73,36 +73,18 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
 Group the widget needs, and two macOS networking traps that are invisible from
 the code and cost days each.
 
-## Do not believe a red build until you have ruled these out
+Do not believe a red build until you have regenerated the project and used a
+derived data path of your own. Two of the three "broken build" scares in one
+night were the tooling rather than the code, and both looked exactly like a
+genuine regression:
 
-Both of these produce failures that look exactly like a broken `main`, and both
-have already sent someone chasing a regression that was not there.
-
-**Regenerate after changing branch.** The project file is generated and
-gitignored, so a `git checkout` or `git reset --hard` brings in source files the
-`.xcodeproj` has never heard of. The result is a pile of errors in a module you
-did not touch. Run `xcodegen generate` first, every time.
-
-**Use your own derived data.** Sharing DerivedData between worktrees mixes a
-stale app binary with a freshly built framework, and dyld reports a missing
-symbol for a function that exists and compiles:
-
-```
-dyld: Symbol not found: _$s11HozzDeliver10UnitFamilyO10settingKeySSvg
-```
-
-Pass `-derivedDataPath /tmp/something-of-your-own`. The same sharing makes the
-simulator wedge with `Test crashed with signal kill before establishing
-connection`.
-
-## A green build is not a working app
-
-Three times now something has passed every test and been broken on a device: a
-framework that linked but was never embedded, a string concatenation the
-compiler type-checked on the simulator and gave up on for the device, and a
-HealthKit authorization request that raises rather than being refused. The
-tests drive a fake data source, so they cannot see any of it.
-
-Build for a device and run the thing before saying it works. When it dies,
-`xcrun devicectl device process launch --console` names the reason in seconds —
-which is worth more than an hour of reasoning about what it might be.
+- The `.xcodeproj` is generated and gitignored, so changing branch brings in
+  source files it does not know about. That surfaces as `cannot find type in
+  scope` across a module you never touched — 26 errors in `HozzDeliver` on one
+  occasion — and reads as a broken `main`. Run `xcodegen generate` after any
+  branch change, and after adding a file of your own.
+- DerivedData shared between two checkouts of the same project mixes a stale
+  app binary with a freshly built framework, which fails at launch as
+  `dyld: Symbol not found` for a symbol that does exist. Pass
+  `-derivedDataPath` somewhere of your own, and use a simulator nothing else
+  is installing to.

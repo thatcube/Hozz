@@ -106,6 +106,28 @@ public struct TimeBucketPlan: Sendable, Equatable {
         return (first.start, last.end)
     }
 
+    /// The column an instant falls in, or `nil` when it is outside the plan.
+    ///
+    /// A binary search rather than a scan: this is called once per record when
+    /// durations are unioned, and a decade of sleep is tens of thousands of
+    /// them against a few hundred columns.
+    public func index(for date: Date) -> Int? {
+        var low = 0
+        var high = columns.count - 1
+        while low <= high {
+            let middle = (low + high) / 2
+            let column = columns[middle]
+            if date < column.start {
+                high = middle - 1
+            } else if date >= column.end {
+                low = middle + 1
+            } else {
+                return column.index
+            }
+        }
+        return nil
+    }
+
     public init(columns: [Column], granularity: ChartGranularity, calendar: Calendar) {
         self.columns = columns
         self.granularity = granularity

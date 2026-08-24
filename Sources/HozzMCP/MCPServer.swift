@@ -1086,9 +1086,8 @@ public actor MCPServer {
                 + "unspecified-asleep stages only. Time in bed is not time "
                 + "asleep and time awake is neither, so neither is counted. "
                 + "A zero means a night recorded with no sleep staged in it. "
-                + "Records that cover the same minutes are added rather than "
-                + "merged, so a night tracked by two apps at once reads longer "
-                + "than it was."
+                + "Records covering the same minutes are merged rather than "
+                + "added, so a night two devices both recorded counts once."
         default:
             return measure.kind == .duration
                 ? "Minutes are the time these samples cover. Their stored "
