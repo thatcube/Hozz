@@ -298,7 +298,7 @@ public actor DeliveryEngine {
             throw error
         }
 
-        guard let batch = windowed.batch else {
+        guard let windowedBatch = windowed.batch else {
             // Every record fell outside the window the user chose. Nothing was
             // sent, and that is a complete delivery of nothing rather than a
             // failure — but it is written down with the count, because a person
@@ -318,6 +318,12 @@ public actor DeliveryEngine {
                 detail: Self.windowDetail(excluded: windowed.excludedRecords)
             )
         }
+
+        // Values are converted into the destination's chosen units last, once
+        // what is being sent has been settled. Nothing about the conversion can
+        // add or remove a record — it only ever rewrites a number and the unit
+        // beside it, together — so it cannot affect anything decided above.
+        let batch = Self.inChosenUnits(windowedBatch, for: destination)
 
         let previous = try await store.deliveryState(for: destination.id)
         try await store.saveDeliveryState(
@@ -403,6 +409,36 @@ public actor DeliveryEngine {
             )
             throw failure
         }
+    }
+
+    /// Rewrites a batch into the destination's chosen units.
+    ///
+    /// The record count is carried across untouched, because a conversion never
+    /// changes it — and the identifier is re-derived from the new bytes,
+    /// because it must. Two batches holding the same readings in different
+    /// units are different bytes and have to be different batches, or a
+    /// receiver honouring the idempotency key would keep whichever arrived
+    /// first and silently discard the other.
+    static func inChosenUnits(
+        _ batch: DeliveryBatch,
+        for destination: Destination
+    ) -> DeliveryBatch {
+        let converted = PayloadUnits.apply(
+            destination.unitPreferences,
+            to: batch.payload,
+            format: batch.format
+        )
+        guard converted != batch.payload else {
+            return batch
+        }
+        return DeliveryBatch(
+            id: DeliveryBatch.identifier(for: converted),
+            sequence: batch.sequence,
+            createdAt: batch.createdAt,
+            recordCount: batch.recordCount,
+            payload: converted,
+            format: batch.format
+        )
     }
 
     /// Writes an honest record of a delivery that did not happen.

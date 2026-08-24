@@ -23,8 +23,26 @@ public enum MetricNameMap {
         return snakeCased(stripped)
     }
 
-    static func snakeCased(_ value: String) -> String {
-        var result = ""
+    /// The HealthKit identifier a metric name came from, when Hozz mapped it.
+    ///
+    /// Needed by the unit preferences: a grouped payload has already thrown the
+    /// identifier away, and distance and body length are the same dimension, so
+    /// without this a waist measurement and a morning run would be offered the
+    /// same choice of units. Nil for a name derived from an unmapped type,
+    /// where the honest answer is that Hozz does not know.
+    public static func typeIdentifier(for metricName: String) -> String? {
+        reversed[metricName]
+    }
+
+    private static let reversed: [String: String] = {
+        var reversed: [String: String] = [:]
+        for (identifier, name) in names {
+            reversed[name] = identifier
+        }
+        return reversed
+    }()
+
+    static func snakeCased(_ value: String) -> String {        var result = ""
         for (index, character) in value.enumerated() {
             if character.isUppercase, index > 0 {
                 result.append("_")

@@ -12,8 +12,8 @@ differently; the [README](../README.md#formats) covers those.
 - [NDJSON](#ndjson) · [JSON](#json) · [CSV](#csv) ·
   [Metrics JSON](#metrics-json) · [InfluxDB line protocol](#influxdb-line-protocol)
 - [Health Auto Export compatibility](#health-auto-export-compatibility)
-- [Delivery mechanics](#delivery-mechanics) — how far back, timeouts, headers,
-  idempotency, retries
+- [Delivery mechanics](#delivery-mechanics) — where to start, units, timeouts,
+  headers, idempotency, retries
 
 ## Conventions
 
@@ -25,6 +25,13 @@ compatibility mode, which uses local time in that app's format.
 as `count/min`, not `bpm`; energy as `kcal`; distance in whatever unit Hozz's
 type catalogue declares canonical for that type. This is deliberate — a unit
 Hozz invented a nicer name for is a unit you cannot map back.
+
+A destination may ask for different units (see [Units](#units)). When it does,
+**the value and its unit always move together**, and the record additionally
+carries `convertedFrom` naming the unit it held before. So a value can never be
+read as something it is not, and a receiver comparing an old batch with a new one
+can tell that the meaning of a column changed rather than having to infer it from
+the numbers.
 
 **Identifiers** are lowercase UUID strings. A sample keeps the UUID HealthKit
 gave it, so the same record delivered twice is recognisably the same record.
@@ -622,6 +629,57 @@ two things:
   unreachable for ever.
 
 Moving it later does not replay, because it excludes nothing already delivered.
+
+### Units
+
+A destination can ask for values in units of its choosing, per group:
+
+| Group | Choices |
+| --- | --- |
+| Distance | `km`, `mi`, `m` |
+| Height and body measurements | `cm`, `in`, `ft` |
+| Weight | `kg`, `lb`, `st` |
+| Energy | `kcal`, `kJ` |
+| Temperature | `degC`, `degF` |
+| Speed | `km/hr`, `mi/hr`, `m/s` |
+| Volume | `L`, `mL`, `fl_oz_us` |
+| Blood pressure | `mmHg`, `kPa` |
+
+Groups rather than individual metrics, because a person has one opinion about
+distance and one about weight, not a hundred. Distance and body measurements are
+separate although both are lengths: somebody who runs in miles does not want
+their height in miles.
+
+Every conversion factor is a defined value rather than a rounded one — an inch is
+exactly 0.0254 m, a pound exactly 0.45359237 kg, a thermochemical kilocalorie
+exactly 4184 J — so a marathon is 42.195 km and 26.219 miles either way round.
+Temperature uses its offset rather than a factor, because 38 °C is 100.4 °F and
+not 38 °F.
+
+Anything with no conversion is left exactly as Health gave it: a count, a
+percentage, a heart rate in `count/min`. So is any reading whose unit Hozz does
+not recognise. That is safe rather than a gap, because the payload always carries
+the unit next to the value — a reading that was not converted is still labelled
+correctly, and nothing is ever mislabelled.
+
+Where the converted unit appears, by format:
+
+| Format | Value | Unit |
+| --- | --- | --- |
+| NDJSON, JSON | `quantity.value` | `quantity.unit`, plus `quantity.convertedFrom` |
+| CSV | `value` column | `unit` column |
+| Metrics JSON | each point's `qty` | the metric's `units`, plus `convertedFrom` |
+| InfluxDB line protocol | *not converted* | — |
+
+Line protocol is deliberately excluded, and the setting is not offered for it.
+The unit is a tag inside a line whose escaping rules differ by position, and
+rewriting one in place is the kind of edit that silently corrupts a batch
+InfluxDB then rejects whole. Not offering the setting is better than offering it
+and quietly not applying it.
+
+Changing a destination's units does not rewrite anything already delivered. A
+receiver keeping a long history will hold both, each correctly labelled — which
+is why `convertedFrom` exists.
 
 ### Timeout
 

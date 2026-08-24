@@ -33,6 +33,7 @@ struct DestinationEditorView: View {
     @State private var payloadSchema: PayloadSchema
     @State private var requestTimeout: TimeInterval
     @State private var maxRequestBytes: Int?
+    @State private var unitChoices: [UnitFamily: String]
     @State private var discovered: [DiscoveredReceiver] = []
     @State private var isBrowsing = false
 
@@ -74,6 +75,9 @@ struct DestinationEditorView: View {
             initialValue: destination?.requestTimeout ?? RequestTimeout.default
         )
         _maxRequestBytes = State(initialValue: destination?.maxRequestBytes)
+        _unitChoices = State(
+            initialValue: destination?.unitPreferences.units ?? [:]
+        )
     }
 
     var body: some View {
@@ -205,6 +209,10 @@ struct DestinationEditorView: View {
             if kind == .restAPI {
                 timeoutSection
                 requestSizeSection
+            }
+
+            if PayloadUnits.applies(to: format) {
+                unitsSection
             }
 
             if PayloadSchema.applies(to: format), kind != .folder {
@@ -483,6 +491,58 @@ struct DestinationEditorView: View {
         }
     }
 
+    /// Which units this destination should receive.
+    ///
+    /// Offered per group rather than per reading, because a person has one
+    /// opinion about distance and one about weight, not a hundred. Distance and
+    /// body measurements are separate on purpose: someone who wants their runs
+    /// in miles does not want their height in miles.
+    private var unitsSection: some View {
+        Section {
+            Button("Use the units for my region") {
+                unitChoices = UnitPreferences.forRegion().units
+            }
+
+            if !unitChoices.isEmpty {
+                Button("Leave every value as Health gives it", role: .destructive) {
+                    unitChoices = [:]
+                }
+            }
+
+            ForEach(UnitFamily.allCases, id: \.self) { family in
+                Picker(family.displayName, selection: binding(for: family)) {
+                    Text("As Health gives it").tag(String?.none)
+                    ForEach(family.choices, id: \.self) { unit in
+                        Text(UnitFamily.displayName(forUnit: unit))
+                            .tag(String?.some(unit))
+                    }
+                }
+            }
+        } header: {
+            Text("Units")
+        } footer: {
+            Text(
+                "Every value Hozz sends carries its own unit, so a reading can "
+                + "never be read as something it is not \u{2014} a converted one "
+                + "also says what it was converted from. Changing this does not "
+                + "rewrite anything already delivered, so a receiver storing a "
+                + "long history will hold both, each labelled correctly."
+                + (format == .influx
+                    ? " Line protocol is not converted: the unit is a tag inside "
+                    + "the line, and rewriting it in place is how a batch gets "
+                    + "quietly corrupted."
+                    : "")
+            )
+        }
+    }
+
+    private func binding(for family: UnitFamily) -> Binding<String?> {
+        Binding(
+            get: { unitChoices[family] },
+            set: { unitChoices[family] = $0 }
+        )
+    }
+
     /// Matching another exporter's field names, for pipelines already built.
     private var compatibilitySection: some View {
         Section {
@@ -692,6 +752,9 @@ struct DestinationEditorView: View {
     /// and back does not lose a measurement name that was typed once.
     private var options: [String: String] {
         var options = existing?.options ?? [:]
+        for family in UnitFamily.allCases {
+            options[family.settingKey] = unitChoices[family]
+        }
         if kind == .restAPI {
             options[Destination.timeoutKey] = String(Int(requestTimeout))
             // Removed rather than set to zero when switched off, so the record
