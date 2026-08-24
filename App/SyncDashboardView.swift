@@ -54,20 +54,7 @@ struct SyncDashboardView: View {
                     .disabled(model.isSyncing)
                 }
             } footer: {
-                Text(
-                    "A destination is a folder or a web address you control. "
-                    + "Hozz has no default and sends nothing until you add one."
-                    + (
-                        model.hasDestinations
-                            ? "\n\nHozz reads the last few months by date as "
-                            + "soon as a destination exists, then keeps working "
-                            + "backwards through everything older. Fetch them "
-                            + "again if you have given Hozz access to more "
-                            + "health types since then; anything already sent "
-                            + "is simply replaced."
-                            : ""
-                    )
-                )
+                Text(destinationFooter)
             }
 
             backgroundRealitySection
@@ -200,6 +187,24 @@ struct SyncDashboardView: View {
 
     /// States the iOS limits plainly rather than letting the user discover them
     /// as a mystery failure.
+    /// Built as statements rather than one expression.
+    ///
+    /// As a single `Text(...)` with a ternary inside a chain of `+`, this
+    /// type-checked fine for the simulator and timed out compiling for a
+    /// device — the same source, failing only where it could not be noticed
+    /// by running the tests.
+    private var destinationFooter: String {
+        var text = "A destination is a folder or a web address you control. "
+        text += "Hozz has no default and sends nothing until you add one."
+        guard model.hasDestinations else { return text }
+        text += "\n\nHozz reads the last few months by date as soon as a "
+        text += "destination exists, then keeps working backwards through "
+        text += "everything older. Fetch them again if you have given Hozz "
+        text += "access to more health types since then; anything already "
+        text += "sent is simply replaced."
+        return text
+    }
+
     private var backgroundRealitySection: some View {
         Section("How background sync behaves") {
             HozzLabel(.lock) {
