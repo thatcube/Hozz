@@ -17,6 +17,7 @@ struct DestinationEditorView: View {
     @State private var kind: DestinationKind
     @State private var format: DeliveryFormat
     @State private var cadence: SyncCadence
+    @State private var deliveryWindow: DeliveryWindow
     @State private var isEnabled: Bool
     @State private var endpoint: String
     @State private var secret: String
@@ -50,6 +51,9 @@ struct DestinationEditorView: View {
         _kind = State(initialValue: destination?.kind ?? preset?.kind ?? .folder)
         _format = State(initialValue: destination?.format ?? preset?.format ?? .ndjson)
         _cadence = State(initialValue: destination?.cadence ?? .whenDataArrives)
+        _deliveryWindow = State(
+            initialValue: destination?.deliveryWindow ?? .sinceLastDelivery
+        )
         _isEnabled = State(initialValue: destination?.isEnabled ?? true)
         _endpoint = State(initialValue: destination?.endpointURL?.absoluteString ?? "")
         _secret = State(initialValue: "")
@@ -165,6 +169,8 @@ struct DestinationEditorView: View {
                 Text(formatExplanation)
             }
 
+            windowSection
+
             if let unsupported = existing?.unsupportedDescription {
                 Section {
                     HozzLabel(.alertTriangle, size: 16) {
@@ -270,6 +276,64 @@ struct DestinationEditorView: View {
 
     private var availableFormats: [DeliveryFormat] {
         DeliveryFormat.available(for: kind)
+    }
+
+    /// How far back this destination is willing to be sent.
+    ///
+    /// Given its own section rather than tucked in with the cadence, because the
+    /// two are easy to confuse and only one of them can leave a reading out.
+    /// "How often" is when Hozz tries; this is what it is allowed to send.
+    private var windowSection: some View {
+        Section {
+            Picker("Date range", selection: $deliveryWindow) {
+                ForEach(DeliveryWindow.allCases, id: \.self) { window in
+                    Text(window.displayName).tag(window)
+                }
+            }
+
+            Text(deliveryWindow.explanation)
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+
+            if willReplayHistory {
+                HozzLabel(.infoCircle, size: 16) {
+                    Text(
+                        "Saving this will send everything again from the "
+                        + "beginning. Readings the narrower range skipped are "
+                        + "still on this iPhone's Health, so widening it does "
+                        + "not leave them behind — but the destination will "
+                        + "receive a lot at once. Each one carries the same "
+                        + "identifier as before, so anything that stores them "
+                        + "by identifier keeps one copy."
+                    )
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                }
+            }
+        } header: {
+            Text("Date range")
+        } footer: {
+            Text(
+                "Separate from how often Hozz syncs. Hozz reads Health with a "
+                + "bookmark rather than a date, so a reading the Health app "
+                + "files under last week is still noticed — but a date range "
+                + "narrower than \u{201C}Everything not yet sent\u{201D} means "
+                + "readings older than it are not delivered here."
+            )
+        }
+    }
+
+    /// Whether saving would widen the window and therefore replay everything.
+    ///
+    /// Worth saying before the fact rather than after. Widening is the right
+    /// thing to allow — it is the only way readings a narrow range skipped are
+    /// ever sent — but somebody pointing this at a home server should know a
+    /// backlog is about to arrive.
+    private var willReplayHistory: Bool {
+        guard let existing else {
+            return false
+        }
+        return !existing.deliveryWindow.covers(deliveryWindow)
     }
 
     private var addressPrecision: InfluxLineProtocol.Precision? {
@@ -513,6 +577,7 @@ struct DestinationEditorView: View {
             headers: existing?.headers ?? [:],
             includedTypes: includedTypes,
             payloadSchema: PayloadSchema.applies(to: format) ? payloadSchema : .hozz,
+            deliveryWindow: deliveryWindow,
             options: options,
             createdAt: existing?.createdAt ?? .now
         )

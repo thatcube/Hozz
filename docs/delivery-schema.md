@@ -12,7 +12,8 @@ differently; the [README](../README.md#formats) covers those.
 - [NDJSON](#ndjson) · [JSON](#json) · [CSV](#csv) ·
   [Metrics JSON](#metrics-json) · [InfluxDB line protocol](#influxdb-line-protocol)
 - [Health Auto Export compatibility](#health-auto-export-compatibility)
-- [Delivery mechanics](#delivery-mechanics) — headers, idempotency, retries
+- [Delivery mechanics](#delivery-mechanics) — date range, headers, idempotency,
+  retries
 
 ## Conventions
 
@@ -562,6 +563,42 @@ timestamp, `qty`, the capitalised `Min`/`Avg`/`Max`, and the sleep point's
 format does not document.
 
 ## Delivery mechanics
+
+### Date range
+
+Each destination has a **delivery window**, which is separate from how often it
+syncs. The default, "Everything not yet sent", applies no date filter at all.
+
+This is worth being precise about, because the name matches a setting in other
+exporters that means something weaker. Hozz reads Health through opaque,
+type-scoped anchors rather than date windows, because Health accepts samples
+written retroactively — a workout imported this morning can carry yesterday's
+date. A cursor of "everything since the last run" never sees those. An anchor
+does: a record that appears is a record Hozz has not read before, whenever it
+claims to have happened. So the default window is not a date range, it is the
+*absence* of one.
+
+The bounded ranges — Today, Yesterday, Yesterday and today, The last 7 days —
+are a filter over records that have already been read, applied when the batch is
+built. Days are the user's own calendar days, not UTC's. A record dated outside
+the range is not delivered, and the acquisition cursor moves past it, so it does
+not come round again on its own.
+
+That has one safeguard, and it is the reason a bounded range is offered at all:
+**widening a destination's range replays its whole history.** Going from Today to
+The last 7 days, or from Today to Yesterday, clears that destination's cursors
+and re-reads Health from the start. Every record carries the identifier HealthKit
+gave it, so a receiver that stores by identifier keeps one copy of each. A
+reading can therefore be excluded, but no reading is unreachable for ever.
+
+Narrowing a range does not replay, because it excludes nothing that was already
+delivered.
+
+Records the range left out are counted on the receipt — "3 readings were outside
+this destination's date range and were not sent" — including on a pass where
+every record was excluded. Nothing arriving and nothing arriving *because you
+asked for today only* look identical from the receiving end, and only one of them
+is worth investigating.
 
 ### Endpoints
 

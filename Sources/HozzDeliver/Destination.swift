@@ -221,6 +221,10 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
     public var includedTypes: Set<HealthTypeKey>
     /// Which field names the payload uses.
     public var payloadSchema: PayloadSchema
+    /// How far back this destination is willing to be sent.
+    ///
+    /// A delivery filter, not an acquisition cursor. See ``DeliveryWindow``.
+    public var deliveryWindow: DeliveryWindow
     /// Per-destination settings that are neither secrets nor HTTP headers —
     /// the InfluxDB measurement name, for instance.
     ///
@@ -249,6 +253,7 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
         authorizationHeader: String = "Authorization",
         includedTypes: Set<HealthTypeKey> = [],
         payloadSchema: PayloadSchema = .hozz,
+        deliveryWindow: DeliveryWindow = .sinceLastDelivery,
         options: [String: String] = [:],
         createdAt: Date = .now
     ) {
@@ -264,6 +269,7 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
         self.authorizationHeader = authorizationHeader
         self.includedTypes = includedTypes
         self.payloadSchema = payloadSchema
+        self.deliveryWindow = deliveryWindow
         self.options = options
         self.createdAt = createdAt
     }
@@ -281,7 +287,7 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, name, kind, format, cadence, isEnabled, folderBookmark
         case endpointURL, headers, authorizationHeader, includedTypes
-        case payloadSchema, options, createdAt
+        case payloadSchema, deliveryWindow, options, createdAt
     }
 
     public init(from decoder: any Decoder) throws {
@@ -332,6 +338,11 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
         format = try value(.format, .ndjson)
         cadence = try value(.cadence, .whenDataArrives)
         payloadSchema = try value(.payloadSchema, .hozz)
+        // The fallback is the unbounded window on purpose. If this build cannot
+        // read the window that was chosen, the destination is parked as
+        // unusable anyway — but should that ever change, the setting that
+        // cannot leave a record out is the safer thing to be wrong about.
+        deliveryWindow = try value(.deliveryWindow, .sinceLastDelivery)
 
         // The InfluxDB precision is not an enum on the way in — it is a string
         // in `options` — so it cannot throw. It can do something worse:
@@ -382,6 +393,11 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
                 ?? payloadSchema.rawValue,
             forKey: .payloadSchema
         )
+        try container.encode(
+            unsupportedSettings[CodingKeys.deliveryWindow.stringValue]
+                ?? deliveryWindow.rawValue,
+            forKey: .deliveryWindow
+        )
     }
 
     /// Whether Hozz understands this destination well enough to use it.
@@ -429,6 +445,8 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
             "a schedule"
         case CodingKeys.payloadSchema.stringValue:
             "a field-name scheme"
+        case CodingKeys.deliveryWindow.stringValue:
+            "a delivery window"
         case Destination.precisionKey:
             "a timestamp precision"
         default:
@@ -603,6 +621,12 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
     case notConfigured
     /// The stored destination uses a setting this build does not recognise.
     case unsupportedSettings(String)
+    /// A delivery window was set, but this build could not take the encoded
+    /// batch apart to apply it.
+    ///
+    /// Delivering the batch whole would have sent readings the user asked to
+    /// exclude, which is the failure that looks like a success.
+    case windowNotApplicable
     case folderUnavailable
     case accessDenied
     case rejected(statusCode: Int, body: String?)
@@ -615,6 +639,10 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
             "This destination is not finished being set up."
         case .unsupportedSettings(let detail):
             detail
+        case .windowNotApplicable:
+            "Hozz could not tell which readings fell inside this destination's "
+                + "date range, so it sent nothing rather than send readings you "
+                + "asked it to leave out."
         case .folderUnavailable:
             "Hozz could not reach that folder. It may have been moved, renamed, or signed out."
         case .accessDenied:
@@ -638,7 +666,7 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
             // 408, 429, and 5xx are the server asking to be tried again.
             statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode)
         case .notConfigured, .folderUnavailable, .accessDenied, .cancelled,
-             .unsupportedSettings:
+             .unsupportedSettings, .windowNotApplicable:
             // Waiting does not teach this build a word it does not know. Only
             // an update or an edit resolves it, so it is put in front of the
             // user instead of retried on a timer forever.
