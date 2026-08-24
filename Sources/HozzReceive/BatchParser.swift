@@ -312,6 +312,8 @@ public struct ParsedBatch: Hashable, Sendable {
     public let characteristics: [ReceivedCharacteristic]
     public let electrocardiograms: [ReceivedElectrocardiogram]
     public let voltagePages: [ReceivedVoltagePage]
+    public let quantitySeriesPages: [ReceivedQuantitySeriesPage]
+    public let quantitySeriesEnds: [ReceivedQuantitySeriesEnd]
     public let audiograms: [ReceivedAudiogram]
     public let moodEntries: [ReceivedMoodEntry]
     public let medicationDoses: [ReceivedMedicationDose]
@@ -329,6 +331,8 @@ public struct ParsedBatch: Hashable, Sendable {
             && characteristics.isEmpty
             && electrocardiograms.isEmpty
             && voltagePages.isEmpty
+            && quantitySeriesPages.isEmpty
+            && quantitySeriesEnds.isEmpty
             && audiograms.isEmpty
             && moodEntries.isEmpty
             && medicationDoses.isEmpty
@@ -342,6 +346,8 @@ public struct ParsedBatch: Hashable, Sendable {
         characteristics: [ReceivedCharacteristic] = [],
         electrocardiograms: [ReceivedElectrocardiogram] = [],
         voltagePages: [ReceivedVoltagePage] = [],
+        quantitySeriesPages: [ReceivedQuantitySeriesPage] = [],
+        quantitySeriesEnds: [ReceivedQuantitySeriesEnd] = [],
         audiograms: [ReceivedAudiogram] = [],
         moodEntries: [ReceivedMoodEntry] = [],
         medicationDoses: [ReceivedMedicationDose] = [],
@@ -354,12 +360,89 @@ public struct ParsedBatch: Hashable, Sendable {
         self.characteristics = characteristics
         self.electrocardiograms = electrocardiograms
         self.voltagePages = voltagePages
+        self.quantitySeriesPages = quantitySeriesPages
+        self.quantitySeriesEnds = quantitySeriesEnds
         self.audiograms = audiograms
         self.moodEntries = moodEntries
         self.medicationDoses = medicationDoses
         self.workoutDetails = workoutDetails
         self.unhandled = unhandled
         self.unreadableCount = unreadableCount
+    }
+}
+
+/// One page of the readings behind a quantity aggregate.
+///
+/// HealthKit stores some metrics as a *series*: one sample whose `quantity` is
+/// an aggregate over `count` underlying readings. The phone exports those
+/// readings as pages beside the aggregate, and they must not be mistaken for
+/// readings of the type in their own right — a page is packaging, not a
+/// measurement, and counting it as one inflates a type by exactly the amount
+/// of detail the phone managed to send.
+public struct ReceivedQuantitySeriesPage: Hashable, Sendable {
+    /// The aggregate sample these readings belong to.
+    public let sampleID: String
+    public let type: String
+    public let sequence: Int
+    public let offset: Int
+    public let count: Int
+    public let unit: String?
+    public let startDate: Date
+    public let endDate: Date?
+    /// The readings as delivered, kept verbatim.
+    public let readings: Data
+
+    public init(
+        sampleID: String,
+        type: String,
+        sequence: Int,
+        offset: Int,
+        count: Int,
+        unit: String?,
+        startDate: Date,
+        endDate: Date?,
+        readings: Data
+    ) {
+        self.sampleID = sampleID
+        self.type = type
+        self.sequence = sequence
+        self.offset = offset
+        self.count = count
+        self.unit = unit
+        self.startDate = startDate
+        self.endDate = endDate
+        self.readings = readings
+    }
+}
+
+/// What the phone says a series added up to.
+///
+/// Deliberately not a record of its own on disk. The end marker's only new
+/// fact is how many readings the phone actually wrote, and that is the one
+/// thing the pages cannot say about themselves: comparing it with the readings
+/// actually held is the difference between "the phone exported fewer than the
+/// aggregate claims" and "a page went missing on the way here". Everything
+/// else about it repeats the aggregate.
+public struct ReceivedQuantitySeriesEnd: Hashable, Sendable {
+    public let sampleID: String
+    public let type: String
+    /// Readings the phone says it wrote for this sample.
+    public let exportedReadings: Int
+    public let startDate: Date
+    public let endDate: Date?
+
+    public init(
+        sampleID: String,
+        type: String,
+        exportedReadings: Int,
+        startDate: Date,
+        endDate: Date?
+    ) {
+        self.sampleID = sampleID
+        self.type = type
+        self.exportedReadings = exportedReadings
+        self.startDate = startDate
+        self.endDate = endDate
     }
 }
 
@@ -481,6 +564,8 @@ public enum BatchParser {
             characteristics: batch.characteristics,
             electrocardiograms: batch.electrocardiograms,
             voltagePages: batch.voltagePages,
+            quantitySeriesPages: batch.quantitySeriesPages,
+            quantitySeriesEnds: batch.quantitySeriesEnds,
             audiograms: batch.audiograms,
             moodEntries: batch.moodEntries,
             medicationDoses: batch.medicationDoses,
@@ -496,6 +581,8 @@ public enum BatchParser {
         var characteristics: [ReceivedCharacteristic] = []
         var electrocardiograms: [ReceivedElectrocardiogram] = []
         var voltagePages: [ReceivedVoltagePage] = []
+        var quantitySeriesPages: [ReceivedQuantitySeriesPage] = []
+        var quantitySeriesEnds: [ReceivedQuantitySeriesEnd] = []
         var audiograms: [ReceivedAudiogram] = []
         var moodEntries: [ReceivedMoodEntry] = []
         var medicationDoses: [ReceivedMedicationDose] = []
@@ -588,6 +675,20 @@ public enum BatchParser {
                 // The end marker carries no data of its own; the header
                 // already says how many measurements to expect.
                 continue
+            case QuantitySeriesShape.elementKind:
+                if let page = QuantitySeriesShape.page(in: object) {
+                    quantitySeriesPages.append(page)
+                    continue
+                }
+            case QuantitySeriesShape.endKind:
+                // Unlike the electrocardiogram's, this end marker does say
+                // something the pages cannot: how many readings the phone
+                // wrote. Compared against the readings actually held, it tells
+                // a short series apart from a page that went missing.
+                if let end = QuantitySeriesShape.end(in: object) {
+                    quantitySeriesEnds.append(end)
+                    continue
+                }
             case AudiogramShape.kind:
                 if let audiogram = AudiogramShape.audiogram(in: object) {
                     audiograms.append(audiogram)
@@ -622,6 +723,8 @@ public enum BatchParser {
             characteristics: characteristics,
             electrocardiograms: electrocardiograms,
             voltagePages: voltagePages,
+            quantitySeriesPages: quantitySeriesPages,
+            quantitySeriesEnds: quantitySeriesEnds,
             audiograms: audiograms,
             moodEntries: moodEntries,
             medicationDoses: medicationDoses,
@@ -1052,6 +1155,70 @@ enum ElectrocardiogramShape {
             withJSONObject: object,
             options: [.sortedKeys, .withoutEscapingSlashes]
         )) ?? Data()
+    }
+}
+
+/// The shape the phone uses for the readings behind a quantity aggregate.
+///
+/// Unlike a route or an electrocardiogram, these are not a type of their own:
+/// they carry the *aggregate's* type identifier, because they are the detail
+/// behind an ordinary heart-rate or cycling-power sample. That is exactly why
+/// they have to be recognised here. Left to the generic path they parse
+/// perfectly well — they have an id, a type and a start date — and become
+/// rows in `sample` under their parent's type, so "how many heart-rate
+/// records do I have" answers with the pages the readings arrived in.
+enum QuantitySeriesShape {
+    static let elementKind = "quantitySeriesReadings"
+    static let endKind = "quantitySeriesEnd"
+
+    static func page(in object: [String: Any]) -> ReceivedQuantitySeriesPage? {
+        guard
+            let sample = object["sample"] as? String,
+            let type = object["type"] as? String,
+            let sequence = BatchParser.numeric(object["sequence"]).map({ Int($0) }),
+            let offset = BatchParser.numeric(object["offset"]).map({ Int($0) }),
+            let readings = object["readings"] as? [[String: Any]],
+            let startText = object["startDate"] as? String,
+            let start = Timestamps.date(from: startText)
+        else {
+            return nil
+        }
+        return ReceivedQuantitySeriesPage(
+            sampleID: sample,
+            type: type,
+            sequence: sequence,
+            offset: offset,
+            // `count` is what the page claims; the array is what it holds. The
+            // array wins, because it is the thing that will actually be read
+            // back.
+            count: readings.count,
+            unit: object["unit"] as? String,
+            startDate: start,
+            endDate: (object["endDate"] as? String).flatMap(Timestamps.date(from:)),
+            readings: (try? JSONSerialization.data(
+                withJSONObject: readings,
+                options: [.sortedKeys, .withoutEscapingSlashes]
+            )) ?? Data()
+        )
+    }
+
+    static func end(in object: [String: Any]) -> ReceivedQuantitySeriesEnd? {
+        guard
+            let sample = object["sample"] as? String,
+            let type = object["type"] as? String,
+            let exported = BatchParser.numeric(object["readings"]).map({ Int($0) }),
+            let startText = object["startDate"] as? String,
+            let start = Timestamps.date(from: startText)
+        else {
+            return nil
+        }
+        return ReceivedQuantitySeriesEnd(
+            sampleID: sample,
+            type: type,
+            exportedReadings: exported,
+            startDate: start,
+            endDate: (object["endDate"] as? String).flatMap(Timestamps.date(from:))
+        )
     }
 }
 

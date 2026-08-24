@@ -5,7 +5,7 @@ import XCTest
 
 /// Someone's health history has to survive an upgrade.
 ///
-/// The receiver's schema went from 1 to 7 in a single evening across five
+/// The receiver's schema went from 1 to 8 in a single evening across five
 /// agents' commits, and every user upgrading arrives from one of those
 /// versions. The previous test for this built a database at the *current*
 /// schema, dropped two tables, and set `user_version = 2` — so every other
@@ -32,7 +32,7 @@ final class SchemaMigrationTests: XCTestCase {
     }
 
     /// The current schema. Every historical fixture must reach this.
-    private static let currentVersion: Int64 = 7
+    private static let currentVersion: Int64 = 8
 
     // MARK: - The historical schemas, as they actually were
 
