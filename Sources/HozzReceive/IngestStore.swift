@@ -202,7 +202,10 @@ public struct IngestResult: Hashable, Sendable {
 ///
 /// Nothing here ever leaves the machine.
 public actor IngestStore {
-    private let database: SQLiteDatabase
+    /// Visible to the module rather than this file so the dashboard queries can
+    /// live in files of their own. They are still actor-isolated, so every read
+    /// is serialised against ingest exactly as it was before.
+    let database: SQLiteDatabase
     private let directory: URL
 
     public init(directory: URL) throws {
