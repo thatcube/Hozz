@@ -564,9 +564,9 @@ format does not document.
 
 ## Delivery mechanics
 
-### How far back
+### Where to start
 
-Each destination has a **delivery window**, which is separate from how often it
+Each destination has a **starting point**, which is separate from how often it
 syncs. The default, "Everything not yet sent", applies no date filter at all.
 
 That name matches a setting in other exporters which means something weaker, so
@@ -575,49 +575,53 @@ rather than date windows, because Health accepts samples written retroactively �
 a workout imported this morning can carry yesterday's date. A cursor of
 "everything since the last run" never sees those. An anchor does: a record that
 appears is a record Hozz has not read before, whenever it claims to have
-happened. So the default window is not a date range, it is the *absence* of one.
+happened. So the default is not a date range, it is the *absence* of one.
 
-Every other choice is a **floor**: an oldest date, with no upper bound.
+Every other choice resolves, once, to a single date:
 
-| Setting | Delivers |
+| Setting | Resolves to |
 | --- | --- |
-| Everything not yet sent | Everything the anchors have not delivered here. |
-| Nothing older than today | Nothing dated before local midnight this morning. |
-| Nothing older than yesterday | Nothing dated before local midnight yesterday. |
-| Nothing older than 7 days | Nothing dated before local midnight 7 days ago. |
-| Nothing older than 30 days | Nothing dated before local midnight 30 days ago. |
+| Everything not yet sent | No date. Nothing is excluded. |
+| Start from today | Local midnight on the day it was chosen. |
+| Start from yesterday | Local midnight the day before it was chosen. |
+| Start from 7 days ago | Local midnight seven days before it was chosen. |
+| Start from 30 days ago | Local midnight thirty days before it was chosen. |
 
-Days are the user's own calendar days, not UTC's. There is deliberately no
-option with an *upper* bound — no "Yesterday only" — because such a window loses
-records twice over: a sample HealthKit gains while a sync is already running is
-dated after the pass began and would be excluded for being too new, and a range
-ending before today rejects everything dated today, which is exactly when
-today's readings are drained. Either way the anchor commits past them and they
-are gone. A floor has neither problem.
+Readings dated before that date are not delivered. Everything from it onwards is,
+with **no upper bound** and **no movement of the date afterwards**. Both of those
+are correctness requirements rather than conveniences.
 
-A floor can still exclude a reading — one older than it — and the anchor moves
-past that reading, so the exclusion is permanent on its own. Two things make it
-safe:
+An upper bound loses records twice over. A sample HealthKit gains while a sync is
+already running comes back dated after the pass began, so a bound at "now"
+excludes it and the cursor commits past it. And a range ending before today — a
+"Yesterday only" — rejects everything dated today, which is exactly when today's
+readings are drained; the steady state is a destination receiving nothing while
+reporting success. Neither is offered.
+
+A date that moved with the clock would be worse still, because sleep is dated
+from bedtime. A line at "midnight this morning", evaluated when the 07:00 sync
+runs, throws away every night's sleep, every night. A daily destination running
+at 02:00 drains twenty-five hours and discards twenty-three. An endpoint down for
+ten minutes at 23:55 has its retry judged against the next day's line, so an
+outage erases a day. Resolving the date once removes all three: it recedes into
+the past and never excludes anything again.
+
+What remains is one deliberate exclusion — a reading dated before the day the
+user picked, including one Health files retroactively — and it is made safe by
+two things:
 
 - **It is counted.** Receipts carry "3 readings were older than this
   destination's limit and were not sent", including on a pass where everything
-  was excluded. Nothing arriving and nothing arriving *because you asked for
-  today only* look identical from the receiving end, and only one is worth
+  was excluded. Nothing arriving and nothing arriving *because you asked to start
+  from today* look identical from the receiving end, and only one is worth
   investigating.
-- **Lowering the floor replays the destination's whole history.** Going from
-  "Nothing older than today" to "Nothing older than 7 days" clears that
-  destination's cursors and re-reads Health from the start. Every record carries
-  the identifier HealthKit gave it, so a receiver that stores by identifier
-  keeps one copy of each. A reading can be excluded; no reading is unreachable
-  for ever.
+- **Moving the starting point earlier replays the whole history.** That clears
+  the destination's cursors and re-reads Health from the beginning. Every record
+  carries the identifier HealthKit gave it, so a receiver that stores by
+  identifier keeps one copy of each. A reading can be excluded; no reading is
+  unreachable for ever.
 
-Raising the floor does not replay, because it excludes nothing already
-delivered.
-
-One honest residue: a floor moves with the clock, so which readings it excludes
-depends on when iOS let Hozz run. A reading from late last night can fall
-outside "nothing older than today" if the sync lands after midnight. The app
-says so on the same screen as the setting.
+Moving it later does not replay, because it excludes nothing already delivered.
 
 ### Timeout
 
@@ -635,12 +639,52 @@ Every POST carries:
 | Header | Meaning |
 | --- | --- |
 | `Content-Type` | The format's media type. |
-| `Idempotency-Key` | The batch identifier. A repeat means the same bytes. |
-| `Hozz-Batch-Id` | The same value, under a Hozz-specific name. |
+| `Idempotency-Key` | Identifies these exact bytes. A repeat means the same bytes. |
+| `Hozz-Batch-Id` | The batch this body belongs to. Shared by every part of a split batch. |
 | `Hozz-Batch-Sequence` | Batch number for this destination. |
-| `Hozz-Record-Count` | How many records the payload holds. |
-| `X-Hozz-Device` | What this phone calls itself. |
+| `Hozz-Record-Count` | How many records **this body** holds. |
+| `Hozz-Destination-Id` | Which configured destination this is for. |
+| `Hozz-Destination-Name` | Its name, percent-encoded. Absent if empty. |
+| `Hozz-Format` | `ndjson`, `json`, `csv`, `metrics`, or `influx`. |
+| `Hozz-Schema` | `hozz` or `healthAutoExport`. |
+| `Hozz-Window` | The starting point in force, e.g. `sinceLastDelivery`. |
+| `Hozz-Part` / `Hozz-Part-Count` | Present only on a batch split across requests. |
+| `X-Hozz-Device` | What this phone calls itself, percent-encoded. |
 | *(configured)* | The destination's authorization header, read from the Keychain. |
+
+Enough to route a payload without opening it. Every one of these is
+configuration: **no header carries a reading, a value, or a credential** — except
+the authorization header the user named themselves, which carries only that.
+
+`Hozz-Destination-Name` and `X-Hozz-Device` are percent-encoded, because a header
+value is defined as ASCII and iOS names a phone with a typographic apostrophe by
+default. Sent raw, "Brandon’s iPhone" is bytes a server may refuse and that most
+frameworks decode as Latin-1 into nonsense. A name that is already ASCII is sent
+unchanged, so nothing changes for anyone whose headers were already correct.
+Decode with any standard percent-decoder; the percent sign itself is encoded, so
+a name containing one round-trips.
+
+There is deliberately no equivalent of another exporter's `automation-aggregation`
+header. Hozz never aggregates — it sends the individual samples HealthKit
+returned — so the field would have exactly one value for ever.
+
+#### Split batches
+
+A destination can cap how large a single request may be. Anything bigger is sent
+as several sequential POSTs, each a complete, valid payload of the same format.
+
+Every part shares `Hozz-Batch-Id` and carries `Hozz-Part` (1-based) and
+`Hozz-Part-Count`. **Each part has its own `Idempotency-Key`**, derived from its
+own bytes — giving every part the batch's key would make a correct receiver treat
+parts two onwards as repeats of part one and discard them, so the batch would
+arrive a fraction complete and look perfect from both ends.
+
+If a part fails, Hozz stops there rather than sending the rest: a gap in the
+middle is one the receiving end has no way to notice. None of the batch is
+counted as delivered, the acquisition cursor does not move, and the whole batch
+is sent again from the first part on the next attempt. The parts that already
+landed carry the same bytes, and therefore the same key, so a receiver that
+honours it stores each reading once.
 
 Answer `2xx` to accept. Hozz treats `408`, `429`, and `5xx` as "try again" and
 retries with backoff; anything else stops and asks the user to fix it. Response

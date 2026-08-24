@@ -296,7 +296,7 @@ struct DestinationEditorView: View {
     /// "How often" is when Hozz tries; this is what it is allowed to send.
     private var windowSection: some View {
         Section {
-            Picker("How far back", selection: $deliveryWindow) {
+            Picker("Start from", selection: $deliveryWindow) {
                 ForEach(DeliveryWindow.allCases, id: \.self) { window in
                     Text(window.displayName).tag(window)
                 }
@@ -306,13 +306,23 @@ struct DestinationEditorView: View {
                 .font(.footnote)
                 .foregroundStyle(.secondary)
 
+            if let date = previewFloor.date {
+                // The actual date, because "7 days ago" stops being true the
+                // day after it is chosen and this one does not move.
+                Text(
+                    "Nothing dated before \(date.formatted(date: .abbreviated, time: .shortened))."
+                )
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+            }
+
             if willReplayHistory {
                 HozzLabel(.infoCircle, size: 16) {
                     Text(
                         "Saving this will send everything again from the "
-                        + "beginning. Readings the higher floor skipped are "
-                        + "still in this iPhone's Health, so lowering it does "
-                        + "not leave them behind — but the destination will "
+                        + "beginning. Readings the later starting point skipped "
+                        + "are still in this iPhone's Health, so moving it back "
+                        + "does not leave them behind — but the destination will "
                         + "receive a lot at once. Each one carries the same "
                         + "identifier as before, so anything that stores them "
                         + "by identifier keeps one copy."
@@ -322,34 +332,48 @@ struct DestinationEditorView: View {
                 }
             }
         } header: {
-            Text("How far back")
+            Text("Where to start")
         } footer: {
             Text(
                 "Separate from how often Hozz syncs. Hozz reads Health with a "
                 + "bookmark rather than a date, so a reading the Health app "
-                + "files under last week is still noticed — but anything older "
-                + "than the limit set here is not delivered to this "
-                + "destination, and is not delivered later either. The limit "
-                + "moves with the clock, so a reading from late last night can "
-                + "fall outside \u{201C}nothing older than today\u{201D} if the "
-                + "sync happens after midnight. Choosing a longer limit later "
-                + "sends everything again from the start, so nothing is out of "
-                + "reach for good."
+                + "files under last week is still noticed — but anything dated "
+                + "before the starting point is not delivered to this "
+                + "destination, and is not delivered later either. The date is "
+                + "worked out once and then kept, so it never creeps forward "
+                + "and leaves last night behind. Choosing an earlier starting "
+                + "point sends everything again from the beginning, so nothing "
+                + "is out of reach for good."
             )
         }
     }
 
-    /// Whether saving would lower the floor and therefore replay everything.
+    /// Whether saving would move the starting point earlier and therefore
+    /// replay everything.
     ///
-    /// Worth saying before the fact rather than after. Lowering it is the right
-    /// thing to allow — it is the only way readings a higher floor skipped are
-    /// ever sent — but somebody pointing this at a home server should know a
-    /// backlog is about to arrive.
+    /// Worth saying before the fact rather than after. Moving it earlier is the
+    /// right thing to allow — it is the only way readings a later starting point
+    /// skipped are ever sent — but somebody pointing this at a home server
+    /// should know a backlog is about to arrive.
     private var willReplayHistory: Bool {
         guard let existing else {
             return false
         }
-        return !existing.deliveryWindow.covers(deliveryWindow)
+        return !existing.deliveryFloor.covers(previewFloor)
+    }
+
+    /// The starting point that saving would put in force.
+    ///
+    /// Mirrors what `DeliveryEngine.save` will do: an unchanged choice keeps the
+    /// date already in force, and a changed one is resolved from now.
+    private var previewFloor: DeliveryFloor {
+        guard deliveryWindow.isBounded else {
+            return .unbounded
+        }
+        if existing?.deliveryWindow == deliveryWindow {
+            return existing?.deliveryFloor ?? .unbounded
+        }
+        return DeliveryFloor(date: deliveryWindow.floor(now: .now))
     }
 
     private var addressPrecision: InfluxLineProtocol.Precision? {

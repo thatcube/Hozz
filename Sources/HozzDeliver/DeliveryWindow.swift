@@ -70,13 +70,13 @@ public enum DeliveryWindow: String, Codable, CaseIterable, Sendable {
         case .sinceLastDelivery:
             "Everything not yet sent"
         case .sinceStartOfToday:
-            "Nothing older than today"
+            "Start from today"
         case .sinceStartOfYesterday:
-            "Nothing older than yesterday"
+            "Start from yesterday"
         case .sinceSevenDaysAgo:
-            "Nothing older than 7 days"
+            "Start from 7 days ago"
         case .sinceThirtyDaysAgo:
-            "Nothing older than 30 days"
+            "Start from 30 days ago"
         }
     }
 
@@ -87,18 +87,12 @@ public enum DeliveryWindow: String, Codable, CaseIterable, Sendable {
             "Everything Hozz has read from Health and not yet delivered here, "
             + "however old it is. A reading the Health app filed under last "
             + "Tuesday this morning still gets sent. Nothing is left out."
-        case .sinceStartOfToday:
-            "Readings dated before midnight this morning are not sent here, "
-            + "and will not be sent later."
-        case .sinceStartOfYesterday:
-            "Readings dated before midnight yesterday are not sent here, and "
-            + "will not be sent later."
-        case .sinceSevenDaysAgo:
-            "Readings dated more than seven days ago are not sent here, and "
-            + "will not be sent later."
-        case .sinceThirtyDaysAgo:
-            "Readings dated more than thirty days ago are not sent here, and "
-            + "will not be sent later."
+        default:
+            "Hozz works out that date once, now, and then keeps it. Readings "
+            + "dated before it are never sent here; everything from it onwards "
+            + "is, including anything Health files retroactively. The date does "
+            + "not creep forward, so last night's sleep is not left behind "
+            + "because the sync happened this morning."
         }
     }
 
@@ -143,7 +137,32 @@ public enum DeliveryWindow: String, Codable, CaseIterable, Sendable {
             ?? startOfToday.addingTimeInterval(-Double(daysBack) * 86_400)
     }
 
-    /// Whether a record with this date belongs in this window.
+}
+
+/// The starting point actually in force for one destination.
+///
+/// The date is resolved once, when the user chooses a window, and then stored on
+/// the destination. Everything that decides whether a reading is sent reads it
+/// from here rather than working it out from the clock — which is the whole
+/// point, because a date worked out at delivery time moves between the moment a
+/// reading was read and the moment it is sent, and every reading it moves past
+/// is lost permanently and reported as delivered.
+public struct DeliveryFloor: Equatable, Sendable {
+    /// The oldest date to deliver, or nil to deliver everything.
+    public let date: Date?
+
+    public init(date: Date?) {
+        self.date = date
+    }
+
+    /// Nothing is excluded.
+    public static let unbounded = DeliveryFloor(date: nil)
+
+    public var isBounded: Bool {
+        date != nil
+    }
+
+    /// Whether a record with this date belongs above the floor.
     ///
     /// A record with no date is always admitted. That is not laxness: the one
     /// record shape that carries no date is a deletion tombstone, and a
@@ -153,41 +172,33 @@ public enum DeliveryWindow: String, Codable, CaseIterable, Sendable {
     ///
     /// There is no upper bound, so a reading recorded while the sync was already
     /// running is never rejected for being too new.
-    public func admits(
-        _ date: Date?,
-        now: Date,
-        calendar: Calendar = .current
-    ) -> Bool {
-        guard let floor = floor(now: now, calendar: calendar), let date else {
+    public func admits(_ recordDate: Date?) -> Bool {
+        guard let date, let recordDate else {
             return true
         }
-        return date >= floor
+        return recordDate >= date
     }
 
-    /// Whether every record this window admits is also admitted by the receiver.
+    /// Whether every record this floor admits is also admitted by the other.
     ///
-    /// Used for one purpose: deciding whether changing a destination's window
-    /// has to replay its history. If the window in force until now admitted
-    /// everything the new one wants, nothing the new one wants was ever dropped,
-    /// and the cursors can carry on. If it did not — going from "Nothing older
-    /// than today" to "Nothing older than 7 days" — then readings the new
-    /// setting wants have already been passed over, and the only way they are
-    /// ever sent is to start the destination again.
+    /// Used for one purpose: deciding whether changing a destination's starting
+    /// point has to replay its history. If the floor in force until now admitted
+    /// everything the new one wants, nothing the new one wants was ever dropped
+    /// and the cursors can carry on. If it did not, readings the new setting
+    /// wants have already been passed over, and the only way they are ever sent
+    /// is to start the destination again.
     ///
-    /// Floors are totally ordered, and the ordering holds whenever it is
-    /// evaluated, because every floor is a fixed number of days back from the
-    /// user's own midnight. That is what makes this a sound basis for the
-    /// decision even though the old window was in force over past days while the
-    /// new one is being judged today.
-    public func covers(_ other: DeliveryWindow) -> Bool {
-        guard let mine = daysBack else {
-            // No floor admits everything.
+    /// Compared as dates rather than as choices, because two destinations set to
+    /// "start from 7 days ago" weeks apart do not have the same starting point,
+    /// and the one that matters is the one on disk.
+    public func covers(_ other: DeliveryFloor) -> Bool {
+        guard let mine = date else {
             return true
         }
-        guard let theirs = other.daysBack else {
+        guard let theirs = other.date else {
             return false
         }
-        return mine >= theirs
+        return mine <= theirs
     }
 }
 
@@ -206,7 +217,7 @@ public struct WindowedBatch: Sendable {
 }
 
 extension DeliveryWindow {
-    /// Applies this window to an encoded batch.
+    /// Applies this destination's resolved starting point to an encoded batch.
     ///
     /// A batch nothing was excluded from comes back byte-identical, with the
     /// identifier it arrived with. A batch that lost records is rebuilt, and
@@ -220,9 +231,7 @@ extension DeliveryWindow {
     /// failure than sending nothing; it is the one that looks like it worked.
     public func apply(
         to batch: DeliveryBatch,
-        destination: Destination,
-        now: Date,
-        calendar: Calendar = .current
+        destination: Destination
     ) throws -> WindowedBatch {
         guard isBounded, !batch.payload.isEmpty else {
             return WindowedBatch(batch: batch, excludedRecords: 0)
@@ -238,9 +247,15 @@ extension DeliveryWindow {
             throw DeliveryError.windowNotApplicable
         }
 
-        let kept = division.records.filter {
-            admits($0.date, now: now, calendar: calendar)
+        let floor = destination.deliveryFloor
+        guard floor.isBounded else {
+            // The choice says to start somewhere, but no date has been resolved
+            // for it yet. Admitting everything is the only safe reading of that:
+            // sending too much is a duplicate, and sending too little is a
+            // reading nobody sees again. `DeliveryEngine.save` resolves one.
+            return WindowedBatch(batch: batch, excludedRecords: 0)
         }
+        let kept = division.records.filter { floor.admits($0.date) }
         let excluded = division.count - kept.count
         guard excluded > 0 else {
             return WindowedBatch(batch: batch, excludedRecords: 0)

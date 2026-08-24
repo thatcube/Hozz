@@ -485,6 +485,31 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
     /// this exists to prevent.
     public static let pendingReplayKey = "pendingReplay"
     public static let maxRequestBytesKey = "maxRequestBytes"
+    /// The concrete date a bounded delivery window resolved to.
+    ///
+    /// Written when the user chooses the window and then left alone, so the
+    /// starting point stops moving. A date worked out afresh at delivery time
+    /// creeps forward between the moment a reading was read and the moment it is
+    /// sent, and everything it creeps past is excluded permanently while the
+    /// delivery is reported as complete — which throws away every night's sleep,
+    /// every night, on a destination set to start from today.
+    public static let windowFloorKey = "windowFloor"
+
+    /// The starting point actually in force for this destination.
+    ///
+    /// Unbounded when the window is ``DeliveryWindow/sinceLastDelivery``, and
+    /// also when a bounded window has no resolved date yet — because admitting
+    /// too much costs a duplicate a receiver can recognise, and admitting too
+    /// little costs a reading nobody sees again.
+    public var deliveryFloor: DeliveryFloor {
+        guard deliveryWindow.isBounded else {
+            return .unbounded
+        }
+        return DeliveryFloor(
+            date: options[Destination.windowFloorKey]
+                .flatMap(InfluxLineProtocol.date(from:))
+        )
+    }
 
     /// The largest body this destination should be sent in one request, or nil
     /// to send each batch whole however large it is.

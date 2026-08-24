@@ -53,16 +53,16 @@ public actor DeliveryEngine {
         return cache[id]
     }
 
-    public func save(_ destination: Destination) async throws {
+    public func save(_ destination: Destination, now: Date = .now) async throws {
         try await loadIfNeeded()
         let previous = cache[destination.id]
 
-        // Lowering a destination's floor replays its whole history.
+        // Moving a destination's starting point earlier replays its history.
         //
         // This is the guarantee that stops a bounded window from losing records
-        // permanently. A higher floor has already let batches go by with
-        // readings the new setting wants, and the cursors moved past them, so
-        // they are not coming round again on their own. Clearing this
+        // permanently. An later starting point has already let batches go by
+        // with readings the new setting wants, and the cursors moved past them,
+        // so they are not coming round again on their own. Clearing this
         // destination's cursors makes it read Health from the start; every
         // record carries the identifier HealthKit gave it, so a receiver
         // recognises the repeats and keeps one of each.
@@ -74,12 +74,14 @@ public actor DeliveryEngine {
         //
         // The marker is written first and cleared last, because the two writes
         // this needs cannot be made atomic from here. A crash between them would
-        // otherwise leave the wider window on disk with the cursors intact and
-        // nothing left to notice, which is exactly the loss being guarded
-        // against.
+        // otherwise leave the earlier starting point on disk with the cursors
+        // intact and nothing left to notice, which is exactly the loss being
+        // guarded against.
         var destination = destination
-        let owesReplay = previous.map { !$0.deliveryWindow.covers(destination.deliveryWindow) }
-            ?? false
+        Self.resolveFloor(&destination, previous: previous, now: now)
+        let owesReplay = previous.map {
+            !$0.deliveryFloor.covers(destination.deliveryFloor)
+        } ?? false
         if owesReplay {
             destination.options[Destination.pendingReplayKey] = "1"
         }
@@ -105,6 +107,37 @@ public actor DeliveryEngine {
                 )
             )
         }
+    }
+
+    /// Pins a bounded window to a concrete date, once.
+    ///
+    /// The date is worked out only when the choice itself changes, or when a
+    /// bounded window has none yet. Re-picking the same option keeps the date
+    /// already in force: moving it forward would quietly exclude readings that
+    /// were being delivered a moment earlier, which is the failure this whole
+    /// arrangement exists to remove.
+    static func resolveFloor(
+        _ destination: inout Destination,
+        previous: Destination?,
+        now: Date
+    ) {
+        guard destination.deliveryWindow.isBounded else {
+            // Nothing is excluded, so a stored date would only be misleading.
+            destination.options[Destination.windowFloorKey] = nil
+            return
+        }
+        if previous?.deliveryWindow == destination.deliveryWindow,
+           let inForce = previous?.options[Destination.windowFloorKey] {
+            destination.options[Destination.windowFloorKey] = inForce
+            return
+        }
+        guard let floor = destination.deliveryWindow.floor(now: now) else {
+            return
+        }
+        destination.options[Destination.windowFloorKey] = Date.ISO8601FormatStyle(
+            includingFractionalSeconds: true,
+            timeZone: .gmt
+        ).format(floor)
     }
 
     /// Persists a destination and keeps the in-memory copy in step.
@@ -243,16 +276,17 @@ public actor DeliveryEngine {
             throw DeliveryError.notConfigured
         }
 
-        // The destination's date range is applied here rather than while
+        // The destination's starting point is applied here rather than while
         // reading Health, and that separation is deliberate: acquisition stays
         // anchor-driven so a retroactively written sample is never missed, and
-        // only the *sending* is narrowed. See `DeliveryWindow`.
+        // only the *sending* is narrowed. The date comes from the destination
+        // rather than from `now`, so a retry an hour later — or a day later —
+        // judges the same readings by the same line. See `DeliveryWindow`.
         let windowed: WindowedBatch
         do {
             windowed = try destination.deliveryWindow.apply(
                 to: batch,
-                destination: destination,
-                now: now
+                destination: destination
             )
         } catch let error as DeliveryError {
             try await recordFailure(

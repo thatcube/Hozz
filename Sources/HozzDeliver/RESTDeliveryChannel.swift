@@ -145,6 +145,41 @@ public struct RESTDeliveryChannel: DeliveryChannel {
         )
     }
 
+    /// Makes a value safe to put in an HTTP header, or nil when there is
+    /// nothing left worth sending.
+    ///
+    /// A header value is defined as ASCII. Anything else is sent as raw bytes
+    /// that a server is entitled to reject and that most frameworks decode as
+    /// Latin-1 — so "Brandon’s iPhone" arrives as "Brandonâ€™s iPhone", if it
+    /// arrives at all. That is not a hypothetical: iOS names a phone with a
+    /// typographic apostrophe by default, so it is the *common* case, and it
+    /// applies equally to a destination someone named in their own language.
+    ///
+    /// Percent-encoding is the fix, and the percent sign is encoded too, so a
+    /// name that genuinely contains one cannot be decoded into something else.
+    /// A plain ASCII name is left exactly as it was, which is what keeps this
+    /// from changing anything for anyone whose headers were already correct.
+    ///
+    /// The length cap is not aesthetic: a server or proxy with a header limit
+    /// rejects the whole request, and losing a batch over a long name would be
+    /// a poor trade for a label.
+    static func headerSafe(_ value: String, limit: Int = 200) -> String? {
+        var encoded = ""
+        for byte in value.utf8 {
+            // Printable ASCII, minus the percent sign, which is the escape.
+            if byte >= 0x20, byte < 0x7F, byte != 0x25 {
+                encoded.append(Character(UnicodeScalar(byte)))
+            } else {
+                encoded += String(format: "%%%02X", byte)
+            }
+            if encoded.count >= limit {
+                break
+            }
+        }
+        let trimmed = encoded.trimmingCharacters(in: .whitespaces)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
     /// One request carrying one part.
     private func request(
         url: URL,
@@ -162,13 +197,36 @@ public struct RESTDeliveryChannel: DeliveryChannel {
         // into a transport failure the user reads as "my server is broken".
         request.timeoutInterval = destination.requestTimeout
         // Names this phone so a receiver can show which device is connected.
-        request.setValue(deviceName, forHTTPHeaderField: "X-Hozz-Device")
+        if let device = Self.headerSafe(deviceName) {
+            request.setValue(device, forHTTPHeaderField: "X-Hozz-Device")
+        }
         request.setValue(batch.format.contentType, forHTTPHeaderField: "Content-Type")
         request.setValue(
             batch.id.uuidString.lowercased(),
             forHTTPHeaderField: "Hozz-Batch-Id"
         )
         request.setValue(String(batch.sequence), forHTTPHeaderField: "Hozz-Batch-Sequence")
+
+        // Enough for a server to route a payload without opening it: which
+        // destination this is, in what shape, and how far back it was allowed
+        // to reach. All of it is configuration rather than health data — no
+        // header here says anything about what is inside the body.
+        request.setValue(
+            destination.id.uuidString.lowercased(),
+            forHTTPHeaderField: "Hozz-Destination-Id"
+        )
+        if let name = Self.headerSafe(destination.name) {
+            request.setValue(name, forHTTPHeaderField: "Hozz-Destination-Name")
+        }
+        request.setValue(batch.format.rawValue, forHTTPHeaderField: "Hozz-Format")
+        request.setValue(
+            destination.payloadSchema.rawValue,
+            forHTTPHeaderField: "Hozz-Schema"
+        )
+        request.setValue(
+            destination.deliveryWindow.rawValue,
+            forHTTPHeaderField: "Hozz-Window"
+        )
 
         // The record count is this part's, not the whole batch's, because it
         // describes the body it arrives with. A receiver checking that it read
