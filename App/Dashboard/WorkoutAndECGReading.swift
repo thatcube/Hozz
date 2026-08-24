@@ -408,6 +408,16 @@ extension HealthMetricReader {
             var finished = false
 
             let query = HKElectrocardiogramQuery(sample) { _, result in
+                // A known gap, recorded rather than left to be rediscovered:
+                // this handler is not `@Sendable`, so `points` and `finished`
+                // are mutated across a concurrency boundary the compiler
+                // cannot check. HealthKit delivers one query's callbacks
+                // serially in practice and no race could be demonstrated, but
+                // there is no compile-time guarantee of that, and the absence
+                // of a guarantee is worth saying out loud. If HealthKit ever
+                // parallelises delivery, the fix is an actor or a lock around
+                // the accumulation — not a wider change.
+                //
                 // `finished` guards the continuation: HealthKit calls this
                 // handler once per reading, and resuming twice traps.
                 guard !finished else {

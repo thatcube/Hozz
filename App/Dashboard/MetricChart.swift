@@ -144,6 +144,25 @@ extension MetricSeries {
     }
 }
 
+// MARK: - Notes under a chart
+
+/// One line of small print under a chart, with an icon to set it apart from
+/// the numbers above it.
+struct MetricNoteLine: View {
+    let text: String
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 6) {
+            HozzIconView(.infoCircle, size: 11)
+                .foregroundStyle(HozzPalette.inkMuted)
+                .padding(.top, 1)
+            Text(text)
+                .hozzCaption()
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+}
+
 // MARK: - Coverage caption
 
 /// The sentence under a chart that says how much of the range is really there.
@@ -159,14 +178,7 @@ struct MetricCoverageNote: View {
 
     var body: some View {
         if let sentence {
-            HStack(alignment: .top, spacing: 6) {
-                HozzIconView(.infoCircle, size: 11)
-                    .foregroundStyle(HozzPalette.inkMuted)
-                    .padding(.top, 1)
-                Text(sentence)
-                    .hozzCaption()
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+            MetricNoteLine(text: sentence)
         }
     }
 

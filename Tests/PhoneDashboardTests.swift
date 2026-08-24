@@ -962,6 +962,71 @@ final class PhoneDashboardTests: XCTestCase {
         XCTAssertGreaterThan(checked, 0, "Precondition: at least one percent metric exists.")
     }
 
+    /// A metric whose values are filed under a day other than the one the
+    /// reading started on has made a choice on the reader's behalf, and a
+    /// choice nobody can see makes a correct number look like a mistake. This
+    /// finds such metrics by exercising the attribution rather than by knowing
+    /// which they are, then insists each one says so on screen.
+    ///
+    /// It also guards the coupling in the other direction: moving
+    /// `dayBoundaryHour` without rewriting the sentence would leave the app
+    /// stating a rule it no longer follows.
+    func testAMetricThatFilesAReadingUnderADifferentDaySaysSoOnScreen() throws {
+        let calendar = calendar(newYork)
+        let sleep = try XCTUnwrap(
+            DashboardMetrics.all.first { $0.kind == .sleep },
+            "Precondition: sleep is on offer."
+        )
+
+        // Worked by hand against the rule, not read back from it: a night that
+        // begins at 23:30 on the 12th is filed under the 13th, and one that
+        // begins at 06:00 on the 12th is filed under the 12th. If both landed
+        // on the day they started, no explanation would be owed.
+        let lateNight = date(2025, 6, 12, 23, 30, zone: newYork)
+        let morning = date(2025, 6, 12, 6, 0, zone: newYork)
+
+        let lateNightDay = try XCTUnwrap(
+            SleepAttribution.day(forSleepStartingAt: lateNight, calendar: calendar)
+        )
+        let morningDay = try XCTUnwrap(
+            SleepAttribution.day(forSleepStartingAt: morning, calendar: calendar)
+        )
+
+        XCTAssertEqual(
+            lateNightDay,
+            date(2025, 6, 13, 0, 0, zone: newYork),
+            "A night beginning before midnight belongs to the morning it ends on."
+        )
+        XCTAssertEqual(
+            morningDay,
+            date(2025, 6, 12, 0, 0, zone: newYork),
+            "A morning nap belongs to the day it happened on."
+        )
+
+        // Established, not assumed: this metric really does re-file a reading.
+        XCTAssertNotEqual(
+            lateNightDay,
+            calendar.startOfDay(for: lateNight),
+            "Precondition: sleep attribution is non-obvious, so it owes an explanation."
+        )
+        XCTAssertNotNil(
+            sleep.note,
+            "Sleep is filed under a day it did not start on and must say so."
+        )
+    }
+
+    /// The counterpart: a metric that files a reading under the day it
+    /// happened does not need small print, and adding some would be noise.
+    /// Nothing here is filed unusually except sleep.
+    func testNoOtherMetricCarriesAnUnexplainedNote() {
+        for metric in DashboardMetrics.all where metric.kind != .sleep {
+            XCTAssertNil(
+                metric.note,
+                "\(metric.title) is filed under the day it was measured; a note only adds noise."
+            )
+        }
+    }
+
     func testEveryMetricOfferedHasAUnitAndAnIdentity() throws {
         var seen: Set<String> = []
         for metric in DashboardMetrics.all {
