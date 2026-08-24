@@ -266,11 +266,13 @@ public actor IngestStore {
     /// live in files of their own. They are still actor-isolated, so every read
     /// is serialised against ingest exactly as it was before.
     let database: SQLiteDatabase
-    private let directory: URL
+    /// Visible to the module for the same reason as `database`: the storage
+    /// report needs to size the files on disk, not only the rows in them.
+    let storeDirectory: URL
 
     public init(directory: URL) throws {
         try StoreLocation.prepareDirectory(directory)
-        self.directory = directory
+        self.storeDirectory = directory
         self.database = try SQLiteDatabase(
             url: directory.appending(path: "hozz-received.sqlite")
         )
@@ -766,6 +768,11 @@ public actor IngestStore {
                 unreadable: batch.unreadableCount
             )
         }
+        // Checked after the duplicate test, so a batch already on disk is
+        // still answered as stored when the disk is full — it *is* stored, and
+        // refusing it would make the phone keep resending something this Mac
+        // already holds.
+        try checkThereIsRoom()
 
         var stored = 0
         var deleted = 0

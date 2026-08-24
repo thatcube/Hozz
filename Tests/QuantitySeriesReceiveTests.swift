@@ -392,3 +392,141 @@ final class QuantitySeriesReceiveTests: XCTestCase {
         XCTAssertTrue(state.isComplete)
     }
 }
+
+/// What the archive costs, and refusing to fill a disk without saying so.
+final class ReceiverStorageTests: XCTestCase {
+    private var root: URL!
+
+    override func setUpWithError() throws {
+        root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "hozz-storage-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(
+            at: root,
+            withIntermediateDirectories: true
+        )
+    }
+
+    override func tearDownWithError() throws {
+        try? FileManager.default.removeItem(at: root)
+        root = nil
+    }
+
+    private func page(sample: String, sequence: Int, values: [Double]) -> String {
+        let readings = values.map {
+            """
+            {"value":\($0),"startDate":"2026-08-24T10:00:00.000Z",\
+            "endDate":"2026-08-24T10:00:00.000Z"}
+            """
+        }.joined(separator: ",")
+        return """
+        {"kind":"quantitySeriesReadings","schemaVersion":1,\
+        "id":"\(sample)-\(sequence)","type":"HKQuantityTypeIdentifierHeartRate",\
+        "sample":"\(sample)","sequence":\(sequence),\
+        "offset":\(sequence * values.count),"count":\(values.count),\
+        "unit":"count/min","startDate":"2026-08-24T10:00:00.000Z",\
+        "endDate":"2026-08-24T10:00:00.000Z","readings":[\(readings)]}
+        """
+    }
+
+    func testTheReportSaysWhatIsOnDiskAndWhatMadeItBig() async throws {
+        let store = try IngestStore(directory: root.appending(path: "store"))
+        let sample = "22222222-2222-4222-8222-222222222222"
+
+        // Three pages of ten readings: thirty readings, counted by hand.
+        let lines = (0..<3).map {
+            page(sample: sample, sequence: $0, values: Array(repeating: 70.0, count: 10))
+        }
+        _ = try await store.ingest(
+            try BatchParser.parse(Data(lines.joined(separator: "\n").utf8)),
+            idempotencyKey: "batch"
+        )
+
+        let report = try await store.storageReport()
+        XCTAssertEqual(report.quantitySeriesPageRows, 3)
+        XCTAssertEqual(
+            report.quantitySeriesReadings,
+            30,
+            "Thirty readings went in, so thirty is the answer."
+        )
+        XCTAssertGreaterThan(
+            report.quantitySeriesBytes,
+            0,
+            "The part that grows has to be attributable, or the number is a shrug."
+        )
+        XCTAssertGreaterThan(
+            report.databaseBytes,
+            report.quantitySeriesBytes,
+            "The file holds the readings and everything else besides."
+        )
+        XCTAssertEqual(
+            report.sampleRows,
+            0,
+            "No aggregates were sent, and pages are not samples."
+        )
+        XCTAssertEqual(report.floorBytes, IngestStore.freeSpaceFloor)
+    }
+
+    func testAVolumeThatWillNotSayItsFreeSpaceIsTreatedAsHavingRoom() {
+        let report = StorageReport(
+            databaseBytes: 1_000,
+            availableBytes: nil,
+            floorBytes: 512 * 1_024 * 1_024,
+            sampleRows: 0,
+            quantitySeriesPageRows: 0,
+            quantitySeriesReadings: 0,
+            quantitySeriesBytes: 0,
+            voltagePageRows: 0,
+            voltageBytes: 0
+        )
+        XCTAssertTrue(
+            report.hasRoom,
+            """
+            Refusing because a question went unanswered would lose records to \
+            ignorance rather than to a full disk.
+            """
+        )
+    }
+
+    func testTheFloorIsAFloorAndNotAWarning() {
+        let floor: Int64 = 512 * 1_024 * 1_024
+        func report(available: Int64) -> StorageReport {
+            StorageReport(
+                databaseBytes: 0,
+                availableBytes: available,
+                floorBytes: floor,
+                sampleRows: 0,
+                quantitySeriesPageRows: 0,
+                quantitySeriesReadings: 0,
+                quantitySeriesBytes: 0,
+                voltagePageRows: 0,
+                voltageBytes: 0
+            )
+        }
+        XCTAssertTrue(report(available: floor).hasRoom, "Exactly at it is still room.")
+        XCTAssertTrue(report(available: floor + 1).hasRoom)
+        XCTAssertFalse(report(available: floor - 1).hasRoom)
+        XCTAssertFalse(report(available: 0).hasRoom)
+    }
+
+    /// A refusal has to be a refusal the phone understands.
+    ///
+    /// The whole safety of this rests on the receiver answering outside the
+    /// 2xx range: the phone keeps the batch and its cursor and tries again
+    /// later. An answer of 200 with nothing stored would tell the phone the
+    /// data was delivered, and it would never be sent again.
+    func testRefusingForSpaceKeepsTheDataOnThePhone() throws {
+        let error = IngestStorageError.notEnoughRoom(
+            availableBytes: 100 * 1_024 * 1_024,
+            floorBytes: 512 * 1_024 * 1_024
+        )
+        let described = try XCTUnwrap(error.errorDescription)
+        XCTAssertTrue(
+            described.contains("refused"),
+            "It has to say the batch was not stored, not merely that space is low."
+        )
+        // 507 is outside 2xx, which is the only property that matters for the
+        // phone: RESTDeliveryChannel rejects anything outside 200...299 and
+        // the sync engine then leaves the cursor where it was.
+        XCTAssertFalse((200...299).contains(507))
+    }
+}

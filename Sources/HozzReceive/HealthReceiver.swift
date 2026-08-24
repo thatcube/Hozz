@@ -388,6 +388,20 @@ public actor HealthReceiver {
                     "unreadable": result.unreadable
                 ]
             )
+        } catch let error as IngestStorageError {
+            // A full disk is not a server fault and not the phone's fault, and
+            // it is the one failure a person can actually do something about.
+            // 507 keeps the batch on the phone exactly as 500 would — anything
+            // outside 2xx does — but it says which problem this is, and the
+            // event says so in the receiver's own status.
+            record(ReceiverEvent(outcome: .rejected("Not enough disk space")))
+            return HTTPResponse(
+                status: 507,
+                json: [
+                    "error": "not enough disk space",
+                    "detail": error.errorDescription ?? "The disk is nearly full."
+                ]
+            )
         } catch {
             // Answering 500 keeps the batch on the phone, which will retry.
             record(ReceiverEvent(outcome: .rejected("Could not be stored")))
