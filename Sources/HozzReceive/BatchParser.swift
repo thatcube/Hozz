@@ -1037,30 +1037,6 @@ public enum BatchParser {
 /// `ISO8601FormatStyle` is a value type, so unlike a shared `DateFormatter` it
 /// carries no mutable state across threads — which matters here because
 /// batches are parsed off the network on whichever queue delivered them.
-public enum Timestamps {
-    private static let fractional = Date.ISO8601FormatStyle(
-        includingFractionalSeconds: true,
-        timeZone: .gmt
-    )
-    private static let whole = Date.ISO8601FormatStyle(
-        includingFractionalSeconds: false,
-        timeZone: .gmt
-    )
-
-    public static func date(from text: String) -> Date? {
-        // Both are tried because Hozz writes fractional seconds but other
-        // producers pointed at the same receiver frequently do not.
-        if let parsed = try? fractional.parse(text) {
-            return parsed
-        }
-        return try? whole.parse(text)
-    }
-
-    public static func text(from date: Date) -> String {
-        fractional.format(date)
-    }
-}
-
 /// Minimal RFC 4180 field splitting, enough for the CSV Hozz writes.
 enum CSV {
     static func fields(in line: String) -> [String] {

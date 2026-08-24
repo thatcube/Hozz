@@ -60,8 +60,8 @@ private actor FakeRouteBackend: SeriesBackend {
         let route = routes[offset]
         let base = try JSONSerialization.data(
             withJSONObject: [
-                "startDate": Timestamps.text(route.start),
-                "endDate": Timestamps.text(route.end),
+                "startDate": RouteTimestamps.text(route.start),
+                "endDate": RouteTimestamps.text(route.end),
                 "metadata": [:],
                 "source": ["name": "Watch", "bundleIdentifier": "com.apple.health"]
             ] as [String: Any],
@@ -121,7 +121,7 @@ private actor FakeRouteBackend: SeriesBackend {
 
 }
 
-private enum Timestamps {
+private enum RouteTimestamps {
     static func text(_ date: Date) -> String {
         Date.ISO8601FormatStyle(
             includingFractionalSeconds: true,
@@ -265,7 +265,7 @@ final class WorkoutRouteTests: XCTestCase {
         XCTAssertEqual(Set(timestamps).count, pointCount, "No point may repeat.")
         XCTAssertEqual(
             timestamps,
-            locations(pointCount).map { Timestamps.text($0.timestamp) },
+            locations(pointCount).map { RouteTimestamps.text($0.timestamp) },
             "A route read out of order is a route that never happened."
         )
     }
@@ -412,7 +412,7 @@ final class WorkoutRouteTests: XCTestCase {
         )
         XCTAssertEqual(
             timestamps,
-            locations(pointCount).map { Timestamps.text($0.timestamp) }
+            locations(pointCount).map { RouteTimestamps.text($0.timestamp) }
         )
     }
 
@@ -799,7 +799,7 @@ final class WorkoutRouteTests: XCTestCase {
         )
         XCTAssertEqual(
             timestamps,
-            locations(pointCount).map { Timestamps.text($0.timestamp) }
+            locations(pointCount).map { RouteTimestamps.text($0.timestamp) }
         )
     }
 

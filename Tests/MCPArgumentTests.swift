@@ -1,4 +1,5 @@
 import Foundation
+import HozzCore
 import HozzMCP
 import HozzReceive
 import XCTest
