@@ -256,10 +256,15 @@ public actor DeliveryEngine {
 
         var updated = destination
         updated.options[Destination.coverageObservedDigestKey] = digest
-        updated.options[Destination.coverageObservedAtKey] = Date.ISO8601FormatStyle(
-            includingFractionalSeconds: true,
-            timeZone: .gmt
-        ).format(observation.moment)
+        // Written and read through `Timestamps`, which is the one place a date
+        // becomes text in this app. A hand-rolled formatter here would be a
+        // third definition of the same format, and this value only works if
+        // the writing and the reading agree exactly: a moment that came back
+        // unreadable would look like coverage nobody had observed, the clock
+        // would be used instead, and the retry it exists to keep identical
+        // would quietly stop being identical.
+        updated.options[Destination.coverageObservedAtKey] =
+            Timestamps.text(from: observation.moment)
         try? await write(updated)
         return observation.moment
     }

@@ -235,6 +235,6 @@ extension Destination {
 
     public var observedCoverageMoment: Date? {
         options[Destination.coverageObservedAtKey]
-            .flatMap(InfluxLineProtocol.date(from:))
+            .flatMap(Timestamps.date(from:))
     }
 }

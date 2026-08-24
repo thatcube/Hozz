@@ -534,8 +534,58 @@ final class CoverageDeliveryTests: XCTestCase {
         }
     }
 
-    // MARK: - A statement is not a reading
+    /// The observation moment goes to disk as text and comes back as a date.
+    ///
+    /// Written down because the failure would be silent: a moment that came
+    /// back unreadable looks exactly like coverage nobody has observed, so the
+    /// clock gets used instead and the retry this exists to keep identical
+    /// quietly stops being identical. Nothing else would complain.
+    func testTheObservedMomentSurvivesGoingToDiskAndBack() async throws {
+        let store = try makeStore()
+        let delivery = DeliveryEngine(
+            store: store,
+            channels: [.folder: CoverageCapturingChannel()]
+        )
+        let destination = makeDestination()
+        try await delivery.save(destination)
 
+        // A moment with a fraction of a second in it, which is where a
+        // format that agrees only roughly comes apart.
+        let moment = Date(timeIntervalSince1970: 1_772_600_767.5)
+        let first = await delivery.coverageObservation(
+            digest: "abc",
+            now: moment,
+            for: destination.id
+        )
+        XCTAssertEqual(first, moment)
+
+        // Read back through the store rather than the cache, so this is a
+        // round trip through the text on disk and not through memory.
+        let reloaded = DeliveryEngine(
+            store: store,
+            channels: [.folder: CoverageCapturingChannel()]
+        )
+        let second = await reloaded.coverageObservation(
+            digest: "abc",
+            now: moment.addingTimeInterval(3_600),
+            for: destination.id
+        )
+        XCTAssertEqual(
+            second,
+            moment,
+            "an hour later, unchanged coverage still carries the moment it "
+                + "was first observed"
+        )
+
+        let changed = await reloaded.coverageObservation(
+            digest: "def",
+            now: moment.addingTimeInterval(7_200),
+            for: destination.id
+        )
+        XCTAssertEqual(changed, moment.addingTimeInterval(7_200))
+    }
+
+    // MARK: - A statement is not a reading
     /// A coverage report is undated on purpose, so a delivery window admits
     /// it — correctly, since it describes a type rather than a moment. What it
     /// must not do is be counted as a record: a backfill pass that delivered
