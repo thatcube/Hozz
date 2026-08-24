@@ -115,9 +115,17 @@ enum QueryTimestamp {
               (0...59).contains(minute) else {
             return nil
         }
-        let second = clock.count == 3
-            ? Int(clock[2].prefix(while: \.isNumber)) ?? 0
-            : 0
+        // Validated, not salvaged. `Int(prefix(while: isNumber)) ?? 0` read
+        // `09:30:abc` as half past nine and `09:30:3600` as half past ten —
+        // discarding or reinterpreting a component nobody could have meant,
+        // which is the exact failure this file exists to prevent.
+        var second = 0
+        if clock.count == 3 {
+            guard let parsed = Int(clock[2]), (0...59).contains(parsed) else {
+                return nil
+            }
+            second = parsed
+        }
         return calendar.date(
             byAdding: DateComponents(hour: hour, minute: minute, second: second),
             to: day

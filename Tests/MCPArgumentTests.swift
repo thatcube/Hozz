@@ -296,6 +296,160 @@ final class MCPArgumentTests: XCTestCase {
         XCTAssertTrue(body.contains("222"), body)
     }
 
+    /// An explicit JSON `null` means "no bound", not a broken argument.
+    ///
+    /// A model filling a schema emits one for every optional property it has
+    /// no value for. `JSONSerialization` decodes it to `NSNull`, which is not
+    /// `nil`, so the first version of the strict parsing refused every one of
+    /// them and failed calls that were perfectly well formed.
+    func testAnExplicitNullIsTreatedAsNoBound() async throws {
+        let store = try await store([
+            steps("old", "2022-02-19T15:00:00.000Z", 111),
+            steps("new", "2026-08-17T15:00:00.000Z", 222)
+        ])
+
+        let arguments = try JSONSerialization.jsonObject(
+            with: Data(
+                """
+                {"type":"HKQuantityTypeIdentifierStepCount",
+                 "bucket":null,"from":null,"to":null}
+                """.utf8
+            )
+        ) as? [String: Any]
+        let body = try text(
+            await call(store, "aggregate_health_data", try XCTUnwrap(arguments))
+        )
+
+        XCTAssertTrue(body.contains("111"), body)
+        XCTAssertTrue(body.contains("222"), body)
+    }
+
+    /// A range the wrong way round is named, not answered as an empty archive.
+    func testABackwardsRangeIsRefusedRatherThanReportedEmpty() async throws {
+        let store = try await store([
+            steps("a", "2026-08-17T15:00:00.000Z", 10)
+        ])
+
+        let reply = try await call(store, "aggregate_health_data", [
+            "type": "HKQuantityTypeIdentifierStepCount",
+            "from": "2026-08-17",
+            "to": "2026-08-01"
+        ])
+        let message = try XCTUnwrap(
+            failure(reply),
+            "a backwards range must not read as \"you have no data\""
+        )
+        XCTAssertTrue(message.contains("wrong way round"), message)
+    }
+
+    /// A clock component nobody could have meant is refused.
+    ///
+    /// Hour and minute were range-checked and seconds were not, so
+    /// `09:30:abc` was read as half past nine and `09:30:3600` as half past
+    /// ten — silently discarding or reinterpreting the very thing this parsing
+    /// exists to catch.
+    func testAnUnreadableSecondsFieldIsRefused() async throws {
+        let store = try await store([
+            steps("a", "2026-08-17T15:00:00.000Z", 10)
+        ])
+
+        for bad in ["2026-08-17T09:30:abc", "2026-08-17T09:30:99",
+                    "2026-08-17T09:30:3600", "2026-08-17T25:00:00"] {
+            let reply = try await call(store, "aggregate_health_data", [
+                "type": "HKQuantityTypeIdentifierStepCount",
+                "from": bad
+            ])
+            XCTAssertNotNil(
+                failure(reply),
+                "\"\(bad)\" was accepted rather than refused"
+            )
+        }
+    }
+
+    /// A local wall clock that is well formed still works.
+    func testAWellFormedLocalTimestampIsAccepted() async throws {
+        let store = try await store([
+            // 08:00 and 18:00 local on 17 August.
+            steps("morning", "2026-08-17T12:00:00.000Z", 10),
+            steps("evening", "2026-08-17T22:00:00.000Z", 20)
+        ])
+
+        let body = try text(
+            await call(store, "aggregate_health_data", [
+                "type": "HKQuantityTypeIdentifierStepCount",
+                "from": "2026-08-17T13:00:00"
+            ])
+        )
+        XCTAssertTrue(body.contains("20"), body)
+        XCTAssertFalse(body.contains(", 10,"), body)
+    }
+
+    /// `list_health_samples` inherits the same range handling.
+    func testSampleListingHonoursABareDateRange() async throws {
+        let store = try await store([
+            steps("old", "2022-02-19T15:00:00.000Z", 111),
+            steps("new", "2026-08-17T15:00:00.000Z", 222)
+        ])
+
+        let body = try text(
+            await call(store, "list_health_samples", [
+                "type": "HKQuantityTypeIdentifierStepCount",
+                "from": "2026-08-01"
+            ])
+        )
+        XCTAssertTrue(body.contains("222"), body)
+        XCTAssertFalse(body.contains("111"), body)
+    }
+
+    // MARK: - A workout is as long as it lasted
+
+    /// A workout's value is its length, so a day of workouts totals.
+    ///
+    /// Classifying workouts as occurrences lost the total — the thing that
+    /// answers "how long do I work out" — and, because a workout sample
+    /// carries the unit `sec`, printed the *count* of workouts labelled as
+    /// seconds.
+    func testWorkoutsTotalTheirDurationRatherThanCounting() async throws {
+        let store = try await store([
+            workout("w1", try local(2026, 8, 17, 7), seconds: 1800),
+            workout("w2", try local(2026, 8, 17, 18), seconds: 2700)
+        ])
+
+        let body = try text(
+            await call(store, "aggregate_health_data", [
+                "type": "HKWorkoutTypeIdentifier",
+                "bucket": "day"
+            ])
+        )
+
+        XCTAssertTrue(body.contains("sum"), "a day of workouts has a length")
+        XCTAssertTrue(
+            body.contains("4500"),
+            "1800 + 2700 seconds, added by hand:\n\(body)"
+        )
+        XCTAssertFalse(
+            body.contains("enumeration cases"),
+            "a workout's value is a duration, not an enumeration:\n\(body)"
+        )
+    }
+
+    private func workout(
+        _ id: String,
+        _ start: Date,
+        seconds: Double
+    ) -> [String: Any] {
+        [
+            "kind": "workout", "id": id,
+            "type": "HKWorkoutTypeIdentifier",
+            "startDate": Timestamps.text(from: start),
+            "endDate": Timestamps.text(
+                from: start.addingTimeInterval(seconds)
+            ),
+            "duration": seconds,
+            "activityType": 52
+        ]
+    }
+
     // MARK: - A stand hour is an hour stood
 
     /// Stand hours report hours stood, and never the sum of the stored values.
