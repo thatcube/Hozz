@@ -88,3 +88,21 @@ genuine regression:
   `dyld: Symbol not found` for a symbol that does exist. Pass
   `-derivedDataPath` somewhere of your own, and use a simulator nothing else
   is installing to.
+
+A green build is not a working app, and a green test run is not even a building
+one. The tests build for a simulator; a phone builds a different product, and
+the compiler's patience is not the same in both. A `Text(...)` holding a ternary
+inside a chain of `+` once type-checked in seconds for the simulator and timed
+out compiling for a device — 1,035 tests passing while the app could not be
+installed at all. No amount of running the tests could have found it. Build for
+the device before handing work over; it costs ninety seconds.
+
+Run anything that touches the clock more than once. Four separate defects in a
+single day shared one shape: a plausible result, no error path, and a symptom
+that appears only under a condition nobody varied — a server left running from
+another checkout, an abandoned history behind a force-push, a sub-millisecond
+remainder that survives formatting, and the hour of the day. `-test-iterations`
+catches the repeatable ones; a suite that passes in the morning and fails at
+seven in the evening will otherwise be blamed on whatever was merged last. The
+rest are caught only by measuring an explanation instead of trusting it,
+including your own.
