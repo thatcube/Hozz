@@ -58,6 +58,12 @@ struct ExportMarkdownStatistics: Equatable {
 /// under the local day it started — except sleep, which is filed under the day
 /// it *ended*, because "last night's sleep" belongs to the morning you woke up
 /// and not to two notes either side of midnight.
+///
+/// Sleep is also the one thing not totalled a record at a time. Health returns
+/// overlapping records for one night, so their durations are merged before
+/// anything is filed — which means holding the date pairs, and only those, for
+/// the length of the read. A decade of nights is on the order of tens of
+/// thousands of pairs against an export that may hold millions of records.
 enum ExportMarkdownWriter {
     struct Metadata {
         let runID: UUID
@@ -92,6 +98,21 @@ enum ExportMarkdownWriter {
 
         var reader = try NDJSONLineReader(fileURL: sourceURL)
         defer { reader.close() }
+
+        // Sleep is the one thing that cannot be totalled a record at a time.
+        // Health returns overlapping records — a watch, a phone and a sleep app
+        // all describing one night — and adding their durations reports eleven
+        // hours for a seven-hour night. They have to be merged, and merging has
+        // to happen across the whole set before anything is filed under a day,
+        // because two records of one night can end either side of midnight and
+        // would never meet if each day were merged separately.
+        //
+        // This is the one exception to holding no records: these are date pairs
+        // rather than records, and only for sleep. A decade of nights is on the
+        // order of tens of thousands of them, a megabyte or so, against an
+        // export that may hold millions of records of every other kind.
+        var asleepStretches: [DateInterval] = []
+        var inBedStretches: [DateInterval] = []
 
         while let line = try reader.nextLine() {
             statistics.linesRead += 1
@@ -168,11 +189,40 @@ enum ExportMarkdownWriter {
                 timeZone: metadata.timeZone
             )
 
+            if isSleep,
+               let start = record.startDate,
+               let end = record.endDate,
+               end > start,
+               let value = record.value.map({ Int($0) }) {
+                let stretch = DateInterval(start: start, end: end)
+                if SleepIntervals.isAsleep(value) {
+                    asleepStretches.append(stretch)
+                } else if SleepIntervals.isInBed(value) {
+                    inBedStretches.append(stretch)
+                }
+            }
+
             if record.kind == "workout" {
                 statistics.workoutsSummarised += 1
             } else {
                 statistics.samplesSummarised += 1
             }
+        }
+
+        // Now that every record has been seen, the night can be worked out. A
+        // stretch is filed under the local day it ended on — the day the
+        // sleeper woke up — which is the rule the chart follows too.
+        for (dayNumber, seconds) in SleepIntervals.secondsByDay(
+            asleepStretches,
+            dayNumber: { day.dayNumber(for: $0) }
+        ) {
+            days[dayNumber, default: DaySummary()].asleepSeconds += seconds
+        }
+        for (dayNumber, seconds) in SleepIntervals.secondsByDay(
+            inBedStretches,
+            dayNumber: { day.dayNumber(for: $0) }
+        ) {
+            days[dayNumber, default: DaySummary()].inBedSeconds += seconds
         }
 
         statistics.retainedDays = days.count
@@ -651,19 +701,14 @@ enum ExportMarkdownWriter {
             )
         }
 
+        /// Counts a sleep record. The seconds are *not* added here.
+        ///
+        /// Overlapping records describe the same night, so their durations
+        /// cannot be added as they arrive — they are merged across the whole
+        /// export first and filed afterwards. `sleepSegments` stays a count of
+        /// records, which is what it has always been and is honest as it is.
         mutating func add(sleep record: ExportRecord) {
             sleepSegments += 1
-            let seconds = Self.seconds(from: record.startDate, to: record.endDate)
-            switch Int(record.value ?? -1) {
-            case 0:
-                inBedSeconds += seconds
-            // 1 is the old undifferentiated "asleep"; 3, 4 and 5 are the core,
-            // deep and REM stages that replaced it. 2 is awake, and is neither.
-            case 1, 3, 4, 5:
-                asleepSeconds += seconds
-            default:
-                break
-            }
         }
 
         func total(of type: String, in types: TypeTable) -> Double? {

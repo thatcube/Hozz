@@ -419,23 +419,13 @@ actor HealthMetricReader {
 
     /// Whether a sleep sample's value means the person was actually asleep.
     ///
-    /// In bed is not asleep and awake is certainly not, so neither counts.
-    /// Reporting time in bed as time slept is the most common way a sleep
-    /// figure flatters someone.
-    nonisolated static func isAsleep(_ value: Int) -> Bool {        guard let stage = HKCategoryValueSleepAnalysis(rawValue: value) else {
-            return false
-        }
-        switch stage {
-        case .asleepUnspecified, .asleepCore, .asleepDeep, .asleepREM:
-            return true
-        case .inBed, .awake:
-            return false
-        @unknown default:
-            // A stage this build has never heard of is not counted as sleep.
-            // Guessing would inflate the figure, and inflating a health number
-            // is the wrong direction to be wrong in.
-            return false
-        }
+    /// Shared with the exported note through `SleepIntervals`, so the two
+    /// surfaces cannot come to disagree about which stages count. A stage this
+    /// build has never heard of is not counted: guessing would inflate the
+    /// figure, and inflating a health number is the wrong direction to be
+    /// wrong in.
+    nonisolated static func isAsleep(_ value: Int) -> Bool {
+        SleepIntervals.isAsleep(value)
     }
 }
 

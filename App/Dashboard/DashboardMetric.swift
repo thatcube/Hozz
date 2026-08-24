@@ -1,5 +1,6 @@
 import Foundation
 import HealthKit
+import HozzHealth
 import HozzUI
 
 /// Which metrics the dashboard offers, and — more importantly — where the
@@ -335,37 +336,11 @@ enum SleepAttribution {
 
     /// Collapses overlapping stretches into the time actually spent asleep.
     ///
-    /// Health readily returns overlapping sleep samples: a watch and a phone
-    /// and a third-party app all describe the same night, and adding their
-    /// durations together reports eleven hours of sleep for a seven-hour
-    /// night. Merging first is the difference between a figure someone can
-    /// trust and one that flatters them.
+    /// The implementation lives in `SleepIntervals`, shared with the exported
+    /// note, because the two surfaces disagreeing about how long a night was
+    /// is exactly what a second copy of this produced.
     static func merge(_ intervals: [DateInterval]) -> [DateInterval] {
-        let sorted = intervals
-            .filter { $0.duration > 0 }
-            .sorted { $0.start < $1.start }
-        guard var current = sorted.first else {
-            return []
-        }
-
-        var merged: [DateInterval] = []
-        for interval in sorted.dropFirst() {
-            if interval.start <= current.end {
-                // Touching or overlapping: extend rather than append. `max` is
-                // needed because a short stretch can sit wholly inside a long
-                // one, and taking the later end unconditionally would shrink
-                // the union.
-                current = DateInterval(
-                    start: current.start,
-                    end: max(current.end, interval.end)
-                )
-            } else {
-                merged.append(current)
-                current = interval
-            }
-        }
-        merged.append(current)
-        return merged
+        SleepIntervals.merge(intervals)
     }
 
     /// Hours asleep per day, with overlaps counted once and each stretch filed

@@ -4,6 +4,7 @@ import HozzCore
 import HozzHealthFake
 import HozzStore
 import XCTest
+@testable import Hozz
 @testable import HozzHealth
 
 /// The daily-notes export throws most of the data away on purpose. These tests
@@ -311,6 +312,232 @@ final class ExportMarkdownTests: XCTestCase {
             "The note has to explain the rule it used: \(text)"
         )
         XCTAssertTrue(text.contains("sleep_hours: 7.50"), text)
+    }
+
+    /// A watch and a phone describing one night must not report two nights'
+    /// worth of sleep.
+    ///
+    /// This is the bug this test was written for. Every record was added as it
+    /// arrived, so anyone running a sleep app alongside the watch had their
+    /// night counted twice — and the note flattered them, which is worse than
+    /// an obvious error because a total that is too high looks exactly like one
+    /// that is right.
+    func testOneNightRecordedTwiceIsCountedOnce() throws {
+        let (entries, _) = try build([
+            // Watch: 23:00 on the 2nd to 06:00 on the 3rd, New York time.
+            sleepSegment(
+                start: "2026-01-03T04:00:00.000Z",
+                end: "2026-01-03T11:00:00.000Z",
+                value: 1
+            ),
+            // Phone: 01:00 to 07:00 on the 3rd. Overlaps the watch by five
+            // hours, and adds one hour at the end that the watch missed.
+            sleepSegment(
+                start: "2026-01-03T06:00:00.000Z",
+                end: "2026-01-03T12:00:00.000Z",
+                value: 4
+            )
+        ])
+
+        // Worked out by hand: the union runs 23:00 to 07:00, which is eight
+        // hours. Added a record at a time it would be seven plus six, thirteen.
+        let text = try note(entries, "2026-01-03")
+        XCTAssertTrue(text.contains("Asleep for **8 h**"), text)
+        XCTAssertTrue(text.contains("sleep_hours: 8"), text)
+        XCTAssertFalse(
+            text.contains("13 h"),
+            "Two devices describing one night is one night: \(text)"
+        )
+        // The segment count is a count of records and is right to stay two.
+        XCTAssertTrue(text.contains("from 2 segments"), text)
+    }
+
+    /// Overlapping records of one night can end either side of midnight, so
+    /// they are filed under different days. Merging each day separately would
+    /// never compare them and would count the hours they share twice.
+    func testAnOverlapThatStraddlesMidnightIsStillCountedOnce() throws {
+        let (entries, _) = try build([
+            // 22:00 to 23:30 on the 2nd, New York time — ends on the 2nd.
+            sleepSegment(
+                start: "2026-01-03T03:00:00.000Z",
+                end: "2026-01-03T04:30:00.000Z",
+                value: 1
+            ),
+            // 23:00 on the 2nd to 02:00 on the 3rd — ends on the 3rd, and
+            // overlaps the first by half an hour.
+            sleepSegment(
+                start: "2026-01-03T04:00:00.000Z",
+                end: "2026-01-03T07:00:00.000Z",
+                value: 1
+            )
+        ])
+
+        // The union is 22:00 to 02:00, four hours, ending on the 3rd. Filed
+        // first and merged afterwards it would be 1.5 hours on the 2nd and
+        // 3 on the 3rd — four and a half hours for a four-hour night.
+        // The record that ended on the 2nd is still counted there — it did
+        // happen — but none of the night's hours are reported on that day.
+        let second = try note(entries, "2026-01-02")
+        XCTAssertFalse(
+            second.contains("Asleep for"),
+            "The whole union ended on the 3rd, so no hours belong on the 2nd: \(second)"
+        )
+        let text = try note(entries, "2026-01-03")
+        XCTAssertTrue(text.contains("Asleep for **4 h**"), text)
+    }
+
+    /// Time in bed is a different measurement, and it double-counted the same
+    /// way. Merging it must not fold it into time asleep either.
+    func testTimeInBedIsMergedSeparatelyFromTimeAsleep() throws {
+        let (entries, _) = try build([
+            // In bed 22:00 to 06:00 on the 3rd, recorded twice with an overlap.
+            sleepSegment(
+                start: "2026-01-03T03:00:00.000Z",
+                end: "2026-01-03T09:00:00.000Z",
+                value: 0
+            ),
+            sleepSegment(
+                start: "2026-01-03T07:00:00.000Z",
+                end: "2026-01-03T11:00:00.000Z",
+                value: 0
+            ),
+            // Actually asleep for two of those hours.
+            sleepSegment(
+                start: "2026-01-03T05:00:00.000Z",
+                end: "2026-01-03T07:00:00.000Z",
+                value: 3
+            )
+        ])
+
+        // In bed is 22:00 to 06:00, eight hours, not the twelve the two
+        // records add up to. Asleep is two, and is not inflated by the in-bed
+        // records that contain it.
+        let text = try note(entries, "2026-01-03")
+        XCTAssertTrue(text.contains("Asleep for **2 h**"), text)
+        XCTAssertTrue(
+            text.contains("in bed for 8 h"),
+            "In bed is eight hours, not the twelve the records add to: \(text)"
+        )
+        XCTAssertTrue(text.contains("in_bed_hours: 8"), text)
+    }
+
+    /// Sleep stages are an enumeration, and which of them count as asleep was
+    /// written out twice — as `1, 3, 4, 5` here and as `HKCategoryValue`
+    /// cases in the app. This exercises the shared definition through the
+    /// export, so a change to it cannot quietly alter what a note reports.
+    func testOnlyTheStagesThatMeanAsleepAreCounted() throws {
+        let stages = [
+            (value: 0, name: "in bed"),
+            (value: 1, name: "asleep, undifferentiated"),
+            (value: 2, name: "awake"),
+            (value: 3, name: "core"),
+            (value: 4, name: "deep"),
+            (value: 5, name: "REM")
+        ]
+
+        // One hour each, back to back from 00:00 on the 3rd, New York time, so
+        // no two of them overlap and each is counted on its own merits.
+        var lines: [[String: Any]] = []
+        for (index, stage) in stages.enumerated() {
+            lines.append(
+                sleepSegment(
+                    start: "2026-01-03T0\(5 + index):00:00.000Z",
+                    end: "2026-01-03T0\(6 + index):00:00.000Z",
+                    value: stage.value
+                )
+            )
+        }
+
+        let (entries, _) = try build(lines)
+        let text = try note(entries, "2026-01-03")
+
+        // Four of the six mean asleep — 1, 3, 4 and 5 — so four hours.
+        XCTAssertTrue(
+            text.contains("Asleep for **4 h**"),
+            "Awake and in bed are not sleep: \(text)"
+        )
+    }
+
+    /// The two surfaces must answer "how much did I sleep on Tuesday" with the
+    /// same number, not merely file it under the same day.
+    ///
+    /// This runs one set of records through both paths — the exported note, and
+    /// the chart's `SleepAttribution` — and compares the hours they report. It
+    /// is the check that keeps them honest from here: they have now disagreed
+    /// twice, once about which day a night belonged to and once about how long
+    /// it was, and both times the disagreement was invisible from either side
+    /// on its own.
+    ///
+    /// The records are deliberately awkward: two devices overlapping, an
+    /// overlap that ends either side of midnight, an evening nap, and a stage
+    /// that is not sleep at all.
+    func testTheNoteAndTheChartReportTheSameHoursForTheSameNight() throws {
+        let segments: [(start: String, end: String, value: Int)] = [
+            // Watch: 23:00 on the 2nd to 06:00 on the 3rd, New York time.
+            (start: "2026-01-03T04:00:00.000Z", end: "2026-01-03T11:00:00.000Z", value: 1),
+            // Phone: 01:00 to 07:00 on the 3rd, overlapping the watch.
+            (start: "2026-01-03T06:00:00.000Z", end: "2026-01-03T12:00:00.000Z", value: 4),
+            // A doze at 21:00 on the 2nd that ends before midnight.
+            (start: "2026-01-03T02:00:00.000Z", end: "2026-01-03T02:30:00.000Z", value: 3),
+            // Awake in the small hours: not sleep, and must count on neither.
+            (start: "2026-01-03T08:00:00.000Z", end: "2026-01-03T08:30:00.000Z", value: 2)
+        ]
+
+        // The note's answer.
+        let (entries, _) = try build(
+            segments.map { sleepSegment(start: $0.start, end: $0.end, value: $0.value) }
+        )
+
+        // The chart's answer, from the same records, through the app's own path.
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = newYork
+        let parser = ISO8601DateFormatter()
+        parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        let asleep = try segments
+            .filter { SleepIntervals.isAsleep($0.value) }
+            .map { segment in
+                DateInterval(
+                    start: try XCTUnwrap(parser.date(from: segment.start)),
+                    end: try XCTUnwrap(parser.date(from: segment.end))
+                )
+            }
+        let readings = SleepAttribution.readings(from: asleep, calendar: calendar)
+
+        // Worked out by hand: the doze is 21:00 to 21:30 on the 2nd, half an
+        // hour. The night is 23:00 to 07:00 merged, eight hours, ending on the
+        // 3rd. The awake half-hour counts on neither.
+        XCTAssertEqual(readings.count, 2, "A doze on the 2nd and a night on the 3rd.")
+
+        for reading in readings {
+            let day = LocalDayFormatter.text(
+                forDayNumber: LocalDayFormatter(timeZone: newYork).dayNumber(for: reading.start)
+            )
+            let text = try note(entries, day)
+            let hours = try XCTUnwrap(
+                Self.frontMatterNumber(named: "sleep_hours", in: text),
+                "The note for \(day) reports no sleep hours: \(text)"
+            )
+            XCTAssertEqual(
+                hours,
+                reading.value,
+                accuracy: 0.01,
+                "\(day): the note says \(hours) hours, the chart says \(reading.value)."
+            )
+        }
+
+        // And the hand-worked figures themselves, so this cannot pass by both
+        // surfaces being wrong in the same way.
+        XCTAssertEqual(readings[0].value, 0.5, accuracy: 0.000_1)
+        XCTAssertEqual(readings[1].value, 8, accuracy: 0.000_1)
+    }
+
+    /// Reads a number out of a note's YAML front matter.
+    private static func frontMatterNumber(named key: String, in text: String) -> Double? {
+        for line in text.split(separator: "\n") where line.hasPrefix("\(key):") {
+            return Double(line.dropFirst(key.count + 1).trimmingCharacters(in: .whitespaces))
+        }
+        return nil
     }
 
     /// Sleep stage codes are an enumeration. Summing them would produce a
