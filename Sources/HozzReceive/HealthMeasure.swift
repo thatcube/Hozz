@@ -277,9 +277,19 @@ public struct HealthMeasure: Sendable, Hashable {
             return HealthMeasure(type: type, kind: .occurrences, storedUnit: nil)
         }
         if !type.hasPrefix("HKQuantityTypeIdentifier") {
-            // Workouts, routes, mood, medication, audiograms: none of them
-            // carry a single number that means anything charted over time.
-            // Each has a view of its own; here they are simply counted.
+            // State of Mind is the exception among the non-quantity types: its
+            // stored value is a valence from -1 to 1, which is a measurement of
+            // how someone felt and averages meaningfully. Counting entries
+            // instead would answer "how often did you record a mood" for a
+            // question about mood — which is what happened when this rule was
+            // first written for the dashboards, where mood has a screen of its
+            // own and never reached here.
+            if type.contains("StateOfMind") {
+                return HealthMeasure(type: type, kind: .average, storedUnit: nil)
+            }
+            // Workouts, routes, medication, audiograms: none of them carry a
+            // single number that means anything charted over time. Each has a
+            // view of its own; here they are simply counted.
             return HealthMeasure(type: type, kind: .occurrences, storedUnit: nil)
         }
 

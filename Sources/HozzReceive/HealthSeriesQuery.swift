@@ -224,7 +224,7 @@ extension IngestStore {
                 readingCount: row?.readings ?? 0,
                 daysWithData: row?.days ?? 0,
                 dayCount: column.dayCount(in: plan.calendar),
-                durationSeconds: row?.duration ?? 0
+                durationSeconds: (((row?.duration ?? 0) * 1000).rounded()) / 1000
             )
         }
 

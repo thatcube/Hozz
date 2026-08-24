@@ -1139,6 +1139,18 @@ final class HealthDashboardTests: XCTestCase {
         XCTAssertEqual(category.kind, .occurrences)
     }
 
+    /// A mood is a measurement of how somebody felt, not a tally of entries.
+    ///
+    /// Valence runs from -1 to 1 and averages meaningfully. Counting instead
+    /// answers "how often did you record a mood" for a question about mood.
+    func testStateOfMindIsAveragedRatherThanCounted() {
+        for type in ["HKStateOfMindTypeIdentifier", "HKDataTypeStateOfMind"] {
+            let measure = HealthMeasure.measure(for: type, storedUnit: nil)
+            XCTAssertEqual(measure.kind, .average, type)
+            XCTAssertFalse(measure.isSummable, "\(type) must never be summed")
+        }
+    }
+
     // MARK: - Display units
 
     func testDistanceSwitchesUnitWithMagnitudeAndNeverMisstatesIt() {
