@@ -216,6 +216,7 @@ public actor HealthKitHealthDataSource: HealthDataSource {
         let key = type.catalogEntry.key
         let catalogEntry = type.catalogEntry
         let sampleType = type.sampleType
+        let expandsSeries = expandsQuantitySeries
 
         return try await withCheckedThrowingContinuation { continuation in
             let query = HKAnchoredObjectQuery(
@@ -252,7 +253,8 @@ public actor HealthKitHealthDataSource: HealthDataSource {
                         let payload = try encoder.encode(
                             sample: sample,
                             catalogEntry: catalogEntry,
-                            medications: medications
+                            medications: medications,
+                            expandsSeries: expandsSeries
                         )
                         changes.append(
                             .upsert(

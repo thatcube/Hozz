@@ -818,22 +818,8 @@ enum ExportMarkdownWriter {
 
     /// Whether a record is a page of a series' detail rather than a reading in
     /// its own right.
-    ///
-    /// The three series families each write elements and an end marker beside
-    /// the sample they belong to, all carrying that sample's type identifier.
-    /// A summary that counted them would count the packaging.
     static func isSeriesDetail(_ kind: String) -> Bool {
-        switch kind {
-        case WorkoutRouteEncoding.shape.elementKind,
-            WorkoutRouteEncoding.shape.endKind,
-            ElectrocardiogramEncoding.shape.elementKind,
-            ElectrocardiogramEncoding.shape.endKind,
-            QuantitySeriesEncoding.elementKind,
-            QuantitySeriesEncoding.endKind:
-            true
-        default:
-            false
-        }
+        SeriesEncoding.isDetailKind(kind)
     }
 
     /// A workout's activity, named where Hozz knows the name and numbered
