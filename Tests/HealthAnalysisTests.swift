@@ -98,12 +98,27 @@ final class HealthAnalysisTests: XCTestCase {
         }
     }
 
+
+    /// Yesterday at local midnight, so a day's readings stay inside their day.
+    ///
+    /// These tests lay readings out at hourly offsets from `base` and then
+    /// assert how many *local days* carry data. Anchored to `Date.now`, six
+    /// readings begun at 19:21 run past midnight, so one synthetic day becomes
+    /// two and "120 days with data" reads 121. The suite therefore passed in
+    /// the morning and failed in the evening, on unchanged code, which is a
+    /// property of the clock rather than of anything under test.
+    static func dayStart(before days: Int) -> Date {
+        Calendar.current.startOfDay(
+            for: Date.now.addingTimeInterval(-Double(days) * 86_400)
+        )
+    }
+
     // MARK: - Trend
 
     func testARealTrendIsReportedWithItsUncertainty() async throws {
         var noise = Noise()
         var objects: [[String: Any]] = []
-        let base = Date.now.addingTimeInterval(-day)
+        let base = Self.dayStart(before: 1)
         for index in 0..<120 {
             let date = base.addingTimeInterval(-Double(119 - index) * day)
             for reading in 0..<6 {
@@ -139,7 +154,7 @@ final class HealthAnalysisTests: XCTestCase {
     func testAFlatSeriesIsReportedAsNoDetectableChange() async throws {
         var noise = Noise()
         var objects: [[String: Any]] = []
-        let base = Date.now.addingTimeInterval(-day)
+        let base = Self.dayStart(before: 1)
         for index in 0..<120 {
             let date = base.addingTimeInterval(-Double(119 - index) * day)
             for reading in 0..<4 {
@@ -171,7 +186,7 @@ final class HealthAnalysisTests: XCTestCase {
 
     func testTooFewDaysRefusesToReportADirection() async throws {
         var objects: [[String: Any]] = []
-        let base = Date.now.addingTimeInterval(-day)
+        let base = Self.dayStart(before: 1)
         for index in 0..<8 {
             objects.append(
                 record(
@@ -200,7 +215,7 @@ final class HealthAnalysisTests: XCTestCase {
     func testTwoUnrelatedTypesAreNotReportedAsRelated() async throws {
         var noise = Noise()
         var objects: [[String: Any]] = []
-        let base = Date.now.addingTimeInterval(-day)
+        let base = Self.dayStart(before: 1)
         for index in 0..<120 {
             let date = base.addingTimeInterval(-Double(119 - index) * day)
             objects.append(
@@ -230,7 +245,7 @@ final class HealthAnalysisTests: XCTestCase {
 
     func testTooFewSharedDaysRefusesToCorrelate() async throws {
         var objects: [[String: Any]] = []
-        let base = Date.now.addingTimeInterval(-day)
+        let base = Self.dayStart(before: 1)
         for index in 0..<10 {
             let date = base.addingTimeInterval(-Double(index) * day)
             objects.append(
@@ -256,7 +271,7 @@ final class HealthAnalysisTests: XCTestCase {
     /// "not synced yet". Answering zero, or erroring, would both be wrong.
     func testAnUnsyncedTypeSaysSoRatherThanReportingNothing() async throws {
         var objects: [[String: Any]] = []
-        let base = Date.now.addingTimeInterval(-day)
+        let base = Self.dayStart(before: 1)
         for index in 0..<40 {
             objects.append(
                 record(
@@ -291,7 +306,7 @@ final class HealthAnalysisTests: XCTestCase {
     func testAWearGapIsNotReportedAsAnUnusualReading() async throws {
         var noise = Noise()
         var objects: [[String: Any]] = []
-        let base = Date.now.addingTimeInterval(-day)
+        let base = Self.dayStart(before: 1)
 
         for index in 0..<120 {
             let date = base.addingTimeInterval(-Double(119 - index) * day)
@@ -356,7 +371,7 @@ final class HealthAnalysisTests: XCTestCase {
 
     func testNoBaselineRefusesToJudgeADayAsUnusual() async throws {
         var objects: [[String: Any]] = []
-        let base = Date.now.addingTimeInterval(-day)
+        let base = Self.dayStart(before: 1)
         for index in 0..<6 {
             objects.append(
                 record(
