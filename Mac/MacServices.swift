@@ -52,6 +52,31 @@ final class MacServices {
     private(set) var token = ""
     private(set) var computerName = ""
 
+    // MARK: - Dashboard state
+
+    /// The whole archive's extent, so an "all time" chart knows where to start.
+    private(set) var archiveSpan: (earliest: Date, latest: Date)?
+    private(set) var archiveDensity: [ArchiveDensityColumn] = []
+    private(set) var overview: [HealthDomain: [IngestStore.MetricSnapshot]] = [:]
+    private(set) var detail: TypeSeries?
+    private(set) var distribution: [DistributionBucket]?
+    private(set) var recent: [HealthRecord] = []
+    private(set) var comparison: [ComparisonSeries] = []
+    private(set) var comparisonTypes: [String] = []
+    private(set) var workouts: [IngestStore.StoredWorkout] = []
+    private(set) var electrocardiograms: [IngestStore.StoredElectrocardiogram] = []
+    private(set) var waveform: IngestStore.Waveform?
+    private(set) var moods: [IngestStore.StoredMoodEntry] = []
+    private(set) var medications: [IngestStore.MedicationAdherence] = []
+
+    /// The viewer's own calendar.
+    ///
+    /// A desktop dashboard is read in the room it is standing in, so days are
+    /// the days of whoever is looking. Held in one place so every chart, axis
+    /// label and coverage count uses the same one rather than each reaching for
+    /// `.current` and quietly disagreeing at a boundary.
+    let calendar = Calendar.current
+
     private var store: IngestStore?
     private var receiver: HealthReceiver?
     private var watcher: FolderIngestWatcher?
@@ -256,6 +281,154 @@ final class MacServices {
     ) async -> [AggregateBucket] {
         guard let store else { return [] }
         return (try? await store.aggregate(type: type, bucket: bucket)) ?? []
+    }
+
+    // MARK: - Dashboards
+
+    /// The columns a range asks for, in the viewer's own calendar.
+    private func plan(for range: ChartRange) -> TimeBucketPlan {
+        TimeBucketPlan.forRange(
+            range,
+            now: .now,
+            earliest: archiveSpan?.earliest,
+            calendar: calendar
+        )
+    }
+
+    /// Everything the overview draws.
+    ///
+    /// Loaded in one hop across the actor boundary per section rather than one
+    /// per chart. Each query aggregates in SQLite, so what crosses back is a few
+    /// hundred columns rather than the 147,330 rows behind them.
+    func loadOverview(range: ChartRange) async {
+        guard let store else { return }
+        if archiveSpan == nil {
+            archiveSpan = try? await store.archiveSpan()
+        }
+
+        // Always the whole archive, whatever range the metrics are showing:
+        // this chart's job is to put the sweep's shape on screen, and a
+        // seven-day window of it would show nothing at all.
+        let wholeArchive = TimeBucketPlan.forRange(
+            .all,
+            now: .now,
+            earliest: archiveSpan?.earliest,
+            calendar: calendar
+        )
+        archiveDensity = (try? await store.archiveDensity(plan: wholeArchive)) ?? []
+
+        let plan = plan(for: range)
+        var loaded: [HealthDomain: [IngestStore.MetricSnapshot]] = [:]
+        for domain in HealthDomain.allCases {
+            loaded[domain] = (try? await store.snapshots(
+                types: domain.types,
+                plan: plan
+            )) ?? []
+        }
+        overview = loaded
+    }
+
+    func loadDetail(type: String, range: ChartRange) async {
+        guard let store else { return }
+        if archiveSpan == nil {
+            archiveSpan = try? await store.archiveSpan()
+        }
+        let plan = plan(for: range)
+        // Cleared first so a slow query never leaves the previous type's numbers
+        // under the new type's name.
+        detail = nil
+        distribution = nil
+        recent = []
+
+        detail = try? await store.series(type: type, plan: plan)
+        if let span = plan.span {
+            distribution = try? await store.distribution(
+                type: type,
+                from: span.start,
+                to: span.end
+            )
+        }
+        recent = (try? await store.samples(type: type, limit: 8)) ?? []
+    }
+
+    /// Types worth offering for comparison.
+    ///
+    /// Anything with a number in it and more than a handful of records. A type
+    /// with three samples cannot show a relationship with anything.
+    var comparableTypes: [TypeSummary] {
+        summaries
+            .filter { $0.recordCount >= 10 }
+            .sorted { left, right in
+                HealthMeasure.measure(for: left.type, storedUnit: left.unit).displayName
+                    < HealthMeasure.measure(for: right.type, storedUnit: right.unit).displayName
+            }
+    }
+
+    func toggleComparison(_ type: String, limit: Int) {
+        if let index = comparisonTypes.firstIndex(of: type) {
+            comparisonTypes.remove(at: index)
+        } else if comparisonTypes.count < limit {
+            comparisonTypes.append(type)
+        } else {
+            // Replacing the oldest rather than refusing: the chip that was
+            // tapped is the one the person wants to see.
+            comparisonTypes.removeFirst()
+            comparisonTypes.append(type)
+        }
+    }
+
+    func loadComparison(range: ChartRange) async {
+        guard let store, !comparisonTypes.isEmpty else {
+            comparison = []
+            return
+        }
+        if archiveSpan == nil {
+            archiveSpan = try? await store.archiveSpan()
+        }
+        let plan = plan(for: range)
+        var lines: [ComparisonSeries] = []
+        for type in comparisonTypes {
+            guard let series = try? await store.series(type: type, plan: plan),
+                  let line = ComparisonSeries(series: series) else {
+                continue
+            }
+            lines.append(line)
+        }
+        comparison = lines
+    }
+
+    func loadWorkouts() async {
+        guard let store else { return }
+        workouts = (try? await store.workouts(limit: 500)) ?? []
+    }
+
+    func route(forWorkout id: String) async -> WorkoutRoute? {
+        guard let store else { return nil }
+        return try? await store.route(forWorkout: id)
+    }
+
+    func heartRate(
+        duringWorkout id: String
+    ) async -> [(at: Date, beatsPerMinute: Double)] {
+        guard let store else { return [] }
+        return (try? await store.heartRate(duringWorkout: id)) ?? []
+    }
+
+    func loadElectrocardiograms() async {
+        guard let store else { return }
+        electrocardiograms = (try? await store.electrocardiograms()) ?? []
+    }
+
+    func loadWaveform(id: String) async {
+        guard let store else { return }
+        waveform = nil
+        waveform = try? await store.voltages(forElectrocardiogram: id)
+    }
+
+    func loadMoodAndMedication() async {
+        guard let store else { return }
+        moods = (try? await store.moodEntries()) ?? []
+        medications = (try? await store.medicationAdherence()) ?? []
     }
 
     func samples(type: String, limit: Int = 200) async -> [HealthRecord] {
