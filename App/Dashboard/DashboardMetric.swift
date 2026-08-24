@@ -66,6 +66,14 @@ struct DashboardMetric: Identifiable, Hashable, Sendable {
     /// How many decimal places the headline deserves. A step count with a
     /// decimal point is noise; a body mass without one is a lie by rounding.
     let fractionDigits: Int
+    /// A rule this metric is filed under, said where someone can read it.
+    ///
+    /// Some metrics need a choice made before they can be drawn at all, and a
+    /// choice a reader cannot see looks like a bug when it surprises them. The
+    /// rule belongs on the screen beside the number, not only in a comment in
+    /// the source — otherwise the only people who can tell the number is
+    /// correct are the people who wrote it.
+    var note: String? = nil
 
     var id: String {
         switch kind {
@@ -189,7 +197,11 @@ enum DashboardMetrics {
             title: "Sleep",
             unitLabel: "hours",
             icon: .bed,
-            fractionDigits: 1
+            fractionDigits: 1,
+            note: """
+            Sleep starting at 6pm or later counts towards the next day. \
+            Overlapping records are counted once.
+            """
         ),
         DashboardMetric(
             kind: .quantity(HKQuantityTypeIdentifier.distanceWalkingRunning.rawValue),
@@ -299,6 +311,23 @@ enum SleepAttribution {
     /// two bars and halving both. Six in the evening is the boundary Health
     /// itself presents sleep on, and it puts a whole night — and an afternoon
     /// nap — where a person would look for it.
+    ///
+    /// It is not free of oddities, and the caption is worded around them. An
+    /// evening nap from 19:00 to 20:00 is filed under the *next* day even
+    /// though nobody woke then, and someone asleep by 17:30 has their night
+    /// filed under the day it started. Both follow from deciding on the start
+    /// alone. Deciding on the *end* instead would fix those two and break a
+    /// commoner case: dozing 22:00–23:00 and then sleeping 23:30–07:00 would
+    /// split one night across two days rather than reporting eight and a half
+    /// hours for it. No rule is right everywhere, so the screen states the
+    /// mechanism — "sleep that starts after 6pm counts towards the next day" —
+    /// which is true in every case, rather than a friendlier summary that is
+    /// true only in most.
+    ///
+    /// This rule is stated on screen, not only here: `DashboardMetrics.sleep`
+    /// carries a note the detail view prints under the chart. A filing rule a
+    /// reader cannot see makes a correct number look like a mistake. Changing
+    /// the hour means changing that sentence too.
     static let dayBoundaryHour = 18
 
     /// The day a stretch of sleep counts towards.

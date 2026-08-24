@@ -116,6 +116,11 @@ struct MetricDetailView: View {
                     MetricEmptyNote()
                         .padding(.vertical, 26)
                 }
+                // Printed whatever the state, because a filing rule explains an
+                // empty chart as readily as a full one.
+                if let note = metric.note {
+                    MetricNoteLine(text: note)
+                }
             } else {
                 ProgressView()
                     .frame(maxWidth: .infinity)

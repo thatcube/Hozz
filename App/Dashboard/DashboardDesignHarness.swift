@@ -17,6 +17,15 @@ import SwiftUI
 ///
 /// Compiled out of release builds entirely, and reachable in a debug build
 /// only by launching with `-HozzDesignHarness`.
+///
+/// **Not dead code — do not delete.** It has no callers in the app because it
+/// is reached by a launch argument, so it reads as unused to anything that
+/// looks for references. It is the only way to see these screens rendered
+/// without Brandon's phone, and it is how a bug that made *every bar chart in
+/// the app invisible* was found: `BarMark` against a date axis draws nothing
+/// unless given a `unit:`, and it does so while compiling cleanly, labelling
+/// its axes and passing every test. Deleting this removes the only check that
+/// catches that class of fault.
 enum DashboardHarnessLaunch {
     static var isRequested: Bool {
         ProcessInfo.processInfo.arguments.contains("-HozzDesignHarness")
@@ -415,6 +424,30 @@ struct DashboardDesignHarness: View {
                     }
                     MetricChart(series: series, metric: SampleSeries.steps, range: .month)
                     MetricCoverageNote(coverage: series.coverage(now: .now), range: .month)
+                }
+                .hozzCard()
+
+                // Sleep is here specifically to render its filing rule. It is
+                // the one metric that files a reading under a day it did not
+                // start on, and the sentence explaining that is easy to break
+                // without anyone noticing, because nothing else shows it.
+                VStack(alignment: .leading, spacing: 12) {
+                    Text("Sleep, a month").hozzLabel().textCase(.uppercase)
+                    MetricChart(
+                        series: SampleSeries.full(
+                            .month,
+                            aggregation: .total,
+                            base: 7.3,
+                            spread: 1.1,
+                            unit: "hr",
+                            overall: nil
+                        ),
+                        metric: SampleSeries.sleep,
+                        range: .month
+                    )
+                    if let note = SampleSeries.sleep.note {
+                        MetricNoteLine(text: note)
+                    }
                 }
                 .hozzCard()
 
