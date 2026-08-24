@@ -81,7 +81,7 @@ extension HealthSyncEngine {
                 scope: scope,
                 type: type,
                 windowStart: window.start,
-                windowEnd: window.end,
+                startedAt: window.end,
                 chunkSeconds: PrimePlan.initialChunk,
                 at: now
             )
@@ -89,12 +89,28 @@ extension HealthSyncEngine {
 
         let pending = try await store.primeRecords(scope: scope)
             .filter { eligible.contains($0.type) }
-            .filter { $0.state == .priming }
-            .filter { $0.frontier > $0.windowStart }
+            // A stalled type is skipped whole. Its density is what stopped the
+            // backfill, and the same density is waiting at the leading edge.
+            .filter { $0.state != .stalled }
+            .filter { record in
+                record.frontier > record.windowStart
+                    || record.coveredThrough
+                        .addingTimeInterval(PrimePlan.topUpInterval) <= now
+            }
         round.remains = !pending.isEmpty
         guard !pending.isEmpty else {
             return round
         }
+
+        // What still owes a backfill, which is what "still priming" means to a
+        // surface. A type whose backfill is done goes on topping up forever,
+        // and reporting that as unfinished work would leave a progress display
+        // that never completes.
+        var owingBackfill = Set(
+            pending
+                .filter { $0.state == .priming && $0.frontier > $0.windowStart }
+                .map(\.type)
+        )
 
         // Least-covered first, rather than in catalogue order or by the clock.
         // Coverage then spreads across types instead of pooling in whichever
@@ -143,8 +159,8 @@ extension HealthSyncEngine {
             round.wasInterrupted = round.wasInterrupted || walk.wasInterrupted
             if let commit = walk.commit {
                 round.commits.append(commit)
-                if commit.state == .priming {
-                    round.remains = true
+                if commit.state != .priming {
+                    owingBackfill.remove(commit.type)
                 }
             }
             if walk.waitingForUnlock {
@@ -156,7 +172,27 @@ extension HealthSyncEngine {
             }
         }
 
+        round.remains = !owingBackfill.isEmpty
         return round
+    }
+
+    /// What one dated read came back with.
+    private enum ChunkRead {
+        case read(DatedHealthChanges)
+        /// iOS took its background time back. Ordinary, and not a fault.
+        case interrupted
+        /// Health cannot be read at all until the phone is unlocked.
+        case locked
+        case failed(String)
+    }
+
+    /// Whether either cursor moved away from where the stored record had them.
+    private static func moved(
+        _ frontier: Date,
+        _ coveredThrough: Date,
+        _ record: PrimeRecord
+    ) -> Bool {
+        frontier < record.frontier || coveredThrough > record.coveredThrough
     }
 
     /// One type's walk during one pass.
@@ -170,7 +206,13 @@ extension HealthSyncEngine {
         var waitingForUnlock = false
     }
 
-    /// Reads chunks of one type's window, newest first, until the budget ends.
+    /// Reads chunks of one type's window until the budget ends: the leading
+    /// edge first, then further into the past.
+    ///
+    /// The order is not arbitrary. Data recorded this morning is at the end of
+    /// the anchored sweep's queue, behind years of backlog, so this walk is the
+    /// only thing that will deliver it this month — and somebody looking at a
+    /// dashboard notices today missing long before they notice February.
     ///
     /// Never throws. A type that cannot be read is a fact about that type, and
     /// letting it abort the pass would take the other types' progress with it —
@@ -185,23 +227,143 @@ extension HealthSyncEngine {
     ) async -> PrimeWalk {
         var walk = PrimeWalk()
         var frontier = record.frontier
+        var coveredThrough = record.coveredThrough
         var seconds = record.chunkSeconds
-        var state = PrimeState.priming
+        var state = record.state
         var failureReason: String?
         var queries = 0
 
-        loop: while true {
+        /// Reads one chunk, or says why it could not.
+        ///
+        /// Deliberately touches none of the walk's state: it takes a range and
+        /// returns an answer. An earlier version recorded the failure from in
+        /// here, which put a mutable local in the same isolation region as an
+        /// actor call and was rejected — rightly, since it was also two places
+        /// that could decide what the walk's state was.
+        func read(_ chunk: Range<Date>) async -> ChunkRead {
+            do {
+                return .read(
+                    try await source.changes(
+                        for: record.type,
+                        from: chunk.lowerBound,
+                        to: chunk.upperBound,
+                        limit: PrimePlan.chunkCapacity
+                    )
+                )
+            } catch {
+                if error is CancellationError || Task.isCancelled {
+                    // iOS taking its time back is the ordinary case, not a
+                    // fault, and recording it as one would report a healthy
+                    // type as broken.
+                    return .interrupted
+                }
+                let failure = HealthKitFailure.classify(
+                    error,
+                    typeIdentifier: record.type.rawValue
+                )
+                if failure.kind == .deviceLocked {
+                    return .locked
+                }
+                return .failed(
+                    failure.underlyingDescription ?? "Health could not be read."
+                )
+            }
+        }
+
+        /// Whether there is room for one more whole chunk.
+        ///
+        /// A chunk is delivered whole or not at all, so a walk only starts one
+        /// it can hold. Asking for a smaller page instead would make a *budget*
+        /// limit look like a density limit, and the walk would shrink its chunk
+        /// in response — permanently, since the length is stored.
+        func hasRoom() -> Bool {
+            walk.changes.count + PrimePlan.chunkCapacity <= allowance
+                && walk.bytes < byteAllowance
+                && queries < Self.primeQueriesPerType
+        }
+
+        /// Handles a chunk that came back over capacity. Returns false when the
+        /// walk cannot narrow any further and has to stop.
+        func narrow() -> Bool {
+            if PrimePlan.isAtMinimum(seconds) {
+                // A minute of one type overflowing a five-hundred record bite
+                // is not something the dated reader can page through without
+                // either dropping records or holding more than a background
+                // launch is given. It stops and says so. The sweep still
+                // reaches every one of these records, so this costs speed
+                // rather than data — and a stalled prime keeps claiming
+                // exactly the stretch it had already delivered.
+                state = .stalled
+                failureReason =
+                    "More records than one read can hold in the shortest window Hozz will ask for."
+                Self.primeLog.notice(
+                    "A type is too dense for a dated read at the shortest window."
+                )
+                return false
+            }
+            seconds = PrimePlan.narrowed(seconds)
+            return true
+        }
+
+        // The leading edge, walked upwards so a half-finished top-up still
+        // abuts what is already covered and can be recorded as it goes.
+        topUp: while state != .stalled {
             if Task.isCancelled {
                 walk.wasInterrupted = true
-                break loop
+                break topUp
+            }
+            guard hasRoom() else {
+                walk.wasInterrupted = true
+                break topUp
             }
             guard
-                walk.changes.count + PrimePlan.chunkCapacity <= allowance,
-                walk.bytes < byteAllowance,
-                queries < Self.primeQueriesPerType
+                let chunk = PrimePlan.topUp(
+                    coveredThrough: coveredThrough,
+                    ceiling: now,
+                    seconds: seconds
+                )
             else {
+                break topUp
+            }
+            let batch: DatedHealthChanges
+            switch await read(chunk) {
+            case .read(let found):
+                queries += 1
+                batch = found
+            case .interrupted:
                 walk.wasInterrupted = true
-                break loop
+                break topUp
+            case .locked:
+                walk.wasInterrupted = true
+                walk.waitingForUnlock = true
+                break topUp
+            case .failed(let reason):
+                walk.wasInterrupted = true
+                failureReason = reason
+                break topUp
+            }
+            if batch.isTruncated {
+                if narrow() {
+                    continue topUp
+                }
+                break topUp
+            }
+
+            walk.changes.append(contentsOf: batch.changes)
+            walk.bytes += batch.changes.reduce(0) { $0 + $1.approximateByteCount }
+            coveredThrough = chunk.upperBound
+            seconds = PrimePlan.resized(seconds, after: batch.changes.count)
+        }
+
+        // Then backwards into the past, until the oldest instant aimed at.
+        backfill: while state == .priming {
+            if Task.isCancelled {
+                walk.wasInterrupted = true
+                break backfill
+            }
+            guard hasRoom() else {
+                walk.wasInterrupted = true
+                break backfill
             }
             guard
                 let chunk = PrimePlan.chunk(
@@ -211,92 +373,69 @@ extension HealthSyncEngine {
                 )
             else {
                 state = .covered
-                break loop
+                break backfill
             }
-
             let batch: DatedHealthChanges
-            do {
-                batch = try await source.changes(
-                    for: record.type,
-                    from: chunk.lowerBound,
-                    to: chunk.upperBound,
-                    limit: PrimePlan.chunkCapacity
-                )
-            } catch {
-                if error is CancellationError || Task.isCancelled {
-                    // iOS taking its time back is the ordinary case, not a
-                    // fault, and recording it as one would report a healthy
-                    // type as broken.
-                    walk.wasInterrupted = true
-                    break loop
-                }
-                let failure = HealthKitFailure.classify(
-                    error,
-                    typeIdentifier: record.type.rawValue
-                )
+            switch await read(chunk) {
+            case .read(let found):
+                queries += 1
+                batch = found
+            case .interrupted:
                 walk.wasInterrupted = true
-                if failure.kind == .deviceLocked {
-                    walk.waitingForUnlock = true
-                } else {
-                    failureReason = failure.underlyingDescription
-                    try? await store.recordPrimeState(
-                        scope: scope,
-                        type: record.type,
-                        state: .priming,
-                        failureReason: failure.underlyingDescription,
-                        at: now
-                    )
-                }
-                break loop
+                break backfill
+            case .locked:
+                walk.wasInterrupted = true
+                walk.waitingForUnlock = true
+                break backfill
+            case .failed(let reason):
+                walk.wasInterrupted = true
+                failureReason = reason
+                break backfill
             }
-            queries += 1
-
             if batch.isTruncated {
-                // More in this stretch than a single bite can hold. Ask again
-                // for a shorter one; nothing is delivered and the frontier has
-                // not moved, so the retry costs a query and no correctness.
-                if PrimePlan.isAtMinimum(seconds) {
-                    // A minute of one type overflowing a five-hundred record
-                    // bite is not something the dated reader can page through
-                    // without either dropping records or holding more than a
-                    // background launch is given. It stops and says so. The
-                    // sweep still reaches every one of these records, so this
-                    // costs speed rather than data — and a stalled prime keeps
-                    // claiming exactly the window it had already delivered.
-                    state = .stalled
-                    failureReason =
-                        "More records than one read can hold in the shortest window Hozz will ask for."
-                    Self.primeLog.notice(
-                        "A type is too dense for a dated read at the shortest window."
-                    )
-                    break loop
+                if narrow() {
+                    continue backfill
                 }
-                seconds = PrimePlan.narrowed(seconds)
-                continue loop
+                break backfill
             }
 
             walk.changes.append(contentsOf: batch.changes)
             walk.bytes += batch.changes.reduce(0) { $0 + $1.approximateByteCount }
-            // The frontier moves to the chunk's start, and only in memory. It
+            // The cursor moves to the chunk's edge, and only in memory. It
             // reaches the store when the destination has accepted the batch —
             // that ordering is the whole resumability story, and reversing it
-            // would claim a window that a failed delivery never carried.
+            // would claim a stretch that a failed delivery never carried.
             frontier = chunk.lowerBound
             seconds = PrimePlan.resized(seconds, after: batch.changes.count)
 
             if frontier <= record.windowStart {
                 state = .covered
-                break loop
+                break backfill
             }
         }
 
-        guard frontier < record.frontier || state != .priming else {
+        // A read that failed is recorded even when nothing moved, so the next
+        // pass and any surface asking why can see it. It changes no cursor, so
+        // the claim stays exactly what it was.
+        if let failureReason, !Self.moved(frontier, coveredThrough, record) {
+            try? await store.recordPrimeState(
+                scope: scope,
+                type: record.type,
+                state: state,
+                failureReason: failureReason,
+                at: now
+            )
+        }
+
+        guard Self.moved(frontier, coveredThrough, record) || state != record.state else {
             return walk
         }
         walk.commit = PendingPrimeCommit(
             type: record.type,
             baseFrontier: record.frontier,
+            baseCoveredThrough: record.coveredThrough,
             frontier: frontier,
+            coveredThrough: coveredThrough,
             chunkSeconds: seconds,
             addedRecordCount: walk.changes.count,
             state: state,
@@ -305,13 +444,18 @@ extension HealthSyncEngine {
         return walk
     }
 
-    /// How much of a window has genuinely been covered, from 0 to 1.
+    /// How much of the intended window has genuinely been covered, from 0 to 1.
+    ///
+    /// Measured from where the prime began rather than from the covered
+    /// stretch's own length, because the top-up keeps extending that stretch
+    /// past the instant it started at — and a fraction that could exceed one is
+    /// not a fraction of anything.
     static func coveredFraction(_ record: PrimeRecord) -> Double {
-        let span = record.windowEnd.timeIntervalSince(record.windowStart)
+        let span = record.startedAt.timeIntervalSince(record.windowStart)
         guard span > 0 else {
             return 1
         }
-        let covered = record.windowEnd.timeIntervalSince(record.frontier)
+        let covered = record.startedAt.timeIntervalSince(record.frontier)
         return min(1, max(0, covered / span))
     }
 

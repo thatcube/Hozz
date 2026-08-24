@@ -210,8 +210,9 @@ public actor HozzStore {
                         scope TEXT NOT NULL,
                         type_key TEXT NOT NULL,
                         window_start REAL NOT NULL,
-                        window_end REAL NOT NULL,
+                        started_at REAL NOT NULL,
                         frontier REAL NOT NULL,
+                        covered_through REAL NOT NULL,
                         chunk_seconds REAL NOT NULL,
                         delivered_count INTEGER NOT NULL DEFAULT 0,
                         state TEXT NOT NULL,
@@ -439,8 +440,8 @@ public actor HozzStore {
     ) throws -> PrimeRecord? {
         try database.query(
             """
-            SELECT type_key, window_start, window_end, frontier, chunk_seconds,
-                   delivered_count, state, failure_reason, updated_at
+            SELECT type_key, window_start, started_at, frontier, covered_through,
+                   chunk_seconds, delivered_count, state, failure_reason, updated_at
             FROM prime_state
             WHERE scope = ? AND type_key = ?;
             """,
@@ -452,8 +453,8 @@ public actor HozzStore {
     public func primeRecords(scope: AnchorScope) throws -> [PrimeRecord] {
         try database.query(
             """
-            SELECT type_key, window_start, window_end, frontier, chunk_seconds,
-                   delivered_count, state, failure_reason, updated_at
+            SELECT type_key, window_start, started_at, frontier, covered_through,
+                   chunk_seconds, delivered_count, state, failure_reason, updated_at
             FROM prime_state
             WHERE scope = ?
             ORDER BY type_key;
@@ -475,35 +476,37 @@ public actor HozzStore {
         scope: AnchorScope,
         type: HealthTypeKey,
         windowStart: Date,
-        windowEnd: Date,
+        startedAt: Date,
         chunkSeconds: TimeInterval,
         at date: Date = .now
     ) throws -> PrimeRecord {
         if let existing = try primeRecord(scope: scope, type: type) {
             return existing
         }
-        // The frontier starts at the window's end, meaning nothing has been
-        // covered. It is the same value a completed prime would have if the
-        // window were empty, which is why `coveredWindow` treats the two
+        // Both cursors start at the same instant, which means the covered
+        // stretch is empty. That is the same arrangement a prime with nothing
+        // to do would have, which is why `coveredWindow` treats the two
         // identically: neither licenses a claim.
         try database.run(
             """
             INSERT INTO prime_state (
-                scope, type_key, window_start, window_end, frontier,
-                chunk_seconds, delivered_count, state, failure_reason, updated_at
+                scope, type_key, window_start, started_at, frontier,
+                covered_through, chunk_seconds, delivered_count, state,
+                failure_reason, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, NULL, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, NULL, ?)
             ON CONFLICT(scope, type_key) DO NOTHING;
             """,
             [
                 .text(scope.rawValue),
                 .text(type.rawValue),
                 .real(windowStart.timeIntervalSince1970),
-                .real(windowEnd.timeIntervalSince1970),
-                .real(windowEnd.timeIntervalSince1970),
+                .real(startedAt.timeIntervalSince1970),
+                .real(startedAt.timeIntervalSince1970),
+                .real(startedAt.timeIntervalSince1970),
                 .real(chunkSeconds),
                 .text(
-                    windowStart < windowEnd
+                    windowStart < startedAt
                         ? PrimeState.priming.rawValue
                         : PrimeState.covered.rawValue
                 ),
@@ -518,13 +521,13 @@ public actor HozzStore {
         return record
     }
 
-    /// Records that a prime cannot continue, without moving its frontier.
+    /// Records that a prime cannot continue, without moving either cursor.
     ///
     /// Separate from a commit because a stall is discovered while *reading*,
     /// before anything has been delivered, and a pass whose delivery then fails
-    /// must still remember why the walk stopped. Nothing here touches the
-    /// frontier, so a stalled prime keeps claiming exactly what it had already
-    /// delivered and not one second more.
+    /// must still remember why the walk stopped. Nothing here touches a cursor,
+    /// so a stalled prime keeps claiming exactly what it had already delivered
+    /// and not one second more.
     public func recordPrimeState(
         scope: AnchorScope,
         type: HealthTypeKey,
@@ -550,32 +553,33 @@ public actor HozzStore {
 
     /// Points every prime in a scope at a fresh window and walks it again.
     ///
-    /// The frontier returns to the new window's end, so the app immediately
-    /// stops claiming a window it is about to re-read. Re-reading delivers
+    /// Both cursors return to the new starting instant, so the app immediately
+    /// stops claiming a stretch it is about to re-read. Re-reading delivers
     /// records the destination already has, which the receiver upserts, so the
     /// cost of asking for this twice is bytes rather than duplicates.
     public func restartPrime(
         scope: AnchorScope,
         windowStart: Date,
-        windowEnd: Date,
+        startedAt: Date,
         chunkSeconds: TimeInterval,
         at date: Date = .now
     ) throws {
         try database.run(
             """
             UPDATE prime_state
-            SET window_start = ?, window_end = ?, frontier = ?,
-                chunk_seconds = ?, delivered_count = 0, state = ?,
-                failure_reason = NULL, updated_at = ?
+            SET window_start = ?, started_at = ?, frontier = ?,
+                covered_through = ?, chunk_seconds = ?, delivered_count = 0,
+                state = ?, failure_reason = NULL, updated_at = ?
             WHERE scope = ?;
             """,
             [
                 .real(windowStart.timeIntervalSince1970),
-                .real(windowEnd.timeIntervalSince1970),
-                .real(windowEnd.timeIntervalSince1970),
+                .real(startedAt.timeIntervalSince1970),
+                .real(startedAt.timeIntervalSince1970),
+                .real(startedAt.timeIntervalSince1970),
                 .real(chunkSeconds),
                 .text(
-                    windowStart < windowEnd
+                    windowStart < startedAt
                         ? PrimeState.priming.rawValue
                         : PrimeState.covered.rawValue
                 ),
@@ -601,29 +605,36 @@ public actor HozzStore {
             throw HozzStoreError.unknownPrime(type: commit.type.rawValue)
         }
         // The same rule the anchors follow, for the same reason: an advance
-        // computed from a frontier that has since moved describes a chunk
+        // computed from cursors that have since moved describes a stretch
         // somebody else may already have handled, and applying it would leave
-        // the frontier below data nothing read.
-        guard existing.frontier == commit.baseFrontier else {
+        // a cursor claiming data nothing read.
+        guard
+            existing.frontier == commit.baseFrontier,
+            existing.coveredThrough == commit.baseCoveredThrough
+        else {
             throw HozzStoreError.stalePrimeFrontier(type: commit.type.rawValue)
         }
-        // A frontier only ever moves backwards through time, towards the start
-        // of the window. Forwards would abandon a stretch already delivered
-        // while still claiming it.
-        guard commit.frontier <= existing.frontier else {
+        // The covered stretch only ever grows, and only outwards. A frontier
+        // that moved up, or a covered edge that moved down, would abandon time
+        // already delivered while still claiming it.
+        guard
+            commit.frontier <= existing.frontier,
+            commit.coveredThrough >= existing.coveredThrough
+        else {
             throw HozzStoreError.stalePrimeFrontier(type: commit.type.rawValue)
         }
 
         try database.run(
             """
             UPDATE prime_state
-            SET frontier = ?, chunk_seconds = ?,
+            SET frontier = ?, covered_through = ?, chunk_seconds = ?,
                 delivered_count = delivered_count + ?, state = ?,
                 failure_reason = ?, updated_at = ?
             WHERE scope = ? AND type_key = ?;
             """,
             [
                 .real(commit.frontier.timeIntervalSince1970),
+                .real(commit.coveredThrough.timeIntervalSince1970),
                 .real(commit.chunkSeconds),
                 .integer(Int64(commit.addedRecordCount)),
                 .text(commit.state.rawValue),
@@ -639,24 +650,26 @@ public actor HozzStore {
         guard let type = HealthTypeKey(rawValue: row.text(0)) else {
             throw HozzStoreError.corruptStoredValue("empty prime type key")
         }
-        guard let state = PrimeState(rawValue: row.text(6)) else {
+        guard let state = PrimeState(rawValue: row.text(7)) else {
             throw HozzStoreError.corruptStoredValue(
-                "unknown prime state \(row.text(6))"
+                "unknown prime state \(row.text(7))"
             )
         }
 
         return PrimeRecord(
             type: type,
             windowStart: Date(timeIntervalSince1970: row.real(1)),
-            windowEnd: Date(timeIntervalSince1970: row.real(2)),
+            startedAt: Date(timeIntervalSince1970: row.real(2)),
             frontier: Date(timeIntervalSince1970: row.real(3)),
-            chunkSeconds: row.real(4),
-            deliveredCount: Int(row.integer(5)),
+            coveredThrough: Date(timeIntervalSince1970: row.real(4)),
+            chunkSeconds: row.real(5),
+            deliveredCount: Int(row.integer(6)),
             state: state,
-            failureReason: row.optionalText(7),
-            updatedAt: Date(timeIntervalSince1970: row.real(8))
+            failureReason: row.optionalText(8),
+            updatedAt: Date(timeIntervalSince1970: row.real(9))
         )
     }
+
 
     // MARK: - Export runs
 

@@ -208,6 +208,96 @@ final class PrimePlanTests: XCTestCase {
             "Ninety days is 7,776,000 seconds."
         )
     }
+
+    // MARK: - The leading edge
+
+    func testATopUpChunkStartsWhereTheCoveredStretchEnds() throws {
+        let coveredThrough = origin
+        let chunk = try XCTUnwrap(
+            PrimePlan.topUp(
+                coveredThrough: coveredThrough,
+                ceiling: origin.addingTimeInterval(10 * 86_400),
+                seconds: 3 * 86_400
+            )
+        )
+
+        XCTAssertEqual(
+            chunk.lowerBound,
+            coveredThrough,
+            """
+            A top-up must abut what is already covered. A gap between them \
+            would leave the claimed stretch discontinuous while still being \
+            reported as one window.
+            """
+        )
+        XCTAssertEqual(
+            chunk.upperBound,
+            Date(timeIntervalSince1970: 1_700_000_000 + 3 * 86_400)
+        )
+    }
+
+    func testATopUpNeverReadsPastTheMomentItWasAskedAbout() throws {
+        let ceiling = origin.addingTimeInterval(600)
+        let chunk = try XCTUnwrap(
+            PrimePlan.topUp(
+                coveredThrough: origin,
+                ceiling: ceiling,
+                seconds: 30 * 86_400
+            )
+        )
+
+        XCTAssertEqual(
+            chunk.upperBound,
+            ceiling,
+            "Reading into the future would claim a stretch that has not happened."
+        )
+    }
+
+    func testACaughtUpEdgeHasNothingToTopUp() {
+        XCTAssertNil(
+            PrimePlan.topUp(
+                coveredThrough: origin,
+                ceiling: origin,
+                seconds: 86_400
+            )
+        )
+        XCTAssertNil(
+            PrimePlan.topUp(
+                coveredThrough: origin.addingTimeInterval(1),
+                ceiling: origin,
+                seconds: 86_400
+            )
+        )
+    }
+
+    /// The two walks meet without overlapping and without a seam.
+    func testTheBackfillAndTheTopUpShareOneEdgeExactly() throws {
+        let started = origin
+        let backfill = try XCTUnwrap(
+            PrimePlan.chunk(
+                frontier: started,
+                windowStart: started.addingTimeInterval(-90 * 86_400),
+                seconds: 86_400
+            )
+        )
+        let topUp = try XCTUnwrap(
+            PrimePlan.topUp(
+                coveredThrough: started,
+                ceiling: started.addingTimeInterval(600),
+                seconds: 86_400
+            )
+        )
+
+        XCTAssertEqual(
+            backfill.upperBound,
+            topUp.lowerBound,
+            """
+            Both walks start from the instant the prime began. The backfill \
+            excludes that instant and the top-up includes it, so a sample \
+            recorded exactly then belongs to precisely one of them.
+            """
+        )
+    }
 }
 
 /// What the store will and will not let a prime say about itself.
@@ -218,7 +308,7 @@ final class PrimeStoreTests: XCTestCase {
         UUID(uuidString: "11111111-2222-3333-4444-555555555555")!
     )
     private let start = Date(timeIntervalSince1970: 1_700_000_000)
-    private var end: Date { start.addingTimeInterval(90 * 86_400) }
+    private var startedAt: Date { start.addingTimeInterval(90 * 86_400) }
 
     override func setUpWithError() throws {
         directory = try TemporaryDirectory()
@@ -237,7 +327,7 @@ final class PrimeStoreTests: XCTestCase {
             scope: scope,
             type: steps,
             windowStart: start,
-            windowEnd: end,
+            startedAt: startedAt,
             chunkSeconds: PrimePlan.initialChunk
         )
     }
@@ -246,7 +336,8 @@ final class PrimeStoreTests: XCTestCase {
         let store = try makeStore()
         let record = try await seed(store)
 
-        XCTAssertEqual(record.frontier, record.windowEnd)
+        XCTAssertEqual(record.frontier, record.startedAt)
+        XCTAssertEqual(record.coveredThrough, record.startedAt)
         XCTAssertNil(
             record.coveredWindow,
             """
@@ -269,7 +360,9 @@ final class PrimeStoreTests: XCTestCase {
                 PendingPrimeCommit(
                     type: steps,
                     baseFrontier: first.frontier,
+                    baseCoveredThrough: first.coveredThrough,
                     frontier: moved,
+                    coveredThrough: first.coveredThrough,
                     chunkSeconds: 86_400,
                     addedRecordCount: 12,
                     state: .priming
@@ -285,12 +378,16 @@ final class PrimeStoreTests: XCTestCase {
             scope: scope,
             type: steps,
             windowStart: start,
-            windowEnd: end.addingTimeInterval(3_600),
+            startedAt: startedAt.addingTimeInterval(3_600),
             chunkSeconds: PrimePlan.initialChunk
         )
 
         XCTAssertEqual(again.frontier, moved)
-        XCTAssertEqual(again.windowEnd, end, "The window must not slide.")
+        XCTAssertEqual(
+            again.startedAt,
+            startedAt,
+            "The instant the walk is measured from must not slide."
+        )
         XCTAssertEqual(again.deliveredCount, 12)
     }
 
@@ -305,7 +402,9 @@ final class PrimeStoreTests: XCTestCase {
                 PendingPrimeCommit(
                     type: steps,
                     baseFrontier: record.frontier,
+                    baseCoveredThrough: record.coveredThrough,
                     frontier: moved,
+                    coveredThrough: record.coveredThrough,
                     chunkSeconds: 86_400,
                     addedRecordCount: 4,
                     state: .priming
@@ -321,7 +420,9 @@ final class PrimeStoreTests: XCTestCase {
                     PendingPrimeCommit(
                         type: steps,
                         baseFrontier: moved,
+                        baseCoveredThrough: record.coveredThrough,
                         frontier: moved.addingTimeInterval(86_400),
+                        coveredThrough: record.coveredThrough,
                         chunkSeconds: 86_400,
                         addedRecordCount: 0,
                         state: .priming
@@ -354,7 +455,9 @@ final class PrimeStoreTests: XCTestCase {
                     PendingPrimeCommit(
                         type: steps,
                         baseFrontier: record.frontier.addingTimeInterval(-1),
+                        baseCoveredThrough: record.coveredThrough,
                         frontier: record.frontier.addingTimeInterval(-86_400),
+                        coveredThrough: record.coveredThrough,
                         chunkSeconds: 86_400,
                         addedRecordCount: 3,
                         state: .priming
@@ -377,8 +480,10 @@ final class PrimeStoreTests: XCTestCase {
                 prime: [
                     PendingPrimeCommit(
                         type: steps,
-                        baseFrontier: end,
+                        baseFrontier: startedAt,
+                        baseCoveredThrough: startedAt,
                         frontier: start,
+                        coveredThrough: startedAt,
                         chunkSeconds: 86_400,
                         addedRecordCount: 1,
                         state: .covered
@@ -413,7 +518,9 @@ final class PrimeStoreTests: XCTestCase {
                 PendingPrimeCommit(
                     type: steps,
                     baseFrontier: record.frontier,
+                    baseCoveredThrough: record.coveredThrough,
                     frontier: start,
+                    coveredThrough: record.coveredThrough,
                     chunkSeconds: 86_400,
                     addedRecordCount: 20,
                     state: .covered
@@ -445,7 +552,9 @@ final class PrimeStoreTests: XCTestCase {
                 PendingPrimeCommit(
                     type: steps,
                     baseFrontier: record.frontier,
+                    baseCoveredThrough: record.coveredThrough,
                     frontier: start,
+                    coveredThrough: record.coveredThrough,
                     chunkSeconds: 86_400,
                     addedRecordCount: 30,
                     state: .covered
@@ -454,11 +563,11 @@ final class PrimeStoreTests: XCTestCase {
             scope: scope
         )
 
-        let laterEnd = end.addingTimeInterval(30 * 86_400)
+        let laterEnd = startedAt.addingTimeInterval(30 * 86_400)
         try await store.restartPrime(
             scope: scope,
             windowStart: start,
-            windowEnd: laterEnd,
+            startedAt: laterEnd,
             chunkSeconds: PrimePlan.initialChunk
         )
 
@@ -473,6 +582,7 @@ final class PrimeStoreTests: XCTestCase {
             the app has just decided it is not sure about.
             """
         )
+        XCTAssertEqual(after?.coveredThrough, laterEnd)
         XCTAssertNil(after?.coveredWindow)
         XCTAssertEqual(after?.deliveredCount, 0)
     }

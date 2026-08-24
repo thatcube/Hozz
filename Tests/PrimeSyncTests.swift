@@ -102,14 +102,16 @@ final class PrimeSyncTests: XCTestCase {
         )
     }
 
-    /// A sample every twelve hours for two hundred days back from `now`, named
-    /// by how many hours ago it happened.
+    /// A sample every twelve hours going back two hundred days from `now`,
+    /// starting twelve hours ago.
     ///
     /// Two hundred days on purpose: more than twice the window, so anything
     /// that quietly read outside it shows up as a name the test never expected.
+    /// Nothing sits at or after `now`, so these fixtures exercise the backfill
+    /// alone; the leading edge has tests of its own that add samples later.
     private func history() -> [ScriptedDatedSample] {
-        stride(from: 0, through: 400, by: 1).map { index in
-            let date = now.addingTimeInterval(-Double(index) * 12 * 3_600)
+        (0..<400).map { index in
+            let date = now.addingTimeInterval(-Double(index + 1) * 12 * 3_600)
             return ScriptedDatedSample(
                 change: change("h\(index)", type: steps, at: date),
                 start: date
@@ -120,18 +122,23 @@ final class PrimeSyncTests: XCTestCase {
     /// The names a ninety day window holds, worked out here from the literals
     /// above rather than from anything the code under test believes.
     ///
-    /// Sample `i` sits `12i` hours before `now`, and the window is half-open:
-    /// `[now - 90 days, now)`. So `i` is held when `now - 2160h <= now - 12i h`
-    /// and `now - 12i h < now` — that is, `12i <= 2160` and `12i > 0`, giving
-    /// every `i` from 1 to 180 inclusive.
-    ///
-    /// Both ends of that are deliberate and both were got wrong here first.
-    /// `h0` sits exactly on `now` and is *out*: the window's end is exclusive,
-    /// and the sweep has that instant covered. `h180` sits exactly ninety days
-    /// back and is *in*: the start is inclusive, because abutting windows have
-    /// to agree about their shared edge or a record falls between them.
+    /// Sample `i` sits `12(i + 1)` hours before `now`, and the window is
+    /// `[now - 90 days, now)`. So `i` is held when `12(i + 1) <= 2160`, which
+    /// is every `i` from 0 to 179 — and `h179` sits exactly ninety days back,
+    /// on the window's inclusive edge. Getting that edge wrong in either
+    /// direction is how a record falls between two abutting chunks, so the
+    /// boundary has a test of its own as well.
     private var namesInWindow: Set<String> {
-        Set((1...180).map { "h\($0)" })
+        Set((0..<180).map { "h\($0)" })
+    }
+
+    /// The name inside a scripted sample, read back out of its payload.
+    private func name(of sample: ScriptedDatedSample) -> String? {
+        guard case .upsert(let object) = sample.change else {
+            return nil
+        }
+        return (try? JSONSerialization.jsonObject(with: object.canonicalPayload))
+            .flatMap { $0 as? [String: Any] }?["sample"] as? String
     }
 
     private func makeDestination(
@@ -462,7 +469,7 @@ final class PrimeSyncTests: XCTestCase {
         await pass(engine, at: now)
 
         let refused = try await store.primeRecord(scope: scope, type: steps)
-        XCTAssertEqual(refused?.frontier, refused?.windowEnd)
+        XCTAssertEqual(refused?.frontier, refused?.coveredThrough)
         XCTAssertNil(
             refused?.coveredWindow,
             """
@@ -506,7 +513,7 @@ final class PrimeSyncTests: XCTestCase {
             try await store.primeRecord(scope: scope, type: steps)
         )
         let covered = try XCTUnwrap(record.coveredWindow)
-        XCTAssertEqual(covered.through, record.windowEnd)
+        XCTAssertEqual(covered.through, record.coveredThrough)
         XCTAssertEqual(covered.from, record.frontier)
         XCTAssertGreaterThan(
             covered.from,
@@ -524,22 +531,241 @@ final class PrimeSyncTests: XCTestCase {
         let expected = Set(
             history()
                 .filter { $0.start >= covered.from && $0.start < covered.through }
-                .compactMap { sample -> String? in
-                    guard case .upsert(let object) = sample.change else {
-                        return nil
-                    }
-                    return (
-                        try? JSONSerialization.jsonObject(
-                            with: object.canonicalPayload
-                        )
-                    ).flatMap { $0 as? [String: Any] }?["sample"] as? String
-                }
+                .compactMap(name(of:))
         )
         XCTAssertEqual(
             names,
             expected,
             "Everything inside a claimed window must actually be there."
         )
+    }
+
+    // MARK: - The leading edge
+
+    /// The half of the problem that is easy to miss.
+    ///
+    /// `HKAnchoredObjectQuery` hands records back in the order Health stored
+    /// them, so a sample recorded this morning sits at the *end* of the queue,
+    /// behind the entire backlog. The sweep is therefore no more current than
+    /// it is complete: without a walk that keeps the leading edge up to date, a
+    /// prime would fill ninety days once and then fall a day behind, daily.
+    func testDataRecordedAfterThePrimeBeganStillArrives() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = try await makeDestination(delivery)
+        let scope = AnchorScope.destination(destination.id)
+
+        let dated = ScriptedDatedHealthDataSource(samples: [steps: history()])
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            // A sweep with a real backlog, so nothing here can arrive by
+            // anchor: this is the situation the whole feature is about.
+            sweep: ScriptedHealthDataSource(
+                streams: [
+                    steps: (0..<20_000).map { change("s\($0)", type: steps, at: now) }
+                ]
+            ),
+            dated: dated
+        )
+
+        await pass(engine, at: now)
+
+        // Something happens after the prime began.
+        let fresh = now.addingTimeInterval(120)
+        await dated.append(
+            ScriptedDatedSample(
+                change: change("recordedToday", type: steps, at: fresh),
+                start: fresh
+            ),
+            to: steps
+        )
+
+        // A pass once the leading edge has gone stale enough to be worth a look.
+        await pass(engine, at: now.addingTimeInterval(PrimePlan.topUpInterval + 60))
+
+        let names = Set(await channel.sampleNames(for: destination.id))
+        XCTAssertTrue(
+            names.contains("recordedToday"),
+            """
+            A sample recorded after the prime started is at the back of the \
+            sweep's queue, behind years of backlog. If the prime does not \
+            fetch it, nothing does for weeks.
+            """
+        )
+
+        let record = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
+        let covered = try XCTUnwrap(record.coveredWindow)
+        XCTAssertGreaterThan(
+            covered.through,
+            record.startedAt,
+            "The covered stretch must grow past where the prime began."
+        )
+        XCTAssertLessThanOrEqual(
+            covered.through,
+            now.addingTimeInterval(PrimePlan.topUpInterval + 60),
+            "A prime may not claim a stretch of time that has not happened."
+        )
+    }
+
+    /// The claim is one stretch, not two, so the two walks must meet exactly.
+    func testTheCoveredStretchIsContiguousAndEverythingInItArrived() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = try await makeDestination(delivery)
+        let scope = AnchorScope.destination(destination.id)
+
+        var samples = history()
+        // Two samples after the prime's starting instant, which only the
+        // top-up can reach, and one exactly on it, which only the backfill's
+        // exclusive upper edge decides the fate of.
+        for offset in [0.0, 90.0, 200.0] {
+            let date = now.addingTimeInterval(offset)
+            samples.append(
+                ScriptedDatedSample(
+                    change: change("edge\(Int(offset))", type: steps, at: date),
+                    start: date
+                )
+            )
+        }
+
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            sweep: ScriptedHealthDataSource(streams: [steps: []]),
+            dated: ScriptedDatedHealthDataSource(samples: [steps: samples])
+        )
+
+        for index in 0..<8 {
+            await pass(
+                engine,
+                at: now.addingTimeInterval(Double(index) * (PrimePlan.topUpInterval + 60))
+            )
+        }
+
+        let record = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
+        let covered = try XCTUnwrap(record.coveredWindow)
+        let names = Set(await channel.sampleNames(for: destination.id))
+
+        // Worked out from the fixture's own dates, not from what arrived.
+        let expected = Set(
+            samples
+                .filter { $0.start >= covered.from && $0.start < covered.through }
+                .compactMap(name(of:))
+        )
+        XCTAssertEqual(
+            names,
+            expected,
+            """
+            Every sample inside the claimed stretch must be there, and nothing \
+            outside it may have been counted towards the claim.
+            """
+        )
+        XCTAssertTrue(
+            names.contains("edge0"),
+            """
+            A sample recorded at the exact instant the prime began belongs to \
+            the top-up, whose lower edge is inclusive. If neither walk claimed \
+            it, it would sit in the seam between them.
+            """
+        )
+    }
+
+    /// Freshness is worth a query. Freshness every forty seconds is not.
+    func testTheLeadingEdgeIsNotCheckedMoreOftenThanItIsWorth() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        _ = try await makeDestination(delivery)
+
+        // Nothing to backfill, so every query after the first pass is a top-up.
+        let dated = ScriptedDatedHealthDataSource(samples: [steps: []])
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            sweep: ScriptedHealthDataSource(streams: [steps: []]),
+            dated: dated
+        )
+
+        await pass(engine, at: now)
+        let afterBackfill = await dated.queryCount(for: steps)
+
+        await pass(engine, at: now.addingTimeInterval(60))
+        let afterSoonAfter = await dated.queryCount(for: steps)
+        XCTAssertEqual(
+            afterSoonAfter,
+            afterBackfill,
+            """
+            A hundred types checked on every pass is a hundred queries to \
+            discover that nothing happened in the last minute.
+            """
+        )
+
+        await pass(engine, at: now.addingTimeInterval(PrimePlan.topUpInterval + 60))
+        let afterInterval = await dated.queryCount(for: steps)
+        XCTAssertGreaterThan(
+            afterInterval,
+            afterSoonAfter,
+            "Once the edge is properly stale it must be looked at."
+        )
+    }
+
+    /// A top-up that was cut off must not leave a hole behind the edge.
+    func testAnInterruptedTopUpDoesNotClaimWhatItDidNotSend() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = try await makeDestination(delivery)
+        let scope = AnchorScope.destination(destination.id)
+
+        let dated = ScriptedDatedHealthDataSource(samples: [steps: []])
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            sweep: ScriptedHealthDataSource(streams: [steps: []]),
+            dated: dated
+        )
+
+        await pass(engine, at: now)
+        let settled = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
+
+        // Now the destination goes away, and the top-up runs anyway.
+        await channel.fail(destination.id)
+        let later = now.addingTimeInterval(PrimePlan.topUpInterval + 60)
+        let fresh = now.addingTimeInterval(30)
+        await dated.append(
+            ScriptedDatedSample(
+                change: change("undelivered", type: steps, at: fresh),
+                start: fresh
+            ),
+            to: steps
+        )
+        await pass(engine, at: later)
+
+        let after = try await XCTUnwrapAsync(
+            try await store.primeRecord(scope: scope, type: steps)
+        )
+        XCTAssertEqual(
+            after.coveredThrough,
+            settled.coveredThrough,
+            """
+            The edge may only move over data the destination accepted. Moving \
+            it here would claim a minute whose one record was never sent.
+            """
+        )
+
+        await channel.recover(destination.id)
+        await pass(engine, at: later.addingTimeInterval(PrimePlan.topUpInterval + 60))
+        let names = Set(await channel.sampleNames(for: destination.id))
+        XCTAssertTrue(names.contains("undelivered"))
     }
 
     // MARK: - Types a prime cannot help with

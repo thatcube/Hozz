@@ -77,7 +77,7 @@ public enum PrimePlan {
         (end.addingTimeInterval(-max(span, 0)), end)
     }
 
-    /// The next chunk to read, or nil when the frontier has reached the start.
+    /// The next backfill chunk, or nil when the frontier has reached the start.
     ///
     /// The chunk is clamped to the window, so the last one lands exactly on
     /// `windowStart` however awkward the chunk length is. That exactness is the
@@ -96,6 +96,43 @@ public enum PrimePlan {
         let start = max(proposed, windowStart)
         return start..<frontier
     }
+
+    /// The next top-up chunk, or nil when the covered edge has caught up.
+    ///
+    /// The mirror image of ``chunk(frontier:windowStart:seconds:)``, and it
+    /// exists for a reason that is easy to miss: `HKAnchoredObjectQuery` hands
+    /// records back in the order they were *stored*, so a sample recorded this
+    /// morning sits at the end of the queue, behind the whole backlog. The
+    /// sweep is therefore no more current than it is complete. Without a walk
+    /// that keeps the leading edge up to date, a prime would fill ninety days
+    /// once and then go stale by a day, every day.
+    ///
+    /// It walks *upwards*, unlike the backfill, and that direction is what
+    /// makes it resumable. Reading downwards from now would leave a stretch
+    /// that touches nothing already delivered, so a half-finished top-up could
+    /// not be recorded at all; upwards, every chunk abuts the covered region
+    /// and can be committed as it goes.
+    public static func topUp(
+        coveredThrough: Date,
+        ceiling: Date,
+        seconds: TimeInterval
+    ) -> Range<Date>? {
+        guard coveredThrough < ceiling else {
+            return nil
+        }
+        let length = clamp(seconds)
+        let proposed = coveredThrough.addingTimeInterval(length)
+        return coveredThrough..<min(proposed, ceiling)
+    }
+
+    /// How stale the leading edge is allowed to get before a pass tops it up.
+    ///
+    /// Not zero, and the difference matters at a hundred types: a pass that
+    /// topped up every type every time would spend a query per type per pass
+    /// to discover that nothing had happened in the last forty seconds. Five
+    /// minutes is far fresher than anything a health export needs and turns
+    /// that into a query per type per five minutes.
+    public static let topUpInterval: TimeInterval = 5 * 60
 
     /// A shorter chunk to try after one came back over capacity.
     ///

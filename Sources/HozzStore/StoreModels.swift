@@ -99,24 +99,39 @@ public enum PrimeState: String, Codable, Hashable, Sendable {
 
 /// What a dated prime has actually covered for one type, in one cursor space.
 ///
-/// The field that matters is ``frontier``, and it matters because of what it is
-/// not. `windowStart` is an intention — the oldest instant this prime is aiming
-/// at — and no surface may ever report it, because aiming at a date is not the
-/// same as holding it. The frontier is the achieved position: it moves only
-/// inside the same transaction that records a delivery the destination
-/// accepted, so `[frontier, windowEnd)` is a claim the app can stand behind.
+/// Two of these fields are achievements and one is an intention, and telling
+/// them apart is the whole discipline of this record. `windowStart` is the
+/// oldest instant the prime is *aiming* at, and no surface may ever report it,
+/// because aiming at a date is not the same as holding it. The two cursors are
+/// what has actually been delivered and accepted:
+///
+///   - ``frontier`` walks *down* towards `windowStart` — the backfill.
+///   - ``coveredThrough`` walks *up* towards now — the top-up.
+///
+/// Between them lies one contiguous stretch, `[frontier, coveredThrough)`, and
+/// every second of it has been handed over. Both cursors move only inside the
+/// transaction that records the delivery, so the stretch is a claim the app can
+/// stand behind.
+///
+/// The top-up exists because the sweep is not current either, which is easy to
+/// miss. `HKAnchoredObjectQuery` returns records in the order Health stored
+/// them, so a sample recorded this morning is at the *end* of the queue, behind
+/// every one of the backlog's records. A prime with only a backfill would fill
+/// ninety days once and then fall a day behind, every day.
 public struct PrimeRecord: Equatable, Sendable {
     public let type: HealthTypeKey
     /// The oldest instant this prime is aiming at. An intention, not a claim.
     public let windowStart: Date
-    /// The newest instant of the window, fixed when the prime began.
+    /// When the prime began, and where both cursors started from.
     ///
-    /// Fixed rather than "now" so the window does not slide out from under a
-    /// walk that takes days: a moving end would leave a permanent sliver of
-    /// unread recent data that the frontier could never catch.
-    public let windowEnd: Date
-    /// Everything from here to ``windowEnd`` has been delivered and accepted.
+    /// Kept because it is the only fixed point: the covered stretch grows in
+    /// both directions away from it, so without it there is nothing to measure
+    /// the backfill's progress against.
+    public let startedAt: Date
+    /// The oldest instant delivered. Walks down towards ``windowStart``.
     public let frontier: Date
+    /// The newest instant delivered. Walks up towards now.
+    public let coveredThrough: Date
     /// The chunk length that suited this type's density last time.
     public let chunkSeconds: TimeInterval
     /// Records this prime has handed over, as the phone counts them.
@@ -128,8 +143,9 @@ public struct PrimeRecord: Equatable, Sendable {
     public init(
         type: HealthTypeKey,
         windowStart: Date,
-        windowEnd: Date,
+        startedAt: Date,
         frontier: Date,
+        coveredThrough: Date,
         chunkSeconds: TimeInterval,
         deliveredCount: Int,
         state: PrimeState,
@@ -138,8 +154,9 @@ public struct PrimeRecord: Equatable, Sendable {
     ) {
         self.type = type
         self.windowStart = windowStart
-        self.windowEnd = windowEnd
+        self.startedAt = startedAt
         self.frontier = frontier
+        self.coveredThrough = coveredThrough
         self.chunkSeconds = chunkSeconds
         self.deliveredCount = deliveredCount
         self.state = state
@@ -147,25 +164,29 @@ public struct PrimeRecord: Equatable, Sendable {
         self.updatedAt = updatedAt
     }
 
-    /// The window that has genuinely been read, or nil when none has.
+    /// The stretch that has genuinely been read, or nil when none has.
     ///
     /// A prime that has delivered nothing has no window, and deliberately does
     /// not report a zero-length one: anything asking whether a primed window
     /// exists would read `from == through` as "yes, an empty one" and present a
     /// density claim about no time at all.
     public var coveredWindow: (from: Date, through: Date)? {
-        guard frontier < windowEnd else {
+        guard frontier < coveredThrough else {
             return nil
         }
-        return (frontier, windowEnd)
+        return (frontier, coveredThrough)
     }
 
+    /// Whether the backfill has reached the oldest instant it was aiming at.
+    ///
+    /// Not the same as finished. The top-up goes on running afterwards, so
+    /// ``coveredThrough`` keeps moving and the claim keeps growing.
     public var isCovered: Bool {
         state == .covered
     }
 }
 
-/// One type's prime frontier advance, staged until its delivery is accepted.
+/// One type's prime cursor advance, staged until its delivery is accepted.
 ///
 /// Deliberately parallel to ``PendingAnchorCommit`` and deliberately separate
 /// from it. They are committed in the same transaction when a batch carried
@@ -174,11 +195,13 @@ public struct PrimeRecord: Equatable, Sendable {
 /// because there is no expressible way to say it.
 public struct PendingPrimeCommit: Equatable, Sendable {
     public let type: HealthTypeKey
-    /// The frontier this advance was computed from. A mismatch means something
-    /// else moved the cursor underneath, and the write is refused rather than
+    /// The cursors this advance was computed from. A mismatch means something
+    /// else moved them underneath, and the write is refused rather than
     /// applied, exactly as a stale anchor base is.
     public let baseFrontier: Date
+    public let baseCoveredThrough: Date
     public let frontier: Date
+    public let coveredThrough: Date
     public let chunkSeconds: TimeInterval
     public let addedRecordCount: Int
     public let state: PrimeState
@@ -187,7 +210,9 @@ public struct PendingPrimeCommit: Equatable, Sendable {
     public init(
         type: HealthTypeKey,
         baseFrontier: Date,
+        baseCoveredThrough: Date,
         frontier: Date,
+        coveredThrough: Date,
         chunkSeconds: TimeInterval,
         addedRecordCount: Int,
         state: PrimeState,
@@ -195,7 +220,9 @@ public struct PendingPrimeCommit: Equatable, Sendable {
     ) {
         self.type = type
         self.baseFrontier = baseFrontier
+        self.baseCoveredThrough = baseCoveredThrough
         self.frontier = frontier
+        self.coveredThrough = coveredThrough
         self.chunkSeconds = chunkSeconds
         self.addedRecordCount = addedRecordCount
         self.state = state
