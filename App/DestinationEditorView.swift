@@ -521,19 +521,19 @@ struct DestinationEditorView: View {
         } header: {
             Text("Units")
         } footer: {
-            Text(
-                "Every value Hozz sends carries its own unit, so a reading can "
-                + "never be read as something it is not \u{2014} a converted one "
-                + "also says what it was converted from. Changing this does not "
-                + "rewrite anything already delivered, so a receiver storing a "
-                + "long history will hold both, each labelled correctly."
-                + (format == .influx
-                    ? " Line protocol is not converted: the unit is a tag inside "
-                    + "the line, and rewriting it in place is how a batch gets "
-                    + "quietly corrupted."
-                    : "")
-            )
+            Text(unitsExplanation)
         }
+    }
+
+    /// Split out of the view because the compiler will not type-check a string
+    /// this long spliced together inline in reasonable time — it builds on the
+    /// simulator and times out for the device, which is a poor way to find out.
+    private var unitsExplanation: String {
+        "Every value Hozz sends carries its own unit, so a reading can never be "
+            + "read as something it is not \u{2014} a converted one also says "
+            + "what it was converted from. Changing this does not rewrite "
+            + "anything already delivered, so a receiver storing a long history "
+            + "will hold both, each labelled correctly."
     }
 
     private func binding(for family: UnitFamily) -> Binding<String?> {

@@ -59,9 +59,13 @@ public enum HealthUnit {
         // Energy, base joule. HealthKit's kilocalorie is the thermochemical
         // one, which is exactly 4184 J — not the 4186 of the fifteen-degree
         // calorie, and the difference is half a percent on a day's intake.
+        // `Cal` with a capital C is HealthKit's large calorie and is the same
+        // 4184 J; `cal` is the small calorie and is a thousandth of it. Getting
+        // those two the same way round matters by a factor of a thousand.
         "J": (.energy, 1),
         "kJ": (.energy, 1_000),
         "cal": (.energy, 4.184),
+        "Cal": (.energy, 4_184),
         "kcal": (.energy, 4_184),
 
         // Speed, base metre per second. A mile per hour is exactly 0.44704 m/s,
@@ -84,6 +88,7 @@ public enum HealthUnit {
         "kPa": (.pressure, 1_000),
         "hPa": (.pressure, 100),
         "mmHg": (.pressure, 133.322_387_415),
+        "inHg": (.pressure, 25.4 * 133.322_387_415),
         "cmAq": (.pressure, 98.0665),
         "atm": (.pressure, 101_325),
 

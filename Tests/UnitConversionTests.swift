@@ -171,6 +171,43 @@ final class UnitConversionTests: XCTestCase {
         )
     }
 
+    /// HealthKit spells the large calorie `Cal` and the small one `cal`, and
+    /// they differ by a factor of a thousand. Filing one as the other would
+    /// report a day's food as two calories, or a biscuit as a week's worth.
+    func testTheLargeAndSmallCalorieAreNotConfused() throws {
+        XCTAssertEqual(
+            try XCTUnwrap(HealthUnit.convert(1, from: "Cal", to: "J")),
+            4_184,
+            accuracy: 1e-9
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(HealthUnit.convert(1, from: "cal", to: "J")),
+            4.184,
+            accuracy: 1e-12
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(HealthUnit.convert(1, from: "Cal", to: "cal")),
+            1_000,
+            accuracy: 1e-9
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(HealthUnit.convert(1, from: "Cal", to: "kcal")),
+            1,
+            accuracy: 1e-12,
+            "They are two spellings of the same unit."
+        )
+    }
+
+    /// An inch of mercury is exactly 25.4 mmHg, which follows from the exact
+    /// inch and the defined millimetre of mercury.
+    func testInchesOfMercuryFollowFromMillimetres() throws {
+        XCTAssertEqual(
+            try XCTUnwrap(HealthUnit.convert(1, from: "inHg", to: "mmHg")),
+            25.4,
+            accuracy: 1e-9
+        )
+    }
+
     /// A millimetre of mercury is exactly 133.322387415 Pa, so a blood pressure
     /// of 120 mmHg is 15.999 kPa.
     func testBloodPressureConvertsToTheRightPressure() throws {
