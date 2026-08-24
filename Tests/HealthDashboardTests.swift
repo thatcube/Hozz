@@ -1196,4 +1196,145 @@ final class HealthDashboardTests: XCTestCase {
         // June 2017 through May 2026 inclusive is nine whole years of months.
         XCTAssertEqual(plan.columns.count, 9 * 12)
     }
+
+    // MARK: - Route completeness
+
+    /// A route missing its final pages is not a complete route.
+    ///
+    /// Gaps found by comparing consecutive offsets cannot see a shortfall at
+    /// the end: everything that arrived is an unbroken run. The watch says how
+    /// many locations it recorded when it closes the series, and that is what
+    /// catches it.
+    func testRouteMissingItsLastPageIsNotComplete() async throws {
+        let store = try await store([
+            routeSample("route-1", workout: "w-1"),
+            locationPage("route-1", sequence: 0, offset: 0, count: 2),
+            routeEnd("route-1", locations: 4)
+        ])
+
+        let loaded = try await store.route(forWorkout: "w-1")
+        let route = try XCTUnwrap(loaded)
+        XCTAssertEqual(route.points.count, 2)
+        XCTAssertFalse(
+            route.isComplete,
+            "two of four locations is not the whole route"
+        )
+        XCTAssertEqual(route.missingPages, 1)
+    }
+
+    /// A page that decodes to fewer locations than it claims is a gap.
+    ///
+    /// Advancing by the claimed count makes the next page line up perfectly and
+    /// hides the hole. The electrocardiogram reader already advances by what it
+    /// actually decoded; this now does the same.
+    func testPageHoldingFewerLocationsThanItClaimsIsAGap() async throws {
+        let store = try await store([
+            routeSample("route-2", workout: "w-2"),
+            locationPage("route-2", sequence: 0, offset: 0, count: 4, actual: 2),
+            locationPage("route-2", sequence: 1, offset: 4, count: 2),
+            routeEnd("route-2", locations: 6)
+        ])
+
+        let loaded = try await store.route(forWorkout: "w-2")
+        let route = try XCTUnwrap(loaded)
+        XCTAssertEqual(route.points.count, 4, "two lost, four drawn")
+        XCTAssertFalse(route.isComplete)
+        XCTAssertGreaterThanOrEqual(route.missingPages, 1)
+    }
+
+    /// Two routes for one workout are joined by a straight line, which is a gap.
+    func testTwoRoutesForOneWorkoutAreNotOneUnbrokenPath() async throws {
+        let store = try await store([
+            routeSample("route-3a", workout: "w-3"),
+            locationPage("route-3a", sequence: 0, offset: 0, count: 2),
+            routeEnd("route-3a", locations: 2),
+            routeSample("route-3b", workout: "w-3", start: "2026-05-04T11:00:00.000Z"),
+            locationPage("route-3b", sequence: 0, offset: 0, count: 2),
+            routeEnd("route-3b", locations: 2)
+        ])
+
+        let loaded = try await store.route(forWorkout: "w-3")
+        let route = try XCTUnwrap(loaded)
+        XCTAssertEqual(route.points.count, 4)
+        XCTAssertFalse(
+            route.isComplete,
+            "a pause and resume leaves a straight line between the two"
+        )
+    }
+
+    /// A whole route in contiguous pages really is complete.
+    func testAWholeRouteIsReportedComplete() async throws {
+        let store = try await store([
+            routeSample("route-4", workout: "w-4"),
+            locationPage("route-4", sequence: 0, offset: 0, count: 2),
+            locationPage("route-4", sequence: 1, offset: 2, count: 2),
+            routeEnd("route-4", locations: 4)
+        ])
+
+        let loaded = try await store.route(forWorkout: "w-4")
+        let route = try XCTUnwrap(loaded)
+        XCTAssertEqual(route.points.count, 4)
+        XCTAssertTrue(route.isComplete)
+        XCTAssertEqual(route.missingPages, 0)
+    }
+
+    // MARK: - Route fixtures
+
+    private func routeSample(
+        _ id: String,
+        workout: String,
+        start: String = "2026-05-04T10:00:00.000Z"
+    ) -> [String: Any] {
+        [
+            "kind": "workoutRoute",
+            "id": id,
+            "type": "HKWorkoutRouteTypeIdentifier",
+            "startDate": start,
+            "endDate": start,
+            "workout": ["id": workout, "activityType": 52]
+        ]
+    }
+
+    private func locationPage(
+        _ routeID: String,
+        sequence: Int,
+        offset: Int,
+        count: Int,
+        actual: Int? = nil
+    ) -> [String: Any] {
+        let held = actual ?? count
+        let locations = (0..<held).map { index -> [String: Any] in
+            [
+                "latitude": 42.65 + Double(offset + index) * 0.0001,
+                "longitude": -73.76 + Double(offset + index) * 0.0001,
+                "altitude": 60.0,
+                "timestamp": "2026-05-04T10:00:0\(index % 10).000Z"
+            ]
+        }
+        return [
+            "kind": "workoutRouteLocations",
+            "id": "\(routeID)-page-\(sequence)",
+            "type": "HKWorkoutRouteTypeIdentifier",
+            "sample": routeID,
+            "sequence": sequence,
+            "offset": offset,
+            // Deliberately the claimed count, which `actual` may undercut.
+            "count": count,
+            "startDate": "2026-05-04T10:00:00.000Z",
+            "endDate": "2026-05-04T10:05:00.000Z",
+            "locations": locations
+        ]
+    }
+
+    private func routeEnd(_ routeID: String, locations: Int) -> [String: Any] {
+        [
+            "kind": "workoutRouteEnd",
+            "id": "\(routeID)-end",
+            "type": "HKWorkoutRouteTypeIdentifier",
+            "sample": routeID,
+            "locations": locations,
+            "startDate": "2026-05-04T10:00:00.000Z",
+            "endDate": "2026-05-04T10:05:00.000Z"
+        ]
+    }
 }

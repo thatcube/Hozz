@@ -116,8 +116,7 @@ struct CompareView: View {
 
     private func chip(_ type: String) -> some View {
         let chosen = services.comparisonTypes.contains(type)
-        let index = services.comparisonTypes.firstIndex(of: type)
-        let tint = index.map { HozzPalette.series($0) } ?? HozzPalette.blue
+        let tint = colour(for: type) ?? HozzPalette.blue
         return Button {
             services.toggleComparison(type, limit: Self.maximumSeries)
         } label: {
@@ -144,20 +143,42 @@ struct CompareView: View {
         .buttonStyle(.plain)
     }
 
+    /// A type's colour, fixed by where it sits in the *chosen* list.
+    ///
+    /// Never by where it sits in the drawn list. A type with nothing in the
+    /// range draws no line, so the two orders diverge the moment one drops
+    /// out — and then the blue chip says Step Count while the only blue line
+    /// on the chart is resting heart rate. On this archive that is the default
+    /// state of the screen, not an edge case.
+    private func colour(for type: String) -> Color? {
+        services.comparisonTypes
+            .firstIndex(of: type)
+            .map { HozzPalette.series($0) }
+    }
+
+    /// Chosen types that could not be drawn, so their absence is stated rather
+    /// than left as a chip with no line.
+    private var undrawable: [String] {
+        let drawn = Set(services.comparison.map(\.id))
+        return services.comparisonTypes.filter { !drawn.contains($0) }
+    }
+
     private var chartCard: some View {
         Card(
             title: "Together",
             subtitle: "Each line is scaled to its own range, so shapes can be compared but heights cannot. Real values are in the legend below."
         ) {
             Chart {
-                ForEach(Array(services.comparison.enumerated()), id: \.element.id) { index, entry in
+                ForEach(services.comparison) { entry in
                     ForEach(entry.points) { point in
                         LineMark(
                             x: .value("When", point.start),
                             y: .value("Scaled", point.normalised),
                             series: .value("Type", entry.id)
                         )
-                        .foregroundStyle(HozzPalette.series(index))
+                        .foregroundStyle(
+                            colour(for: entry.id) ?? HozzPalette.blue
+                        )
                         .lineStyle(StrokeStyle(lineWidth: 2, lineCap: .round))
                         .interpolationMethod(.monotone)
                     }
@@ -197,7 +218,7 @@ struct CompareView: View {
                     }
                     HStack(spacing: 10) {
                         RoundedRectangle(cornerRadius: 1.5)
-                            .fill(HozzPalette.series(index))
+                            .fill(colour(for: entry.id) ?? HozzPalette.blue)
                             .frame(width: 16, height: 3)
                         VStack(alignment: .leading, spacing: 1) {
                             Text(entry.series.measure.displayName)
@@ -220,6 +241,32 @@ struct CompareView: View {
                             .font(.caption2)
                             .foregroundStyle(HozzPalette.inkMuted)
                         }
+                    }
+                    .padding(.vertical, 8)
+                }
+
+                // A chosen type with no line is otherwise invisible: the chip
+                // stays lit and the chart is simply one line short, which reads
+                // as a drawing bug rather than as an answer.
+                ForEach(undrawable, id: \.self) { type in
+                    Divider().overlay(HozzPalette.lineSoft)
+                    HStack(spacing: 10) {
+                        RoundedRectangle(cornerRadius: 1.5)
+                            .fill(HozzPalette.lineSoft)
+                            .frame(width: 16, height: 3)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(
+                                HealthMeasure
+                                    .measure(for: type, storedUnit: nil)
+                                    .displayName
+                            )
+                            .font(.callout.weight(.medium))
+                            .foregroundStyle(HozzPalette.inkMuted)
+                            Text("Not enough in this range to draw a line.")
+                                .font(.caption2)
+                                .foregroundStyle(HozzPalette.inkMuted)
+                        }
+                        Spacer()
                     }
                     .padding(.vertical, 8)
                 }

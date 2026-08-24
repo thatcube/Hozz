@@ -26,10 +26,24 @@ struct ElectrocardiogramView: View {
         }
         .task {
             await services.loadElectrocardiograms()
-            if selected == nil, let first = services.electrocardiograms.first {
-                selected = first
-                await services.loadWaveform(id: first.id)
+            if selected == nil {
+                selected = services.electrocardiograms.first
             }
+        }
+        // Keyed on the reading, not fired from the button.
+        //
+        // Setting `selected` and then starting an unstructured `Task` leaves a
+        // window — at least a frame, and in practice a SQLite read plus a
+        // decode of fifteen thousand points — where the header, the
+        // classification and the completeness banner describe the reading just
+        // clicked while the trace on screen is still the previous one's. A
+        // partial waveform could be titled "Waveform", drawn in confident blue,
+        // under someone else's date. That is the one thing this file exists to
+        // prevent. `.task(id:)` also cancels the outgoing load, so two quick
+        // clicks cannot land out of order.
+        .task(id: selected?.id) {
+            guard let id = selected?.id else { return }
+            await services.loadWaveform(id: id)
         }
     }
 
@@ -39,7 +53,6 @@ struct ElectrocardiogramView: View {
                 ForEach(services.electrocardiograms) { reading in
                     Button {
                         selected = reading
-                        Task { await services.loadWaveform(id: reading.id) }
                     } label: {
                         row(reading)
                     }

@@ -33,9 +33,13 @@ public struct WorkoutRoute: Sendable, Hashable {
     }
 
     public let points: [Point]
-    /// Whether every page between the first and the last is present.
+    /// Whether every location the watch recorded is present and in one
+    /// unbroken run.
     public let isComplete: Bool
-    /// How many pages were expected to be contiguous but were not.
+    /// How many places a gap was found: a page missing between two others, a
+    /// page that decoded to fewer locations than it claimed, a shortfall
+    /// against the total the watch reported, or the join between two routes
+    /// belonging to one workout.
     public let missingPages: Int
 
     public init(points: [Point], isComplete: Bool, missingPages: Int) {
@@ -55,6 +59,10 @@ extension IngestStore {
     /// Both links live in the stored JSON rather than in columns, so both are
     /// read out of it — the schema is another agent's to change, not this
     /// query's.
+    ///
+    /// Completeness is decided the same way an electrocardiogram's is, because
+    /// the failure is the same: a missing page draws as a straight line across
+    /// a park, which is a plausible-looking lie about where somebody went.
     public func route(forWorkout workoutID: String) throws -> WorkoutRoute? {
         let routeIDs = try database.query(
             """
@@ -74,7 +82,14 @@ extension IngestStore {
         var points: [WorkoutRoute.Point] = []
         var missingPages = 0
 
-        for routeID in routeIDs {
+        for (ordinal, routeID) in routeIDs.enumerated() {
+            // A workout paused and resumed produces two routes. Joining them
+            // end to end draws a straight line between where one stopped and
+            // the other started, which is a gap like any other.
+            if ordinal > 0 {
+                missingPages += 1
+            }
+
             let pages = try database.query(
                 """
                 SELECT json_extract(CAST(raw AS TEXT), '$.offset'),
@@ -98,13 +113,29 @@ extension IngestStore {
             var nextOffset = 0
             for page in pages {
                 if page.offset != nextOffset {
-                    // A page between the last one and this never arrived. The
-                    // locations that did are still shown; the gap is what makes
-                    // the route incomplete.
                     missingPages += 1
                 }
-                points.append(contentsOf: Self.locations(in: page.raw))
-                nextOffset = page.offset + page.count
+                let decoded = Self.locations(in: page.raw)
+                if decoded.count < page.count {
+                    // The page is here and part of it did not survive reading.
+                    // `count` is what the page claims; the array is what it
+                    // holds, and the array is what will actually be drawn.
+                    missingPages += 1
+                }
+                points.append(contentsOf: decoded)
+                // Advanced by what was decoded, not by what was claimed.
+                // Advancing by the claim makes the next page line up perfectly
+                // and hides the hole that was just found.
+                nextOffset = page.offset + decoded.count
+            }
+
+            // The watch says how many locations it recorded when it closes the
+            // series. Without checking it, a route missing its final pages is
+            // an unbroken run of everything that did arrive — contiguous, and
+            // wrong.
+            if let expected = try expectedLocations(forRoute: routeID),
+               nextOffset < expected {
+                missingPages += 1
             }
         }
 
@@ -116,6 +147,21 @@ extension IngestStore {
             isComplete: missingPages == 0,
             missingPages: missingPages
         )
+    }
+
+    /// How many locations the watch said the route held, if it said.
+    private func expectedLocations(forRoute routeID: String) throws -> Int? {
+        try database.query(
+            """
+            SELECT json_extract(CAST(raw AS TEXT), '$.locations')
+              FROM sample
+             WHERE kind = 'workoutRouteEnd'
+               AND json_extract(CAST(raw AS TEXT), '$.sample') = ?
+             LIMIT 1
+            """,
+            [.text(routeID)],
+            row: { $0.optionalReal(0).map { Int($0) } }
+        ).first ?? nil
     }
 
     private static func locations(in raw: Data) -> [WorkoutRoute.Point] {
