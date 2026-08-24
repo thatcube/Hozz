@@ -102,13 +102,7 @@ extension HealthSyncEngine {
         // touch. A type whose backfill finished last week still holds its
         // months, and leaving it out would retract a true claim.
         for record in known {
-            guard
-                let covered = record.coveredWindow,
-                let window = CoverageReporter.PrimedWindow(
-                    from: covered.from,
-                    through: covered.through
-                )
-            else {
+            guard let window = Self.reportable(record.coveredWindow) else {
                 continue
             }
             round.windows[record.type] = window
@@ -188,9 +182,8 @@ extension HealthSyncEngine {
                 if commit.state != .priming {
                     owingBackfill.remove(commit.type)
                 }
-                if let window = CoverageReporter.PrimedWindow(
-                    from: commit.frontier,
-                    through: commit.coveredThrough
+                if let window = Self.reportable(
+                    (from: commit.frontier, through: commit.coveredThrough)
                 ) {
                     round.windows[commit.type] = window
                 }
@@ -558,6 +551,32 @@ extension HealthSyncEngine {
         }
         let covered = record.startedAt.timeIntervalSince(record.frontier)
         return min(1, max(0, covered / span))
+    }
+
+    /// A covered stretch as it is safe to tell a receiver about.
+    ///
+    /// The oldest end is exact: it moves only when history was read. The newest
+    /// end is floored, because it moves whenever the clock does — a top-up over
+    /// an empty stretch still advances it — and a receiver decides whether
+    /// coverage is worth a delivery by hashing these numbers. Reported to the
+    /// second, a static archive would produce different bytes on every pass and
+    /// receive a recordless batch every five minutes for ever.
+    ///
+    /// Flooring understates the claim rather than stretching it, so everything
+    /// in the reported stretch really is present. A stretch that floors away to
+    /// nothing is reported as no window at all, which is the same answer this
+    /// gives to a prime that has delivered nothing — and the right one, since
+    /// neither can support a claim.
+    static func reportable(
+        _ covered: (from: Date, through: Date)?
+    ) -> CoverageReporter.PrimedWindow? {
+        guard let covered else {
+            return nil
+        }
+        return CoverageReporter.PrimedWindow(
+            from: covered.from,
+            through: PrimePlan.reportableEdge(covered.through)
+        )
     }
 
     /// Whether a type can be primed by a dated read at all.

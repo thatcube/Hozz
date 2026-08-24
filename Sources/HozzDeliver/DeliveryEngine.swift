@@ -254,14 +254,34 @@ public actor DeliveryEngine {
             return observation.moment
         }
 
-        var updated = destination
-        updated.options[Destination.coverageObservedDigestKey] = digest
-        updated.options[Destination.coverageObservedAtKey] = Date.ISO8601FormatStyle(
+        let text = Date.ISO8601FormatStyle(
             includingFractionalSeconds: true,
             timeZone: .gmt
         ).format(observation.moment)
+
+        var updated = destination
+        updated.options[Destination.coverageObservedDigestKey] = digest
+        updated.options[Destination.coverageObservedAtKey] = text
         try? await write(updated)
-        return observation.moment
+
+        // The moment as it will be *read back*, not as it was observed, and
+        // the difference is a millisecond that costs a receiver a duplicate.
+        //
+        // An instant carries more precision than the text it is written as, and
+        // formatting then parsing does not always land back on the same double:
+        // an instant written as `…57.869Z` can parse to one that formats as
+        // `…57.868Z`. The next pass stamps its batch from the parsed value, so
+        // returning the unparsed one here makes the two payloads differ by one
+        // character — same length, same meaning, different bytes — and the
+        // batch identity is a hash of those bytes. The receiver is handed what
+        // it should recognise as a retry and stores it a second time, which on
+        // a receiver too old to read these lines is a quarantined row per type
+        // per delivery, for ever.
+        //
+        // Round-tripping the value through the same text the next pass will
+        // read makes the two identical by construction rather than by luck
+        // about the sub-millisecond part of a clock reading.
+        return InfluxLineProtocol.date(from: text) ?? observation.moment
     }
 
     private func loadedDestination(_ id: UUID) async throws -> Destination? {

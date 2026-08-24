@@ -21,6 +21,11 @@ private actor PrimeRecordingChannel: DeliveryChannel {
         failing.remove(destinationID)
     }
 
+    /// How many batches this destination has been sent.
+    func payloadCount(for destinationID: UUID) -> Int {
+        payloads[destinationID, default: []].count
+    }
+
     /// The last coverage line sent for one type, as the bytes that actually
     /// went out. Kept as bytes rather than decoded here so what crosses back is
     /// exactly what crossed the wire.
@@ -1300,6 +1305,77 @@ final class PrimeSyncTests: XCTestCase {
             Everything in the new window must have arrived a second time. \
             Anything that did not was claimed on the strength of the first \
             walk, which the restart had already thrown away.
+            """
+        )
+    }
+
+    /// A device with nothing happening must not become a delivery treadmill.
+    ///
+    /// The leading edge moves whenever the clock does — a top-up over an empty
+    /// stretch still advances it — so reported to the second it would differ on
+    /// every pass, coverage would always be "news", and a static archive would
+    /// receive a batch containing no records every five minutes for ever. An
+    /// endpoint that happened to be switched off would fail every five minutes,
+    /// back off, and eventually be parked as broken: a destination with nothing
+    /// wrong with it, which would then stop carrying records either.
+    ///
+    /// The suite could not see this before. The existing test of the invariant
+    /// builds its engine without a dated reader, so the one configuration in
+    /// which the invariant can break is the one it does not cover.
+    func testAQuietDeviceIsNotSentABatchOnEveryPass() async throws {
+        let store = try makeStore()
+        let channel = PrimeRecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = try await makeDestination(delivery)
+
+        let engine = makeEngine(
+            store: store,
+            delivery: delivery,
+            sweep: ScriptedHealthDataSource(streams: [steps: []]),
+            dated: ScriptedDatedHealthDataSource(samples: [steps: []])
+        )
+
+        // 1,759,996,800 is 488,888 hours after the epoch exactly, so the passes
+        // below can be placed either side of a reporting boundary on purpose
+        // rather than by luck.
+        let hourStart = Date(timeIntervalSince1970: 1_759_996_800)
+
+        // Enough passes to walk the whole empty window and settle.
+        for offset in [0.0, 600, 1_200, 1_800] {
+            await pass(engine, at: hourStart.addingTimeInterval(offset))
+        }
+        let settled = await channel.payloadCount(for: destination.id)
+
+        // Three more, spread over another twenty minutes, with nothing whatever
+        // happening on the device — and all still inside the same hour.
+        for offset in [2_400.0, 3_000, 3_540] {
+            await pass(engine, at: hourStart.addingTimeInterval(offset))
+        }
+
+        let afterQuietPasses = await channel.payloadCount(for: destination.id)
+        XCTAssertEqual(
+            afterQuietPasses,
+            settled,
+            """
+            Nothing changed, so nothing was worth sending. A leading edge \
+            reported to the second would have made every one of these passes \
+            look like news, for ever.
+            """
+        )
+
+        // It does still refresh, though — just on the clock's terms rather than
+        // the pass's. A claim that never moved would go stale instead, which is
+        // the opposite failure and just as dishonest.
+        for offset in [4_200.0, 4_800] {
+            await pass(engine, at: hourStart.addingTimeInterval(offset))
+        }
+        let afterTheHour = await channel.payloadCount(for: destination.id)
+        XCTAssertEqual(
+            afterTheHour,
+            settled + 1,
+            """
+            One delivery for the hour that passed, not one for each of the two \
+            passes inside it.
             """
         )
     }

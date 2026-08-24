@@ -134,6 +134,40 @@ public enum PrimePlan {
     /// that into a query per type per five minutes.
     public static let topUpInterval: TimeInterval = 5 * 60
 
+    /// How precisely the leading edge is *reported*, as opposed to tracked.
+    ///
+    /// The two are different numbers on purpose, and the reason is a trap the
+    /// rest of this file walks straight into otherwise.
+    ///
+    /// A receiver is sent coverage when its coverage has changed, and "changed"
+    /// is decided by hashing the facts. `primedFrom` is a fact about data: it
+    /// moves only when a stretch of history was actually read, and it stops
+    /// when the backfill finishes. `primedThrough` is not. On a type with
+    /// nothing in it, the top-up still reads an empty stretch and still moves
+    /// the edge, so the edge advances by exactly the time that has passed and
+    /// never stops — which makes it a clock reading wearing the clothes of a
+    /// measurement. Hashed at full precision it differs on every pass, so
+    /// coverage is always "news", and a destination on a completely static
+    /// archive would receive a batch containing no records every five minutes
+    /// for ever. An endpoint that happened to be switched off would fail every
+    /// five minutes, back off, and eventually be parked as broken.
+    ///
+    /// Reporting the edge to the hour costs a receiver nothing it can use — no
+    /// health surface needs a coverage claim to the second — and it is the
+    /// *floor*, so the claim is understated rather than stretched: everything
+    /// in the reported window really is present, with a little more besides.
+    public static let reportingGranularity: TimeInterval = 3_600
+
+    /// The leading edge as it is safe to report: floored, never stretched.
+    public static func reportableEdge(_ date: Date) -> Date {
+        let seconds = date.timeIntervalSince1970
+        return Date(
+            timeIntervalSince1970:
+                (seconds / reportingGranularity).rounded(.down)
+                    * reportingGranularity
+        )
+    }
+
     /// A shorter chunk to try after one came back over capacity.
     ///
     /// Quartering rather than halving because the only thing a truncated read
