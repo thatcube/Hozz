@@ -23,6 +23,16 @@ extension IngestStore {
     /// one day each, and it is the same code the dashboard charts are drawn
     /// from, so a total here and a column there can never disagree about which
     /// Tuesday a sample was on.
+    ///
+    /// A stretch of time is filed under the moment it *ended* — the day the
+    /// sleeper woke up — and, crucially, `from` and `to` select on that same
+    /// moment. The two cannot differ. A row labelled Monday means the sleep
+    /// somebody woke up from on Monday, so a night beginning Sunday at 23:00
+    /// is Monday's; if the bounds filtered on the start instead, asking for
+    /// Monday to Friday would return a row labelled Monday that deliberately
+    /// omitted most of Monday's sleep. A bucket has to contain what its label
+    /// says, and that is what decides the question — "sleep from Monday to
+    /// Friday" is the nights you woke up on, not the nights you began on.
     func localAggregate(
         type: String,
         bucket: BucketSize,
@@ -33,11 +43,17 @@ extension IngestStore {
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = timeZone
 
+        let measure = try measure(for: type)
+        // The instant that decides where a record belongs: when it ended, for
+        // something that occupies time; when it was taken, for everything else.
+        let isStretch = measure.kind == .duration
+        let filed = isStretch ? "COALESCE(end_date, start_date)" : "start_date"
+
         // Without explicit bounds the range is the type's own extent, so the
         // caller still gets everything held rather than an arbitrary window.
         let extent = try database.query(
             """
-            SELECT MIN(start_date), MAX(start_date) FROM sample
+            SELECT MIN(\(filed)), MAX(\(filed)) FROM sample
              WHERE type = ? AND value IS NOT NULL
             """,
             [.text(type)],
@@ -82,7 +98,6 @@ extension IngestStore {
             return []
         }
 
-        let measure = try measure(for: type)
         let values = plan.columns.map { column in
             "(\(column.index),"
                 + "'\(Timestamps.text(from: column.start))',"
@@ -100,9 +115,14 @@ extension IngestStore {
             counted = "(CASE WHEN CAST(s.value AS INTEGER) IN (\(list)) THEN 1 ELSE 0 END)"
         }
 
-        // The caller's own bounds are still applied inside the join, so a range
-        // starting mid-day reports only that day's later samples even though
-        // the bucket it falls in begins at midnight.
+        // The caller's own bounds are applied inside the join, on the same
+        // column the buckets use, so a range starting mid-day reports only
+        // that day's later records even though the bucket begins at midnight.
+        // Written out rather than prefixed: `s.` in front of `COALESCE(...)`
+        // is not a qualified column, it is a syntax error.
+        let filedColumn = isStretch
+            ? "COALESCE(s.end_date, s.start_date)"
+            : "s.start_date"
         let rows = try database.query(
             """
             WITH b(idx, lo, hi) AS (VALUES \(values))
@@ -111,10 +131,10 @@ extension IngestStore {
                    SUM(\(counted))
               FROM b JOIN sample s
                 ON s.type = ?
-               AND s.start_date >= b.lo
-               AND s.start_date < b.hi
-               AND s.start_date >= ?
-               AND s.start_date <= ?
+               AND \(filedColumn) >= b.lo
+               AND \(filedColumn) < b.hi
+               AND \(filedColumn) >= ?
+               AND \(filedColumn) <= ?
              WHERE s.value IS NOT NULL
              GROUP BY b.idx
              ORDER BY b.idx
@@ -136,11 +156,10 @@ extension IngestStore {
             )
         }
 
-        // Time covered, not durations added. Only a duration measure needs it,
-        // and those types are inherently low-volume — a handful of records a
-        // night — so the rows are read rather than summed in SQL.
+        // Time covered, not durations added, and merged across the whole range
+        // before anything is filed. The same function the dashboards call.
         let unioned = measure.kind == .duration
-            ? try unionedSeconds(type: type, measure: measure, plan: plan)
+            ? try durationSeconds(type: type, plan: plan, measure: measure)
             : [:]
 
         let starts = Dictionary(

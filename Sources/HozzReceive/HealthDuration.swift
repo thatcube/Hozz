@@ -3,73 +3,83 @@ import HozzCore
 import HozzStore
 
 extension IngestStore {
-    /// Time actually covered by a type's records, per column.
+    /// Seconds per bucket for a category whose value is a stretch of time.
     ///
-    /// Not the sum of their durations. Sleep arrives as separate records, and
-    /// two devices describing one night each write one — a watch and a phone,
-    /// or a watch and a third-party app — so adding them reports that night
-    /// twice. The result looks like an unusually good night's sleep rather
-    /// than like an error, which is the worst way for a number to be wrong.
+    /// One implementation, read by the Mac dashboards and by the MCP tool,
+    /// because the alternative is what this codebase keeps finding: two copies
+    /// of one rule that agree until they do not, and nothing to say which is
+    /// right. The phone's chart and the Markdown export share `SleepIntervals`
+    /// for the same reason; that type cannot be called from here because it
+    /// works on HealthKit samples and builds for iOS, so what is shared is the
+    /// rule in ``TimeUnion`` and, deliberately, the behaviour below.
     ///
-    /// ``TimeUnion`` is the rule, shared with the Markdown export rather than
-    /// reimplemented here. Two implementations of one rule is exactly how the
-    /// day-boundary bug happened: they agreed until they did not, and nothing
-    /// said which was right.
+    /// Reads the stretches rather than summing them in SQL, because the answer
+    /// is the union of overlapping records and SQL cannot express that. Each
+    /// merged stretch is then filed under the bucket its *end* falls in — the
+    /// day the sleeper woke up. A night begun at 23:30 is the next morning's:
+    /// filing on the start puts a 7pm nap under tomorrow, a day nobody was
+    /// asleep, and files a night begun at 17:30 under yesterday.
     ///
-    /// A record belongs to the column its *start* falls in, which is the
-    /// attribution the export uses, so a night beginning at eleven is that
-    /// night's sleep rather than being split across two days.
-    func unionedSeconds(
+    /// Merging happens across the whole range before anything is filed. Two
+    /// records of one night can end either side of a bucket boundary, so
+    /// merging within a bucket afterwards would never compare them and would
+    /// count their shared hours twice.
+    func durationSeconds(
         type: String,
-        measure: HealthMeasure,
-        plan: TimeBucketPlan
+        plan: TimeBucketPlan,
+        measure: HealthMeasure
     ) throws -> [Int: Double] {
-        guard let span = plan.span else {
+        guard let first = plan.columns.first, let last = plan.columns.last else {
             return [:]
         }
+        // A stretch that starts before the window can still end inside it, and
+        // it is the end that decides where it is filed.
+        let lower = first.start.addingTimeInterval(-Self.longestPlausibleStretch)
 
-        var predicate = ""
-        if !measure.countedValues.isEmpty {
-            let list = measure.countedValues
-                .sorted()
-                .map(String.init)
-                .joined(separator: ", ")
-            predicate = " AND CAST(value AS INTEGER) IN (\(list))"
-        }
-
-        let rows = try database.query(
+        var sql = """
+            SELECT s.start_date, s.end_date, s.value
+              FROM sample s
+             WHERE s.type = ? AND s.start_date >= ? AND s.start_date < ?
+               AND s.end_date IS NOT NULL
             """
-            SELECT start_date, end_date FROM sample
-             WHERE type = ? AND start_date >= ? AND start_date < ?\(predicate)
-             ORDER BY start_date
-            """,
-            [
-                .text(type),
-                .text(Timestamps.text(from: span.start)),
-                .text(Timestamps.text(from: span.end))
-            ],
-            row: { ($0.text(0), $0.optionalText(1)) }
-        )
-
-        var byColumn: [Int: [DateInterval]] = [:]
-        for row in rows {
-            guard let start = Timestamps.date(from: row.0),
-                  let index = plan.index(for: start) else {
-                continue
-            }
-            // A record with no end, or one ending before it began, covers no
-            // time. Counted, but contributing nothing — which is different
-            // from being dropped, and the sample count still shows it.
-            guard let endText = row.1,
-                  let end = Timestamps.date(from: endText),
-                  end > start else {
-                continue
-            }
-            byColumn[index, default: []].append(
-                DateInterval(start: start, end: end)
-            )
+        var parameters: [SQLiteValue] = [
+            .text(type),
+            .text(Timestamps.text(from: lower)),
+            .text(Timestamps.text(from: last.end))
+        ]
+        if !measure.countedValues.isEmpty {
+            let list = measure.countedValues.sorted()
+                .map(String.init).joined(separator: ", ")
+            sql += " AND CAST(s.value AS INTEGER) IN (\(list))"
         }
 
-        return byColumn.mapValues { TimeUnion.seconds(of: $0) }
+        let stretches: [DateInterval] = try database.query(sql, parameters) { row in
+            guard
+                let start = Timestamps.date(from: row.text(0)),
+                let end = Timestamps.date(from: row.text(1)),
+                end > start
+            else {
+                return nil
+            }
+            return DateInterval(start: start, end: end)
+        }.compactMap { $0 }
+
+        var seconds: [Int: Double] = [:]
+        for stretch in TimeUnion.merge(stretches) {
+            guard let column = plan.columns.first(where: {
+                stretch.end > $0.start && stretch.end <= $0.end
+            }) else {
+                continue
+            }
+            seconds[column.index, default: 0] += stretch.duration
+        }
+        return seconds
     }
+
+    /// How far before the window to look for a stretch that ends inside it.
+    ///
+    /// Sleep is the only duration category with a meaningful length, and two
+    /// days is far longer than any single stretch Health records. Reading from
+    /// the beginning of time instead would make every chart scan the archive.
+    static let longestPlausibleStretch: TimeInterval = 2 * 24 * 3_600
 }

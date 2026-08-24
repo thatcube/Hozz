@@ -553,7 +553,7 @@ final class MCPArgumentTests: XCTestCase {
         XCTAssertFalse(body.contains("average"), body)
     }
 
-    // MARK: - One night counted once
+    // MARK: - One night counted once, on the day you woke up
 
     /// Two devices describing one night report that night once.
     ///
@@ -574,23 +574,112 @@ final class MCPArgumentTests: XCTestCase {
             ])
         )
 
+        // Begun on the 17th, woken from on the 18th, and filed there.
         XCTAssertTrue(
-            body.contains("2026-08-17, 480, 2"),
+            body.contains("2026-08-18, 480"),
             "eight hours from two records of the same night:\n\(body)"
         )
         XCTAssertFalse(body.contains("960"), "that would be counting it twice")
+        XCTAssertFalse(
+            body.contains("2026-08-17,"),
+            "nobody woke up on the 17th from this night:\n\(body)"
+        )
         XCTAssertTrue(
             body.contains("merged rather than added"),
             "the reply should say how overlaps are handled:\n\(body)"
         )
     }
 
-    /// Partly overlapping records cover the union, not the sum and not one.
-    func testPartlyOverlappingRecordsCoverTheirUnion() async throws {
+    /// A night is filed under the morning it ended, not the evening it began.
+    ///
+    /// Filing on the start puts a seven o'clock nap under tomorrow — a day
+    /// nobody was asleep — and a night begun at half past five under yesterday.
+    /// The phone's chart and the Markdown export both file on the wake day,
+    /// and this is the fourth surface agreeing with them.
+    func testANightIsFiledUnderTheDayTheSleeperWokeUp() async throws {
         let store = try await store([
-            // 23:00–03:00 and 01:00–07:00 overlap by two hours.
-            sleep("a", from: try local(2026, 8, 17, 23), hours: 4, value: 3),
-            sleep("b", from: try local(2026, 8, 18, 1), hours: 6, value: 4)
+            sleep("night", from: try local(2026, 8, 17, 23), hours: 7, value: 3)
+        ])
+
+        let body = try text(
+            await call(store, "aggregate_health_data", [
+                "type": "HKCategoryTypeIdentifierSleepAnalysis",
+                "bucket": "day"
+            ])
+        )
+        XCTAssertTrue(body.contains("2026-08-18, 420"), body)
+        XCTAssertFalse(body.contains("2026-08-17,"), body)
+    }
+
+    /// An evening nap is that evening's, because that is when it ended.
+    func testAnEveningNapStaysOnItsOwnEvening() async throws {
+        let store = try await store([
+            sleep("nap", from: try local(2026, 8, 17, 19), hours: 1, value: 3)
+        ])
+
+        let body = try text(
+            await call(store, "aggregate_health_data", [
+                "type": "HKCategoryTypeIdentifierSleepAnalysis",
+                "bucket": "day"
+            ])
+        )
+        XCTAssertTrue(body.contains("2026-08-17, 60"), body)
+    }
+
+    /// A night that began before the range but ended inside it is in range.
+    ///
+    /// This is the question the wake-day rule forces and the reason `from` and
+    /// `to` had to move onto the same instant the buckets use. The row is
+    /// labelled the 18th and means the sleep somebody woke up from on the
+    /// 18th; if the bounds still filtered on the start, that row would be
+    /// labelled the 18th and deliberately omit most of it.
+    func testANightBegunBeforeTheRangeButEndedInsideItIsIncluded() async throws {
+        let store = try await store([
+            sleep("night", from: try local(2026, 8, 17, 23), hours: 7, value: 3)
+        ])
+
+        let body = try text(
+            await call(store, "aggregate_health_data", [
+                "type": "HKCategoryTypeIdentifierSleepAnalysis",
+                "bucket": "day",
+                "from": "2026-08-18"
+            ])
+        )
+        XCTAssertTrue(
+            body.contains("2026-08-18, 420"),
+            "the night ended on the 18th, so it is the 18th's:\n\(body)"
+        )
+    }
+
+    /// And one that ended after the range is not in it.
+    func testANightEndedAfterTheRangeIsExcluded() async throws {
+        let store = try await store([
+            sleep("night", from: try local(2026, 8, 17, 23), hours: 7, value: 3)
+        ])
+
+        let reply = try await call(store, "aggregate_health_data", [
+            "type": "HKCategoryTypeIdentifierSleepAnalysis",
+            "bucket": "day",
+            "to": "2026-08-17"
+        ])
+        let body = try text(reply)
+        XCTAssertTrue(
+            body.contains("no records in that range"),
+            "nobody woke up on the 17th:\n\(body)"
+        )
+    }
+
+    /// Records of one night that end either side of midnight are still merged.
+    ///
+    /// Merging has to happen across the whole range before anything is filed.
+    /// Merging within each bucket afterwards would never compare these two,
+    /// and would count the hours they share twice.
+    func testStretchesEndingEitherSideOfMidnightAreStillMerged() async throws {
+        let store = try await store([
+            // 22:00–00:30 and 23:00–06:00 overlap; the first ends on the 17th
+            // and the second on the 18th.
+            sleep("early", from: try local(2026, 8, 17, 22), hours: 2.5, value: 3),
+            sleep("main", from: try local(2026, 8, 17, 23), hours: 7, value: 4)
         ])
 
         let body = try text(
@@ -600,11 +689,10 @@ final class MCPArgumentTests: XCTestCase {
             ])
         )
 
-        // 23:00 to 07:00 is eight hours. The second record starts after
-        // midnight, so it belongs to the 18th — the same attribution the
-        // Markdown export uses — and each day's own union is taken.
-        XCTAssertTrue(body.contains("2026-08-17, 240"), body)
-        XCTAssertTrue(body.contains("2026-08-18, 360"), body)
+        // The union runs 22:00 to 06:00 — eight hours — as one stretch, ending
+        // on the 18th. Merged within buckets it would have been 150 + 420.
+        XCTAssertTrue(body.contains("2026-08-18, 480"), body)
+        XCTAssertFalse(body.contains("2026-08-17, 150"), body)
     }
 
     /// Records that do not overlap still add up.
@@ -657,7 +745,7 @@ final class MCPArgumentTests: XCTestCase {
             ])
         )
         XCTAssertTrue(
-            body.contains("2026-08-17, 240, 2"),
+            body.contains("2026-08-17, 240"),
             "four hours staged asleep; the awake record adds nothing:\n\(body)"
         )
     }
