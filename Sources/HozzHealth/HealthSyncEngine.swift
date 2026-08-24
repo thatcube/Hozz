@@ -13,19 +13,37 @@ public struct SyncOutcome: Equatable, Sendable {
     public let typesDrained: Int
     public let wasInterrupted: Bool
     public let waitingForUnlock: Bool
+    /// How many of ``deliveredRecords`` came from the dated prime rather than
+    /// the anchored sweep.
+    ///
+    /// Worth separating because they answer different questions. Sweep records
+    /// are progress through a backlog whose size nobody knows; prime records
+    /// are progress through a window whose size is known exactly, so only these
+    /// can be turned into a fraction without inventing a denominator.
+    public let primedRecords: Int
+    /// Whether any type still has a dated window left to walk.
+    ///
+    /// False does not mean the history is complete — it means the *recent*
+    /// window is. The sweep is still walking everything older, and a surface
+    /// that read this as "done" would claim the gap does not exist.
+    public let primingRemains: Bool
 
     public init(
         deliveredRecords: Int,
         destinationCount: Int,
         typesDrained: Int,
         wasInterrupted: Bool,
-        waitingForUnlock: Bool
+        waitingForUnlock: Bool,
+        primedRecords: Int = 0,
+        primingRemains: Bool = false
     ) {
         self.deliveredRecords = deliveredRecords
         self.destinationCount = destinationCount
         self.typesDrained = typesDrained
         self.wasInterrupted = wasInterrupted
         self.waitingForUnlock = waitingForUnlock
+        self.primedRecords = primedRecords
+        self.primingRemains = primingRemains
     }
 
     public static let idle = SyncOutcome(
@@ -75,10 +93,45 @@ public actor HealthSyncEngine {
     /// with a handful of new records finishes in a single pass.
     public static let minimumFairShare = 50
 
-    private let store: HozzStore
+    /// The most of one pass's budget the dated prime may take.
+    ///
+    /// The prime goes first, because it is the only reader that can make the
+    /// recent past appear and it is the reason somebody opening the app on
+    /// their second day sees anything at all. But it does not get everything:
+    /// a pass that spent its whole budget priming would stop the sweep dead,
+    /// and the sweep is the only reader that will ever finish. Three quarters
+    /// is enough for the prime to cross ninety days quickly while leaving the
+    /// backlog moving every single pass.
+    static let primeRecordCeiling = batchRecordLimit * 3 / 4
+
+    /// The most of one pass's *bytes* the dated prime may take.
+    ///
+    /// The same reservation as the record ceiling, and for the same reason. A
+    /// prime allowed to run right up to the byte limit would start a chunk at
+    /// one byte below it and overshoot by a whole chunk, leaving the sweep's
+    /// own guard tripped before it read anything. The prime finishes either
+    /// way; the sweep would simply have lost that pass.
+    static let primeByteCeiling = batchByteLimit * 3 / 4
+
+    /// The most dated queries one type may spend in a single pass.
+    ///
+    /// A sparse type crosses its whole window in a handful of chunks because
+    /// each empty chunk widens the next. This bounds the pathological case —
+    /// a type that keeps returning just enough records to stay narrow — so one
+    /// type cannot spend a whole background launch on queries.
+    static let primeQueriesPerType = 24
+
+    let store: HozzStore
     private let source: any HealthDataSource
+    /// The dated reader, when there is one.
+    ///
+    /// Optional because the prime is an addition to a pipeline that works
+    /// without it, and because a caller that has no dated reader should get the
+    /// old behaviour exactly, rather than a prime that quietly does nothing.
+    let datedSource: (any DatedHealthDataSource)?
+    let primeSpan: TimeInterval
     private let delivery: DeliveryEngine
-    private let allTypes: [HealthTypeKey]
+    let allTypes: [HealthTypeKey]
     private let lease: ExportWriterLease
 
     public init(
@@ -86,12 +139,16 @@ public actor HealthSyncEngine {
         source: any HealthDataSource,
         delivery: DeliveryEngine,
         types: [HealthTypeKey],
+        datedSource: (any DatedHealthDataSource)? = nil,
+        primeSpan: TimeInterval = PrimePlan.defaultSpan,
         lease: ExportWriterLease = .shared
     ) {
         self.store = store
         self.source = source
         self.delivery = delivery
         self.allTypes = types
+        self.datedSource = datedSource
+        self.primeSpan = primeSpan
         self.lease = lease
     }
 
@@ -127,6 +184,8 @@ public actor HealthSyncEngine {
         }
 
         var deliveredRecords = 0
+        var primedRecords = 0
+        var primingRemains = false
         var typesDrained = 0
         var interrupted = false
         var waitingForUnlock = false
@@ -146,9 +205,22 @@ public actor HealthSyncEngine {
             } catch {
                 Self.log.error("A destination could not be synced this pass.")
                 interrupted = true
+                // A destination that could not be evaluated is not a
+                // destination that is finished. Leaving this alone would let a
+                // pass where everything failed report nothing outstanding,
+                // which reads downstream as "up to date" — a claim made on the
+                // strength of never having looked.
+                primingRemains = true
                 continue
             }
             deliveredRecords += result.deliveredRecords
+            // Carried up with the rest, and worth naming because leaving them
+            // out is invisible: the fields have defaults, so an outcome that
+            // dropped them still compiles, still looks right, and quietly turns
+            // every sentence downstream that depends on them into one nobody
+            // can ever see.
+            primedRecords += result.primedRecords
+            primingRemains = primingRemains || result.primingRemains
             typesDrained = max(typesDrained, result.typesDrained)
             interrupted = interrupted || result.wasInterrupted
             waitingForUnlock = waitingForUnlock || result.waitingForUnlock
@@ -169,7 +241,9 @@ public actor HealthSyncEngine {
             destinationCount: destinations.count,
             typesDrained: typesDrained,
             wasInterrupted: interrupted,
-            waitingForUnlock: waitingForUnlock
+            waitingForUnlock: waitingForUnlock,
+            primedRecords: primedRecords,
+            primingRemains: primingRemains
         )
     }
 
@@ -203,6 +277,20 @@ public actor HealthSyncEngine {
         var states: [HealthTypeKey: TypeState] = [:]
         var interrupted = false
         var waitingForUnlock = false
+
+        // The prime runs before the sweep and into the same batch. Before,
+        // because the recent past is what somebody is waiting to see; the same
+        // batch, because two batches would be two deliveries, two chances to
+        // fail, and two places to be interrupted between reading and recording.
+        let prime = try await primeRound(
+            destination: destination,
+            scope: scope,
+            now: now
+        )
+        records.append(contentsOf: prime.changes)
+        recordBytes += prime.bytes
+        interrupted = interrupted || prime.wasInterrupted
+        waitingForUnlock = waitingForUnlock || prime.waitingForUnlock
 
         let share = Self.fairShare(candidateCount: candidates.count)
 
@@ -294,10 +382,17 @@ public actor HealthSyncEngine {
         // ignores timestamps, so it can be taken before the moment is known.
         let held = try await store.streamRecords(scope: scope)
         let passCoverage = Self.passCoverage(for: committable)
+        // The digest is taken over the same reports that will be sent, windows
+        // included. A digest that summarised less than the payload would let
+        // the bytes change while the digest said they had not: the moment
+        // stamped on them would be reused from an earlier pass, and a receiver
+        // would be handed a widened window under a fingerprint claiming nothing
+        // had changed.
         let digest = CoverageReporter.digest(
             of: CoverageReporter.reports(
                 from: held,
                 pass: passCoverage,
+                primedWindows: prime.windows,
                 observedAt: now
             )
         )
@@ -309,11 +404,11 @@ public actor HealthSyncEngine {
         let coverage = CoverageReporter.reports(
             from: held,
             pass: passCoverage,
-            // Empty until the dated reader lands. Everything downstream — the
-            // wire shape, the receiver's table, and every sentence built on it
-            // — already carries a primed window, so switching it on is one
-            // dictionary built here rather than a change that has to travel.
-            primedWindows: [:],
+            // What the dated prime has genuinely delivered, as this batch will
+            // leave it. A window widens only inside the transaction that
+            // records the delivery, so a receiver is never told about a stretch
+            // that a refused batch failed to carry.
+            primedWindows: prime.windows,
             observedAt: observedAt
         )
         let coverageIsNews = destination.format.carriesCoverage
@@ -322,13 +417,28 @@ public actor HealthSyncEngine {
         guard !records.isEmpty || coverageIsNews else {
             // Nothing new for this destination. Still commit any cursor that
             // moved without data, so an empty stream is not re-read forever.
-            try await commitAnchors(committable, scope: scope)
+            //
+            // The prime's frontier is committed here too, and this is not a
+            // detail: a type with nothing at all in the last ninety days walks
+            // its whole window without producing a single record, and if that
+            // only counted when something was delivered, its window would be
+            // walked again on every pass, forever, and never be reported as
+            // covered. An empty stretch that has been read is covered — the
+            // claim "everything in this window is present" is true of nothing
+            // in exactly the way it is true of something.
+            try await commit(
+                committable,
+                prime: prime.commits,
+                scope: scope
+            )
             return SyncOutcome(
                 deliveredRecords: 0,
                 destinationCount: 1,
                 typesDrained: touched.count,
                 wasInterrupted: interrupted,
-                waitingForUnlock: waitingForUnlock
+                waitingForUnlock: waitingForUnlock,
+                primedRecords: 0,
+                primingRemains: prime.remains
             )
         }
 
@@ -356,16 +466,22 @@ public actor HealthSyncEngine {
             Self.log.error(
                 "A destination did not accept its batch; it will be retried."
             )
+            // Neither cursor moves. The prime re-reads the same chunk next
+            // time, which is the trade this design makes on purpose: a repeat
+            // the receiver absorbs, rather than a window claimed for data that
+            // never arrived.
             return SyncOutcome(
                 deliveredRecords: 0,
                 destinationCount: 1,
                 typesDrained: touched.count,
                 wasInterrupted: true,
-                waitingForUnlock: waitingForUnlock
+                waitingForUnlock: waitingForUnlock,
+                primedRecords: 0,
+                primingRemains: prime.remains
             )
         }
 
-        try await commitAnchors(committable, scope: scope)
+        try await commit(committable, prime: prime.commits, scope: scope)
         if coverageIsNews {
             // After the batch was accepted, so a refusal leaves the coverage
             // still owed rather than recorded as told.
@@ -377,7 +493,9 @@ public actor HealthSyncEngine {
             destinationCount: 1,
             typesDrained: touched.count,
             wasInterrupted: interrupted,
-            waitingForUnlock: waitingForUnlock
+            waitingForUnlock: waitingForUnlock,
+            primedRecords: prime.changes.count,
+            primingRemains: prime.remains
         )
     }
 
@@ -513,6 +631,30 @@ public actor HealthSyncEngine {
         }
     }
 
+    /// Points every destination's prime at a fresh window and walks it again.
+    ///
+    /// The one thing somebody might genuinely want to ask for by hand. Health
+    /// authorization can be widened in Settings long after Hozz first ran, and
+    /// a prime that already covered its window has no way to notice: it
+    /// finished, correctly, over the types it was allowed to see.
+    ///
+    /// Cheap to be wrong about. Re-reading delivers records the destination
+    /// already holds, and the receiver upserts on `(id, type)`, so asking twice
+    /// costs bytes rather than duplicates — while the cursors return to the new
+    /// starting instant first, so nothing is claimed while it is being re-read.
+    public func restartPrime(now: Date = .now) async throws {
+        let window = PrimePlan.window(endingAt: now, span: primeSpan)
+        for destination in try await delivery.destinations() {
+            try await store.restartPrime(
+                scope: .destination(destination.id),
+                windowStart: window.start,
+                startedAt: window.end,
+                chunkSeconds: PrimePlan.initialChunk,
+                at: now
+            )
+        }
+    }
+
     /// Rotates the order types are visited in, by the hour.
     ///
     /// The fair share already stops one type eating a whole pass, but the
@@ -552,11 +694,18 @@ public actor HealthSyncEngine {
     /// The judgement itself lives in ``coverageState(for:)``, which the batch
     /// on the wire uses too: the receiver is told exactly what the store is
     /// about to record, in the same breath, or neither happens.
-    private func commitAnchors(
+    ///
+    /// Named for what it does rather than for the cursor it started with. It
+    /// carries the dated prime's frontiers in the same transaction, and a
+    /// function called `commitAnchors` that also moved something else would be
+    /// the exact kind of quietly-wrong name this app cannot afford: the one
+    /// thing a prime must never do is advance an anchor.
+    private func commit(
         _ states: [HealthTypeKey: TypeState],
+        prime primeCommits: [PendingPrimeCommit],
         scope: AnchorScope
     ) async throws {
-        guard !states.isEmpty else {
+        guard !states.isEmpty || !primeCommits.isEmpty else {
             return
         }
         let closedAt = Date.now
@@ -576,7 +725,11 @@ public actor HealthSyncEngine {
                 )
             }
             .sorted { $0.type < $1.type }
-        try await store.commit(commits, scope: scope)
+        try await store.commit(
+            commits,
+            prime: primeCommits.sorted { $0.type < $1.type },
+            scope: scope
+        )
     }
 }
 

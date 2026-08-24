@@ -309,6 +309,33 @@ final class SyncViewModel {
         await load()
     }
 
+    /// Reads the last few months again, then syncs.
+    ///
+    /// Offered because Health authorization can be widened in Settings long
+    /// after Hozz first ran, and a prime that already finished has no way to
+    /// notice types it was never allowed to see. Nothing is lost by asking: the
+    /// receiver stores each record under its own identifier, so a record that
+    /// arrives twice replaces itself.
+    func fetchRecentMonthsAgain() async {
+        guard !isSyncing else {
+            return
+        }
+        isSyncing = true
+        defer { isSyncing = false }
+
+        do {
+            let services = try await resolveServices()
+            try await services.exporter.requestAuthorization()
+            try await services.sync.primeAgain()
+            let outcome = try await services.sync.sync(force: true)
+            lastSyncSummary = Self.describe(outcome)
+            lastError = nil
+        } catch {
+            lastError = error.localizedDescription
+        }
+        await load()
+    }
+
     /// Sends a tiny probe so the user sees a real response before trusting a
     /// destination. The most common setup failure in this space is a wrong auth
     /// header discovered days later.
@@ -350,15 +377,30 @@ final class SyncViewModel {
         return services
     }
 
-    private static func describe(_ outcome: SyncOutcome) -> String {
+    static func describe(_ outcome: SyncOutcome) -> String {
         if outcome.waitingForUnlock {
             return "Waiting for this iPhone to be unlocked."
         }
         if outcome.deliveredRecords == 0 {
-            return "Everything was already up to date."
+            // "Up to date" is a claim about somebody's whole history, and it is
+            // the easiest sentence here to make untrue. It is available only
+            // when a pass both sent nothing *and* got all the way through:
+            // a pass that was cut short, or whose destination refused it, has
+            // established nothing at all, and one still fetching the recent
+            // months has established that it is not finished.
+            if outcome.wasInterrupted {
+                return "Hozz did not get through this sync. It will pick up where it left off."
+            }
+            return outcome.primingRemains
+                ? "Nothing new to send. Still fetching your recent history."
+                : "Everything was already up to date."
         }
         let plural = outcome.deliveredRecords == 1 ? "record" : "records"
-        return "Sent \(outcome.deliveredRecords.formatted()) \(plural)."
+        let sent = "Sent \(outcome.deliveredRecords.formatted()) \(plural)."
+        guard outcome.primedRecords > 0 else {
+            return sent
+        }
+        return "\(sent) \(outcome.primedRecords.formatted()) from recent months."
     }
 
     static func relative(_ date: Date) -> String {

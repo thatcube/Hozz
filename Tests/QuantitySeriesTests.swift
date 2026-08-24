@@ -1263,6 +1263,40 @@ final class QuantitySeriesTests: XCTestCase {
         XCTAssertNil(single["seriesReadingsExported"])
     }
 
+    /// The promise is withdrawn by the one reader that cannot keep it.
+    ///
+    /// The anchored sweep notices a series sample as it goes past and queues
+    /// its readings, so its records may say the readings travelled with them.
+    /// A dated read cannot: paging readings needs a position inside the sample,
+    /// and a date range has nowhere to carry one. Left saying otherwise, a
+    /// consumer that excludes an aggregate because its readings are supposedly
+    /// present would drop the sample outright — and go on dropping it until the
+    /// sweep arrived, which is the weeks-long wait the dated read exists to
+    /// avoid.
+    func testADatedReadDoesNotPromiseReadingsItCannotSend() {
+        let primed = HealthSampleEncoder.quantityObject(
+            unit: unit,
+            value: 72.4,
+            description: "72.4 count/min",
+            count: 300,
+            expandsSeries: false
+        )
+
+        XCTAssertEqual(
+            primed["aggregatesSeries"] as? Bool,
+            true,
+            """
+            There is still more detail behind this number, and saying so is \
+            what stops an average of three hundred readings being read as one \
+            measurement.
+            """
+        )
+        XCTAssertNil(
+            primed["seriesReadingsExported"],
+            "A promise about the rest of the export that nothing will keep."
+        )
+    }
+
     func testEverySeriesFamilysDetailIsRecognisedAsDetail() {
         for kind in [
             QuantitySeriesEncoding.elementKind,

@@ -11,10 +11,18 @@ public enum HealthSampleEncodingError: Error, Sendable {
 public struct HealthSampleEncoder: Sendable {
     public init() {}
 
+    /// - Parameter expandsSeries: Whether the readings behind a series sample
+    ///   are travelling with this record. False for a dated read, which has
+    ///   nowhere to carry the position inside a sample that paging the readings
+    ///   needs, and so delivers the aggregate alone. It governs one mark and
+    ///   one mark only — see ``quantityObject(unit:value:description:count:expandsSeries:)``
+    ///   — because that mark is a promise about the rest of the export, and a
+    ///   promise nothing is going to keep must not be made.
     public func encode(
         sample: HKSample,
         catalogEntry: HealthCatalogEntry,
-        medications: [AnyHashable: MedicationConceptFacts] = [:]
+        medications: [AnyHashable: MedicationConceptFacts] = [:],
+        expandsSeries: Bool = true
     ) throws -> Data {
         var object = baseObject(sample: sample)
 
@@ -68,7 +76,8 @@ public struct HealthSampleEncoder: Sendable {
                 unit: unitString,
                 value: quantity.quantity.doubleValue(for: unit),
                 description: quantity.quantity.description,
-                count: quantity.count
+                count: quantity.count,
+                expandsSeries: expandsSeries
             )
         case let category as HKCategorySample:
             object["kind"] = "category"
@@ -204,15 +213,24 @@ public struct HealthSampleEncoder: Sendable {
     /// record's id" — which is what stops a consumer adding a value to the
     /// very readings it is the aggregate of, counting an hour of heart rate
     /// twice: once as an average, once as three hundred readings. Hozz always
-    /// exports the readings now, so today they always travel together; they
-    /// are kept separate because only one of them is a promise about the rest
-    /// of the export, and only that one has to be withdrawn if it stops being
-    /// true.
+    /// They are kept separate because only one of them is a promise about the
+    /// rest of the export, and only that one has to be withdrawn if it stops
+    /// being true — which is now, for one reader. The anchored sweep notices a
+    /// series sample as it goes past and queues its readings, so its records
+    /// keep the promise. A dated read cannot: paging readings needs a position
+    /// inside the sample, and a date range has nowhere to carry one. It
+    /// delivers the aggregate alone and says so, which leaves a consumer able
+    /// to use the number in front of it. Claiming otherwise would be worse
+    /// than useless: a consumer that excludes an aggregate because the readings
+    /// are supposedly present would drop the sample entirely, and go on
+    /// dropping it until the sweep arrived — weeks away, which is the whole
+    /// thing the dated read exists to avoid.
     static func quantityObject(
         unit: String,
         value: Double,
         description: String,
-        count: Int
+        count: Int,
+        expandsSeries: Bool = true
     ) -> [String: Any] {
         var object: [String: Any] = [
             "unit": unit,
@@ -224,8 +242,11 @@ public struct HealthSampleEncoder: Sendable {
             object["aggregatesSeries"] = true
             // A unit is always present here — the quantity branch throws
             // without one — so a sample standing for more than one reading is
-            // exactly a sample this build expands.
-            object["seriesReadingsExported"] = true
+            // exactly a sample the anchored sweep expands. Only that reader
+            // may say so.
+            if expandsSeries {
+                object["seriesReadingsExported"] = true
+            }
         }
         return object
     }

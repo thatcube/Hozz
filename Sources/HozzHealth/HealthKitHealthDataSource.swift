@@ -27,8 +27,8 @@ public enum HealthKitSourceError: Error, LocalizedError, Equatable, Sendable {
 /// HealthKit's completion queue, and only `Sendable` values cross back into
 /// structured concurrency.
 public actor HealthKitHealthDataSource: HealthDataSource {
-    private let healthStore: HKHealthStore
-    private let encoder: HealthSampleEncoder
+    let healthStore: HKHealthStore
+    let encoder: HealthSampleEncoder
     private let typesByKey: [HealthTypeKey: ExportableHealthType]
     private let routes: SeriesReader<HealthKitWorkoutRouteBackend>
     private let electrocardiograms: SeriesReader<HealthKitElectrocardiogramBackend>
@@ -76,6 +76,11 @@ public actor HealthKitHealthDataSource: HealthDataSource {
             types.map { ($0.catalogEntry.key, $0) },
             uniquingKeysWith: { first, _ in first }
         )
+    }
+
+    /// The exportable type behind a key, or nil when Hozz cannot read it.
+    func exportableType(for key: HealthTypeKey) -> ExportableHealthType? {
+        typesByKey[key]
     }
 
     /// The number of samples whose canonical encoding failed and were written as
@@ -176,13 +181,103 @@ public actor HealthKitHealthDataSource: HealthDataSource {
         let seriesSamples: [UUID]
     }
 
+    /// What encoding a batch of samples produced, whatever query found them.
+    struct Encoded: Sendable {
+        var changes: [HealthChange] = []
+        var encodingErrors = 0
+        var seriesSamples: [UUID] = []
+    }
+
+    /// Turns HealthKit samples into records, identically for every query.
+    ///
+    /// Shared rather than written twice because the anchored sweep and the
+    /// dated prime must produce *byte-identical* records for the same sample.
+    /// The receiver upserts on `(id, type)`, so a record that arrives by both
+    /// routes is meant to be the same record; two encoders that drifted apart
+    /// would turn a harmless repeat into a value that changes depending on
+    /// which reader happened to get there last.
+    ///
+    /// `nonisolated` because it touches nothing but its arguments, which lets
+    /// it run inside a HealthKit completion handler without hopping actors.
+    /// - Parameter expandsSeries: Whether the caller is going to deliver the
+    ///   readings behind a series sample. Only the anchored sweep can, so only
+    ///   it may have its records claim so.
+    nonisolated static func encode(
+        samples: [HKSample],
+        key: HealthTypeKey,
+        catalogEntry: HealthCatalogEntry,
+        encoder: HealthSampleEncoder,
+        medications: [AnyHashable: MedicationConceptFacts],
+        expandsSeries: Bool = true
+    ) -> Encoded {
+        var result = Encoded()
+        result.changes.reserveCapacity(samples.count)
+
+        for sample in samples {
+            do {
+                let payload = try encoder.encode(
+                    sample: sample,
+                    catalogEntry: catalogEntry,
+                    medications: medications,
+                    expandsSeries: expandsSeries
+                )
+                result.changes.append(
+                    .upsert(
+                        CapturedHealthObject(
+                            id: sample.uuid,
+                            type: key,
+                            canonicalPayload: payload
+                        )
+                    )
+                )
+                // Noticed only after the sample encodes, so a reading
+                // page is never the only thing an export holds about a
+                // sample it could not otherwise describe.
+                if
+                    let quantity = sample as? HKQuantitySample,
+                    QuantitySeriesEncoding.isExpandable(
+                        count: quantity.count,
+                        canonicalUnit: catalogEntry.canonicalUnit
+                    )
+                {
+                    result.seriesSamples.append(quantity.uuid)
+                }
+            } catch {
+                // A sample Hozz cannot encode losslessly is recorded as
+                // an explicit error in the output rather than dropped,
+                // so the export never overstates its own coverage.
+                result.encodingErrors += 1
+                guard
+                    let payload = try? encoder.encodeEncodingFailure(
+                        id: sample.uuid,
+                        typeIdentifier: key.rawValue,
+                        message: String(describing: error)
+                    )
+                else {
+                    continue
+                }
+                result.changes.append(
+                    .upsert(
+                        CapturedHealthObject(
+                            id: sample.uuid,
+                            type: key,
+                            canonicalPayload: payload
+                        )
+                    )
+                )
+            }
+        }
+
+        return result
+    }
+
     /// The medication list, read once and reused.
     ///
     /// A course of tablets is thousands of dose events pointing at the same
     /// handful of medicines, so looking each one up per dose would be absurd.
     /// A medication added mid-drain simply misses the cache and its dose says
     /// the medication is unresolved, which is true rather than invented.
-    private func medications(
+    func medications(
         for type: ExportableHealthType
     ) async throws -> [AnyHashable: MedicationConceptFacts] {
         guard type.catalogEntry.family == .medication else {
@@ -238,65 +333,17 @@ public actor HealthKitHealthDataSource: HealthDataSource {
                 }
 
                 var changes: [HealthChange] = []
-                changes.reserveCapacity(
-                    (samples?.count ?? 0) + (deletions?.count ?? 0)
+                let encoded = Self.encode(
+                    samples: samples ?? [],
+                    key: key,
+                    catalogEntry: catalogEntry,
+                    encoder: encoder,
+                    medications: medications
                 )
-                var encodingErrors = 0
-                var seriesSamples: [UUID] = []
-
-                for sample in samples ?? [] {
-                    do {
-                        let payload = try encoder.encode(
-                            sample: sample,
-                            catalogEntry: catalogEntry,
-                            medications: medications
-                        )
-                        changes.append(
-                            .upsert(
-                                CapturedHealthObject(
-                                    id: sample.uuid,
-                                    type: key,
-                                    canonicalPayload: payload
-                                )
-                            )
-                        )
-                        // Noticed only after the sample encodes, so a reading
-                        // page is never the only thing an export holds about a
-                        // sample it could not otherwise describe.
-                        if
-                            let quantity = sample as? HKQuantitySample,
-                            QuantitySeriesEncoding.isExpandable(
-                                count: quantity.count,
-                                canonicalUnit: catalogEntry.canonicalUnit
-                            )
-                        {
-                            seriesSamples.append(quantity.uuid)
-                        }
-                    } catch {
-                        // A sample Hozz cannot encode losslessly is recorded as
-                        // an explicit error in the output rather than dropped,
-                        // so the export never overstates its own coverage.
-                        encodingErrors += 1
-                        guard
-                            let payload = try? encoder.encodeEncodingFailure(
-                                id: sample.uuid,
-                                typeIdentifier: key.rawValue,
-                                message: String(describing: error)
-                            )
-                        else {
-                            continue
-                        }
-                        changes.append(
-                            .upsert(
-                                CapturedHealthObject(
-                                    id: sample.uuid,
-                                    type: key,
-                                    canonicalPayload: payload
-                                )
-                            )
-                        )
-                    }
-                }
+                changes = encoded.changes
+                changes.reserveCapacity(
+                    encoded.changes.count + (deletions?.count ?? 0)
+                )
 
                 for deletion in deletions ?? [] {
                     changes.append(
@@ -312,8 +359,8 @@ public actor HealthKitHealthDataSource: HealthDataSource {
                         returning: Page(
                             changes: changes,
                             anchor: token,
-                            encodingErrors: encodingErrors,
-                            seriesSamples: seriesSamples
+                            encodingErrors: encoded.encodingErrors,
+                            seriesSamples: encoded.seriesSamples
                         )
                     )
                 } catch {

@@ -254,8 +254,6 @@ public actor DeliveryEngine {
             return observation.moment
         }
 
-        var updated = destination
-        updated.options[Destination.coverageObservedDigestKey] = digest
         // Written and read through `Timestamps`, which is the one place a date
         // becomes text in this app. A hand-rolled formatter here would be a
         // third definition of the same format, and this value only works if
@@ -263,10 +261,31 @@ public actor DeliveryEngine {
         // unreadable would look like coverage nobody had observed, the clock
         // would be used instead, and the retry it exists to keep identical
         // would quietly stop being identical.
-        updated.options[Destination.coverageObservedAtKey] =
-            Timestamps.text(from: observation.moment)
+        let text = Timestamps.text(from: observation.moment)
+
+        var updated = destination
+        updated.options[Destination.coverageObservedDigestKey] = digest
+        updated.options[Destination.coverageObservedAtKey] = text
         try? await write(updated)
-        return observation.moment
+
+        // The moment as it will be *read back*, not as it was observed, and
+        // the difference is a millisecond that costs a receiver a duplicate.
+        //
+        // An instant carries more precision than the text it is written as, and
+        // formatting then parsing does not always land back on the same double:
+        // an instant written as `…57.869Z` can parse to one that formats as
+        // `…57.868Z`. The next pass stamps its batch from the parsed value, so
+        // returning the unparsed one here makes the two payloads differ by one
+        // character — same length, same meaning, different bytes — and the
+        // batch identity is a hash of those bytes. The receiver is handed what
+        // it should recognise as a retry and stores it a second time, which on
+        // a receiver too old to read these lines is a quarantined row per type
+        // per delivery, for ever.
+        //
+        // Round-tripping the value through the same text the next pass will
+        // read makes the two identical by construction rather than by luck
+        // about the sub-millisecond part of a clock reading.
+        return Timestamps.date(from: text) ?? observation.moment
     }
 
     private func loadedDestination(_ id: UUID) async throws -> Destination? {

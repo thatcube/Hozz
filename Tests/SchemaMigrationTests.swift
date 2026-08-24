@@ -617,7 +617,7 @@ final class SchemaMigrationTests: XCTestCase {
 
         let store = try HozzStore(directory: directory)
         let version = try await store.schemaVersion()
-        XCTAssertEqual(version, 2)
+        XCTAssertEqual(version, 3)
 
         let database = try SQLiteDatabase(url: databaseURL)
         defer { database.close() }
@@ -647,6 +647,14 @@ final class SchemaMigrationTests: XCTestCase {
         )
         XCTAssertTrue(tables.contains("destination"))
         XCTAssertTrue(tables.contains("delivery_state"))
+        XCTAssertTrue(
+            tables.contains("prime_state"),
+            """
+            The dated prime's frontier must survive a migration from an older \
+            store, and must arrive as its own table: an anchor and a frontier \
+            sharing a row is one careless UPDATE away from losing history.
+            """
+        )
     }
 
     func testThePhoneStoreIsIdempotentAcrossReopens() async throws {
@@ -655,7 +663,7 @@ final class SchemaMigrationTests: XCTestCase {
         for _ in 0..<3 {
             let store = try HozzStore(directory: directory)
             let version = try await store.schemaVersion()
-            XCTAssertEqual(version, 2)
+            XCTAssertEqual(version, 3)
         }
     }
 }

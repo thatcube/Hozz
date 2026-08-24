@@ -82,6 +82,167 @@ public struct StreamRecord: Equatable, Sendable {
     }
 }
 
+/// How a dated prime of one type is getting on.
+public enum PrimeState: String, Codable, Hashable, Sendable {
+    /// The window is being walked and part of it may already be delivered.
+    case priming
+    /// The frontier reached the start of the window. Everything in it is here.
+    case covered
+    /// The walk cannot continue without either dropping records or reading more
+    /// than a background launch can hold, so it stopped and said so.
+    ///
+    /// Nothing is lost by this: the anchored sweep still reaches every record
+    /// eventually. What is lost is the *speed*, and a stalled prime says that
+    /// plainly rather than quietly claiming the window.
+    case stalled
+}
+
+/// What a dated prime has actually covered for one type, in one cursor space.
+///
+/// Two of these fields are achievements and one is an intention, and telling
+/// them apart is the whole discipline of this record. `windowStart` is the
+/// oldest instant the prime is *aiming* at, and no surface may ever report it,
+/// because aiming at a date is not the same as holding it. The two cursors are
+/// what has actually been delivered and accepted:
+///
+///   - ``frontier`` walks *down* towards `windowStart` — the backfill.
+///   - ``coveredThrough`` walks *up* towards now — the top-up.
+///
+/// Between them lies one contiguous stretch, `[frontier, coveredThrough)`, and
+/// every second of it has been handed over. Both cursors move only inside the
+/// transaction that records the delivery, so the stretch is a claim the app can
+/// stand behind.
+///
+/// The top-up exists because the sweep is not current either, which is easy to
+/// miss. `HKAnchoredObjectQuery` returns records in the order Health stored
+/// them, so a sample recorded this morning is at the *end* of the queue, behind
+/// every one of the backlog's records. A prime with only a backfill would fill
+/// ninety days once and then fall a day behind, every day.
+public struct PrimeRecord: Equatable, Sendable {
+    public let type: HealthTypeKey
+    /// The oldest instant this prime is aiming at. An intention, not a claim.
+    public let windowStart: Date
+    /// When the prime began, and where both cursors started from.
+    ///
+    /// Kept because it is the only fixed point: the covered stretch grows in
+    /// both directions away from it, so without it there is nothing to measure
+    /// the backfill's progress against.
+    public let startedAt: Date
+    /// The oldest instant delivered. Walks down towards ``windowStart``.
+    public let frontier: Date
+    /// The newest instant delivered. Walks up towards now.
+    public let coveredThrough: Date
+    /// The chunk length the backfill found suited this type last time.
+    public let chunkSeconds: TimeInterval
+    /// The chunk length the top-up found suited this type last time.
+    ///
+    /// Kept apart from the backfill's, because the two walks are measuring
+    /// different things. A type can be quiet for months and busy this
+    /// afternoon, or the reverse, and one shared number means each walk hands
+    /// the other an estimate of a stretch it never read — which is then spent,
+    /// several queries at a time, discovering it was wrong.
+    public let topUpSeconds: TimeInterval
+    /// Records this prime has handed over, as the phone counts them.
+    public let deliveredCount: Int
+    public let state: PrimeState
+    public let failureReason: String?
+    public let updatedAt: Date
+
+    public init(
+        type: HealthTypeKey,
+        windowStart: Date,
+        startedAt: Date,
+        frontier: Date,
+        coveredThrough: Date,
+        chunkSeconds: TimeInterval,
+        topUpSeconds: TimeInterval,
+        deliveredCount: Int,
+        state: PrimeState,
+        failureReason: String? = nil,
+        updatedAt: Date
+    ) {
+        self.type = type
+        self.windowStart = windowStart
+        self.startedAt = startedAt
+        self.frontier = frontier
+        self.coveredThrough = coveredThrough
+        self.chunkSeconds = chunkSeconds
+        self.topUpSeconds = topUpSeconds
+        self.deliveredCount = deliveredCount
+        self.state = state
+        self.failureReason = failureReason
+        self.updatedAt = updatedAt
+    }
+
+    /// The stretch that has genuinely been read, or nil when none has.
+    ///
+    /// A prime that has delivered nothing has no window, and deliberately does
+    /// not report a zero-length one: anything asking whether a primed window
+    /// exists would read `from == through` as "yes, an empty one" and present a
+    /// density claim about no time at all.
+    public var coveredWindow: (from: Date, through: Date)? {
+        guard frontier < coveredThrough else {
+            return nil
+        }
+        return (frontier, coveredThrough)
+    }
+
+    /// Whether the backfill has reached the oldest instant it was aiming at.
+    ///
+    /// Not the same as finished. The top-up goes on running afterwards, so
+    /// ``coveredThrough`` keeps moving and the claim keeps growing.
+    public var isCovered: Bool {
+        state == .covered
+    }
+}
+
+/// One type's prime cursor advance, staged until its delivery is accepted.
+///
+/// Deliberately parallel to ``PendingAnchorCommit`` and deliberately separate
+/// from it. They are committed in the same transaction when a batch carried
+/// both, but they are different rows in different tables, and no code path
+/// turns one into the other — a prime cannot advance an anchor by accident
+/// because there is no expressible way to say it.
+public struct PendingPrimeCommit: Equatable, Sendable {
+    public let type: HealthTypeKey
+    /// The cursors this advance was computed from. A mismatch means something
+    /// else moved them underneath, and the write is refused rather than
+    /// applied, exactly as a stale anchor base is.
+    public let baseFrontier: Date
+    public let baseCoveredThrough: Date
+    public let frontier: Date
+    public let coveredThrough: Date
+    public let chunkSeconds: TimeInterval
+    public let topUpSeconds: TimeInterval
+    public let addedRecordCount: Int
+    public let state: PrimeState
+    public let failureReason: String?
+
+    public init(
+        type: HealthTypeKey,
+        baseFrontier: Date,
+        baseCoveredThrough: Date,
+        frontier: Date,
+        coveredThrough: Date,
+        chunkSeconds: TimeInterval,
+        topUpSeconds: TimeInterval,
+        addedRecordCount: Int,
+        state: PrimeState,
+        failureReason: String? = nil
+    ) {
+        self.type = type
+        self.baseFrontier = baseFrontier
+        self.baseCoveredThrough = baseCoveredThrough
+        self.frontier = frontier
+        self.coveredThrough = coveredThrough
+        self.chunkSeconds = chunkSeconds
+        self.topUpSeconds = topUpSeconds
+        self.addedRecordCount = addedRecordCount
+        self.state = state
+        self.failureReason = failureReason
+    }
+}
+
 public enum ExportRunState: String, Codable, Hashable, Sendable {
     /// The run owns the current export and is actively draining.
     case running

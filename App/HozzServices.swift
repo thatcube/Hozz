@@ -54,7 +54,12 @@ final class HozzServices: @unchecked Sendable {
                 store: store,
                 source: source,
                 delivery: delivery,
-                types: types.map(\.catalogEntry.key)
+                types: types.map(\.catalogEntry.key),
+                // The same object, offered twice, because it is the same
+                // HealthKit connection read two ways: by anchor for the sweep
+                // that will eventually have everything, and by date for the
+                // prime that makes the recent past appear now.
+                datedSource: source
             ),
             delivery: delivery
         )
@@ -107,6 +112,14 @@ struct SyncCoordinator: Sendable {
     @discardableResult
     func sync(force: Bool = false) async throws -> SyncOutcome {
         try await engine.sync(ignoringCadence: force)
+    }
+
+    /// Walks the recent months again for every destination.
+    ///
+    /// The pass that follows does the work; this only moves the cursors back,
+    /// so the app stops claiming the stretch before it starts re-reading it.
+    func primeAgain() async throws {
+        try await engine.restartPrime()
     }
 }
 

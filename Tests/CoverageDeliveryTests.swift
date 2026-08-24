@@ -500,6 +500,55 @@ final class CoverageDeliveryTests: XCTestCase {
         )
     }
 
+    /// The same claim, without waiting for the clock to land badly.
+    ///
+    /// The test above catches this only when `Date.now` happens to fall on an
+    /// awkward sub-millisecond value, which is why it passed alone and failed
+    /// in a full run. The property underneath is exact and can be checked
+    /// exactly: an instant carries more precision than the text it is stored
+    /// as, and formatting then parsing does not always land back on the same
+    /// double — an instant written as `…57.869Z` can parse to one that formats
+    /// as `…57.868Z`. A batch stamped from the unparsed value and its retry
+    /// stamped from the parsed one then differ by a single character: same
+    /// length, same meaning, different bytes, different identity, and a
+    /// receiver storing a retry a second time.
+    func testAnObservedMomentSurvivesBeingWrittenDown() async throws {
+        let store = try makeStore()
+        let channel = CoverageCapturingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = makeDestination()
+        try await delivery.save(destination)
+
+        // Offsets chosen to land all over the millisecond rather than on it.
+        for (index, offset) in stride(from: 0.0, to: 0.004, by: 0.000_37)
+            .enumerated() {
+            let digest = "digest-\(index)"
+            let observed = Date(timeIntervalSince1970: 1_760_000_000 + offset)
+
+            let stamped = await delivery.coverageObservation(
+                digest: digest,
+                now: observed,
+                for: destination.id
+            )
+            // The retry: same coverage, later pass, and it must rebuild the
+            // same bytes.
+            let retried = await delivery.coverageObservation(
+                digest: digest,
+                now: observed.addingTimeInterval(3_600),
+                for: destination.id
+            )
+
+            XCTAssertEqual(
+                Timestamps.text(from: stamped),
+                Timestamps.text(from: retried),
+                """
+                An observation stamped at \(observed.timeIntervalSince1970) \
+                must read back as the same text, or the retry is a new batch.
+                """
+            )
+        }
+    }
+
     /// And the retry must still be a retry of the *records*, not just of the
     /// coverage: nothing may be dropped on the way through.
     func testARefusedBatchLosesNoRecordsOnItsRetry() async throws {
