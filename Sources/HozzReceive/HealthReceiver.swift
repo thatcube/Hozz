@@ -364,13 +364,21 @@ public actor HealthReceiver {
             )
             try? await store.noteDelivery(
                 from: deviceName,
-                records: result.stored
+                records: result.storedAnything
             )
             record(
                 ReceiverEvent(
                     outcome: result.duplicate
                         ? .duplicate
-                        : .stored(records: result.stored, deleted: result.deleted)
+                        // Everything this batch put on disk, not only the rows
+                        // that are samples in their own right. During a series
+                        // backfill a batch is often nothing but reading pages,
+                        // and reporting that as "0 records" is as wrong as
+                        // counting each page as a reading was.
+                        : .stored(
+                            records: result.storedAnything,
+                            deleted: result.deleted
+                        )
                 )
             )
             return HTTPResponse(
@@ -385,6 +393,7 @@ public actor HealthReceiver {
                     // lines that were not JSON and could not be stored at all.
                     "characteristics": result.characteristics,
                     "unhandled": result.unhandled,
+                    "seriesPages": result.seriesPages,
                     "unreadable": result.unreadable
                 ]
             )

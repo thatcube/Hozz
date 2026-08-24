@@ -235,6 +235,13 @@ public struct IngestResult: Hashable, Sendable {
     /// Records stored without being understood. Not a loss — the bytes are on
     /// disk — but a signal that this receiver is behind the phone.
     public let unhandled: Int
+    /// Pages of series readings stored. Counted apart from `stored`, which
+    /// means rows that are samples in their own right — a page is several
+    /// hundred readings belonging to one of those. Reported rather than
+    /// folded in or dropped: during a series backfill a batch is often
+    /// nothing but pages, and calling that "0 records" is as wrong in one
+    /// direction as counting each page as a reading was in the other.
+    public let seriesPages: Int
 
     public init(
         stored: Int,
@@ -242,7 +249,8 @@ public struct IngestResult: Hashable, Sendable {
         duplicate: Bool,
         unreadable: Int,
         characteristics: Int = 0,
-        unhandled: Int = 0
+        unhandled: Int = 0,
+        seriesPages: Int = 0
     ) {
         self.stored = stored
         self.deleted = deleted
@@ -250,6 +258,13 @@ public struct IngestResult: Hashable, Sendable {
         self.unreadable = unreadable
         self.characteristics = characteristics
         self.unhandled = unhandled
+        self.seriesPages = seriesPages
+    }
+
+    /// Everything this batch put on disk, which is what a person means by
+    /// "did it arrive".
+    public var storedAnything: Int {
+        stored + characteristics + unhandled + seriesPages
     }
 }
 
@@ -652,45 +667,65 @@ public actor IngestStore {
     private static func rehomeMisfiledSeriesPages(
         _ database: SQLiteDatabase
     ) throws {
-        let misfiled = try database.query(
-            """
-            SELECT id, type, raw FROM sample
-            WHERE kind IN (?, ?)
-            """,
-            [
-                .text(QuantitySeriesShape.elementKind),
-                .text(QuantitySeriesShape.endKind)
-            ],
-            row: { ($0.text(0), $0.text(1), $0.blob(2) ?? Data()) }
-        )
-        guard !misfiled.isEmpty else {
-            return
-        }
+        // Read in slices, not all at once. The premise of this migration is
+        // that the table is *full* of these rows, and a misfiled page carries
+        // its whole record — five hundred readings, some forty kilobytes — in
+        // `raw`. Twenty thousand of them is a gigabyte resident, inside
+        // `init`, at app start; failing that allocation rolls the transaction
+        // back and the next launch attempts exactly the same one. Wedged
+        // forever, on precisely the archives most worth protecting.
+        //
+        // Keyed by rowid rather than a bare LIMIT, because a row readable as
+        // neither shape is deliberately left in place and a plain LIMIT would
+        // select it again on every pass and never terminate.
+        var cursor: Int64 = 0
+        let slice = 200
 
-        for (id, type, raw) in misfiled {
-            guard
-                let object = try? JSONSerialization.jsonObject(with: raw)
-                    as? [String: Any]
-            else {
-                continue
-            }
-            if let page = QuantitySeriesShape.page(in: object) {
-                try insert(page, into: database)
-            } else if let end = QuantitySeriesShape.end(in: object) {
-                try insert(end, into: database)
-            } else {
-                // Readable as neither shape. It stays exactly where it is
-                // rather than being dropped for being inconvenient — a row
-                // nobody can interpret is still a row somebody sent.
-                continue
-            }
-            // Removed only once its contents are somewhere else, and matched
-            // on the whole primary key so a row that merely shares an
-            // identifier is untouched.
-            try database.run(
-                "DELETE FROM sample WHERE id = ? AND type = ?",
-                [.text(id), .text(type)]
+        while true {
+            let misfiled = try database.query(
+                """
+                SELECT rowid, id, type, raw FROM sample
+                WHERE kind IN (?, ?) AND rowid > ?
+                ORDER BY rowid
+                LIMIT \(slice)
+                """,
+                [
+                    .text(QuantitySeriesShape.elementKind),
+                    .text(QuantitySeriesShape.endKind),
+                    .integer(cursor)
+                ],
+                row: { ($0.integer(0), $0.text(1), $0.text(2), $0.blob(3) ?? Data()) }
             )
+            guard !misfiled.isEmpty else {
+                return
+            }
+
+            for (rowid, id, type, raw) in misfiled {
+                cursor = max(cursor, rowid)
+                guard
+                    let object = try? JSONSerialization.jsonObject(with: raw)
+                        as? [String: Any]
+                else {
+                    continue
+                }
+                if let page = QuantitySeriesShape.page(in: object) {
+                    try insert(page, into: database)
+                } else if let end = QuantitySeriesShape.end(in: object) {
+                    try insert(end, into: database)
+                } else {
+                    // Readable as neither shape. It stays exactly where it is
+                    // rather than being dropped for being inconvenient — a row
+                    // nobody can interpret is still a row somebody sent.
+                    continue
+                }
+                // Removed only once its contents are somewhere else, and
+                // matched on the whole primary key so a row that merely shares
+                // an identifier is untouched.
+                try database.run(
+                    "DELETE FROM sample WHERE id = ? AND type = ?",
+                    [.text(id), .text(type)]
+                )
+            }
         }
     }
 
@@ -778,13 +813,14 @@ public actor IngestStore {
         var deleted = 0
         var storedCharacteristics = 0
         var storedUnhandled = 0
+        var storedSeriesPages = 0
         let timestamp = Timestamps.text(from: now)
 
         // One transaction, so a batch is either wholly stored or wholly absent.
         // A half-applied batch would be indistinguishable from a complete one
         // on the next delivery, and the missing half would never be resent.
         try database.transaction {
-            (stored, deleted, storedCharacteristics, storedUnhandled) =
+            (stored, deleted, storedCharacteristics, storedUnhandled, storedSeriesPages) =
                 try Self.write(batch, at: timestamp, into: database)
 
             if let idempotencyKey {
@@ -805,7 +841,8 @@ public actor IngestStore {
             duplicate: false,
             unreadable: batch.unreadableCount,
             characteristics: storedCharacteristics,
-            unhandled: storedUnhandled
+            unhandled: storedUnhandled,
+            seriesPages: storedSeriesPages
         )
     }
 
@@ -817,7 +854,7 @@ public actor IngestStore {
         _ batch: ParsedBatch,
         at timestamp: String,
         into database: SQLiteDatabase
-    ) throws -> (Int, Int, Int, Int) {
+    ) throws -> (Int, Int, Int, Int, Int) {
         var stored = 0
         var deleted = 0
         var storedCharacteristics = 0
@@ -1198,7 +1235,13 @@ public actor IngestStore {
             storedAudiograms
         )
 
-        return (stored, deleted, storedCharacteristics, storedUnhandled)
+        return (
+            stored,
+            deleted,
+            storedCharacteristics,
+            storedUnhandled,
+            storedQuantitySeriesPages
+        )
     }
 
 
@@ -1546,10 +1589,26 @@ public actor IngestStore {
     ///
     /// A batch that comes back with the record still unhandled has not been
     /// understood, however successfully it parsed as JSON.
+    /// Whether a re-read of a quarantined record produced anything this
+    /// receiver can now file properly.
+    ///
+    /// Every shape counts, not only the three the first version knew about.
+    /// A record that now parses into a reading page or an electrocardiogram is
+    /// exactly what promotion exists for, and judging it "still not understood"
+    /// stamps its parser version forward and leaves it in quarantine for good —
+    /// which is the one outcome promotion is meant to prevent.
     private static func understood(_ batch: ParsedBatch) -> Bool {
         !batch.records.isEmpty
             || !batch.deletions.isEmpty
             || !batch.characteristics.isEmpty
+            || !batch.electrocardiograms.isEmpty
+            || !batch.voltagePages.isEmpty
+            || !batch.quantitySeriesPages.isEmpty
+            || !batch.quantitySeriesEnds.isEmpty
+            || !batch.audiograms.isEmpty
+            || !batch.moodEntries.isEmpty
+            || !batch.medicationDoses.isEmpty
+            || !batch.workoutDetails.isEmpty
     }
 
     /// Places a record in quarantine directly, for tests that need to stand in

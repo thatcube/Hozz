@@ -286,6 +286,171 @@ final class QuantitySeriesReceiveTests: XCTestCase {
         )
     }
 
+    /// A real v7 database — the tables genuinely absent — with rows to move.
+    ///
+    /// The other migration test writes its rows through a v8 store and stamps
+    /// the version back, so `quantity_series_page` exists throughout and the
+    /// test would pass even if the rehoming ran before the tables were
+    /// created. This one drops them, which is the state a receiver upgrading
+    /// from v7 is actually in: get the order wrong and it fails with "no such
+    /// table" and rolls the whole migration back.
+    func testAGenuineOlderDatabaseWithRowsToMoveUpgradesCleanly() async throws {
+        let directory = root.appending(path: "store")
+        let line = readingPage(
+            id: "page-0",
+            sequence: 0,
+            offset: 0,
+            values: [70, 71, 72]
+        )
+
+        do {
+            let store = try IngestStore(directory: directory)
+            await store.close()
+        }
+
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let raw = try SQLiteDatabase(url: databaseURL)
+        try raw.execute("DROP TABLE IF EXISTS quantity_series_page")
+        try raw.execute("DROP TABLE IF EXISTS quantity_series")
+        try raw.run(
+            """
+            INSERT INTO sample
+                (id, type, kind, start_date, end_date, value, unit,
+                 source_name, raw, received_at)
+            VALUES (?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?)
+            """,
+            [
+                .text("page-0"),
+                .text(heartRate),
+                .text("quantitySeriesReadings"),
+                .text("2026-08-24T10:00:00.000Z"),
+                .text("2026-08-24T10:00:00.000Z"),
+                .blob(Data(line.utf8)),
+                .text("2026-08-24T10:00:00.000Z")
+            ]
+        )
+        try raw.execute("PRAGMA user_version = 7")
+        raw.close()
+
+        let store = try IngestStore(directory: directory)
+        let after = try await store.totalRecordCount()
+        XCTAssertEqual(after, 0, "Moved out of `sample`.")
+        let values = try await store.quantitySeriesReadings(forSample: sample)
+            .map(\.value)
+        XCTAssertEqual(values, [70, 71, 72], "And moved, not lost.")
+    }
+
+    func testAPageThatIsNotReadableAsOneIsQuarantinedNotFiledAsASample() async throws {
+        let store = try makeStore()
+        // The kind says reading page; the fields do not. It must not fall
+        // through to the generic parser, which would accept it on its id, type
+        // and date and put it right back in `sample` — where the migration
+        // that repairs such rows will never look again.
+        let batch = try parse(
+            """
+            {"kind":"quantitySeriesReadings","schemaVersion":1,"id":"broken",\
+            "type":"\(heartRate)","startDate":"2026-08-24T10:00:00.000Z",\
+            "endDate":"2026-08-24T10:00:00.000Z"}
+            """
+        )
+
+        XCTAssertTrue(batch.quantitySeriesPages.isEmpty)
+        XCTAssertTrue(
+            batch.records.isEmpty,
+            "It must not become an ordinary sample row."
+        )
+        XCTAssertEqual(
+            batch.unhandled.count,
+            1,
+            "It goes to quarantine, which is the receiver's keep-it-anyway path."
+        )
+
+        _ = try await store.ingest(batch, idempotencyKey: "broken")
+        let total = try await store.totalRecordCount()
+        XCTAssertEqual(total, 0)
+    }
+
+    func testTwoSamplesDoNotBleedIntoEachOther() async throws {
+        let store = try makeStore()
+        let other = "33333333-3333-4333-8333-333333333333"
+        let mine = readingPage(
+            id: "mine-0",
+            sequence: 0,
+            offset: 0,
+            values: [70, 71, 72]
+        )
+        let theirs = mine
+            .replacingOccurrences(of: sample, with: other)
+            .replacingOccurrences(of: "\"mine-0\"", with: "\"theirs-0\"")
+            .replacingOccurrences(of: "\"value\":70.0", with: "\"value\":90.0")
+            .replacingOccurrences(of: "\"value\":71.0", with: "\"value\":91.0")
+            .replacingOccurrences(of: "\"value\":72.0", with: "\"value\":92.0")
+
+        _ = try await store.ingest(
+            try parse([mine, theirs]),
+            idempotencyKey: "two"
+        )
+
+        let ours = try await store.quantitySeriesReadings(forSample: sample)
+            .map(\.value)
+        let others = try await store.quantitySeriesReadings(forSample: other)
+            .map(\.value)
+        XCTAssertEqual(ours, [70, 71, 72])
+        XCTAssertEqual(
+            others,
+            [90, 91, 92],
+            "Two samples sharing a sequence number are still two samples."
+        )
+    }
+
+    func testAPageWithNoUnitIsStillStored() async throws {
+        let store = try makeStore()
+        let line = readingPage(
+            id: "page-0",
+            sequence: 0,
+            offset: 0,
+            values: [70, 71, 72]
+        ).replacingOccurrences(of: "\"unit\":\"count/min\",", with: "")
+
+        _ = try await store.ingest(try parse(line), idempotencyKey: "no-unit")
+
+        let held = try await store.quantitySeriesReadings(forSample: sample)
+        XCTAssertEqual(
+            held.map(\.value),
+            [70, 71, 72],
+            "A missing unit is a missing label, not a reason to drop readings."
+        )
+        XCTAssertNil(held.first?.unit)
+    }
+
+    func testAPageOnlyBatchIsNotReportedAsHavingStoredNothing() async throws {
+        let store = try makeStore()
+        let result = try await store.ingest(
+            try parse([
+                readingPage(
+                    id: "page-0",
+                    sequence: 0,
+                    offset: 0,
+                    values: [70, 71, 72]
+                ),
+                endMarker(id: "end-0", readings: 3)
+            ]),
+            idempotencyKey: "pages-only"
+        )
+
+        XCTAssertEqual(result.stored, 0, "No samples were sent.")
+        XCTAssertEqual(result.seriesPages, 1)
+        XCTAssertEqual(
+            result.storedAnything,
+            1,
+            """
+            A backfill batch is often nothing but pages. Reporting that as \
+            nothing stored is the same kind of wrong as counting each page as \
+            a reading.
+            """
+        )
+    }
+
     func testTheAggregateStillSaysNotToAddItToItsOwnReadings() async throws {
         let store = try makeStore()
         let batch = try parse(aggregate(id: sample, value: 72.5, count: 6))

@@ -478,7 +478,8 @@ public enum BatchParser {
     /// - 3: ECG readings, their voltage pages, and audiograms.
     /// - 4: State of Mind valence, and medication doses.
     /// - 5: workout statistics and per-activity legs.
-    public static let parserVersion = 5
+    /// - 6: the readings behind a quantity aggregate, and their end markers.
+    public static let parserVersion = 6
 
     public static func parse(_ payload: Data) throws -> ParsedBatch {
         let text = String(decoding: payload, as: UTF8.self)
@@ -678,8 +679,22 @@ public enum BatchParser {
             case QuantitySeriesShape.elementKind:
                 if let page = QuantitySeriesShape.page(in: object) {
                     quantitySeriesPages.append(page)
-                    continue
+                } else {
+                    // Deliberately not left to fall through. A page carries an
+                    // id, a type and a start date, so the generic parser below
+                    // accepts it happily and files it in `sample` under its
+                    // parent's type — which is the exact fault this case
+                    // exists to prevent, and the migration that repairs it is
+                    // gated on a schema version that has already passed.
+                    unhandled.append(
+                        unhandledRecord(
+                            object,
+                            kind: kind,
+                            reason: "A quantity series page without the sample, position or readings that make it one."
+                        )
+                    )
                 }
+                continue
             case QuantitySeriesShape.endKind:
                 // Unlike the electrocardiogram's, this end marker does say
                 // something the pages cannot: how many readings the phone
@@ -687,8 +702,16 @@ public enum BatchParser {
                 // a short series apart from a page that went missing.
                 if let end = QuantitySeriesShape.end(in: object) {
                     quantitySeriesEnds.append(end)
-                    continue
+                } else {
+                    unhandled.append(
+                        unhandledRecord(
+                            object,
+                            kind: kind,
+                            reason: "A quantity series end marker without the sample it ends."
+                        )
+                    )
                 }
+                continue
             case AudiogramShape.kind:
                 if let audiogram = AudiogramShape.audiogram(in: object) {
                     audiograms.append(audiogram)
