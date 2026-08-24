@@ -1,4 +1,5 @@
 import Foundation
+import HozzCore
 
 /// The words an overview row and its heading use.
 ///
@@ -57,17 +58,33 @@ public enum OverviewNarration {
                 + "recent one that has arrived."
 
         case .incomplete(let report):
-            if let from = report.primedFrom, let through = report.primedThrough {
+            if let from = report.primedFrom,
+               let through = report.primedThrough,
+               standing.motion == .arriving {
                 return "Your phone has filled in \(day(from)) to \(day(through)) "
                     + "directly, and is still working back through everything "
                     + "older. Those two stretches do not meet yet, so there is "
                     + "a gap in the middle that is not a gap in your history."
             }
-            if report.state == .authorizationIndeterminate {
-                return "Your phone finished reading this type and Health "
-                    + "returned nothing at all. Health answers the same way "
-                    + "whether you have no records of it or Hozz was never "
-                    + "granted it, so this cannot tell you which."
+            // A stream that has stopped must not be described as working. The
+            // sentence above used to be given to every unfinished type with a
+            // window, including ones that had failed and were never coming
+            // back — so a hole that had stopped being filled was reported as
+            // one that was still closing.
+            //
+            // Every stopped state goes through one place, including the
+            // indeterminate one, which used to answer ahead of this and so
+            // never picked up anything the others learned to say.
+            guard standing.motion == .arriving else {
+                return Self.halted(
+                    report.state,
+                    newest: newest,
+                    strandedGap: report.primedFrom.flatMap { from in
+                        report.primedThrough.map {
+                            (from: day(from), through: day($0))
+                        }
+                    }
+                )
             }
             guard let newest else {
                 return "Your phone is still reading this type, so what is here "
@@ -86,6 +103,72 @@ public enum OverviewNarration {
             return "Your phone has not said whether it has finished reading "
                 + "this type. \(newest) is the newest record that has arrived, "
                 + "which may or may not be your newest."
+        }
+    }
+
+    /// What to say about a type whose reading has stopped rather than paused.
+    ///
+    /// Written out per state rather than defaulted, so a state added later
+    /// breaks this switch instead of quietly inheriting a sentence that does
+    /// not describe it.
+    private static func halted(
+        _ state: CoverageState,
+        newest: String?,
+        strandedGap: (from: String, through: String)? = nil
+    ) -> String {
+        let held = newest.map {
+            " What is here reaches \($0), and is not necessarily all there is."
+        } ?? ""
+        // A hole that has stopped being filled is a different thing from one
+        // that is still closing, and saying so is the whole point of telling
+        // the two apart. Named after the state's own sentence, because why the
+        // reading stopped is what a person can act on.
+        let stranded = strandedGap.map {
+            " Everything from \($0.from) to \($0.through) is here, and the "
+                + "older stretch is not — and while this type is stopped that "
+                + "hole will stay where it is."
+        } ?? ""
+
+        switch state {
+        case .draining, .anchorClosed:
+            // Handled by the caller; answered rather than crashed, because a
+            // state and a motion disagreeing is not worth a blank screen.
+            return "Your phone is still reading this type.\(held)\(stranded)"
+        case .authorizationIndeterminate:
+            return "Your phone finished reading this type and Health "
+                + "returned nothing at all. Health answers the same way "
+                + "whether you have no records of it or Hozz was never "
+                + "granted it, so this cannot tell you which.\(held)\(stranded)"
+        case .deviceLockedDeferred:
+            return "Your phone was locked when it last tried to read this "
+                + "type, and will carry on once it is unlocked.\(held)\(stranded)"
+        case .authorizationDismissed:
+            return "Your phone is waiting for permission to read this type. "
+                + "Open Hozz on the phone and allow it, and the rest will "
+                + "follow.\(held)\(stranded)"
+        case .limitedAuthorizationWindow:
+            return "Your phone was granted only part of this type's history, "
+                + "so the rest cannot be read at all.\(held)\(stranded)"
+        case .tombstoneGapSuspected:
+            return "Your phone could not read this type through to the end, "
+                + "so what is here may have gaps in the middle as well as at "
+                + "the edges.\(held)\(stranded)"
+        case .unsupported:
+            return "Your phone cannot read this type — Health reports it as "
+                + "unavailable or restricted on that device.\(held)\(stranded)"
+        case .unverifiedOnDevice:
+            return "Your phone has not confirmed this type on this device, so "
+                + "how much of it exists is not established.\(held)\(stranded)"
+        case .readFailed:
+            return "Your phone's own reading of this type failed, so it has "
+                + "stopped rather than paused. This is a fault in Hozz rather "
+                + "than anything about you or your Health data.\(held)\(stranded)"
+        case .unknown:
+            return "Your phone sent a status for this type that this copy of "
+                + "Hozz cannot interpret — it may be running a newer version, "
+                + "or it may have met an error it could not classify. Either "
+                + "way, how completely this type has been read is not "
+                + "known.\(held)\(stranded)"
         }
     }
 }
@@ -235,15 +318,25 @@ extension IngestStore.MetricSnapshot {
 
     /// The words that go in front of a figure whose records are not all here.
     ///
-    /// A type the phone has reported on is genuinely still being read, which
-    /// is worth saying plainly — it is coming. A type nothing has been said
-    /// about might be finished, might not, and this receiver has no way to
-    /// tell, so it claims neither.
+    /// A type that is genuinely still being read is worth saying plainly — it
+    /// is coming. A type that has *stopped* must not borrow that sentence: on
+    /// Brandon's phone the workout-route stream delivered 541 records, failed
+    /// on an error nobody had classified, and was reported as still arriving
+    /// every week afterwards. Reassurance a person cannot act on is worse than
+    /// no annotation.
     private static func arrivalPrefix(for standing: TypeCoverageStanding) -> String? {
         switch standing {
-        case .complete: nil
-        case .incomplete: "still arriving"
-        case .untold: "may be incomplete"
+        case .complete:
+            return nil
+        case .untold:
+            return "may be incomplete"
+        case .incomplete:
+            switch standing.motion {
+            case .arriving: return "still arriving"
+            case .paused: return "paused"
+            case .stopped: return "stopped early"
+            case .unknown: return "status not understood"
+            }
         }
     }
 }

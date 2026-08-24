@@ -60,6 +60,17 @@ public enum TypeCoverageStanding: Hashable, Sendable {
         return report.hasPrimedWindow
     }
 
+    /// Whether the hole is one the phone is still working to close.
+    ///
+    /// A gap with a sweep running behind it will be filled. A gap with a sweep
+    /// that has *stopped* will not, and the two want opposite sentences: one
+    /// is patience, the other is a fault. They were the same sentence until a
+    /// review caught it, which is precisely the collapse this whole signal was
+    /// built to remove — surviving inside the code that removes it.
+    public var hasClosingGap: Bool {
+        hasGap && motion == .arriving
+    }
+
     /// The stretch a dated query filled, when there is one.
     public var primedWindow: (from: Date, through: Date)? {
         guard
@@ -81,12 +92,65 @@ public enum TypeCoverageStanding: Hashable, Sendable {
         report?.state == .authorizationIndeterminate
     }
 
+    /// What is happening to this type right now, as opposed to how much of it
+    /// is here.
+    ///
+    /// A dashboard row has to choose one word, and "still arriving" was being
+    /// used for all of them — including streams that had stopped on an error
+    /// and were never coming back. Reassurance a person cannot act on is worse
+    /// than no annotation at all.
+    public enum Motion: Hashable, Sendable {
+        /// The sweep is running and has more to hand over.
+        case arriving
+        /// Stopped for a reason that clears itself, without anyone doing
+        /// anything.
+        case paused
+        /// Stopped. Nothing more is coming unless something changes.
+        case stopped
+        /// Nothing is known about it either way.
+        case unknown
+    }
+
+    public var motion: Motion {
+        switch self {
+        case .complete:
+            return .stopped
+        case .untold:
+            return .unknown
+        case .incomplete(let report):
+            switch report.state {
+            case .draining, .anchorClosed:
+                return .arriving
+            case .deviceLockedDeferred:
+                return .paused
+            case .authorizationIndeterminate,
+                 .authorizationDismissed,
+                 .limitedAuthorizationWindow,
+                 .tombstoneGapSuspected,
+                 .unsupported,
+                 .unverifiedOnDevice,
+                 .readFailed:
+                return .stopped
+            case .unknown:
+                return .unknown
+            }
+        }
+    }
+
     /// How to describe this type's standing in one clause, or nothing when
     /// there is nothing worth saying.
     ///
     /// Silence is the right answer for a complete type without a gap: the
     /// numbers beside it already say everything, and a row that annotates
     /// every state equally trains a reader to skip the annotation.
+    ///
+    /// Every other state gets its own clause. They used to share `draining`'s
+    /// — "still arriving" — which meant a stream that had *stopped* on an
+    /// error was described as making progress. That is the failure this whole
+    /// signal exists to prevent, in the surface built to prevent it: on
+    /// Brandon's phone the workout-route stream delivered 541 records, hit an
+    /// error nobody had classified, and every week since has been reported as
+    /// still on its way.
     public var qualifier: String? {
         switch self {
         case .complete:
@@ -94,16 +158,49 @@ public enum TypeCoverageStanding: Hashable, Sendable {
         case .untold:
             "your phone has not said whether this type is finished"
         case .incomplete(let report):
-            if hasGap {
-                "recent days are complete; older history is still arriving, "
+            hasClosingGap
+                ? "recent days are complete; older history is still arriving, "
                     + "so the middle is not here yet"
-            } else if report.state == .authorizationIndeterminate {
-                "your phone read this type and Health returned nothing, which "
-                    + "it reports the same way whether there is nothing to "
-                    + "read or permission was declined"
-            } else {
-                "still arriving"
-            }
+                : Self.qualifier(for: report.state)
+        }
+    }
+
+    /// One clause per state, written out rather than defaulted.
+    ///
+    /// A `default:` here would be the same trap the states themselves were in:
+    /// a case added later would silently inherit somebody else's sentence, and
+    /// nothing would fail. Adding a state has to break this switch.
+    private static func qualifier(for state: CoverageState) -> String {
+        switch state {
+        case .draining:
+            "still arriving"
+        case .anchorClosed:
+            // Unreachable: a closed anchor is `.complete`. Answered rather
+            // than crashed, because a state and a standing disagreeing is not
+            // worth taking the dashboard down over.
+            "still arriving"
+        case .authorizationIndeterminate:
+            "your phone read this type and Health returned nothing, which "
+                + "it reports the same way whether there is nothing to "
+                + "read or permission was declined"
+        case .authorizationDismissed:
+            "your phone is waiting for permission to read this type"
+        case .deviceLockedDeferred:
+            "your phone was locked and will pick this up when it is unlocked"
+        case .limitedAuthorizationWindow:
+            "your phone was granted only part of this type's history"
+        case .tombstoneGapSuspected:
+            "your phone could not read this type to the end, so it may have "
+                + "gaps"
+        case .unsupported:
+            "your phone cannot read this type"
+        case .unverifiedOnDevice:
+            "your phone has not confirmed this type on this device"
+        case .readFailed:
+            "your phone's own read of this type failed, so it has stopped "
+                + "rather than paused"
+        case .unknown:
+            "your phone sent a status this copy of Hozz cannot act on"
         }
     }
 }
