@@ -130,8 +130,17 @@ Each value is tagged with its own type, because HealthKit metadata is
 
 `type` is one of `string`, `number`, `bool`, `date`, `data` (base64),
 `quantity` (which carries a `description` string rather than a `value`), `array`
-(whose `value` is an array of tagged values), or `unsupported` (with a `class`
+(whose `value` is an array of tagged values), `nonFiniteNumber` (whose `value`
+is `"nan"`, `"infinity"` or `"-infinity"`), or `unsupported` (with a `class`
 naming what it was).
+
+`nonFiniteNumber` exists because JSON has no way to write those three, and
+handing one to a JSON encoder does not fail for that value alone — it makes the
+whole record unwritable. A sample carrying one could not be encoded at all, and
+for a series type that was permanent: the reader takes one sample per page, so
+the cursor never advanced past it and the stream stopped for good. Reported as
+what it is rather than dropped or rounded to something finite, because a number
+that is not a number is a fact about the record.
 
 ### Workouts
 

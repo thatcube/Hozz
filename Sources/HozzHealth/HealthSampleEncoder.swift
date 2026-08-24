@@ -359,7 +359,11 @@ public struct HealthSampleEncoder: Sendable {
         }
     }
 
-    private func taggedMetadataValue(_ value: Any) -> Any {
+    /// Internal rather than private so the recursive array case can be
+    /// checked directly. HealthKit refuses an array as a metadata value at
+    /// write time, so a test cannot reach that branch through a real sample —
+    /// and a branch nothing can reach is a branch nothing is checking.
+    func taggedMetadataValue(_ value: Any) -> Any {
         switch value {
         case let value as Date:
             return ["type": "date", "value": Self.timestamp(value)]
@@ -373,6 +377,24 @@ public struct HealthSampleEncoder: Sendable {
             if CFGetTypeID(value) == CFBooleanGetTypeID() {
                 return ["type": "bool", "value": value.boolValue]
             }
+            // JSON cannot write NaN or an infinity, and handing one to
+            // `JSONSerialization` does not fail politely for that value — it
+            // makes `isValidJSONObject` reject the **whole object**. So a
+            // single sample carrying a non-finite number in its metadata
+            // cannot be encoded at all, and for a series type that is
+            // permanent: the reader takes one sample per page, the encode
+            // throws, and the anchor never advances past it.
+            //
+            // Reported as what it is rather than dropped or rounded to
+            // something finite. A number that is not a number is a fact about
+            // the record, and inventing a value for it would be worse than
+            // saying so.
+            guard value.doubleValue.isFinite else {
+                return [
+                    "type": "nonFiniteNumber",
+                    "value": Self.nonFiniteName(value.doubleValue)
+                ]
+            }
             return ["type": "number", "value": value]
         case let values as [Any]:
             return [
@@ -385,6 +407,17 @@ public struct HealthSampleEncoder: Sendable {
                 "class": String(describing: type(of: value))
             ]
         }
+    }
+
+    /// What a number that is not a number is called.
+    ///
+    /// Named rather than numbered, because the three cases are genuinely
+    /// different facts and a reader should be able to tell them apart.
+    static func nonFiniteName(_ value: Double) -> String {
+        if value.isNaN {
+            return "nan"
+        }
+        return value > 0 ? "infinity" : "-infinity"
     }
 
     private static func timestamp(_ date: Date) -> String {
