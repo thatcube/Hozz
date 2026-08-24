@@ -27,6 +27,25 @@ public enum PayloadDivision {
         public let date: Date?
         let content: Content
 
+        /// Roughly what this record adds to a payload, separator included.
+        ///
+        /// Only ever used to decide where to cut, and always checked against
+        /// the real bytes afterwards, so being a little generous here costs a
+        /// slightly smaller part and nothing else.
+        var estimatedBytes: Int {
+            switch content {
+            case .line(let line):
+                // The line, plus a newline or a comma and a newline.
+                line.count + 2
+            case .metricPoint(let name, let units, let point):
+                // The point, plus its share of the metric envelope it may have
+                // to open: {"name":"…","units":"…","data":[]}.
+                point.count + name.count + units.count + 40
+            case .metricWorkout(let object), .metricDeletion(let object):
+                object.count + 2
+            }
+        }
+
         enum Content: Sendable {
             /// A whole line, exactly as the builder wrote it.
             case line(Data)
@@ -53,6 +72,23 @@ public enum PayloadDivision {
 
         public var count: Int {
             records.count
+        }
+
+        /// What every part costs before it holds a single record.
+        var framingBytes: Int {
+            switch format {
+            case .ndjson, .influx:
+                0
+            case .json:
+                // "[\n" and "\n]\n".
+                5
+            case .csv:
+                header?.count ?? 0
+            case .metrics:
+                // {"data":{"metrics":[]}} and room for the workout and deletion
+                // keys if this part happens to carry any.
+                60
+            }
         }
 
         /// Rebuilds a payload holding exactly the given records, in order.
@@ -192,6 +228,81 @@ public enum PayloadDivision {
             let end = min(start + maxRecords, division.count)
             return division.recompose(Array(division.records[start..<end]))
         }
+    }
+
+    /// Splits a payload into parts that each fit inside `maxBytes`.
+    ///
+    /// The size limit that matters is a server's, and servers count bytes. An
+    /// nginx in front of somebody's home API refuses a body over one megabyte
+    /// by default, and the whole batch is rejected — so the useful question is
+    /// not "how many records" but "how much".
+    ///
+    /// Packing is greedy over an estimate and then **verified against the real
+    /// bytes**, because an estimate that is wrong in the wrong direction
+    /// produces a part the server refuses, which is the failure this is meant
+    /// to avoid. A part that still does not fit is halved until it does or
+    /// until it holds a single record.
+    ///
+    /// A single record larger than the limit is sent on its own rather than
+    /// dropped. It will probably be refused, and that is the honest outcome: it
+    /// cannot be made smaller without throwing away part of a reading.
+    public static func divide(
+        _ payload: Data,
+        format: DeliveryFormat,
+        maxBytes: Int,
+        influxPrecision: InfluxLineProtocol.Precision = .nanoseconds,
+        dateStyle: PointDateStyle = .iso8601
+    ) -> [Data] {
+        guard
+            maxBytes > 0,
+            payload.count > maxBytes,
+            let division = decompose(
+                payload,
+                format: format,
+                influxPrecision: influxPrecision,
+                dateStyle: dateStyle
+            ),
+            division.count > 1
+        else {
+            return [payload]
+        }
+
+        var parts: [[Record]] = []
+        var current: [Record] = []
+        var currentBytes = division.framingBytes
+
+        for record in division.records {
+            let cost = record.estimatedBytes
+            if !current.isEmpty, currentBytes + cost > maxBytes {
+                parts.append(current)
+                current = []
+                currentBytes = division.framingBytes
+            }
+            current.append(record)
+            currentBytes += cost
+        }
+        if !current.isEmpty {
+            parts.append(current)
+        }
+
+        return parts.flatMap { part in
+            fit(part, in: division, maxBytes: maxBytes)
+        }
+    }
+
+    /// Recomposes a group and halves it until the bytes really do fit.
+    private static func fit(
+        _ records: [Record],
+        in division: Division,
+        maxBytes: Int
+    ) -> [Data] {
+        let payload = division.recompose(records)
+        guard payload.count > maxBytes, records.count > 1 else {
+            return [payload]
+        }
+        let middle = records.count / 2
+        return fit(Array(records[..<middle]), in: division, maxBytes: maxBytes)
+            + fit(Array(records[middle...]), in: division, maxBytes: maxBytes)
     }
 
     /// Whether taking this payload apart and putting it back gives the same

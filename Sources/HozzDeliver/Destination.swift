@@ -484,6 +484,27 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
     /// often than necessary is harmless; acting on it less often is the failure
     /// this exists to prevent.
     public static let pendingReplayKey = "pendingReplay"
+    public static let maxRequestBytesKey = "maxRequestBytes"
+
+    /// The largest body this destination should be sent in one request, or nil
+    /// to send each batch whole however large it is.
+    ///
+    /// The limit that bites in practice is a server's, not a phone's: an nginx
+    /// in front of somebody's home API refuses a body over one megabyte by
+    /// default and takes the whole batch down with it. Splitting is off unless
+    /// asked for, because it changes how many requests an already-working
+    /// destination receives, and a setup that works should keep working
+    /// untouched across an update.
+    public var maxRequestBytes: Int? {
+        guard
+            let raw = options[Destination.maxRequestBytesKey],
+            let bytes = Int(raw),
+            bytes >= RequestSize.minimum
+        else {
+            return nil
+        }
+        return bytes
+    }
 
     /// Whether this destination still owes its history a replay.
     public var isReplayPending: Bool {
@@ -676,6 +697,19 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
     /// Delivering the batch whole would have sent readings the user asked to
     /// exclude, which is the failure that looks like a success.
     case windowNotApplicable
+    /// A batch split across several requests stopped partway.
+    ///
+    /// Its own case rather than the underlying failure, because the two are not
+    /// the same fact and the difference is the one the user needs. "The server
+    /// refused the data" and "the server took the first two of five and then
+    /// refused" call for different things to be checked, and nothing else in
+    /// the system can reconstruct the second from the first.
+    ///
+    /// Nothing is recorded as delivered either way: the acquisition cursor does
+    /// not move, and the whole batch is sent again from the first part. The
+    /// parts that did land carry the same bytes and therefore the same
+    /// idempotency key, so a receiver that honours it stores them once.
+    case incompleteBatch(accepted: Int, total: Int, detail: String, isTransient: Bool)
     case folderUnavailable
     case accessDenied
     case rejected(statusCode: Int, body: String?)
@@ -692,6 +726,11 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
             "Hozz could not tell how old the readings in this batch were, so "
                 + "it sent nothing rather than send readings you asked it to "
                 + "leave out."
+        case .incompleteBatch(let accepted, let total, let detail, _):
+            "This batch was sent in \(total) requests and the destination "
+                + "accepted \(accepted) of them before stopping. \(detail) "
+                + "Nothing has been counted as delivered, and the whole batch "
+                + "will be sent again from the beginning."
         case .folderUnavailable:
             "Hozz could not reach that folder. It may have been moved, renamed, or signed out."
         case .accessDenied:
@@ -714,6 +753,10 @@ public enum DeliveryError: Error, LocalizedError, Equatable, Sendable {
         case .rejected(let statusCode, _):
             // 408, 429, and 5xx are the server asking to be tried again.
             statusCode == 408 || statusCode == 429 || (500...599).contains(statusCode)
+        case .incompleteBatch(_, _, _, let isTransient):
+            // Carried through from whatever stopped it. A split delivery that
+            // failed on a 500 deserves the same patience as an unsplit one.
+            isTransient
         case .notConfigured, .folderUnavailable, .accessDenied, .cancelled,
              .unsupportedSettings, .windowNotApplicable:
             // Waiting does not teach this build a word it does not know. Only

@@ -32,6 +32,7 @@ struct DestinationEditorView: View {
     @State private var precision: InfluxLineProtocol.Precision
     @State private var payloadSchema: PayloadSchema
     @State private var requestTimeout: TimeInterval
+    @State private var maxRequestBytes: Int?
     @State private var discovered: [DiscoveredReceiver] = []
     @State private var isBrowsing = false
 
@@ -72,6 +73,7 @@ struct DestinationEditorView: View {
         _requestTimeout = State(
             initialValue: destination?.requestTimeout ?? RequestTimeout.default
         )
+        _maxRequestBytes = State(initialValue: destination?.maxRequestBytes)
     }
 
     var body: some View {
@@ -202,6 +204,7 @@ struct DestinationEditorView: View {
 
             if kind == .restAPI {
                 timeoutSection
+                requestSizeSection
             }
 
             if PayloadSchema.applies(to: format), kind != .folder {
@@ -422,6 +425,41 @@ struct DestinationEditorView: View {
     }
 
 
+    /// Whether to split a large batch across several requests.
+    ///
+    /// Off unless asked for. Splitting changes how many requests an existing
+    /// destination receives, and a setup that works today should go on working
+    /// untouched after an update.
+    private var requestSizeSection: some View {
+        Section {
+            Picker("Largest request", selection: $maxRequestBytes) {
+                Text("Send it all at once").tag(Int?.none)
+                ForEach(RequestSize.choices, id: \.self) { bytes in
+                    Text(RequestSize.displayName(for: bytes)).tag(Int?.some(bytes))
+                }
+            }
+
+            if let maxRequestBytes {
+                Text(RequestSize.explanation(for: maxRequestBytes))
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+            }
+        } header: {
+            Text("Request size")
+        } footer: {
+            Text(
+                "If your server answers HTTP 413, or times out on a big batch, "
+                + "its limit is smaller than what Hozz is sending. nginx "
+                + "refuses anything over 1 MB unless told otherwise. Splitting "
+                + "sends the same readings in several requests instead. If one "
+                + "of them fails, Hozz stops there, counts none of the batch as "
+                + "delivered, and sends the whole thing again next time, so a "
+                + "half-arrived batch is never recorded as a success."
+            )
+        }
+    }
+
+    /// Matching another exporter's field names, for pipelines already built.
     private var compatibilitySection: some View {
         Section {
             Picker("Field names", selection: $payloadSchema) {
@@ -632,6 +670,9 @@ struct DestinationEditorView: View {
         var options = existing?.options ?? [:]
         if kind == .restAPI {
             options[Destination.timeoutKey] = String(Int(requestTimeout))
+            // Removed rather than set to zero when switched off, so the record
+            // says nothing rather than saying something meaningless.
+            options[Destination.maxRequestBytesKey] = maxRequestBytes.map(String.init)
         }
         guard format == .influx || options[Destination.measurementKey] != nil else {
             // A folder has no measurement name, and stamping one on it would
