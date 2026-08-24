@@ -154,6 +154,16 @@ extension IngestStore {
         // single reading outvotes an hour of them.
         let readings = "COALESCE(json_extract(CAST(s.raw AS TEXT), '$.quantity.count'), 1)"
 
+        // A stretch of time belongs to the bucket it *ended* in — a night
+        // beginning at 23:30 is the next morning's, which is what the phone's
+        // chart and the Markdown export both say. Everything else is filed on
+        // the moment it was taken. Counts and durations must use the same
+        // column or a night lands in one bucket while its records land in the
+        // one before.
+        let bucketColumn = measure.kind == .duration
+            ? "COALESCE(s.end_date, s.start_date)"
+            : "s.start_date"
+
         let values = plan.columns.map { column in
             "(\(column.index),"
                 + "'\(Timestamps.text(from: column.start))',"
@@ -181,8 +191,8 @@ extension IngestStore {
                        ELSE 0 END)
               FROM b JOIN sample s
                 ON s.type = ?
-               AND s.start_date >= b.lo
-               AND s.start_date < b.hi
+               AND \(bucketColumn) >= b.lo
+               AND \(bucketColumn) < b.hi
              GROUP BY b.idx
             """
 
@@ -208,6 +218,22 @@ extension IngestStore {
             uniqueKeysWithValues: fetched.map { ($0.index, $0) }
         )
 
+        // A duration category is the one shape SQL cannot answer.
+        //
+        // Two devices readily describe the same night — a watch and a phone
+        // both wrote sleep here — and `SUM(end - start)` counts their shared
+        // hours twice, reporting a night that never happened. Worse, it errs
+        // generously, so it reads as a good night rather than as a fault. The
+        // union has to be taken over the stretches themselves, which SQL has
+        // no way to express, so the rows are read and merged here instead.
+        //
+        // Filed on the end, not the start: a night beginning at 23:30 belongs
+        // to the morning the sleeper woke up, which is what both the phone's
+        // chart and the Markdown export already say.
+        let mergedDurations = measure.kind == .duration
+            ? try durationSeconds(type: type, plan: plan, measure: measure)
+            : [:]
+
         let columns = plan.columns.map { column in
             let row = rows[column.index]
             return SeriesColumn(
@@ -224,7 +250,9 @@ extension IngestStore {
                 readingCount: row?.readings ?? 0,
                 daysWithData: row?.days ?? 0,
                 dayCount: column.dayCount(in: plan.calendar),
-                durationSeconds: (((row?.duration ?? 0) * 1000).rounded()) / 1000
+                durationSeconds: measure.kind == .duration
+                    ? (((mergedDurations[column.index] ?? 0) * 1000).rounded()) / 1000
+                    : (((row?.duration ?? 0) * 1000).rounded()) / 1000
             )
         }
 
@@ -309,4 +337,75 @@ extension IngestStore {
         }
         return byType
     }
+
+    /// Seconds per bucket for a category whose value is a stretch of time.
+    ///
+    /// Reads the stretches rather than summing them in SQL, because the answer
+    /// is the union of overlapping records and SQL cannot express that. Each
+    /// merged stretch is then filed under the bucket its *end* falls in — the
+    /// day the sleeper woke up.
+    ///
+    /// Merging happens across the whole range before anything is filed. Two
+    /// records of one night can end either side of a bucket boundary, so
+    /// merging within a bucket afterwards would never compare them and would
+    /// count their shared hours twice, which is the bug this replaces.
+    private func durationSeconds(
+        type: String,
+        plan: TimeBucketPlan,
+        measure: HealthMeasure
+    ) throws -> [Int: Double] {
+        guard let first = plan.columns.first, let last = plan.columns.last else {
+            return [:]
+        }
+        // A stretch that starts before the window can still end inside it, and
+        // it is the end that decides where it is filed.
+        let lower = first.start.addingTimeInterval(-Self.longestPlausibleStretch)
+
+        var sql = """
+            SELECT s.start_date, s.end_date, s.value
+              FROM sample s
+             WHERE s.type = ? AND s.start_date >= ? AND s.start_date < ?
+               AND s.end_date IS NOT NULL
+            """
+        var parameters: [SQLiteValue] = [
+            .text(type),
+            .text(Timestamps.text(from: lower)),
+            .text(Timestamps.text(from: last.end))
+        ]
+        if !measure.countedValues.isEmpty {
+            let list = measure.countedValues.sorted()
+                .map(String.init).joined(separator: ", ")
+            sql += " AND CAST(s.value AS INTEGER) IN (\(list))"
+        }
+        _ = parameters
+
+        let stretches: [DateInterval] = try database.query(sql, parameters) { row in
+            guard
+                let start = Timestamps.date(from: row.text(0)),
+                let end = Timestamps.date(from: row.text(1)),
+                end > start
+            else {
+                return nil
+            }
+            return DateInterval(start: start, end: end)
+        }.compactMap { $0 }
+
+        var seconds: [Int: Double] = [:]
+        for stretch in TimeUnion.merge(stretches) {
+            guard let column = plan.columns.first(where: {
+                stretch.end > $0.start && stretch.end <= $0.end
+            }) else {
+                continue
+            }
+            seconds[column.index, default: 0] += stretch.duration
+        }
+        return seconds
+    }
+
+    /// How far before the window to look for a stretch that ends inside it.
+    ///
+    /// Sleep is the only duration category with a meaningful length, and two
+    /// days is far longer than any single stretch Health records. Reading from
+    /// the beginning of time instead would make every chart scan the archive.
+    private static let longestPlausibleStretch: TimeInterval = 2 * 24 * 3_600
 }

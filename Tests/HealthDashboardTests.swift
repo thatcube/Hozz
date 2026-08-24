@@ -637,13 +637,28 @@ final class HealthDashboardTests: XCTestCase {
             )
         ])
 
-        let plan = try dayPlan(from: try local(2026, 5, 4), days: 1)
+        // Two days, because the core block ends at 00:30 on the 5th and a
+        // night is filed under the morning it ended — the day the sleeper woke
+        // up, which is what the phone's chart and the Markdown export say.
+        let plan = try dayPlan(from: try local(2026, 5, 4), days: 2)
         let series = try await store.series(
             type: "HKCategoryTypeIdentifierSleepAnalysis",
             plan: plan
         )
 
         XCTAssertEqual(series.measure.kind, .duration)
+        XCTAssertEqual(
+            series.columns[0].durationSeconds,
+            0,
+            accuracy: 0.5,
+            "Nothing ended on the 4th, so the 4th holds no sleep."
+        )
+        XCTAssertEqual(
+            series.columns[1].durationSeconds,
+            7200,
+            accuracy: 0.5,
+            "The two-hour core block ended on the 5th."
+        )
         // Only the two-hour core block counts: 7,200 seconds.
         XCTAssertEqual(try XCTUnwrap(series.headline), 7200, accuracy: 0.5)
         XCTAssertEqual(series.displayUnit.label, "hr")
