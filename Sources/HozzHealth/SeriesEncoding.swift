@@ -88,11 +88,42 @@ public struct SeriesPage: Sendable {
     public let header: SeriesHeader?
     public let deletions: [UUID]
     public let anchor: Data
+    /// A sample that was on this page and could not be encoded.
+    ///
+    /// A backend reports one rather than throwing, and the difference is the
+    /// whole of it. A series backend reads exactly one sample per page, so a
+    /// throw here means the cursor never moves — and the next pass reads the
+    /// same sample, fails the same way, and does so for ever. One record with
+    /// something awkward in it stops the entire type, permanently, and on
+    /// Brandon's phone that is what happened to workout routes: 541 records
+    /// and then nothing, every pass, for weeks.
+    ///
+    /// The ordinary sample path has never had this problem. It catches a
+    /// per-sample encoding failure, writes a record in its place, and carries
+    /// on. This is that, for series.
+    public let unencodable: UnencodableSample?
 
-    public init(header: SeriesHeader?, deletions: [UUID], anchor: Data) {
+    public init(
+        header: SeriesHeader?,
+        deletions: [UUID],
+        anchor: Data,
+        unencodable: UnencodableSample? = nil
+    ) {
         self.header = header
         self.deletions = deletions
         self.anchor = anchor
+        self.unencodable = unencodable
+    }
+}
+
+/// A sample the backend could not turn into bytes, and why.
+public struct UnencodableSample: Sendable, Equatable {
+    public let id: UUID
+    public let reason: String
+
+    public init(id: UUID, reason: String) {
+        self.id = id
+        self.reason = reason
     }
 }
 

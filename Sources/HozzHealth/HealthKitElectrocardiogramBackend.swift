@@ -55,26 +55,71 @@ public struct HealthKitElectrocardiogramBackend: SeriesBackend {
                 do {
                     let token = try HealthKitAnchorCoding.token(for: newAnchor)
                     var header: SeriesHeader?
-                    if let sample = samples?.first as? HKElectrocardiogram {
-                        header = SeriesHeader(
-                            id: sample.uuid,
-                            startDate: sample.startDate,
-                            endDate: sample.endDate,
-                            basePayload: try ElectrocardiogramEncoding.basePayload(
-                                try encoder.encodeBaseFields(sample: sample),
-                                classification: Self.classification(sample.classification),
-                                symptomsStatus: Self.symptoms(sample.symptomsStatus),
-                                averageHeartRate: sample.averageHeartRate?
-                                    .doubleValue(
-                                        for: HKUnit.count()
-                                            .unitDivided(by: .minute())
-                                    ),
-                                samplingFrequencyHertz: sample.samplingFrequency?
-                                    .doubleValue(for: .hertz()),
-                                numberOfVoltageMeasurements: sample
-                                    .numberOfVoltageMeasurements
+                    if let object = samples?.first {
+                        // The cast comes first, and a failure is reported
+                        // rather than ignored. Falling through with a nil
+                        // header would advance the cursor past a reading with
+                        // nothing standing in for it — and worse, an empty
+                        // page is what tells the drain a type is caught up, so
+                        // the export would claim completeness in the same
+                        // breath as it skipped a record.
+                        guard let sample = object as? HKElectrocardiogram else {
+                            continuation.resume(
+                                returning: SeriesPage(
+                                    header: nil,
+                                    deletions: (deletions ?? []).map(\.uuid),
+                                    anchor: token.data,
+                                    unencodable: UnencodableSample(
+                                        id: object.uuid,
+                                        reason: "Health returned a "
+                                            + String(describing: type(of: object))
+                                            + " where an electrocardiogram was expected."
+                                    )
+                                )
                             )
-                        )
+                            return
+                        }
+                        // Encoding is per-sample and the cursor is not. This
+                        // stream has never met a reading it could not encode,
+                        // which is luck rather than design — it reads one
+                        // sample per page exactly as the route stream does, so
+                        // a throw here would strand the cursor and stop
+                        // electrocardiograms permanently, which is what
+                        // happened to routes.
+                        do {
+                            header = SeriesHeader(
+                                id: sample.uuid,
+                                startDate: sample.startDate,
+                                endDate: sample.endDate,
+                                basePayload: try ElectrocardiogramEncoding.basePayload(
+                                    try encoder.encodeBaseFields(sample: sample),
+                                    classification: Self.classification(sample.classification),
+                                    symptomsStatus: Self.symptoms(sample.symptomsStatus),
+                                    averageHeartRate: sample.averageHeartRate?
+                                        .doubleValue(
+                                            for: HKUnit.count()
+                                                .unitDivided(by: .minute())
+                                        ),
+                                    samplingFrequencyHertz: sample.samplingFrequency?
+                                        .doubleValue(for: .hertz()),
+                                    numberOfVoltageMeasurements: sample
+                                        .numberOfVoltageMeasurements
+                                )
+                            )
+                        } catch {
+                            continuation.resume(
+                                returning: SeriesPage(
+                                    header: nil,
+                                    deletions: (deletions ?? []).map(\.uuid),
+                                    anchor: token.data,
+                                    unencodable: UnencodableSample(
+                                        id: sample.uuid,
+                                        reason: String(describing: error)
+                                    )
+                                )
+                            )
+                            return
+                        }
                     }
                     continuation.resume(
                         returning: SeriesPage(

@@ -35,15 +35,32 @@ public struct HealthKitWorkoutRouteBackend: SeriesBackend {
             start: header.startDate,
             end: header.endDate
         )
+        // Folding the workout in is encoding, and encoding is per-sample. The
+        // route stream is the only one that does this step, and a throw here
+        // would strand the cursor exactly as one in `rawPage` would.
+        let basePayload: Data
+        do {
+            basePayload = try WorkoutRouteEncoding.basePayload(
+                header.basePayload,
+                workout: link
+            )
+        } catch {
+            return SeriesPage(
+                header: nil,
+                deletions: page.deletions,
+                anchor: page.anchor,
+                unencodable: UnencodableSample(
+                    id: header.id,
+                    reason: String(describing: error)
+                )
+            )
+        }
         return SeriesPage(
             header: SeriesHeader(
                 id: header.id,
                 startDate: header.startDate,
                 endDate: header.endDate,
-                basePayload: try WorkoutRouteEncoding.basePayload(
-                    header.basePayload,
-                    workout: link
-                )
+                basePayload: basePayload
             ),
             deletions: page.deletions,
             anchor: page.anchor
@@ -85,14 +102,35 @@ public struct HealthKitWorkoutRouteBackend: SeriesBackend {
                     let token = try HealthKitAnchorCoding.token(for: newAnchor)
                     var header: SeriesHeader?
                     if let sample = samples?.first {
-                        header = SeriesHeader(
-                            id: sample.uuid,
-                            startDate: sample.startDate,
-                            endDate: sample.endDate,
-                            basePayload: try encoder.encodeBaseFields(
-                                sample: sample
+                        // Encoding is per-sample and the cursor is not. A throw
+                        // here would carry the whole page away and leave the
+                        // cursor where it was, so the same sample would be read
+                        // and fail again on every later pass — for ever. It is
+                        // reported instead, and `SeriesReader` writes a record
+                        // in its place in the same batch that moves the cursor.
+                        do {
+                            header = SeriesHeader(
+                                id: sample.uuid,
+                                startDate: sample.startDate,
+                                endDate: sample.endDate,
+                                basePayload: try encoder.encodeBaseFields(
+                                    sample: sample
+                                )
                             )
-                        )
+                        } catch {
+                            continuation.resume(
+                                returning: SeriesPage(
+                                    header: nil,
+                                    deletions: (deletions ?? []).map(\.uuid),
+                                    anchor: token.data,
+                                    unencodable: UnencodableSample(
+                                        id: sample.uuid,
+                                        reason: String(describing: error)
+                                    )
+                                )
+                            )
+                            return
+                        }
                     }
                     continuation.resume(
                         returning: SeriesPage(

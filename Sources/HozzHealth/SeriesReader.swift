@@ -106,6 +106,38 @@ public actor SeriesReader<Backend: SeriesBackend> {
             .delete(CapturedHealthDeletion(id: $0, type: shape.typeKey))
         }
 
+        // A sample the backend could not encode is recorded in its place and
+        // the cursor moves past it. The record and the advance travel in one
+        // batch, so the sink commits both or neither — which is the only thing
+        // that makes this safe rather than a way to lose a sample quietly.
+        //
+        // Without it the cursor cannot move at all, and a series backend reads
+        // one sample per page, so a single awkward record stops the type for
+        // good. That is not a hypothetical: it is what workout routes have
+        // been doing on Brandon's phone for weeks, and the electrocardiogram
+        // stream has the same shape and has simply not met one yet.
+        //
+        // Appended rather than returned early, so a page carrying a failure
+        // *and* a header keeps both. No backend produces that today and
+        // nothing enforces it, and an early return there would drop the header
+        // while advancing past it — the exact loss this is here to prevent,
+        // reintroduced by the shape of the code that prevents it.
+        if let unencodable = page.unencodable {
+            changes.append(
+                .upsert(
+                    CapturedHealthObject(
+                        id: unencodable.id,
+                        type: shape.typeKey,
+                        canonicalPayload: try encoder.encodeEncodingFailure(
+                            id: unencodable.id,
+                            typeIdentifier: shape.typeIdentifier,
+                            message: unencodable.reason
+                        )
+                    )
+                )
+            )
+        }
+
         guard let header = page.header else {
             return HealthChangeBatch(
                 changes: changes,
