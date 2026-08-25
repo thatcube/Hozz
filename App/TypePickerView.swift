@@ -62,46 +62,54 @@ struct TypePickerView: View {
                           + "Hozz less often, which uses less battery. Turn the "
                           + "switch above on to send everything instead."
                 )
+                .hozzFormFooter()
             }
+            .hozzFormRows()
 
             if !selection.isEmpty {
                 ForEach(filteredGroups, id: \.family) { group in
-                    Section(group.family.sectionTitle) {
+                    Section {
                         ForEach(group.entries, id: \.key) { entry in
                             Button {
                                 toggle(entry.key)
                             } label: {
                                 HStack {
                                     Text(entry.displayName)
-                                        .foregroundStyle(.primary)
+                                        .foregroundStyle(HozzPalette.ink)
                                     Spacer()
                                     if selection.contains(entry.key) {
                                         HozzIconView(.check, size: 18)
                                             .foregroundStyle(
                                                 selection.count > 1
-                                                    ? HozzPalette.action
-                                                    : .secondary
+                                                    ? HozzPalette.blue
+                                                    : HozzPalette.inkMuted
                                             )
                                     }
                                 }
                             }
                         }
+                    } header: {
+                        Text(group.family.sectionTitle).hozzFormHeader()
                     }
+                    .hozzFormRows()
                 }
             }
         }
+        .hozzFormChrome()
         .searchable(text: $searchText, prompt: "Search data types")
         .navigationTitle("Data types")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Cancel") { dismiss() }
+                    .tint(HozzPalette.blue)
             }
             ToolbarItem(placement: .confirmationAction) {
                 Button("Done") {
                     onSave(selection)
                     dismiss()
                 }
+                .tint(HozzPalette.blue)
             }
         }
     }

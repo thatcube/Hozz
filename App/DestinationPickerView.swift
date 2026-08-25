@@ -87,61 +87,22 @@ struct DestinationPickerView: View {
     private let pairing = ReceiverPairing()
 
     var body: some View {
-        List {
+        HozzScreen {
             computersSection
 
-            Section {
+            HozzSection(
+                "Where should your Health data go?",
+                footer: "Hozz has no default destination. Nothing leaves this "
+                    + "iPhone until you add one."
+            ) {
                 ForEach(DestinationPreset.allCases) { preset in
                     Button {
                         chosen = preset
                     } label: {
-                        HStack(spacing: 14) {
-                            Image(preset.iconName)
-                                .renderingMode(.template)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 26, height: 26)
-                                .foregroundStyle(
-                                    preset.isRecommended ? HozzPalette.action : .secondary
-                                )
-
-                            VStack(alignment: .leading, spacing: 3) {
-                                HStack(spacing: 6) {
-                                    Text(preset.displayName)
-                                        .font(.body.weight(.medium))
-                                        .foregroundStyle(.primary)
-                                    if preset.isRecommended {
-                                        Text("Easiest")
-                                            .font(.caption2.weight(.semibold))
-                                            .padding(.horizontal, 6)
-                                            .padding(.vertical, 2)
-                                            .background(
-                                                HozzPalette.action.opacity(0.15),
-                                                in: Capsule()
-                                            )
-                                            .foregroundStyle(HozzPalette.action)
-                                    }
-                                }
-                                Text(preset.summary)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-
-                            Spacer()
-                            HozzIconView(.chevronRight, size: 14)
-                                .foregroundStyle(.tertiary)
-                        }
-                        .padding(.vertical, 4)
+                        PresetRow(preset: preset)
                     }
                     .buttonStyle(.plain)
                 }
-            } header: {
-                Text("Where should your Health data go?")
-            } footer: {
-                Text(
-                    "Hozz has no default destination. Nothing leaves this "
-                    + "iPhone until you add one."
-                )
             }
         }
         .navigationTitle("Add a destination")
@@ -184,6 +145,7 @@ struct DestinationPickerView: View {
         .toolbar {
             ToolbarItem(placement: .cancellationAction) {
                 Button("Cancel") { dismiss() }
+                    .tint(HozzPalette.blue)
             }
         }
         .navigationDestination(item: $chosen) { preset in
@@ -201,7 +163,7 @@ struct DestinationPickerView: View {
     /// address" underneath. Something that only appears once you have guessed
     /// the right category is not discoverable at all.
     private var computersSection: some View {
-        Section {
+        HozzSection("Your computers", footer: footerText) {
             if computers.isEmpty {
                 emptyRow
             }
@@ -210,36 +172,25 @@ struct DestinationPickerView: View {
                 Button {
                     Task { await connect(to: receiver) }
                 } label: {
-                    HStack(spacing: 14) {
-                        HozzIconView(.deviceDesktop, size: 26)
-                            .foregroundStyle(isOnline ? HozzPalette.action : .secondary)
-                        VStack(alignment: .leading, spacing: 3) {
-                            Text(receiver.name)
-                                .font(.body.weight(.medium))
-                                .foregroundStyle(isOnline ? .primary : .secondary)
-                            Text(status(for: receiver))
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                        }
-                        Spacer()
+                    HozzRow(
+                        receiver.name,
+                        detail: status(for: receiver),
+                        icon: .deviceDesktop,
+                        tone: isOnline ? .action : .neutral
+                    ) {
                         if connecting == receiver.id {
-                            ProgressView()
+                            ProgressView().controlSize(.small)
                         } else if isOnline {
-                            HozzIconView(.chevronRight, size: 14)
-                                .foregroundStyle(.tertiary)
+                            HozzChevron()
                         }
                     }
-                    .padding(.vertical, 4)
+                    .opacity(isOnline ? 1 : 0.62)
                 }
                 .buttonStyle(.plain)
                 // Offering a computer that cannot answer only produces a
                 // failure the user could not have avoided.
                 .disabled(connecting != nil || !isOnline)
             }
-        } header: {
-            Text("Your computers")
-        } footer: {
-            Text(footerText)
         }
     }
 
@@ -252,21 +203,27 @@ struct DestinationPickerView: View {
     private var emptyRow: some View {
         switch browsing {
         case .denied:
-            Label {
-                Text("Hozz needs permission to see this network")
-            } icon: {
-                HozzIconView(.alertTriangle, size: 20)
+            HozzNoteCard {
+                HozzNote(
+                    "Hozz needs permission to see this network",
+                    icon: .alertTriangle,
+                    tone: .warning
+                )
             }
-            .foregroundStyle(.secondary)
         case .failed:
-            Label("Could not search this network", systemImage: "wifi.slash")
-                .foregroundStyle(.secondary)
-        case .idle, .searching:
-            HStack(spacing: 10) {
-                ProgressView()
-                Text("Looking for computers…")
-                    .foregroundStyle(.secondary)
+            HozzNoteCard {
+                HozzNote("Could not search this network", icon: .wifiOff)
             }
+        case .idle, .searching:
+            HStack(spacing: 11) {
+                ProgressView().controlSize(.small)
+                Text("Looking for computers…").hozzCaption()
+                Spacer(minLength: 0)
+            }
+            .hozzCard(
+                padding: HozzMetrics.rowPadding,
+                radius: HozzMetrics.rowRadius
+            )
         }
     }
 
@@ -412,5 +369,56 @@ struct DestinationPickerView: View {
         )
         await model.save(destination, secret: token)
         dismiss()
+    }
+}
+
+/// One kind of destination on offer.
+private struct PresetRow: View {
+    let preset: DestinationPreset
+
+    var body: some View {
+        HStack(spacing: 12) {
+            Image(preset.iconName)
+                .renderingMode(.template)
+                .resizable()
+                .scaledToFit()
+                .frame(width: 17, height: 17)
+                .foregroundStyle(
+                    preset.isRecommended ? HozzPalette.blue : HozzPalette.inkSoft
+                )
+                .frame(width: 30, height: 30)
+                .background(
+                    preset.isRecommended
+                        ? HozzPalette.iconWell
+                        : HozzPalette.neutralWell,
+                    in: Circle()
+                )
+
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(preset.displayName)
+                        .font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(HozzPalette.ink)
+                    if preset.isRecommended {
+                        Text("Easiest")
+                            .font(.system(size: 10, weight: .semibold))
+                            .tracking(0.4)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(HozzPalette.blueWash, in: Capsule())
+                            .foregroundStyle(HozzPalette.actionText)
+                    }
+                }
+                Text(preset.summary)
+                    .hozzCaption()
+                    .fixedSize(horizontal: false, vertical: true)
+                    .multilineTextAlignment(.leading)
+            }
+
+            Spacer(minLength: 0)
+            HozzChevron()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .hozzCard(padding: HozzMetrics.rowPadding, radius: HozzMetrics.rowRadius)
     }
 }

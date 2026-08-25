@@ -1,4 +1,8 @@
 #if DEBUG
+import HozzCatalog
+import HozzCore
+import HozzDeliver
+import HozzHealth
 import HozzUI
 import SwiftUI
 
@@ -211,6 +215,71 @@ enum SampleSeries {
     }
 }
 
+/// Made-up state for the screens that are not the dashboard.
+///
+/// Every one of them is the real view; only what it is handed is invented.
+@MainActor
+enum SampleChrome {
+    static let syncModel = SyncViewModel()
+
+    static var types: Set<HealthTypeKey> {
+        Set(
+            HealthObserverDefaults.commonTypeIdentifiers
+                .prefix(6)
+                .map(HealthTypeKey.init)
+        )
+    }
+
+    static var progress: ExportViewModel.ProgressPresentation {
+        let names = [
+            "Steps", "Heart rate", "Sleep analysis", "Active energy",
+            "Walking distance", "Resting heart rate", "Body mass"
+        ]
+        let steps = names.enumerated().map { index, name in
+            ExportViewModel.ExportStep(
+                id: name,
+                name: name,
+                recordCount: (index + 1) * 4_137,
+                state: index == names.count - 1 ? .exporting : .completed
+            )
+        }
+        return ExportViewModel.ProgressPresentation(
+            export: HealthExportProgress(
+                completedTypes: 6,
+                totalTypes: 11,
+                recordCount: 118_402,
+                currentTypeIdentifier: "HKQuantityTypeIdentifierBodyMass",
+                currentTypeName: "Body mass",
+                currentTypeFamily: .quantity,
+                currentTypeRecordCount: 2_140,
+                currentTypeState: .exporting
+            ),
+            steps: steps,
+            exportStartedAt: Date(timeIntervalSinceNow: -412),
+            currentTypeStartedAt: Date(timeIntervalSinceNow: -37),
+            estimatedRemainingSeconds: 180...420,
+            estimateCapturedAt: Date(timeIntervalSinceNow: -10)
+        )
+    }
+
+    static var result: HealthExportResult {
+        HealthExportResult(
+            runID: UUID(),
+            fileURL: URL(fileURLWithPath: "/tmp/hozz-export.ndjson.zip"),
+            recordCount: 1_284_907,
+            attemptedTypeCount: 96,
+            nonEmptyTypeCount: 41,
+            catalogTypeCount: 132,
+            zeroResultTypeCount: 55,
+            failedTypeCount: 0,
+            sampleEncodingErrorCount: 0,
+            fileByteCount: 214_884_112,
+            format: .ndjson,
+            wasResumed: true
+        )
+    }
+}
+
 /// The harness itself: the real overview chrome, then the states worth
 /// looking at side by side.
 struct DashboardDesignHarness: View {
@@ -230,9 +299,38 @@ struct DashboardDesignHarness: View {
             NavigationStack { workouts }
                 .tabItem { Label("Workouts", systemImage: "figure.run") }
                 .tag(3)
+            NavigationStack { DestinationPickerView(model: harnessSyncModel) }
+                .tabItem { Label("Picker", systemImage: "plus.circle") }
+                .tag(4)
+            NavigationStack {
+                DestinationEditorView(
+                    model: harnessSyncModel,
+                    destination: nil,
+                    preset: .homeAssistant
+                )
+            }
+            .tabItem { Label("Editor", systemImage: "slider.horizontal.3") }
+            .tag(5)
+            NavigationStack { TypePickerView(selection: SampleChrome.types) { _ in } }
+                .tabItem { Label("Types", systemImage: "checklist") }
+                .tag(6)
+            NavigationStack { ExportSessionView(
+                presentation: SampleChrome.progress,
+                exportFormat: .ndjson,
+                pauseAction: {}
+            ) }
+            .tabItem { Label("Exporting", systemImage: "arrow.down.circle") }
+            .tag(7)
+            NavigationStack { ExportReadyView(result: SampleChrome.result, newExportAction: {}) }
+                .tabItem { Label("Ready", systemImage: "checkmark.circle") }
+                .tag(8)
         }
-        .tint(HozzPalette.action)
+        .tint(HozzPalette.blue)
     }
+
+    /// Empty on purpose: a destination that has never synced is exactly what
+    /// someone opening these screens for the first time sees.
+    private var harnessSyncModel: SyncViewModel { SampleChrome.syncModel }
 
     /// Workouts, including a multi-sport one, which is the layout most likely
     /// to break and the least likely to be seen by accident.
@@ -519,7 +617,7 @@ struct DashboardDesignHarness: View {
                     Text("An incomplete trace").hozzLabel().textCase(.uppercase)
                     Label("This trace is incomplete", systemImage: "exclamationmark.triangle")
                         .font(.system(size: 14, weight: .medium))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(HozzPalette.warning)
                     Text(
                         """
                         4,096 of 15,360 readings arrived. What is drawn below is \

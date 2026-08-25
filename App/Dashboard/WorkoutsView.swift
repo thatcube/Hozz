@@ -45,7 +45,7 @@ struct WorkoutsView: View {
                 if let failure = model.failure {
                     Label(failure, systemImage: "exclamationmark.triangle")
                         .font(.system(size: 14))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(HozzPalette.warning)
                         .hozzCard()
                 } else if model.isLoading && model.workouts.isEmpty {
                     ProgressView()

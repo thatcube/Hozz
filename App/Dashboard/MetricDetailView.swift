@@ -99,7 +99,7 @@ struct MetricDetailView: View {
             if let failure = model.failure {
                 Label(failure, systemImage: "exclamationmark.triangle")
                     .font(.system(size: 14))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(HozzPalette.warning)
                     .fixedSize(horizontal: false, vertical: true)
             } else if let series = model.series {
                 headline(for: series)

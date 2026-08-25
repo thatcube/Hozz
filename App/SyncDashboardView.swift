@@ -8,18 +8,25 @@ import SwiftUI
 /// stops and the user finds out weeks later. Every destination states when it
 /// last succeeded and what it is doing now, and "Sync now" is always available
 /// so nobody has to wonder whether iOS has run the app.
+///
+/// Drawn as cards on the page wash rather than as a `List`, for the same reason
+/// the dashboard is: they are one app and were not reading as one.
 struct SyncDashboardView: View {
     @Bindable var model: SyncViewModel
     @State private var editingDestination: Destination?
     @State private var isAddingDestination = false
+    @State private var pendingDeletion: Destination?
 
     var body: some View {
-        List {
-            statusSection
+        HozzScreen {
+            HozzScreenTitle("Automatic export")
+
+            statusCard
+
             backfillSection
 
             if model.hasDestinations {
-                Section("Destinations") {
+                HozzSection("Destinations") {
                     ForEach(model.summaries) { summary in
                         Button {
                             editingDestination = summary.destination
@@ -27,39 +34,49 @@ struct SyncDashboardView: View {
                             DestinationRow(summary: summary)
                         }
                         .buttonStyle(.plain)
-                    }
-                    .onDelete { indexSet in
-                        let doomed = indexSet.map { model.summaries[$0].destination }
-                        Task {
-                            for destination in doomed {
-                                await model.delete(destination)
+                        .contextMenu {
+                            Button("Remove", role: .destructive) {
+                                pendingDeletion = summary.destination
                             }
                         }
                     }
                 }
             }
 
-            Section {
+            HozzSection(footer: destinationFooter) {
                 Button {
                     isAddingDestination = true
                 } label: {
-                    HozzLabel("Add a destination", icon: .folderPlus)
+                    HozzRow(
+                        "Add a destination",
+                        icon: .folderPlus,
+                        isProminent: true
+                    ) {
+                        HozzChevron()
+                    }
                 }
+                .buttonStyle(.plain)
+
                 if model.hasDestinations {
                     Button {
                         Task { await model.fetchRecentMonthsAgain() }
                     } label: {
-                        HozzLabel("Fetch recent months again", icon: .refresh)
+                        HozzRow(
+                            "Fetch recent months again",
+                            icon: .refresh,
+                            isProminent: true
+                        )
                     }
+                    .buttonStyle(.plain)
                     .disabled(model.isSyncing)
+                    .opacity(model.isSyncing ? 0.5 : 1)
                 }
-            } footer: {
-                Text(destinationFooter)
             }
 
             backgroundRealitySection
         }
-        .navigationTitle("Automatic export")
+        .navigationTitle("Automatic")
+        .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button {
@@ -85,6 +102,29 @@ struct SyncDashboardView: View {
                 DestinationEditorView(model: model, destination: destination)
             }
         }
+        // Removing a destination used to be a swipe on a list row, and the list
+        // is gone. It is confirmed and named here rather than taken on one
+        // gesture, because it is the only thing in Hozz whose removal the app
+        // cannot undo.
+        .alert(
+            "Remove \(pendingDeletion?.name ?? "this destination")?",
+            isPresented: .init(
+                get: { pendingDeletion != nil },
+                set: { if !$0 { pendingDeletion = nil } }
+            )
+        ) {
+            Button("Remove", role: .destructive) {
+                guard let doomed = pendingDeletion else { return }
+                pendingDeletion = nil
+                Task { await model.delete(doomed) }
+            }
+            Button("Keep it", role: .cancel) { pendingDeletion = nil }
+        } message: {
+            Text(
+                "Hozz stops sending there. Anything already delivered stays "
+                + "where it is."
+            )
+        }
         .task {
             await model.load()
             await model.startObserving()
@@ -92,6 +132,32 @@ struct SyncDashboardView: View {
         .refreshable {
             await model.load()
         }
+    }
+
+    /// What sync is doing right now, said once and prominently.
+    private var statusCard: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 14) {
+                HozzIconWell(statusIcon, tone: statusTone, diameter: 44)
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(model.overallStatus)
+                        .hozzHeading(size: 17)
+                        .fixedSize(horizontal: false, vertical: true)
+                    if let summary = model.lastSyncSummary {
+                        Text(summary)
+                            .hozzCaption()
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+
+            if let error = model.lastError {
+                HozzNote(error, icon: .alertTriangle, tone: .warning)
+            }
+        }
+        .hozzCard()
     }
 
     /// Leads with how many types are *complete*, and carries how many have
@@ -104,29 +170,19 @@ struct SyncDashboardView: View {
     @ViewBuilder
     private var backfillSection: some View {
         if let backfill = model.backfill, backfill.typesSelected > 0 {
-            Section("First sync through your history") {
-                Label {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text(
-                            "\(backfill.typesComplete) of \(backfill.typesSelected) health types complete"
-                        )
-                        .font(.body.weight(.medium))
-
-                        Text(backfillDetail(backfill))
-                            .font(.footnote)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
-                } icon: {
-                    Image(
-                        systemName: backfill.isUnderway
-                            ? "arrow.triangle.2.circlepath"
-                            : "checkmark.circle"
+            HozzSection("First sync through your history") {
+                VStack(alignment: .leading, spacing: 10) {
+                    HozzNote(
+                        "\(backfill.typesComplete) of \(backfill.typesSelected) "
+                        + "health types complete",
+                        icon: backfill.isUnderway ? .refresh : .circleCheck,
+                        tone: backfill.isUnderway ? .action : .positive
                     )
-                    .foregroundStyle(
-                        backfill.isUnderway ? HozzPalette.action : .green
-                    )
+                    Text(backfillDetail(backfill))
+                        .hozzCaption()
+                        .fixedSize(horizontal: false, vertical: true)
                 }
+                .hozzCard()
             }
         }
     }
@@ -158,33 +214,6 @@ struct SyncDashboardView: View {
         return text
     }
 
-    private var statusSection: some View {
-        Section {
-            HStack(spacing: 14) {
-                HozzIconView(statusIcon, size: 30)
-                    .foregroundStyle(statusColor)
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(model.overallStatus)
-                        .font(.headline)
-                    if let summary = model.lastSyncSummary {
-                        Text(summary)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                    }
-                }
-            }
-            .padding(.vertical, 6)
-
-            if let error = model.lastError {
-                HozzLabel(.alertTriangle) {
-                    Text(error).font(.footnote)
-                }
-                .foregroundStyle(.orange)
-            }
-        }
-    }
-
     /// States the iOS limits plainly rather than letting the user discover them
     /// as a mystery failure.
     /// Built as statements rather than one expression.
@@ -206,22 +235,28 @@ struct SyncDashboardView: View {
     }
 
     private var backgroundRealitySection: some View {
-        Section("How background sync behaves") {
-            HozzLabel(.lock) {
-                Text("Health can only be read while this iPhone is unlocked.")
-            }
-            HozzLabel(.clock) {
-                Text("iOS decides when Hozz runs. Expect within a few hours, not instantly.")
-            }
-            HozzLabel(.alertTriangle) {
-                Text("Force-quitting Hozz stops it until you open it again.")
-            }
-            HozzLabel(.circleCheck) {
-                Text("Nothing is ever lost. Anything missed is sent on the next run.")
+        HozzSection("How background sync behaves") {
+            HozzNoteCard {
+                HozzNote(
+                    "Health can only be read while this iPhone is unlocked.",
+                    icon: .lock
+                )
+                HozzNote(
+                    "iOS decides when Hozz runs. Expect within a few hours, "
+                    + "not instantly.",
+                    icon: .clock
+                )
+                HozzNote(
+                    "Force-quitting Hozz stops it until you open it again.",
+                    icon: .alertTriangle
+                )
+                HozzNote(
+                    "Nothing is ever lost. Anything missed is sent on the "
+                    + "next run.",
+                    icon: .circleCheck
+                )
             }
         }
-        .font(.footnote)
-        .foregroundStyle(.secondary)
     }
 
     private var statusIcon: HozzIcon {
@@ -233,12 +268,11 @@ struct SyncDashboardView: View {
         }
     }
 
-    private var statusColor: Color {
+    private var statusTone: HozzTone {
         switch model.overallIcon {
-        case .healthy: .green
-        case .retrying: .orange
-        case .attention: .orange
-        case .idle: HozzPalette.action
+        case .healthy: .positive
+        case .retrying, .attention: .warning
+        case .idle: .action
         }
     }
 }
@@ -247,29 +281,17 @@ private struct DestinationRow: View {
     let summary: SyncViewModel.DestinationSummary
 
     var body: some View {
-        HStack(spacing: 12) {
-            HozzIconView(icon, size: 24)
-                .foregroundStyle(color)
-
-            VStack(alignment: .leading, spacing: 3) {
-                Text(summary.destination.name)
-                    .font(.body.weight(.medium))
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-
-            Spacer()
-
+        HozzRow(
+            summary.destination.name,
+            detail: detail,
+            icon: icon,
+            tone: tone
+        ) {
             if !summary.destination.isEnabled {
-                Text("Off")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Text("Off").hozzCaption()
             }
-            HozzIconView(.chevronRight, size: 16)
-                .foregroundStyle(.tertiary)
+            HozzChevron()
         }
-        .padding(.vertical, 3)
     }
 
     private var icon: HozzIcon {
@@ -284,19 +306,11 @@ private struct DestinationRow: View {
         }
     }
 
-    private var kindIcon: HozzIcon {
-        switch summary.destination.kind {
-        case .folder: .folder
-        case .restAPI: .api
-        case .mqtt: .plugConnected
-        }
-    }
-
-    private var color: Color {
+    private var tone: HozzTone {
         switch summary.state {
-        case .delivered: .green
-        case .needsAttention, .retrying: .orange
-        default: .secondary
+        case .delivered: .positive
+        case .needsAttention, .retrying: .warning
+        default: .action
         }
     }
 

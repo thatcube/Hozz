@@ -121,7 +121,7 @@ struct DashboardView: View {
             if let failure = model.failure {
                 Text(failure)
                     .hozzCaption()
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(HozzPalette.warning)
             }
         }
         .hozzCard(padding: 22)
@@ -139,10 +139,10 @@ struct DashboardView: View {
         } else {
             LazyVGrid(
                 columns: [
-                    GridItem(.flexible(), spacing: 13),
-                    GridItem(.flexible(), spacing: 13)
+                    GridItem(.flexible(), spacing: HozzMetrics.gridGap),
+                    GridItem(.flexible(), spacing: HozzMetrics.gridGap)
                 ],
-                spacing: 13
+                spacing: HozzMetrics.gridGap
             ) {
                 ForEach(model.cards) { card in
                     NavigationLink {
@@ -271,7 +271,7 @@ struct MetricCardView: View {
             // Still reading. A skeleton rather than a spinner per card, which
             // would make the grid flicker.
             RoundedRectangle(cornerRadius: 6, style: .continuous)
-                .fill(HozzPalette.lineSoft.opacity(0.6))
+                .fill(HozzPalette.skeleton)
                 .frame(height: 26)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding(.trailing, 30)

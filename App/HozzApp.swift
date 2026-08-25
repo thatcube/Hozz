@@ -15,7 +15,7 @@ struct HozzApp: App {
     var body: some Scene {
         WindowGroup {
             RootView()
-                .tint(HozzPalette.action)
+                .tint(HozzPalette.blue)
         }
     }
 }

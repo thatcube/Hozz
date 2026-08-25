@@ -325,6 +325,7 @@ targets:
       - target: HozzHealthFake
       - target: HozzReceive
       - target: HozzMCP
+      - target: HozzUI
       - target: Hozz
       # A test writes a stored value no build of Hozz produces, to check what
       # happens when this one meets a word it does not know.

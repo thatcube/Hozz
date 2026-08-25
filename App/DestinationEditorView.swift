@@ -82,21 +82,79 @@ struct DestinationEditorView: View {
 
     var body: some View {
         Form {
+            // One modifier rather than fourteen. Applied to the builder's
+            // whole tuple, `listRowBackground` reaches every section under
+            // it, so a section added later cannot quietly forget to be the
+            // right colour — which is exactly how the app came to have two
+            // looks in the first place.
+            formContent
+                .hozzFormRows()
+        }
+        .hozzFormChrome()
+        .navigationTitle(existing == nil ? "New destination" : "Destination")
+        .navigationBarTitleDisplayMode(.inline)
+        .task {
+            // Browsing prompts for local network access, so it starts only on
+            // the screen where an address is actually being chosen.
+            isBrowsing = true
+            await browser.onChange { receivers in
+                Task { @MainActor in
+                    discovered = receivers
+                    if !receivers.isEmpty {
+                        isBrowsing = false
+                    }
+                }
+            }
+            await browser.start()
+        }
+        .onDisappear {
+            Task { await browser.stop() }
+        }
+        .toolbar {
+            ToolbarItem(placement: .cancellationAction) {
+                Button("Cancel") { dismiss() }
+                    .tint(HozzPalette.blue)
+            }
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Save") {
+                    Task { await save() }
+                }
+                .disabled(!isValid)
+                .tint(HozzPalette.blue)
+            }
+        }
+        .fileImporter(
+            isPresented: $isPickingFolder,
+            allowedContentTypes: [.folder]
+        ) { result in
+            handleFolderSelection(result)
+        }
+        .sheet(isPresented: $isPickingTypes) {
+            NavigationStack {
+                TypePickerView(selection: includedTypes) { selection in
+                    includedTypes = selection
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var formContent: some View {
             if let preset {
                 Section {
                     ForEach(Array(preset.steps.enumerated()), id: \.offset) { index, step in
                         HStack(alignment: .top, spacing: 10) {
                             Text("\(index + 1)")
                                 .font(.caption.weight(.bold))
-                                .foregroundStyle(HozzPalette.action)
+                                .foregroundStyle(HozzPalette.blue)
                                 .frame(width: 18, height: 18)
                                 .background(
-                                    HozzPalette.action.opacity(0.15),
+                                    HozzPalette.iconWell,
                                     in: Circle()
                                 )
                             Text(step)
                                 .font(.footnote)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(HozzPalette.inkSoft)
                         }
                     }
 
@@ -104,11 +162,12 @@ struct DestinationEditorView: View {
                         HozzLabel(.infoCircle, size: 16) {
                             Text(caveat)
                                 .font(.footnote)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(HozzPalette.inkSoft)
                         }
                     }
                 } header: {
                     Text("Setting up \(preset.displayName)")
+                        .hozzFormHeader()
                 }
             } else {
                 Section {
@@ -122,7 +181,7 @@ struct DestinationEditorView: View {
 
                     Text(kindExplanation)
                         .font(.footnote)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(HozzPalette.inkSoft)
                 }
             }
 
@@ -163,18 +222,19 @@ struct DestinationEditorView: View {
                 } label: {
                     HStack {
                         Text("Data types")
-                            .foregroundStyle(.primary)
+                            .foregroundStyle(HozzPalette.ink)
                         Spacer()
                         Text(includedTypes.isEmpty ? "Everything" : "\(includedTypes.count)")
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(HozzPalette.inkSoft)
                         HozzIconView(.chevronRight, size: 14)
-                            .foregroundStyle(.tertiary)
+                            .foregroundStyle(HozzPalette.inkMuted)
                     }
                 }
 
                 Toggle("Enabled", isOn: $isEnabled)
             } header: {
                 Text("Details")
+                    .hozzFormHeader()
             } footer: {
                 Text(formatExplanation)
             }
@@ -186,10 +246,11 @@ struct DestinationEditorView: View {
                     HozzLabel(.alertTriangle, size: 16) {
                         Text(unsupported)
                             .font(.footnote)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(HozzPalette.inkSoft)
                     }
                 } header: {
                     Text("Not understood by this version")
+                        .hozzFormHeader()
                 } footer: {
                     // Saying this plainly matters: saving is the escape hatch,
                     // and it is also the moment the original setting is
@@ -220,10 +281,13 @@ struct DestinationEditorView: View {
             }
 
             if let testResult {
-                Section("Test result") {
+                Section {
                     Text(testResult)
-                        .font(.footnote)
+                        .font(.system(size: 13))
+                        .foregroundStyle(HozzPalette.inkSoft)
                         .textSelection(.enabled)
+                } header: {
+                    Text("Test result").hozzFormHeader()
                 }
             }
 
@@ -247,50 +311,6 @@ struct DestinationEditorView: View {
                     + "instead of finding out days later."
                 )
             }
-        }
-        .navigationTitle(existing == nil ? "New destination" : "Destination")
-        .navigationBarTitleDisplayMode(.inline)
-        .task {
-            // Browsing prompts for local network access, so it starts only on
-            // the screen where an address is actually being chosen.
-            isBrowsing = true
-            await browser.onChange { receivers in
-                Task { @MainActor in
-                    discovered = receivers
-                    if !receivers.isEmpty {
-                        isBrowsing = false
-                    }
-                }
-            }
-            await browser.start()
-        }
-        .onDisappear {
-            Task { await browser.stop() }
-        }
-        .toolbar {
-            ToolbarItem(placement: .cancellationAction) {
-                Button("Cancel") { dismiss() }
-            }
-            ToolbarItem(placement: .confirmationAction) {
-                Button("Save") {
-                    Task { await save() }
-                }
-                .disabled(!isValid)
-            }
-        }
-        .fileImporter(
-            isPresented: $isPickingFolder,
-            allowedContentTypes: [.folder]
-        ) { result in
-            handleFolderSelection(result)
-        }
-        .sheet(isPresented: $isPickingTypes) {
-            NavigationStack {
-                TypePickerView(selection: includedTypes) { selection in
-                    includedTypes = selection
-                }
-            }
-        }
     }
 
     private var availableFormats: [DeliveryFormat] {
@@ -312,7 +332,7 @@ struct DestinationEditorView: View {
 
             Text(deliveryWindow.explanation)
                 .font(.footnote)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HozzPalette.inkSoft)
 
             if let date = previewFloor.date {
                 // The actual date, because "7 days ago" stops being true the
@@ -321,7 +341,7 @@ struct DestinationEditorView: View {
                     "Nothing dated before \(date.formatted(date: .abbreviated, time: .shortened))."
                 )
                 .font(.footnote)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HozzPalette.inkSoft)
             }
 
             if willReplayHistory {
@@ -336,11 +356,12 @@ struct DestinationEditorView: View {
                         + "by identifier keeps one copy."
                     )
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HozzPalette.inkSoft)
                 }
             }
         } header: {
             Text("Where to start")
+                .hozzFormHeader()
         } footer: {
             Text(
                 "Separate from how often Hozz syncs. Hozz reads Health with a "
@@ -410,11 +431,12 @@ struct DestinationEditorView: View {
                         + "decade. Make them match."
                     )
                     .font(.footnote)
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(HozzPalette.warning)
                 }
             }
         } header: {
             Text("InfluxDB")
+                .hozzFormHeader()
         } footer: {
             Text(
                 "Every sample is written to this measurement, tagged with its "
@@ -443,9 +465,10 @@ struct DestinationEditorView: View {
 
             Text(RequestTimeout.explanation(for: requestTimeout))
                 .font(.footnote)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(HozzPalette.inkSoft)
         } header: {
             Text("Timeout")
+                .hozzFormHeader()
         } footer: {
             Text(
                 "A large batch posted to a small computer can take minutes to "
@@ -474,10 +497,11 @@ struct DestinationEditorView: View {
             if let maxRequestBytes {
                 Text(RequestSize.explanation(for: maxRequestBytes))
                     .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HozzPalette.inkSoft)
             }
         } header: {
             Text("Request size")
+                .hozzFormHeader()
         } footer: {
             Text(
                 "If your server answers HTTP 413, or times out on a big batch, "
@@ -520,6 +544,7 @@ struct DestinationEditorView: View {
             }
         } header: {
             Text("Units")
+                .hozzFormHeader()
         } footer: {
             Text(unitsExplanation)
         }
@@ -553,6 +578,7 @@ struct DestinationEditorView: View {
             }
         } header: {
             Text("Field names")
+                .hozzFormHeader()
         } footer: {
             Text(
                 payloadSchema == .hozz
@@ -579,13 +605,14 @@ struct DestinationEditorView: View {
                         if folderName != nil {
                             Text("Tap to change")
                                 .font(.caption)
-                                .foregroundStyle(.secondary)
+                                .foregroundStyle(HozzPalette.inkSoft)
                         }
                     }
                 }
             }
         } header: {
             Text("Folder")
+                .hozzFormHeader()
         } footer: {
             Text(
                 "Pick anywhere the Files app can reach — iCloud Drive, Dropbox, "
@@ -612,6 +639,7 @@ struct DestinationEditorView: View {
                 .autocorrectionDisabled()
         } header: {
             Text(kind == .mqtt ? "Broker" : "Web address")
+                .hozzFormHeader()
         } footer: {
             Text(
                 "Hozz posts batches here and includes an idempotency key, so a "
@@ -634,13 +662,15 @@ struct DestinationEditorView: View {
                 Button {
                     endpoint = receiver.url
                 } label: {
-                    HStack {
-                        Label(receiver.name, systemImage: "desktopcomputer")
-                            .foregroundStyle(.primary)
+                    HStack(spacing: 11) {
+                        HozzIconView(.deviceDesktop, size: 20)
+                            .foregroundStyle(HozzPalette.blue)
+                        Text(receiver.name)
+                            .foregroundStyle(HozzPalette.ink)
                         Spacer()
                         if endpoint == receiver.url {
-                            Image(systemName: "checkmark")
-                                .foregroundStyle(.tint)
+                            HozzIconView(.check, size: 17)
+                                .foregroundStyle(HozzPalette.blue)
                         }
                     }
                 }
@@ -649,7 +679,7 @@ struct DestinationEditorView: View {
             HStack(spacing: 10) {
                 ProgressView()
                 Text("Looking for Hozz on this network…")
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(HozzPalette.inkSoft)
             }
         }
     }

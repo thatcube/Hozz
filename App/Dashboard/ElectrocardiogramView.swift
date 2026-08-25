@@ -38,7 +38,7 @@ struct ElectrocardiogramListView: View {
                 if let failure = model.failure {
                     Label(failure, systemImage: "exclamationmark.triangle")
                         .font(.system(size: 14))
-                        .foregroundStyle(.orange)
+                        .foregroundStyle(HozzPalette.warning)
                         .hozzCard()
                 } else if model.isLoading && model.readings.isEmpty {
                     ProgressView()
@@ -233,7 +233,7 @@ struct ElectrocardiogramDetailView: View {
             if let failure = model.failure {
                 Label(failure, systemImage: "exclamationmark.triangle")
                     .font(.system(size: 14))
-                    .foregroundStyle(.orange)
+                    .foregroundStyle(HozzPalette.warning)
                     .fixedSize(horizontal: false, vertical: true)
             } else if let waveform = model.waveform {
                 if !waveform.isComplete {
@@ -261,7 +261,7 @@ struct ElectrocardiogramDetailView: View {
         VStack(alignment: .leading, spacing: 4) {
             Label("This trace is incomplete", systemImage: "exclamationmark.triangle")
                 .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(.orange)
+                .foregroundStyle(HozzPalette.warning)
             Text(
                 """
                 \(waveform.points.count.formatted()) of \
@@ -274,7 +274,7 @@ struct ElectrocardiogramDetailView: View {
             .fixedSize(horizontal: false, vertical: true)
         }
         .padding(11)
-        .background(Color.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+        .background(HozzPalette.warningWash, in: RoundedRectangle(cornerRadius: 10))
     }
 }
 
