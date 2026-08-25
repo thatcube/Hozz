@@ -1,5 +1,5 @@
 import SwiftUI
-import Testing
+import XCTest
 import UIKit
 
 @testable import HozzUI
@@ -14,7 +14,7 @@ import UIKit
 ///
 /// The thresholds are WCAG 2.1: 4.5:1 for body text, 3:1 for a graphical
 /// element or large text.
-struct PaletteContrastTests {
+final class PaletteContrastTests: XCTestCase {
     // MARK: - Reading a colour as it will actually be drawn
 
     private static func components(
@@ -64,8 +64,7 @@ struct PaletteContrastTests {
 
     // MARK: - Text
 
-    @Test
-    func textIsLegibleOnEverySurfaceItIsDrawnOn() {
+    func testTextIsLegibleOnEverySurfaceItIsDrawnOn() {
         let surfaces: [(String, Color)] = [
             ("air", HozzPalette.air),
             ("cardTop", HozzPalette.cardTop),
@@ -86,7 +85,7 @@ struct PaletteContrastTests {
             for (surfaceName, surface) in surfaces {
                 for (inkName, ink) in inks {
                     let measured = Self.ratio(ink, on: surface, style)
-                    #expect(
+                    XCTAssertTrue(
                         measured >= 4.5,
                         """
                         \(inkName) on \(surfaceName) in \(styleName) is \
@@ -101,8 +100,7 @@ struct PaletteContrastTests {
     /// Warning and positive carry sentences, not just icons, so they are held
     /// to the text threshold rather than the graphical one — including on the
     /// tinted surfaces they are drawn on.
-    @Test
-    func statusTonesAreLegibleAsText() {
+    func testStatusTonesAreLegibleAsText() {
         let surfaces: [(String, Color)] = [
             ("air", HozzPalette.air),
             ("cardTop", HozzPalette.cardTop),
@@ -117,7 +115,7 @@ struct PaletteContrastTests {
                     ("positive", HozzPalette.positive)
                 ] {
                     let measured = Self.ratio(tone, on: surface, style)
-                    #expect(
+                    XCTAssertTrue(
                         measured >= 4.5,
                         "\(toneName) on \(surfaceName) in \(styleName) is \(measured)"
                     )
@@ -128,8 +126,7 @@ struct PaletteContrastTests {
 
     // MARK: - Graphics
 
-    @Test
-    func theBrandBlueReadsAsAShapeWhereverItIsDrawn() {
+    func testTheBrandBlueReadsAsAShapeWhereverItIsDrawn() {
         let surfaces: [(String, Color)] = [
             ("air", HozzPalette.air),
             ("cardTop", HozzPalette.cardTop),
@@ -140,7 +137,7 @@ struct PaletteContrastTests {
         for (styleName, style) in Self.styles {
             for (surfaceName, surface) in surfaces {
                 let measured = Self.ratio(HozzPalette.blue, on: surface, style)
-                #expect(
+                XCTAssertTrue(
                     measured >= 3,
                     """
                     blue on \(surfaceName) in \(styleName) is \(measured), \
@@ -152,15 +149,14 @@ struct PaletteContrastTests {
     }
 
     /// A button label is not large text, so 3:1 is not enough for it.
-    @Test
-    func aFilledButtonsLabelMeetsBodyContrast() {
+    func testAFilledButtonsLabelMeetsBodyContrast() {
         for (styleName, style) in Self.styles {
             let measured = Self.ratio(
                 HozzPalette.onAction,
                 on: HozzPalette.actionFill,
                 style
             )
-            #expect(
+            XCTAssertTrue(
                 measured >= 4.5,
                 "the filled button in \(styleName) is \(measured)"
             )
@@ -174,8 +170,7 @@ struct PaletteContrastTests {
     /// and the "Easiest" chip both put blue text on a blue tint, at 3.10 and
     /// 2.97 — the second being the exact pairing the palette's own comment
     /// calls out as failing even the graphical threshold.
-    @Test
-    func blueTextIsLegibleOnEveryTintItIsDrawnOn() {
+    func testBlueTextIsLegibleOnEveryTintItIsDrawnOn() {
         let surfaces: [(String, Color)] = [
             ("cardTop", HozzPalette.cardTop),
             ("cardBottom", HozzPalette.cardBottom),
@@ -190,7 +185,7 @@ struct PaletteContrastTests {
                     on: surface,
                     style
                 )
-                #expect(
+                XCTAssertTrue(
                     measured >= 4.5,
                     """
                     actionText on \(surfaceName) in \(styleName) is \
@@ -202,8 +197,7 @@ struct PaletteContrastTests {
     }
 
     /// Every quiet button reads: each tone's label against its own fill.
-    @Test
-    func everyQuietButtonToneIsLegibleOnItsOwnFill() {
+    func testEveryQuietButtonToneIsLegibleOnItsOwnFill() {
         let tones: [(String, HozzTone)] = [
             ("action", .action),
             ("neutral", .neutral),
@@ -214,7 +208,7 @@ struct PaletteContrastTests {
         for (styleName, style) in Self.styles {
             for (name, tone) in tones {
                 let measured = Self.ratio(tone.textColor, on: tone.well, style)
-                #expect(
+                XCTAssertTrue(
                     measured >= 4.5,
                     "the \(name) quiet button in \(styleName) is \(measured)"
                 )
@@ -223,8 +217,7 @@ struct PaletteContrastTests {
     }
 
     /// And every icon in its disc reads as a shape.
-    @Test
-    func everyIconToneIsVisibleInItsOwnWell() {
+    func testEveryIconToneIsVisibleInItsOwnWell() {
         let tones: [(String, HozzTone)] = [
             ("action", .action),
             ("neutral", .neutral),
@@ -235,7 +228,7 @@ struct PaletteContrastTests {
         for (styleName, style) in Self.styles {
             for (name, tone) in tones {
                 let measured = Self.ratio(tone.color, on: tone.well, style)
-                #expect(
+                XCTAssertTrue(
                     measured >= 3,
                     "the \(name) icon in \(styleName) is \(measured)"
                 )
@@ -283,8 +276,7 @@ struct PaletteContrastTests {
     /// another at 14%, or from a system material. So this asserts the property
     /// that keeps that door open, rather than trusting a comment asking people
     /// not to close it.
-    @Test
-    func everyTokenIsAFlatOpaqueColour() {
+    func testEveryTokenIsAFlatOpaqueColour() {
         for (styleName, style) in Self.styles {
             for (name, color) in Self.everyToken {
                 let resolved = UIColor(color).resolvedColor(
@@ -292,11 +284,11 @@ struct PaletteContrastTests {
                 )
                 var alpha: CGFloat = 0
                 let read = resolved.getRed(nil, green: nil, blue: nil, alpha: &alpha)
-                #expect(
+                XCTAssertTrue(
                     read,
                     "\(name) in \(styleName) is not a plain RGB colour"
                 )
-                #expect(
+                XCTAssertTrue(
                     alpha == 1,
                     """
                     \(name) in \(styleName) has alpha \(alpha). Tokens are \
@@ -313,12 +305,11 @@ struct PaletteContrastTests {
     ///
     /// `onAction` is the one exception worth allowing in principle, and it is
     /// not one in practice — white on a deep blue, near-black on a pale one.
-    @Test
-    func everyTokenIsDesignedForBothAppearances() {
+    func testEveryTokenIsDesignedForBothAppearances() {
         for (name, color) in Self.everyToken where name != "cardShadow" {
             let light = Self.components(color, .light)
             let dark = Self.components(color, .dark)
-            #expect(
+            XCTAssertTrue(
                 light != dark,
                 """
                 \(name) is the same value in both appearances. Dark is \
@@ -336,8 +327,7 @@ struct PaletteContrastTests {
     /// This is the check that would have caught the obvious way to make dark
     /// mode darker: darkening the page and leaving the card alone, which
     /// darkens the card with it and leaves a page with no cards on it.
-    @Test
-    func aCardIsDistinguishableFromThePageBehindIt() {
+    func testACardIsDistinguishableFromThePageBehindIt() {
         for (styleName, style) in Self.styles {
             let card = Self.luminance(HozzPalette.cardTop, style)
             let page = Self.luminance(HozzPalette.air, style)
@@ -347,7 +337,7 @@ struct PaletteContrastTests {
                 style
             )
             let separated = abs(card - page) > 0.002 || hairline >= 1.08
-            #expect(
+            XCTAssertTrue(
                 separated,
                 """
                 In \(styleName) a card is indistinguishable from the page: \
@@ -359,22 +349,21 @@ struct PaletteContrastTests {
 
     /// Dark mode is meant to be dark. Brandon asked for this specifically, and
     /// "darker" is a claim that can be checked rather than asserted.
-    @Test
-    func darkModeIsActuallyDark() {
+    func testDarkModeIsActuallyDark() {
         let page = Self.luminance(HozzPalette.air, .dark)
-        #expect(
+        XCTAssertTrue(
             page < 0.01,
             "the dark page has luminance \(page), which is not dark"
         )
 
         let card = Self.luminance(HozzPalette.cardTop, .dark)
-        #expect(
+        XCTAssertTrue(
             card < 0.02,
             "a dark card has luminance \(card), which is not dark"
         )
 
         // Lifted rather than sunk: on a near-black page a card that is darker
         // still cannot be seen at all.
-        #expect(card > page, "a dark card should sit above the page, not below")
+        XCTAssertTrue(card > page, "a dark card should sit above the page, not below")
     }
 }
