@@ -21,6 +21,7 @@ Package.resolved
 .env
 .env.*
 *.p8
+selfIdentity.plist
 *.xcconfig.local
 
 # Editors

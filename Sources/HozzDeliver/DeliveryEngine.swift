@@ -647,10 +647,15 @@ public actor DeliveryEngine {
     ) async -> Destination? {
         guard destination.kind == .restAPI,
               let current = destination.endpointURL?.absoluteString,
-              let known = SharedReceiverStore(
-                  accessGroup: SharedReceiverStore.resolvedAccessGroup()
-              ).published(),
-              known.endpoints.contains(current) || known.name == destination.name
+              let savedToken = (try? credentials.secret(
+                  for: destination.credentialKey
+              )) ?? nil,
+              let known = Self.matchingReceiver(
+                  token: savedToken,
+                  among: SharedReceiverStore(
+                      accessGroup: SharedReceiverStore.resolvedAccessGroup()
+                  ).publishedAll()
+              )
         else {
             return nil
         }
@@ -672,6 +677,20 @@ public actor DeliveryEngine {
         var repaired = destination
         repaired.endpointURL = URL(string: working)
         return repaired
+    }
+
+    /// The record belonging to this destination, not whichever Mac published
+    /// most recently.
+    ///
+    /// Names and addresses both change. The token already stored in the
+    /// destination's Keychain is the stable fact that identifies its Mac, and
+    /// prevents a hand-entered REST destination with a similar name from being
+    /// silently repointed.
+    static func matchingReceiver(
+        token: String,
+        among receivers: [SharedReceiver]
+    ) -> SharedReceiver? {
+        receivers.first { $0.token == token }
     }
 
     /// Parks a destination Hozz cannot safely use, with a reason to show.
@@ -712,13 +731,32 @@ public actor DeliveryEngine {
         _ batch: DeliveryBatch,
         to destination: Destination
     ) async throws -> DeliveryReceipt {
+        try await loadIfNeeded()
         if let detail = destination.unsupportedDescription {
             throw DeliveryError.unsupportedSettings(detail)
         }
         guard let channel = channels[destination.kind] else {
             throw DeliveryError.notConfigured
         }
-        return try await channel.deliver(batch, to: destination)
+        let savedBeforeTest = cache[destination.id]
+        let mayPersistRepair =
+            savedBeforeTest?.kind == destination.kind
+                && savedBeforeTest?.endpointURL == destination.endpointURL
+        let target = await repairedEndpointIfNeeded(for: destination)
+            ?? destination
+        let receipt = try await channel.deliver(batch, to: target)
+        if mayPersistRepair,
+           target != destination,
+           let savedBeforeTest,
+           cache[destination.id] == savedBeforeTest {
+            // Persist only the endpoint into the exact saved configuration.
+            // The editor normalises defaults into its draft, so writing the
+            // whole draft here would save changes the user only asked to test.
+            var repairedSaved = savedBeforeTest
+            repairedSaved.endpointURL = target.endpointURL
+            try? await save(repairedSaved)
+        }
+        return receipt
     }
 
     /// The next sequence number to use for a destination.

@@ -807,7 +807,15 @@ struct DestinationEditorView: View {
     private func runTest() async {
         isTesting = true
         defer { isTesting = false }
-        testResult = await model.test(build(), secret: secret.isEmpty ? nil : secret)
+        let addressTested = endpoint
+        let result = await model.test(
+            build(),
+            secret: secret.isEmpty ? nil : secret
+        )
+        testResult = result.message
+        if endpoint == addressTested, let repaired = result.endpointURL {
+            endpoint = repaired.absoluteString
+        }
     }
 
     private func save() async {

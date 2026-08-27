@@ -339,7 +339,10 @@ final class SyncViewModel {
     /// Sends a tiny probe so the user sees a real response before trusting a
     /// destination. The most common setup failure in this space is a wrong auth
     /// header discovered days later.
-    func test(_ destination: Destination, secret: String?) async -> String {
+    func test(
+        _ destination: Destination,
+        secret: String?
+    ) async -> DestinationTestResult {
         do {
             let services = try await resolveServices()
             if let secret {
@@ -347,7 +350,10 @@ final class SyncViewModel {
             }
             return try await services.delivery.test(destination)
         } catch {
-            return error.localizedDescription
+            return DestinationTestResult(
+                message: error.localizedDescription,
+                endpointURL: nil
+            )
         }
     }
 

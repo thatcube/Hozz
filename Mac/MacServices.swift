@@ -88,6 +88,10 @@ final class MacServices {
     private var receiver: HealthReceiver?
     private var watcher: FolderIngestWatcher?
     private(set) var watchedFolder: URL?
+    /// The complete addresses last shared with the phone, including the port.
+    private var publishedEndpoints: [String] = []
+    private var isPublishingAddress = false
+    private var addressMonitor: Task<Void, Never>?
 
     /// Where the received database actually lives.
     ///
@@ -534,15 +538,26 @@ final class MacServices {
         guard !token.isEmpty, !hosts.isEmpty else {
             return
         }
+        let endpoints = hosts.map { "http://\($0):\(port)" }
+        guard !isPublishingAddress else {
+            return
+        }
+        if sharedWithOtherDevices == true,
+           endpoints == publishedEndpoints {
+            return
+        }
         let record = SharedReceiver(
             name: computerName.isEmpty ? "Mac" : "Hozz on \(computerName)",
             token: token,
-            endpoints: hosts.map { "http://\($0):\(port)" }
+            endpoints: endpoints
         )
+        isPublishingAddress = true
         Task { @MainActor in
+            defer { isPublishingAddress = false }
             do {
                 let group = SharedReceiverStore.resolvedAccessGroup()
                 try SharedReceiverStore(accessGroup: group).publish(record)
+                publishedEndpoints = endpoints
                 sharedWithOtherDevices = true
                 // Addresses only — never the token.
                 Self.log.info(
@@ -557,11 +572,36 @@ final class MacServices {
         }
     }
 
+    /// Keeps a long-running Mac current across DHCP leases and port fallback.
+    ///
+    /// A path monitor reports whether Wi-Fi is usable, not whether one usable
+    /// address was replaced by another. No Keychain write happens while the
+    /// complete endpoint list is unchanged; a failed publication is retried.
+    private func monitorAddressChanges() {
+        guard addressMonitor == nil else {
+            return
+        }
+        addressMonitor = Task { [weak self] in
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(for: .seconds(30))
+                } catch {
+                    return
+                }
+                guard let self, case .ready(let port) = self.status else {
+                    continue
+                }
+                self.publishAddress(port: port)
+            }
+        }
+    }
+
     private func apply(_ state: ReceiverState) {
         switch state {
         case .listening(let port):
             status = .ready(port: port)
             publishAddress(port: port)
+            monitorAddressChanges()
         case .failed(let reason):
             status = .failed(reason)
         case .starting, .stopped:

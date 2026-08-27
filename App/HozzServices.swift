@@ -123,13 +123,18 @@ struct SyncCoordinator: Sendable {
     }
 }
 
+struct DestinationTestResult: Sendable {
+    let message: String
+    let endpointURL: URL?
+}
+
 extension DeliveryEngine {
     /// Sends a small, clearly-marked probe and reports what came back.
     ///
     /// Setup failures in this space are almost always a wrong URL or a wrong
     /// auth header, discovered days later when data never arrived. This turns
     /// that into an immediate, readable answer.
-    func test(_ destination: Destination) async throws -> String {
+    func test(_ destination: Destination) async throws -> DestinationTestResult {
         let batch = DeliveryBatch(
             id: UUID(),
             sequence: 0,
@@ -140,17 +145,38 @@ extension DeliveryEngine {
         )
 
         do {
+            let savedEndpointBefore = try await self.destination(
+                id: destination.id
+            )?.endpointURL
             let receipt = try await deliverWithoutRecording(batch, to: destination)
-            switch destination.kind {
+            let message = switch destination.kind {
             case .folder:
-                return "Wrote \(receipt.artifactName ?? "a test file") successfully."
+                "Wrote \(receipt.artifactName ?? "a test file") successfully."
             case .restAPI:
-                return "The destination accepted the test. \(receipt.detail ?? "")"
+                "The destination accepted the test. \(receipt.detail ?? "")"
             case .mqtt:
-                return "The broker accepted the test. \(receipt.detail ?? "")"
+                "The broker accepted the test. \(receipt.detail ?? "")"
             }
+            let savedEndpointAfter = try await self.destination(
+                id: destination.id
+            )?.endpointURL
+            return DestinationTestResult(
+                message: message,
+                // An edited draft was tested but not persisted; returning the
+                // old cached address would overwrite the user's working edit.
+                // Only return the endpoint when this test actually changed the
+                // saved destination it began from.
+                endpointURL:
+                    savedEndpointBefore == destination.endpointURL
+                        && savedEndpointAfter != savedEndpointBefore
+                    ? savedEndpointAfter
+                    : nil
+            )
         } catch let error as DeliveryError {
-            return error.errorDescription ?? "The test failed."
+            return DestinationTestResult(
+                message: error.errorDescription ?? "The test failed.",
+                endpointURL: nil
+            )
         }
     }
 }

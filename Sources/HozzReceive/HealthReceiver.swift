@@ -67,6 +67,10 @@ public actor HealthReceiver {
     private let serviceName: String
     private var pairedDevices: [PairedDevice] = []
     private var hasRetriedOnAnyPort = false
+    private var requestedPort = HealthReceiver.defaultPort
+    private var serviceRestarts = 0
+    private static let maximumServiceRestarts = 5
+    private var shouldRun = false
     private var listener: NWListener?
     private var connections: Set<ObjectIdentifier> = []
 
@@ -138,6 +142,8 @@ public actor HealthReceiver {
         guard listener == nil else {
             return
         }
+        shouldRun = true
+        requestedPort = port
         update(.starting)
 
         let parameters = NWParameters.tcp
@@ -187,6 +193,7 @@ public actor HealthReceiver {
     }
 
     public func stop() {
+        shouldRun = false
         listener?.cancel()
         listener = nil
         update(.stopped)
@@ -195,23 +202,32 @@ public actor HealthReceiver {
     private func handleListenerState(_ state: NWListener.State) {
         switch state {
         case .ready:
+            serviceRestarts = 0
             if let port = listener?.port?.rawValue {
                 update(.listening(port: port))
                 Self.log.info("Receiver listening on port \(port, privacy: .public).")
             }
-        case .failed(let error):
-            // Almost always the port already being in use — another copy of
-            // Hozz, or something else that claimed it. Falling back to any free
-            // port keeps the app working; the address is published either way,
-            // so the phone still finds it.
-            if !hasRetriedOnAnyPort {
+        case .waiting(let error), .failed(let error):
+            // The error seen on the affected Mac was -65563:
+            // kDNSServiceErr_ServiceNotRunning. Rebuilding the listener is the
+            // only recovery after mDNSResponder restarts; changing ports cannot
+            // repair a dead service connection.
+            if Self.isTransientServiceFailure(error),
+               serviceRestarts < Self.maximumServiceRestarts {
+                serviceRestarts += 1
+                Self.log.info(
+                    "Bonjour service unavailable; restarting receiver."
+                )
+                restart(after: .seconds(1), port: requestedPort)
+                return
+            }
+            // Only EADDRINUSE means another process claimed the port.
+            if Self.isPortInUse(error), !hasRetriedOnAnyPort {
                 hasRetriedOnAnyPort = true
                 Self.log.error(
                     "Port \(Self.defaultPort, privacy: .public) unavailable, using any free port."
                 )
-                listener?.cancel()
-                listener = nil
-                Task { await self.start(port: 0) }
+                restart(after: .zero, port: 0)
                 return
             }
             update(.failed(error.localizedDescription))
@@ -220,6 +236,39 @@ public actor HealthReceiver {
         default:
             break
         }
+    }
+
+    static func isTransientServiceFailure(_ error: NWError) -> Bool {
+        guard case .dns(let code) = error else {
+            return false
+        }
+        return code == kDNSServiceErr_ServiceNotRunning
+            || code == kDNSServiceErr_DefunctConnection
+    }
+
+    static func isPortInUse(_ error: NWError) -> Bool {
+        if case .posix(let code) = error {
+            return code == .EADDRINUSE
+        }
+        return false
+    }
+
+    private func restart(after delay: Duration, port: UInt16) {
+        listener?.cancel()
+        listener = nil
+        Task { [weak self] in
+            if delay != .zero {
+                try? await Task.sleep(for: delay)
+            }
+            await self?.resumeAfterRestart(port: port)
+        }
+    }
+
+    private func resumeAfterRestart(port: UInt16) async {
+        guard shouldRun else {
+            return
+        }
+        await start(port: port)
     }
 
     private func update(_ newState: ReceiverState) {
