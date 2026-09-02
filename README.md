@@ -5,7 +5,7 @@
 <h1 align="center">Hozz</h1>
 
 <p align="center">
-  Export your Apple Health data to destinations you own — your Mac, a folder, Home Assistant, and more. No accounts, no analytics, no server in the middle.
+  Move your health data to the places you use — your Mac, files, home systems, and more. No accounts, no analytics, no server in the middle.
 </p>
 
 <p align="center">
@@ -18,15 +18,13 @@
   <a href="https://github.com/sponsors/thatcube"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?logo=githubsponsors&logoColor=white" alt="Sponsor" /></a>
 </p>
 
-Hozz is a free, open-source **iPhone** app with a companion **Mac** app. The
-phone reads the Health data Apple lets an app read and sends it — on demand, or
-automatically in the background — to places **you** control: your own Mac, a
-folder in iCloud/Dropbox/anywhere, Home Assistant, InfluxDB, an MQTT broker, or
-any endpoint you run. The Mac app receives those deliveries, stores them in a
-local database, charts them, and can even answer questions about them through an
-AI assistant.
+Hozz is an open-source health data tool. Today, its **iPhone** app reads Apple
+Health and sends a copy — on demand or automatically — to places **you**
+control: your **Mac**, a folder, Home Assistant, InfluxDB, MQTT, or any endpoint
+you run. The Mac app stores and charts those deliveries and can answer questions
+about them through an AI assistant.
 
-There is no subscription, account, analytics, advertising, or hosted relay.
+There is no account, analytics, advertising, or hosted relay.
 **Nothing leaves your iPhone until you add a destination and confirm it** — Hozz
 ships with no default destination and never picks one for you.
 
@@ -132,8 +130,8 @@ against Hozz without reading the source.
 
 ## Getting started
 
-Hozz is an early-alpha, non-commercial project and isn't on the App Store yet, so
-today you build it yourself from source with Xcode. See
+Hozz is an early alpha and isn't on the App Store yet, so today you build it
+yourself from source with Xcode. See
 **[CONTRIBUTING.md](CONTRIBUTING.md)** for setup.
 
 You'll want:
@@ -191,9 +189,8 @@ app's networking gotchas, and how to enable clinical records all live in
 
 ## Donate
 
-Hozz is free and open source, and it has no paid features. Donations are entirely
-optional and support continued development of Hozz and Brandon's other free,
-open-source apps. Anything is appreciated, and not donating is completely fine.
+Sponsorship supports continued development of Hozz and Brandon's other
+open-source projects.
 
 **[Donate via GitHub Sponsors](https://github.com/sponsors/thatcube)**
 

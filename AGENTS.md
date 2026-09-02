@@ -1,17 +1,18 @@
 # Hozz contributor notes
 
-Hozz moves someone's health data to somewhere they own. Almost everything that
-matters follows from two things: tell the truth about what happened, and do not
-lose records.
+Hozz moves someone's health data between the places and platforms they use.
+Today that starts with Apple Health on iPhone and destinations they control.
+Almost everything that matters follows from two things: tell the truth about
+what happened, and do not lose records.
 
 Nothing below is a rule for its own sake. If something here makes the app worse,
 change it and say why in the commit.
 
 ## What Hozz is
 
-Free and open source. No subscription, account, advertising, analytics, or
-server the maintainer runs. There is nothing to sign up for and nothing phoning
-home, and that is the reason to choose it over the alternatives.
+Open source. Hozz currently has no account, advertising, analytics, or server
+the maintainer runs. Its future pricing or tier structure is not a product
+promise; do not turn today's business model into permanent marketing copy.
 
 Nothing leaves the device until someone adds a destination and confirms it.
 Hozz ships with no default destination and never picks one on a user's behalf.

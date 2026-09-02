@@ -6,8 +6,8 @@ Hozz is and does as a user, see the [README](README.md). For the exact wire
 format of every delivery, see [`docs/delivery-schema.md`](docs/delivery-schema.md);
 for the MCP tools, see [`docs/mcp.md`](docs/mcp.md).
 
-Hozz is an early-alpha, non-commercial project. Issues and pull requests are
-welcome, but reviews and merges may take a while.
+Hozz is an early-alpha project. Issues and pull requests are welcome, but
+reviews and merges may take a while.
 
 ## Guiding principles
 

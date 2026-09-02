@@ -16,7 +16,7 @@ struct AboutView: View {
                         tone: .action
                     )
                     HozzNote(
-                        "No subscription, paywall, account, or analytics",
+                        "No account, analytics, or server of ours",
                         icon: .heartHandshake,
                         tone: .action
                     )
@@ -80,7 +80,7 @@ struct AboutView: View {
                     }
                 }
                 Link(destination: HozzLinks.developer) {
-                    HozzRow("More free apps", icon: .world, isProminent: true) {
+                    HozzRow("More apps", icon: .world, isProminent: true) {
                         HozzIconView(.externalLink, size: 14)
                             .foregroundStyle(HozzPalette.inkMuted)
                     }
@@ -99,12 +99,12 @@ struct AboutView: View {
         VStack(alignment: .leading, spacing: 12) {
             HozzIconView(.heart, size: 32)
                 .foregroundStyle(HozzPalette.blue)
-            Text("Your Health data, wherever you want it")
+            Text("Your health data, across the places you use")
                 .hozzDisplay(size: 26)
                 .fixedSize(horizontal: false, vertical: true)
             Text(
-                "Free and open source, with no subscription, no account, "
-                + "and no server of ours in the middle."
+                "Open source. Today, Hozz reads Apple Health on iPhone and "
+                    + "moves it to places you control."
             )
             .hozzBody()
             .fixedSize(horizontal: false, vertical: true)

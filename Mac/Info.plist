@@ -27,7 +27,7 @@
 		<string>_hozz._tcp</string>
 	</array>
 	<key>NSHumanReadableCopyright</key>
-	<string>Free and open source.</string>
+	<string>© 2026 Brandon Moore</string>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Hozz receives Health data your iPhone sends directly to this Mac over your own network.</string>
 </dict>

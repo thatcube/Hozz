@@ -503,7 +503,7 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         LSMinimumSystemVersion: "14.0"
-        NSHumanReadableCopyright: "Free and open source."
+        NSHumanReadableCopyright: "© 2026 Brandon Moore"
         # Required before a sandboxed app may advertise or browse Bonjour.
         NSBonjourServices:
           - _hozz._tcp

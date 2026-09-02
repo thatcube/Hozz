@@ -74,7 +74,7 @@ struct ExportSetupView: View {
                     )
                 }
                 Link(destination: HozzLinks.developer) {
-                    HozzRow("More free apps", icon: .world, isProminent: true)
+                    HozzRow("More apps", icon: .world, isProminent: true)
                 }
             }
         }
