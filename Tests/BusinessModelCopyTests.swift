@@ -11,6 +11,8 @@ final class BusinessModelCopyTests: XCTestCase {
         let roots = [
             repository.appending(path: "App"),
             repository.appending(path: "Mac"),
+            repository.appending(path: "docs"),
+            repository.appending(path: "receiver"),
             repository.appending(path: "README.md"),
             repository.appending(path: "CONTRIBUTING.md"),
             repository.appending(path: "AGENTS.md"),
