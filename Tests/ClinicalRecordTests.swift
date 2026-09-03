@@ -281,8 +281,44 @@ final class ClinicalRecordTests: XCTestCase {
             id.uuidString.lowercased(),
             "The identity is derived; the UUID is kept only for tracing."
         )
+        XCTAssertEqual(
+            object["canonicalId"] as? String,
+            "apple.healthkit:\(object["id"] as? String ?? "")"
+        )
+        XCTAssertEqual(
+            object["canonicalType"] as? String,
+            "clinical.record"
+        )
         XCTAssertEqual(object["kind"] as? String, "clinicalRecord")
         XCTAssertEqual(object["displayName"] as? String, "Haemoglobin")
+    }
+
+    func testAStableClinicalIdentityCarriesAMonotonicObservedVersion() throws {
+        let first = ClinicalRecordFacts(
+            healthKitID: UUID(),
+            clinicalType: labResult.rawValue,
+            displayName: "Haemoglobin",
+            sourceBundleIdentifier: "com.example.hospital",
+            startDate: Date(timeIntervalSince1970: 100),
+            endDate: Date(timeIntervalSince1970: 100),
+            fhir: fhir()
+        )
+        let second = ClinicalRecordFacts(
+            healthKitID: UUID(),
+            clinicalType: labResult.rawValue,
+            displayName: "Haemoglobin",
+            sourceBundleIdentifier: "com.example.hospital",
+            startDate: Date(timeIntervalSince1970: 200),
+            endDate: Date(timeIntervalSince1970: 200),
+            fhir: fhir()
+        )
+
+        let firstObject = encode(first)
+        let secondObject = encode(second)
+
+        XCTAssertEqual(firstObject["canonicalId"] as? String, secondObject["canonicalId"] as? String)
+        XCTAssertEqual(firstObject["recordVersion"] as? Int64, 100_000)
+        XCTAssertEqual(secondObject["recordVersion"] as? Int64, 200_000)
     }
 
     func testTheSameRecordEncodesTheSameWayTwice() {

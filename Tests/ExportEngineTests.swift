@@ -134,6 +134,42 @@ final class ExportEngineTests: XCTestCase {
         XCTAssertEqual(manifest?["attemptedTypes"] as? Int, 1)
     }
 
+    func testNDJSONArchiveCarriesVersionedSidecarWithoutChangingRecordStream() async throws {
+        let store = try makeStore()
+        let source = ScriptedHealthDataSource(
+            streams: [steps: [upsert("step-0", type: steps)]]
+        )
+        let engine = makeEngine(store: store, source: source, types: [steps])
+
+        guard
+            case .completed(let result) = try await engine.export(
+                format: .ndjson,
+                progress: { _ in }
+            )
+        else {
+            return XCTFail("The run should have completed.")
+        }
+
+        let entries = try ExportArtifactReader.readZipEntries(at: result.fileURL)
+        let manifestData = try XCTUnwrap(
+            entries[HozzArchiveContract.manifestEntry]
+        )
+        let manifest = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: manifestData) as? [String: Any]
+        )
+        let recordsEntry = try XCTUnwrap(manifest["recordsEntry"] as? String)
+
+        XCTAssertEqual(manifest["schemaVersion"] as? Int, 1)
+        XCTAssertEqual(manifest["format"] as? String, "hozz-ndjson")
+        XCTAssertEqual(
+            manifest["recordSchema"] as? String,
+            "hozz/v1/canonical-record"
+        )
+        XCTAssertNotNil(entries[recordsEntry])
+        XCTAssertNil(manifest["recordCount"])
+        XCTAssertEqual(try sampleIdentifiers(in: result.fileURL), ["step-0"])
+    }
+
     // MARK: - The acceptance gate
 
     func testAKilledRunReplaysItsUnsealedPartWithoutGapsOrDuplicates() async throws {

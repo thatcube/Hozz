@@ -1,4 +1,5 @@
 import CoreFoundation
+import CryptoKit
 import Foundation
 import HealthKit
 import HozzCatalog
@@ -31,6 +32,10 @@ public struct HealthSampleEncoder: Sendable {
         // a deployment target that predates it.
         if #available(iOS 18.0, *), let stateOfMind = sample as? HKStateOfMind {
             object["kind"] = "stateOfMind"
+            object["canonicalType"] = HozzHealthArchiveContract.canonicalType(
+                for: sample.sampleType.identifier,
+                kind: "stateOfMind"
+            )
             object.merge(StateOfMindEncoding.object(for: stateOfMind)) {
                 current, _ in current
             }
@@ -52,6 +57,10 @@ public struct HealthSampleEncoder: Sendable {
         // cannot appear in a case pattern.
         if #available(iOS 26.0, *), let dose = sample as? HKMedicationDoseEvent {
             object["kind"] = "medicationDose"
+            object["canonicalType"] = HozzHealthArchiveContract.canonicalType(
+                for: sample.sampleType.identifier,
+                kind: "medicationDose"
+            )
             object.merge(
                 MedicationEncoding.object(
                     for: HealthKitMedicationDirectory.facts(for: dose),
@@ -71,10 +80,11 @@ public struct HealthSampleEncoder: Sendable {
                 throw HealthSampleEncodingError.missingCanonicalUnit(sample.sampleType.identifier)
             }
             let unit = HKUnit(from: unitString)
+            let canonicalValue = quantity.quantity.doubleValue(for: unit)
             object["kind"] = "quantity"
             object["quantity"] = Self.quantityObject(
                 unit: unitString,
-                value: quantity.quantity.doubleValue(for: unit),
+                value: canonicalValue,
                 description: quantity.quantity.description,
                 count: quantity.count,
                 expandsSeries: expandsSeries
@@ -110,10 +120,18 @@ public struct HealthSampleEncoder: Sendable {
             } ?? []
         case let audiogram as HKAudiogramSample:
             object["kind"] = "audiogram"
+            object["canonicalType"] = HozzHealthArchiveContract.canonicalType(
+                for: sample.sampleType.identifier,
+                kind: "audiogram"
+            )
             object["sensitivityPoints"] = AudiogramEncoding
                 .sensitivityPoints(audiogram)
         case let correlation as HKCorrelation:
             object["kind"] = "correlation"
+            object["canonicalType"] = HozzHealthArchiveContract.canonicalType(
+                for: sample.sampleType.identifier,
+                kind: "correlation"
+            )
             object["members"] = correlation.objects.sorted {
                 $0.uuid.uuidString < $1.uuid.uuidString
             }.map { member in
@@ -124,6 +142,10 @@ public struct HealthSampleEncoder: Sendable {
             }
         default:
             object["kind"] = "sample"
+            object["canonicalType"] = HozzHealthArchiveContract.canonicalType(
+                for: sample.sampleType.identifier,
+                kind: "sample"
+            )
         }
 
         return try serialize(object)
@@ -236,7 +258,17 @@ public struct HealthSampleEncoder: Sendable {
             "unit": unit,
             "value": value,
             "description": description,
-            "count": count
+            "count": count,
+            "canonical": [
+                "unit": unit,
+                "value": value
+            ],
+            // HealthKit does not expose a stable original unit/value pair. Its
+            // own description is preserved without relabelling the canonical
+            // conversion as the original measurement.
+            "original": [
+                "description": description
+            ]
         ]
         if count > 1 {
             object["aggregatesSeries"] = true
@@ -252,11 +284,28 @@ public struct HealthSampleEncoder: Sendable {
     }
 
     public func encodeDeletion(id: UUID, typeIdentifier: String) throws -> Data {
+        let sourceID = id.uuidString.lowercased()
         let object: [String: Any] = [
             "kind": "deletion",
-            "id": id.uuidString.lowercased(),
+            "id": sourceID,
+            "canonicalId": HozzHealthArchiveContract.canonicalID(for: sourceID),
+            "recordVersion": 2,
             "type": typeIdentifier,
-            "schemaVersion": 1
+            "canonicalType": HozzHealthArchiveContract.canonicalType(
+                for: typeIdentifier
+            ),
+            "schemaVersion": HozzHealthArchiveContract.schemaVersion,
+            "sourceRecord": [
+                "store": HozzHealthArchiveContract.sourceStore,
+                "id": sourceID,
+                "type": typeIdentifier
+            ],
+            "lineage": [
+                [
+                    "store": HozzHealthArchiveContract.sourceStore,
+                    "recordId": sourceID
+                ]
+            ]
         ]
         return try JSONSerialization.data(
             withJSONObject: object,
@@ -269,20 +318,70 @@ public struct HealthSampleEncoder: Sendable {
     /// The record is written into the export in the sample's place so the
     /// output never silently omits an object HealthKit returned.
     public func encodeEncodingFailure(
-        id: UUID,
+        id sourceRecordID: UUID,
         typeIdentifier: String,
         message: String
     ) throws -> Data {
+        let failureID = Self.encodingFailureID(
+            sourceRecordID: sourceRecordID,
+            typeIdentifier: typeIdentifier
+        )
+        let recordID = failureID.uuidString.lowercased()
+        let sourceID = sourceRecordID.uuidString.lowercased()
         let object: [String: Any] = [
             "kind": "sampleEncodingError",
-            "id": id.uuidString.lowercased(),
+            "id": recordID,
+            "canonicalId": HozzHealthArchiveContract.canonicalID(for: recordID),
+            "recordVersion": 1,
             "type": typeIdentifier,
+            "canonicalType": HozzHealthArchiveContract.canonicalType(
+                for: typeIdentifier,
+                kind: "sampleEncodingError"
+            ),
             "message": message,
-            "schemaVersion": 1
+            "schemaVersion": HozzHealthArchiveContract.schemaVersion,
+            "sourceRecord": [
+                "store": HozzHealthArchiveContract.sourceStore,
+                "id": sourceID,
+                "type": typeIdentifier
+            ],
+            "lineage": [
+                [
+                    "store": HozzHealthArchiveContract.sourceStore,
+                    "recordId": sourceID
+                ]
+            ],
+            "parentCanonicalId": HozzHealthArchiveContract.canonicalID(
+                for: sourceID
+            )
         ]
         return try JSONSerialization.data(
             withJSONObject: object,
             options: [.sortedKeys, .withoutEscapingSlashes]
+        )
+    }
+
+    public static func encodingFailureID(
+        sourceRecordID: UUID,
+        typeIdentifier: String
+    ) -> UUID {
+        var hasher = SHA256()
+        hasher.update(data: Data("HozzEncodingFailure".utf8))
+        hasher.update(data: Data([0]))
+        hasher.update(data: Data(typeIdentifier.utf8))
+        withUnsafeBytes(of: sourceRecordID.uuid) {
+            hasher.update(data: Data($0))
+        }
+        var bytes = Array(hasher.finalize().prefix(16))
+        bytes[6] = (bytes[6] & 0x0F) | 0x50
+        bytes[8] = (bytes[8] & 0x3F) | 0x80
+        return UUID(
+            uuid: (
+                bytes[0], bytes[1], bytes[2], bytes[3],
+                bytes[4], bytes[5], bytes[6], bytes[7],
+                bytes[8], bytes[9], bytes[10], bytes[11],
+                bytes[12], bytes[13], bytes[14], bytes[15]
+            )
         )
     }
 
@@ -303,15 +402,33 @@ public struct HealthSampleEncoder: Sendable {
     }
 
     private func baseObject(sample: HKSample) -> [String: Any] {
+        let sourceID = sample.uuid.uuidString.lowercased()
+        let typeIdentifier = sample.sampleType.identifier
         var object: [String: Any] = [
-            "schemaVersion": 1,
-            "id": sample.uuid.uuidString.lowercased(),
-            "type": sample.sampleType.identifier,
+            "schemaVersion": HozzHealthArchiveContract.schemaVersion,
+            "id": sourceID,
+            "canonicalId": HozzHealthArchiveContract.canonicalID(for: sourceID),
+            "recordVersion": 1,
+            "type": typeIdentifier,
+            "canonicalType": HozzHealthArchiveContract.canonicalType(
+                for: typeIdentifier
+            ),
             "catalogVersion": HealthTypeCatalog.version,
             "startDate": Self.timestamp(sample.startDate),
             "endDate": Self.timestamp(sample.endDate),
             "metadata": metadataObject(sample.metadata ?? [:]),
-            "source": sourceObject(sample.sourceRevision)
+            "source": sourceObject(sample.sourceRevision),
+            "sourceRecord": [
+                "store": HozzHealthArchiveContract.sourceStore,
+                "id": sourceID,
+                "type": typeIdentifier
+            ],
+            "lineage": [
+                [
+                    "store": HozzHealthArchiveContract.sourceStore,
+                    "recordId": sourceID
+                ]
+            ]
         ]
 
         if let device = sample.device {

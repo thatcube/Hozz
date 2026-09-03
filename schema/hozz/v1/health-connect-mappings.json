@@ -1,0 +1,184 @@
+{
+  "schemaVersion": 1,
+  "sourceStore": "apple.healthkit",
+  "targetStore": "healthConnect",
+  "targetPackage": "com.thatcube.hozz",
+  "recordMappings": [
+    {
+      "sourceIdentifier": "HKQuantityTypeIdentifierStepCount",
+      "canonicalType": "activity.steps",
+      "sourceKind": "quantity",
+      "targetRecord": "StepsRecord",
+      "canonicalUnit": "count",
+      "quality": "exact"
+    },
+    {
+      "sourceIdentifier": "HKQuantityTypeIdentifierHeartRate",
+      "canonicalType": "vitals.heart-rate",
+      "sourceKind": "quantity",
+      "targetRecord": "HeartRateRecord",
+      "canonicalUnit": "count/s",
+      "quality": "conditional",
+      "warningCode": "heart-rate-aggregate"
+    },
+    {
+      "sourceIdentifier": "HKQuantityTypeIdentifierBodyMass",
+      "canonicalType": "body.weight",
+      "sourceKind": "quantity",
+      "targetRecord": "WeightRecord",
+      "canonicalUnit": "kg",
+      "quality": "exact"
+    },
+    {
+      "sourceIdentifier": "HKQuantityTypeIdentifierHeight",
+      "canonicalType": "body.height",
+      "sourceKind": "quantity",
+      "targetRecord": "HeightRecord",
+      "canonicalUnit": "m",
+      "quality": "exact"
+    },
+    {
+      "sourceIdentifier": "HKCategoryTypeIdentifierSleepAnalysis",
+      "canonicalType": "sleep.stage",
+      "sourceKind": "category",
+      "targetRecord": "SleepSessionRecord",
+      "quality": "conditional"
+    },
+    {
+      "sourceIdentifier": "HKQuantityTypeIdentifierDistanceWalkingRunning",
+      "canonicalType": "activity.distance",
+      "sourceKind": "quantity",
+      "targetRecord": "DistanceRecord",
+      "canonicalUnit": "m",
+      "quality": "exact"
+    },
+    {
+      "sourceIdentifier": "HKQuantityTypeIdentifierActiveEnergyBurned",
+      "canonicalType": "energy.active",
+      "sourceKind": "quantity",
+      "targetRecord": "ActiveCaloriesBurnedRecord",
+      "canonicalUnit": "kcal",
+      "quality": "exact"
+    },
+    {
+      "sourceIdentifier": "HKWorkoutTypeIdentifier",
+      "canonicalType": "activity.exercise-session",
+      "sourceKind": "workout",
+      "targetRecord": "ExerciseSessionRecord",
+      "quality": "conditional",
+      "warningCode": "workout-activity-generalized"
+    }
+  ],
+  "sleepStages": [
+    {
+      "sourceValue": 0,
+      "sourceName": "inBed",
+      "disposition": "archiveOnly",
+      "warningCode": "sleep-in-bed-overlap"
+    },
+    {
+      "sourceValue": 1,
+      "sourceName": "asleepUnspecified",
+      "targetStage": "SLEEPING",
+      "disposition": "exact"
+    },
+    {
+      "sourceValue": 2,
+      "sourceName": "awake",
+      "targetStage": "AWAKE",
+      "disposition": "exact"
+    },
+    {
+      "sourceValue": 3,
+      "sourceName": "asleepCore",
+      "targetStage": "LIGHT",
+      "disposition": "lossy",
+      "warningCode": "sleep-core-to-light"
+    },
+    {
+      "sourceValue": 4,
+      "sourceName": "asleepDeep",
+      "targetStage": "DEEP",
+      "disposition": "exact"
+    },
+    {
+      "sourceValue": 5,
+      "sourceName": "asleepREM",
+      "targetStage": "REM",
+      "disposition": "exact"
+    }
+  ],
+  "workoutActivities": [
+    {
+      "sourceValue": 13,
+      "sourceName": "cycling",
+      "targetExercise": "BIKING",
+      "disposition": "exact"
+    },
+    {
+      "sourceValue": 24,
+      "sourceName": "hiking",
+      "targetExercise": "HIKING",
+      "disposition": "exact"
+    },
+    {
+      "sourceValue": 37,
+      "sourceName": "running",
+      "targetExercise": "RUNNING",
+      "disposition": "exact"
+    },
+    {
+      "sourceValue": 52,
+      "sourceName": "walking",
+      "targetExercise": "WALKING",
+      "disposition": "exact"
+    }
+  ],
+  "archiveOnlyKinds": [
+    "audiogram",
+    "characteristics",
+    "clinicalRecord",
+    "correlation",
+    "electrocardiogram",
+    "electrocardiogramEnd",
+    "electrocardiogramVoltages",
+    "medicationDose",
+    "quantitySeriesEnd",
+    "quantitySeriesReadings",
+    "sampleEncodingError",
+    "sample",
+    "stateOfMind",
+    "workoutRoute",
+    "workoutRouteEnd",
+    "workoutRouteLocations"
+  ],
+  "archiveOnlyCanonicalTypes": {
+    "audiogram": "hearing.audiogram",
+    "characteristics": "person.characteristics",
+    "clinicalRecord": "clinical.record",
+    "correlation": "archive.correlation",
+    "electrocardiogram": "cardiac.electrocardiogram",
+    "electrocardiogramEnd": "cardiac.electrocardiogram-end",
+    "electrocardiogramVoltages": "cardiac.electrocardiogram-waveform",
+    "medicationDose": "medication.dose",
+    "quantitySeriesEnd": "series.end",
+    "quantitySeriesReadings": "series.readings",
+    "sampleEncodingError": "archive.encoding-error",
+    "sample": "archive.raw",
+    "stateOfMind": "mind.state",
+    "workoutRoute": "activity.exercise-route",
+    "workoutRouteEnd": "activity.exercise-route-end",
+    "workoutRouteLocations": "activity.exercise-route-locations"
+  },
+  "warningMessages": {
+    "heart-rate-aggregate": "Health Connect needs individual heart-rate readings; this archive record is an aggregate and cannot be projected exactly.",
+    "sleep-core-to-light": "Apple's Core sleep stage is projected as Health Connect Light sleep.",
+    "sleep-in-bed-overlap": "In-bed intervals stay in the Hozz archive because Health Connect sleep-stage overlap semantics differ.",
+    "workout-activity-generalized": "The Apple workout activity has no exact Health Connect exercise type and is projected as Other workout.",
+    "workout-details-archive-only": "Workout events, statistics, route relationships, or multi-sport legs remain only in the Hozz archive.",
+    "source-store-loop": "This record already came from this Health Connect package and will not be written back to it.",
+    "unsupported-type": "Health Connect has no mapped representation for this record.",
+    "invalid-value": "The record value is outside the range Health Connect accepts.",
+    "tombstone": "Deleted records remain as Hozz tombstones and are not inserted into Health Connect."
+  }
+}

@@ -857,11 +857,18 @@ final class QuantitySeriesTests: XCTestCase {
         )
         XCTAssertEqual(
             upsert.id,
-            SeriesEncoding.identifier(
-                shape: QuantitySeriesEncoding.shape(for: heartRate.rawValue),
-                sample: sample,
-                suffix: "error"
+            HealthSampleEncoder.encodingFailureID(
+                sourceRecordID: sample,
+                typeIdentifier: heartRate.rawValue
             )
+        )
+        XCTAssertEqual(
+            object["canonicalId"] as? String,
+            "apple.healthkit:\(upsert.id.uuidString.lowercased())"
+        )
+        XCTAssertEqual(
+            object["parentCanonicalId"] as? String,
+            "apple.healthkit:\(sample.uuidString.lowercased())"
         )
     }
 

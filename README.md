@@ -141,6 +141,14 @@ You'll want:
   browser, charts, and assistant — or any of the other destinations above
   instead.
 
+### Android foundation
+
+This repository also contains an **unreleased Android foundation** under
+[`Android/`](Android/). It can import a lossless Hozz NDJSON/ZIP archive into a
+local canonical store, show archive-only records, preview Health Connect mapping
+loss, and explicitly write the mapped subset. Apple Health extraction still
+happens on an Apple device; Android support is not a shipped product yet.
+
 ## What Hozz keeps, and its limits
 
 Hozz's honesty is a feature. It currently exports quantity and category samples,

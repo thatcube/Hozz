@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://hozz.brando.page/schema/hozz/v1/archive-manifest.schema.json",
+  "title": "Hozz archive manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schemaVersion",
+    "archiveId",
+    "format",
+    "recordSchema",
+    "recordsEntry",
+    "createdAt"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "const": 1
+    },
+    "archiveId": {
+      "type": "string",
+      "minLength": 1
+    },
+    "format": {
+      "const": "hozz-ndjson"
+    },
+    "recordSchema": {
+      "const": "hozz/v1/canonical-record"
+    },
+    "recordsEntry": {
+      "type": "string",
+      "pattern": "\\.ndjson$"
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "recordCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sourcePlatform": {
+      "type": "string",
+      "minLength": 1
+    }
+  }
+}

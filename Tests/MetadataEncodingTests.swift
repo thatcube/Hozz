@@ -38,6 +38,30 @@ final class MetadataEncodingTests: XCTestCase {
         return try XCTUnwrap(object["metadata"] as? [String: Any])
     }
 
+    func testBaseFieldsCarryCanonicalIdentityAndSourceLineage() throws {
+        let sample = sample(metadata: [:])
+        let data = try HealthSampleEncoder().encodeBaseFields(sample: sample)
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let sourceID = sample.uuid.uuidString.lowercased()
+
+        XCTAssertEqual(
+            object["canonicalId"] as? String,
+            "apple.healthkit:\(sourceID)"
+        )
+        XCTAssertEqual(object["canonicalType"] as? String, "activity.steps")
+        XCTAssertEqual(object["recordVersion"] as? Int, 1)
+        XCTAssertEqual(
+            (object["sourceRecord"] as? [String: Any])?["id"] as? String,
+            sourceID
+        )
+        XCTAssertEqual(
+            (object["lineage"] as? [[String: Any]])?.first?["store"] as? String,
+            "apple.healthkit"
+        )
+    }
+
     // MARK: - The three values that could not be written
 
     func testANonFiniteNumberDoesNotStopTheSampleBeingEncoded() throws {

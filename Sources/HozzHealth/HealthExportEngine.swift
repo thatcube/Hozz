@@ -820,8 +820,25 @@ public actor HealthExportEngine {
             // The parts are already deflate-compressed, so this is a copy.
             return try inArchive(finalURL: finalURL, modifiedAt: run.startedAt) {
                 archive in
+                let recordsEntry = "\(baseName).ndjson"
+                let manifest: [String: Any] = [
+                    "schemaVersion": HozzHealthArchiveContract.schemaVersion,
+                    "archiveId": run.id.uuidString.lowercased(),
+                    "format": HozzHealthArchiveContract.format,
+                    "recordSchema": HozzHealthArchiveContract.recordSchema,
+                    "recordsEntry": recordsEntry,
+                    "createdAt": Self.timestamp(run.startedAt),
+                    "sourcePlatform": "iOS"
+                ]
+                let manifestData = try JSONSerialization.data(
+                    withJSONObject: manifest,
+                    options: [.sortedKeys, .withoutEscapingSlashes]
+                )
+                try archive.beginEntry(name: HozzHealthArchiveContract.manifestEntry)
+                try archive.write(manifestData)
+                try archive.endEntry()
                 try archive.addEntry(
-                    name: "\(baseName).ndjson",
+                    name: recordsEntry,
                     copying: parts.map { part in
                         ZipMember(
                             url: spool.appending(path: part.fileName),

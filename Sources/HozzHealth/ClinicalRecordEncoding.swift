@@ -123,6 +123,17 @@ public enum ClinicalRecordEncoding {
         let identity = identity(for: record)
         object["kind"] = kind
         object["id"] = identity.id.uuidString.lowercased()
+        object["canonicalId"] = HozzHealthArchiveContract.canonicalID(
+            for: identity.id.uuidString.lowercased()
+        )
+        object["canonicalType"] = HozzHealthArchiveContract.canonicalType(
+            for: record.clinicalType,
+            kind: kind
+        )
+        object["recordVersion"] = max(
+            Int64(record.startDate.timeIntervalSince1970 * 1_000),
+            1
+        )
         object["clinicalType"] = record.clinicalType
         object["displayName"] = record.displayName
         // Kept so a record can still be traced back to this device's Health

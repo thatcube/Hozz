@@ -1,0 +1,126 @@
+{
+  "schemaVersion": 1,
+  "source": "Sources/HozzUI/HozzPalette.swift",
+  "colors": [
+    {
+      "name": "blue",
+      "light": "#5D8CB0",
+      "dark": "#7CB4DE"
+    },
+    {
+      "name": "blueWash",
+      "light": "#DCECF6",
+      "dark": "#16293A"
+    },
+    {
+      "name": "mist",
+      "light": "#EDF6FC",
+      "dark": "#0B1620"
+    },
+    {
+      "name": "air",
+      "light": "#F8FBFD",
+      "dark": "#05090F"
+    },
+    {
+      "name": "ink",
+      "light": "#132638",
+      "dark": "#E9F2F9"
+    },
+    {
+      "name": "inkSoft",
+      "light": "#3F5568",
+      "dark": "#A7C3D8"
+    },
+    {
+      "name": "inkMuted",
+      "light": "#4E6274",
+      "dark": "#8AA8BF"
+    },
+    {
+      "name": "line",
+      "light": "#CBDCE7",
+      "dark": "#24384A"
+    },
+    {
+      "name": "lineSoft",
+      "light": "#DEEBF2",
+      "dark": "#1A2A38"
+    },
+    {
+      "name": "bloom",
+      "light": "#CAE1F1",
+      "dark": "#16344E"
+    },
+    {
+      "name": "cardTop",
+      "light": "#F8FBFD",
+      "dark": "#111C28"
+    },
+    {
+      "name": "cardBottom",
+      "light": "#EDF6FC",
+      "dark": "#0C1621"
+    },
+    {
+      "name": "iconWell",
+      "light": "#E4F0F9",
+      "dark": "#16293A"
+    },
+    {
+      "name": "actionFill",
+      "light": "#4C7A9E",
+      "dark": "#7CB4DE"
+    },
+    {
+      "name": "onAction",
+      "light": "#FFFFFF",
+      "dark": "#05090F"
+    },
+    {
+      "name": "actionText",
+      "light": "#436C8C",
+      "dark": "#7CB4DE"
+    },
+    {
+      "name": "warning",
+      "light": "#9E5320",
+      "dark": "#F0B27A"
+    },
+    {
+      "name": "positive",
+      "light": "#2A7252",
+      "dark": "#7FCBA4"
+    },
+    {
+      "name": "warningWell",
+      "light": "#F6E7DA",
+      "dark": "#33261B"
+    },
+    {
+      "name": "positiveWell",
+      "light": "#DCEDE4",
+      "dark": "#18302A"
+    },
+    {
+      "name": "neutralWell",
+      "light": "#E4EAEF",
+      "dark": "#1D2A36"
+    },
+    {
+      "name": "warningWash",
+      "light": "#F8EFE7",
+      "dark": "#241C14"
+    },
+    {
+      "name": "skeleton",
+      "light": "#E9F1F7",
+      "dark": "#17242F"
+    },
+    {
+      "name": "cardShadow",
+      "light": "#132638",
+      "dark": "#000000"
+    }
+  ]
+}

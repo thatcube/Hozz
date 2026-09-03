@@ -194,6 +194,10 @@ final class SeriesResilienceTests: XCTestCase {
         guard case .upsert(let object) = try XCTUnwrap(batch.changes.first) else {
             return XCTFail("a stand-in has to be a record, not a deletion")
         }
+        let failureID = HealthSampleEncoder.encodingFailureID(
+            sourceRecordID: bad,
+            typeIdentifier: "HKWorkoutRouteTypeIdentifier"
+        )
         XCTAssertEqual(object.id, bad)
 
         let payload = try XCTUnwrap(
@@ -201,7 +205,10 @@ final class SeriesResilienceTests: XCTestCase {
                 as? [String: Any]
         )
         XCTAssertEqual(payload["kind"] as? String, "sampleEncodingError")
-        XCTAssertEqual(payload["id"] as? String, bad.uuidString.lowercased())
+        XCTAssertEqual(
+            payload["id"] as? String,
+            failureID.uuidString.lowercased()
+        )
         XCTAssertEqual(
             payload["type"] as? String,
             "HKWorkoutRouteTypeIdentifier"

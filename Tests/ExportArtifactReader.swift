@@ -159,7 +159,17 @@ enum ExportArtifactReader {
 
     /// Parses an NDJSON export into one dictionary per line.
     static func records(in fileURL: URL) throws -> [[String: Any]] {
-        try lines(in: try readSingleZipEntry(at: fileURL))
+        let entries = try readZipEntries(at: fileURL)
+        guard
+            let records = entries
+                .filter({ $0.key.hasSuffix(".ndjson") })
+                .sorted(by: { $0.key < $1.key })
+                .first?
+                .value
+        else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        return try lines(in: records)
     }
 
     static func lines(in data: Data) throws -> [[String: Any]] {

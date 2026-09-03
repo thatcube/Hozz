@@ -490,7 +490,13 @@ final class WorkoutRouteTests: XCTestCase {
 
         XCTAssertEqual(records.count, 1)
         XCTAssertEqual(records[0]["kind"] as? String, "sampleEncodingError")
-        XCTAssertEqual(records[0]["id"] as? String, id.uuidString.lowercased())
+        XCTAssertEqual(
+            records[0]["id"] as? String,
+            HealthSampleEncoder.encodingFailureID(
+                sourceRecordID: id,
+                typeIdentifier: WorkoutRouteEncoding.typeKey.rawValue
+            ).uuidString.lowercased()
+        )
 
         let after = try SeriesAnchor.decode(batch.proposedAnchor)
         XCTAssertNil(

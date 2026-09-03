@@ -82,6 +82,19 @@ xcodebuild -project Hozz.xcodeproj -scheme Hozz \
   -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
 ```
 
+Android foundation build and tests:
+
+```bash
+cd Android
+./gradlew testDebugUnitTest assembleDebug assembleDebugAndroidTest
+```
+
+The Android project needs JDK 17 or newer and an Android SDK with API 37 to
+compile; the app's minimum runtime remains Android 9/API 28. Run
+`connectedDebugAndroidTest` with an emulator or device to exercise the SQLite
+idempotency test. Android is an unreleased foundation, not a currently shipped
+Hozz platform.
+
 The XCTest suite runs over a thousand tests covering anchors, transaction
 boundaries, cancellation, retries, tombstones, deterministic encoding, the
 export writer lease, characteristics, series streaming for routes and ECG,

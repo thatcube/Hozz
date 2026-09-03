@@ -247,6 +247,16 @@ final class HealthKitBridgeTests: XCTestCase {
 
         XCTAssertEqual(object["count"] as? Int, 300)
         XCTAssertEqual(
+            (object["canonical"] as? [String: Any])?["value"] as? Double,
+            142
+        )
+        XCTAssertEqual(
+            (object["original"] as? [String: Any])?["description"] as? String,
+            "142 count/min"
+        )
+        XCTAssertNil((object["original"] as? [String: Any])?["unit"])
+        XCTAssertNil((object["original"] as? [String: Any])?["value"])
+        XCTAssertEqual(
             object["aggregatesSeries"] as? Bool,
             true,
             "One number standing for three hundred must not read as a single measurement."
@@ -280,8 +290,24 @@ final class HealthKitBridgeTests: XCTestCase {
         let object = try XCTUnwrap(
             JSONSerialization.jsonObject(with: data) as? [String: Any]
         )
+        let failureID = HealthSampleEncoder.encodingFailureID(
+            sourceRecordID: id,
+            typeIdentifier: "HKQuantityTypeIdentifierStepCount"
+        )
 
         XCTAssertEqual(object["kind"] as? String, "sampleEncodingError")
-        XCTAssertEqual(object["id"] as? String, id.uuidString.lowercased())
+        XCTAssertEqual(
+            object["id"] as? String,
+            failureID.uuidString.lowercased()
+        )
+        XCTAssertEqual(
+            object["canonicalId"] as? String,
+            "apple.healthkit:\(failureID.uuidString.lowercased())"
+        )
+        XCTAssertEqual(
+            object["parentCanonicalId"] as? String,
+            "apple.healthkit:\(id.uuidString.lowercased())"
+        )
+        XCTAssertEqual(object["recordVersion"] as? Int, 1)
     }
 }

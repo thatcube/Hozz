@@ -238,15 +238,15 @@ public actor QuantitySeriesExpander {
         anchor: QuantityAnchor,
         message: String
     ) throws -> Expansion {
-        Expansion(
+        let failureID = HealthSampleEncoder.encodingFailureID(
+            sourceRecordID: sampleID,
+            typeIdentifier: type.rawValue
+        )
+        return Expansion(
             changes: [
                 .upsert(
                     CapturedHealthObject(
-                        id: SeriesEncoding.identifier(
-                            shape: shape,
-                            sample: sampleID,
-                            suffix: "error"
-                        ),
+                        id: failureID,
                         type: type,
                         canonicalPayload: try encoder.encodeEncodingFailure(
                             id: sampleID,

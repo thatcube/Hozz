@@ -177,6 +177,10 @@ public enum SeriesEncoding {
         object["catalogVersion"] = HealthTypeCatalog.version
         object["id"] = header.id.uuidString.lowercased()
         object["type"] = shape.typeIdentifier
+        object["canonicalType"] = HozzHealthArchiveContract.canonicalType(
+            for: shape.typeIdentifier,
+            kind: shape.headerKind
+        )
 
         return .upsert(
             CapturedHealthObject(
