@@ -23,11 +23,14 @@ import argparse
 import hashlib
 import hmac
 import io
+import ipaddress
 import json
 import math
 import os
 import re
 import sqlite3
+import socket
+import ssl
 import struct
 import sys
 import tempfile
@@ -95,6 +98,10 @@ CREATE TABLE IF NOT EXISTS samples (
     end_date    TEXT,
     value       REAL,
     unit        TEXT,
+    minimum     REAL,
+    maximum     REAL,
+    text_value  TEXT,
+    duration_seconds REAL,
     source      TEXT,
     raw         TEXT NOT NULL
 );
@@ -104,7 +111,8 @@ CREATE INDEX IF NOT EXISTS samples_parent ON samples(parent_canonical_id);
 CREATE TABLE IF NOT EXISTS batches (
     key         TEXT PRIMARY KEY,
     received_at REAL NOT NULL,
-    records     INTEGER NOT NULL
+    records     INTEGER NOT NULL,
+    deletions   INTEGER NOT NULL DEFAULT -1
 );
 
 CREATE TABLE IF NOT EXISTS ingested_files (
@@ -146,7 +154,7 @@ def connect(path):
             db.execute("DROP TABLE samples_legacy")
         else:
             create_schema(db)
-            ensure_current_columns(db)
+        ensure_current_columns(db)
         db.commit()
         return db
     except Exception:
@@ -168,6 +176,21 @@ def ensure_current_columns(db):
     if "resolution_canonical_id" not in columns:
         db.execute(
             "ALTER TABLE samples ADD COLUMN resolution_canonical_id TEXT"
+        )
+    for name, declaration in (
+        ("minimum", "REAL"),
+        ("maximum", "REAL"),
+        ("text_value", "TEXT"),
+        ("duration_seconds", "REAL"),
+    ):
+        if name not in columns:
+            db.execute(f"ALTER TABLE samples ADD COLUMN {name} {declaration}")
+    batch_columns = {
+        row[1] for row in db.execute("PRAGMA table_info(batches)")
+    }
+    if "deletions" not in batch_columns:
+        db.execute(
+            "ALTER TABLE batches ADD COLUMN deletions INTEGER NOT NULL DEFAULT -1"
         )
     restore_continuation_errors(db)
     reconcile_parent_tombstones(db)
@@ -215,8 +238,9 @@ def migrate_legacy_rows(db):
                 (canonical_id, source_id, parent_canonical_id,
                  resolution_canonical_id, record_version,
                  tombstone, type, kind, start_date, end_date, value, unit,
-                 source, raw)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 minimum, maximum, text_value, duration_seconds, source, raw)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL,
+                    NULL, ?, ?)
             """,
             (
                 canonical_id,
@@ -920,8 +944,8 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
                 (canonical_id, source_id, parent_canonical_id,
                  resolution_canonical_id, record_version,
                  tombstone, type, kind, start_date, end_date, value, unit,
-                 source, raw)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 minimum, maximum, text_value, duration_seconds, source, raw)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(canonical_id) DO UPDATE SET
                 source_id = excluded.source_id,
                 parent_canonical_id = excluded.parent_canonical_id,
@@ -934,6 +958,10 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
                 end_date = excluded.end_date,
                 value = excluded.value,
                 unit = excluded.unit,
+                minimum = excluded.minimum,
+                maximum = excluded.maximum,
+                text_value = excluded.text_value,
+                duration_seconds = excluded.duration_seconds,
                 source = excluded.source,
                 raw = excluded.raw
             WHERE excluded.record_version > samples.record_version
@@ -949,8 +977,15 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
                 kind,
                 record.get("startDate"),
                 record.get("endDate"),
-                quantity.get("value", record.get("value")),
+                quantity.get(
+                    "value",
+                    record.get("value", record.get("duration")),
+                ),
                 quantity.get("unit"),
+                record.get("minimum"),
+                record.get("maximum"),
+                record.get("textValue"),
+                record.get("durationSeconds", record.get("duration")),
                 source.get("name"),
                 parse_line,
             ),
@@ -988,8 +1023,12 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
 
     if batch_key:
         db.execute(
-            "INSERT OR IGNORE INTO batches VALUES (?, ?, ?)",
-            (batch_key, time.time(), stored),
+            """
+            INSERT OR IGNORE INTO batches
+                (key, received_at, records, deletions)
+            VALUES (?, ?, ?, ?)
+            """,
+            (batch_key, time.time(), stored, deleted),
         )
     restore_unresolved_continuation_errors(db)
     reconcile_encoding_errors(db)
@@ -1390,6 +1429,7 @@ def is_compatible_envelope(value):
     return (
         isinstance(data.get("metrics"), list)
         or isinstance(data.get("deletions"), list)
+        or isinstance(data.get("workouts"), list)
     )
 
 
@@ -1402,52 +1442,231 @@ def nonempty_token(value):
 def ingest_compatible(db, envelope, batch_key=None):
     """Flatten the Health Auto Export shaped payload into the same table."""
     lines = []
+    deletion_lines = []
+    legacy_aliases = []
+    identities = set()
     data = envelope.get("data", {})
-    for metric in data.get("metrics", []):
-        name = metric.get("name", "unknown")
-        units = metric.get("units")
-        for point in metric.get("data", []):
-            lines.append(json.dumps({
-                "id": f"{name}:{point.get('date')}",
-                "type": name,
-                "kind": "quantity",
-                "startDate": point.get("date"),
-                "endDate": point.get("endDate", point.get("date")),
-                "quantity": {"value": point.get("qty"), "unit": units},
-                "source": {"name": point.get("source")},
-            }))
-    # Upserts from this envelope are keyed by name and date, because the format
-    # carries no per-sample identifier. Deletions arrive with HealthKit's real
-    # identifier, which would match nothing, so they are applied by the same
-    # (type, date) pair the upserts used.
-    deletions = [
-        (deletion.get("name") or deletion.get("type"), deletion.get("date"))
-        for deletion in data.get("deletions", [])
-    ]
-    try:
-        stored, deleted, duplicate, _ = _ingest_lines(
-            db, lines, batch_key
-        )
-        deletion_lines = []
-        for name, date in deletions:
-            if not name or not date:
-                continue
-            deletion_lines.append(json.dumps({
-                "deleted": True,
-                "id": f"{name}:{date}",
-                "kind": "deletion",
+    if not isinstance(data, dict):
+        raise PartialBatch("compatible envelope data is not an object")
+    metrics = data.get("metrics", [])
+    workouts = data.get("workouts", [])
+    deletions = data.get("deletions", [])
+    if not all(isinstance(value, list) for value in (metrics, workouts, deletions)):
+        raise PartialBatch("compatible envelope collections are not arrays")
+    receipt = (
+        db.execute(
+            "SELECT records, deletions FROM batches WHERE key = ?",
+            (batch_key,),
+        ).fetchone()
+        if batch_key
+        else None
+    )
+    duplicate_receipt = receipt is not None
+    migrate_legacy_receipt = bool(
+        duplicate_receipt and receipt[1] < 0
+    )
+    repair_legacy_deletions = bool(
+        migrate_legacy_receipt and deletions
+    )
+    if duplicate_receipt and not migrate_legacy_receipt:
+        # Releases before stable point IDs could acknowledge a mixed batch while
+        # dropping its date-less deletions. The receipt proves its live records
+        # were already handled; replay only the deletions so those old batches
+        # can be repaired without accepting another unmatchable live record.
+        metrics = []
+        workouts = []
+
+    for metric in metrics:
+        if not isinstance(metric, dict):
+            raise PartialBatch("compatible metric is not an object")
+        name = require_text(metric, "name", "compatible metric")
+        units = require_text(metric, "units", "compatible metric")
+        points = metric.get("data")
+        if not isinstance(points, list):
+            raise PartialBatch(f"compatible metric {name} has no data array")
+        for point in points:
+            if not isinstance(point, dict):
+                raise PartialBatch(f"compatible metric {name} has a non-object point")
+            source = point.get("source")
+            if source is not None and not isinstance(source, str):
+                raise PartialBatch(f"compatible metric {name} has invalid source")
+            identity = require_text(point, "id", f"{name} point")
+            date_alias = point.get("date")
+            if isinstance(date_alias, str) and date_alias:
+                legacy_aliases.append(
+                    (name, date_alias, compatible_epoch_milliseconds(date_alias))
+                )
+            if name == "heart_rate":
+                start = require_text(point, "date", "heart-rate point")
+                values = [
+                    finite_number(point, field, "heart-rate point")
+                    for field in ("Min", "Avg", "Max")
+                ]
+                if values[0] != values[1] or values[1] != values[2]:
+                    raise PartialBatch(
+                        "heart-rate compatibility point is an aggregate"
+                    )
+                line = compatibility_quantity(
+                    identity,
+                    name,
+                    units,
+                    start,
+                    point.get("endDate", start),
+                    values[1],
+                    source,
+                    point,
+                    minimum=values[0],
+                    maximum=values[2],
+                )
+            elif name == "sleep_analysis":
+                start = require_text(point, "startDate", "sleep point")
+                end = require_text(point, "endDate", "sleep point")
+                legacy_aliases.append(
+                    (name, start, compatible_epoch_milliseconds(start))
+                )
+                hours = finite_number(point, "qty", "sleep point")
+                stage = require_text(point, "value", "sleep point")
+                stages = {
+                    "In Bed": 0,
+                    "Asleep": 1,
+                    "Awake": 2,
+                    "Core": 3,
+                    "Deep": 4,
+                    "REM": 5,
+                }
+                if stage == "Unspecified":
+                    raw_stage = finite_number(point, "rawValue", "sleep point")
+                    if not raw_stage.is_integer() or not -(2**31) <= raw_stage < 2**31:
+                        raise PartialBatch("sleep point has invalid rawValue")
+                    stage_value = int(raw_stage)
+                elif stage in stages:
+                    stage_value = stages[stage]
+                else:
+                    raise PartialBatch(f"unsupported sleep stage {stage}")
+                line = {
+                    "id": identity,
+                    "kind": "category",
+                    "recordVersion": 1,
+                    "schemaVersion": 1,
+                    "sourceRecord": {
+                        "id": identity,
+                        "store": "healthAutoExport",
+                        "type": name,
+                    },
+                    "startDate": start,
+                    "endDate": end,
+                    "textValue": stage,
+                    "durationSeconds": hours * 3_600,
+                    "type": name,
+                    "value": stage_value,
+                    "compatibilityRaw": point,
+                }
+                if source:
+                    line["source"] = {"name": source}
+            else:
+                start = require_text(point, "date", f"{name} point")
+                end = point.get("endDate", start)
+                if not isinstance(end, str) or not end:
+                    raise PartialBatch(f"compatible metric {name} has invalid endDate")
+                line = compatibility_quantity(
+                    identity,
+                    name,
+                    units,
+                    start,
+                    end,
+                    finite_number(point, "qty", f"{name} point"),
+                    source,
+                    point,
+                )
+            add_compatible_line(lines, identities, line)
+
+    for workout in workouts:
+        if not isinstance(workout, dict):
+            raise PartialBatch("compatible workout is not an object")
+        identity = require_text(workout, "id", "compatible workout")
+        name = require_text(workout, "name", "compatible workout")
+        start = require_text(workout, "start", "compatible workout")
+        end = require_text(workout, "end", "compatible workout")
+        duration = finite_number(workout, "duration", "compatible workout")
+        add_compatible_line(
+            lines,
+            identities,
+            {
+                "id": identity,
+                "kind": "workout",
+                "recordVersion": 1,
                 "schemaVersion": 1,
-                "startDate": date,
-                "endDate": date,
-                "type": name,
-            }))
-        if deletion_lines:
-            deletion_stored, deletion_count, _, _ = _ingest_lines(
-                db,
-                deletion_lines,
+                "sourceRecord": {
+                    "id": identity,
+                    "store": "healthAutoExport",
+                    "type": "workout",
+                },
+                "startDate": start,
+                "endDate": end,
+                "duration": duration,
+                "durationSeconds": duration,
+                "textValue": name,
+                "type": "workout",
+                "compatibilityRaw": workout,
+            },
+        )
+
+    for deletion in deletions:
+        if not isinstance(deletion, dict):
+            raise PartialBatch("compatible deletion is not an object")
+        identity = require_text(deletion, "id", "compatible deletion")
+        name = require_text(deletion, "name", "compatible deletion")
+        record_type = require_text(deletion, "type", "compatible deletion")
+        if repair_legacy_deletions:
+            date = require_text(
+                deletion,
+                "date",
+                "legacy compatible deletion",
             )
-            stored += deletion_stored
-            deleted += deletion_count
+            identity = f"{name}:{date}"
+            source_store = "apple.healthkit"
+        else:
+            source_store = "healthAutoExport"
+        add_compatible_line(
+            deletion_lines,
+            identities,
+            {
+                "deleted": True,
+                "id": identity,
+                "kind": "deletion",
+                "recordVersion": 2,
+                "schemaVersion": 1,
+                "sourceRecord": {
+                    "id": identity,
+                    "store": source_store,
+                    "type": record_type,
+                },
+                "textValue": name,
+                "type": record_type,
+                "compatibilityRaw": deletion,
+            },
+        )
+
+    try:
+        alias_deletions = reconcile_compatible_aliases(db, legacy_aliases)
+        encoded_lines = [
+            json.dumps(line, separators=(",", ":"))
+            for line in [*lines, *deletion_lines]
+        ]
+        if migrate_legacy_receipt:
+            stored, deleted, _, _ = _ingest_lines(db, encoded_lines)
+            duplicate = True
+            db.execute(
+                "UPDATE batches SET deletions = ? WHERE key = ?",
+                (deleted, batch_key),
+            )
+        else:
+            stored, deleted, duplicate, _ = _ingest_lines(
+                db,
+                encoded_lines,
+                batch_key,
+            )
+        deleted += alias_deletions
         db.commit()
         return stored, deleted, duplicate
     except Exception:
@@ -1455,7 +1674,131 @@ def ingest_compatible(db, envelope, batch_key=None):
         raise
 
 
+def reconcile_compatible_aliases(db, aliases):
+    targets = {}
+    for record_type, date_text, epoch in dict.fromkeys(aliases):
+        targets.setdefault(record_type, set()).add((date_text, epoch))
+
+    tombstones = []
+    for record_type, dates in targets.items():
+        rows = db.execute(
+            """
+            SELECT source_id, start_date, record_version FROM samples
+            WHERE type = ? AND tombstone = 0
+              AND canonical_id LIKE 'apple.healthkit:%'
+            """,
+            (record_type,),
+        )
+        for source_id, start_date, version in rows:
+            is_legacy_sleep = (
+                record_type == "sleep_analysis"
+                and source_id == "sleep_analysis:None"
+            )
+            same_instant = False
+            if (
+                isinstance(start_date, str)
+                and source_id.startswith(f"{record_type}:")
+            ):
+                try:
+                    old_epoch = compatible_epoch_milliseconds(start_date)
+                except PartialBatch:
+                    old_epoch = None
+                same_instant = any(old_epoch == epoch for _, epoch in dates)
+            if not is_legacy_sleep and not same_instant:
+                continue
+            tombstones.append(json.dumps({
+                "deleted": True,
+                "id": source_id,
+                "kind": "deletion",
+                "recordVersion": max(2, version + 1),
+                "schemaVersion": 1,
+                "sourceRecord": {
+                    "id": source_id,
+                    "store": "apple.healthkit",
+                    "type": record_type,
+                },
+                "type": record_type,
+            }, separators=(",", ":")))
+    if not tombstones:
+        return 0
+    _, deleted, _, _ = _ingest_lines(db, tombstones)
+    return deleted
+
+
+def compatible_epoch_milliseconds(value):
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (AttributeError, ValueError) as error:
+        raise PartialBatch("compatible point has an invalid timestamp") from error
+    if parsed.tzinfo is None:
+        raise PartialBatch("compatible point timestamp has no time zone")
+    return int(parsed.timestamp() * 1_000)
+
+
+def compatibility_quantity(
+    identity,
+    name,
+    units,
+    start,
+    end,
+    value,
+    source,
+    raw,
+    minimum=None,
+    maximum=None,
+):
+    line = {
+        "id": identity,
+        "kind": "quantity",
+        "recordVersion": 1,
+        "schemaVersion": 1,
+        "sourceRecord": {
+            "id": identity,
+            "store": "healthAutoExport",
+            "type": name,
+        },
+        "startDate": start,
+        "endDate": end,
+        "quantity": {"value": value, "unit": units},
+        "type": name,
+        "compatibilityRaw": raw,
+    }
+    if source:
+        line["source"] = {"name": source}
+    if minimum is not None:
+        line["minimum"] = minimum
+    if maximum is not None:
+        line["maximum"] = maximum
+    return line
+
+
+def add_compatible_line(lines, identities, line):
+    identity = line["id"]
+    if identity in identities:
+        raise PartialBatch(
+            "compatible payload contains records with indistinguishable identities"
+        )
+    identities.add(identity)
+    lines.append(line)
+
+
+def finite_number(value, field, context):
+    number = value.get(field)
+    if (
+        isinstance(number, bool)
+        or not isinstance(number, (int, float))
+        or not math.isfinite(number)
+    ):
+        raise PartialBatch(f"{context} has invalid {field}")
+    return float(number)
+
+
 def serve(args):
+    tls_context, address_family = serve_security(
+        args.host,
+        args.cert,
+        args.key,
+    )
     db = connect(args.database)
 
     class Handler(BaseHTTPRequestHandler):
@@ -1531,11 +1874,44 @@ def serve(args):
         def log_message(self, *_):
             pass  # Access logs would record nothing useful and add noise.
 
-    print(f"Hozz receiver listening on http://0.0.0.0:{args.port}")
+    class ReceiverHTTPServer(HTTPServer):
+        pass
+
+    ReceiverHTTPServer.address_family = address_family
+    server = ReceiverHTTPServer((args.host, args.port), Handler)
+    if tls_context is not None:
+        server.socket = tls_context.wrap_socket(
+            server.socket,
+            server_side=True,
+        )
+    scheme = "https" if tls_context is not None else "http"
+    display_host = f"[{args.host}]" if ":" in args.host else args.host
+    print(f"Hozz receiver listening on {scheme}://{display_host}:{args.port}")
     print(f"Database: {os.path.abspath(args.database)}")
     if args.allow_unauthenticated:
         print("Unauthenticated access was explicitly enabled.")
-    HTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
+    server.serve_forever()
+
+
+def serve_security(host, certificate, key):
+    if bool(certificate) != bool(key):
+        raise ValueError("--cert and --key must be provided together")
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError as error:
+        if host != "localhost":
+            raise ValueError("serve host must be an IP literal or localhost") from error
+        address = ipaddress.ip_address("127.0.0.1")
+    family = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+    if certificate is None:
+        if not address.is_loopback:
+            raise ValueError(
+                "plaintext serving is restricted to loopback; configure --cert and --key"
+            )
+        return None, family
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    context.load_cert_chain(certfile=certificate, keyfile=key)
+    return context, family
 
 
 def watch(args):
@@ -1887,6 +2263,9 @@ def build_argument_parser():
 
     serve_parser = sub.add_parser("serve", help="accept batches over HTTP")
     serve_parser.add_argument("--port", type=int, default=8765)
+    serve_parser.add_argument("--host", "--bind", default="127.0.0.1")
+    serve_parser.add_argument("--cert")
+    serve_parser.add_argument("--key")
     authentication = serve_parser.add_mutually_exclusive_group(required=True)
     authentication.add_argument(
         "--token",

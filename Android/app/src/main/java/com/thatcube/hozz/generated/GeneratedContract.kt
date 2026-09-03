@@ -128,4 +128,77 @@ object GeneratedContract {
         "workout-activity-generalized" to "The Apple workout activity has no exact Health Connect exercise type and is projected as Other workout.",
         "workout-details-archive-only" to "Workout events, statistics, route relationships, or multi-sport legs remain only in the Hozz archive."
     )
+
+    val recordPropertyNames: Set<String> = setOf(
+        "activityType",
+        "canonicalId",
+        "canonicalType",
+        "characteristics",
+        "complete",
+        "completedAt",
+        "createdAt",
+        "deleted",
+        "deliveredCount",
+        "device",
+        "endDate",
+        "id",
+        "kind",
+        "lineage",
+        "message",
+        "metadata",
+        "observedAt",
+        "parentCanonicalId",
+        "primedFrom",
+        "primedThrough",
+        "quantity",
+        "readAt",
+        "recordVersion",
+        "records",
+        "resolutionCanonicalId",
+        "resumedAt",
+        "run",
+        "schemaVersion",
+        "sequence",
+        "source",
+        "sourceRecord",
+        "startDate",
+        "state",
+        "type",
+        "value"
+    )
+    val runPropertyNamesByKind: Map<String, Set<String>> = mapOf(
+        "completion" to setOf("kind", "schemaVersion", "run", "completedAt", "records"),
+        "manifest" to setOf("kind", "schemaVersion", "run", "createdAt"),
+        "resume" to setOf("kind", "schemaVersion", "run", "resumedAt", "records"),
+        "typeCoverage" to setOf("kind", "schemaVersion", "type", "state", "complete", "observedAt", "deliveredCount", "primedFrom", "primedThrough"),
+        "typeError" to setOf("kind", "schemaVersion", "type", "message"),
+        "typeSummary" to setOf("kind", "schemaVersion", "type", "records", "state")
+    )
+    val canonicalPropertyNamesByKind: Map<String, Set<String>> = mapOf(
+        "audiogram" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate"),
+        "category" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate", "value"),
+        "characteristics" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "readAt", "characteristics"),
+        "clinicalRecord" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate"),
+        "correlation" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate"),
+        "deletion" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type"),
+        "electrocardiogram" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate"),
+        "electrocardiogramEnd" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate", "parentCanonicalId"),
+        "electrocardiogramVoltages" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate", "parentCanonicalId", "sequence"),
+        "medicationDose" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate"),
+        "quantity" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate", "quantity"),
+        "quantitySeriesEnd" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate", "parentCanonicalId"),
+        "quantitySeriesReadings" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate", "parentCanonicalId", "sequence"),
+        "sample" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate"),
+        "sampleEncodingError" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "message", "parentCanonicalId", "resolutionCanonicalId"),
+        "stateOfMind" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate"),
+        "workout" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate", "activityType"),
+        "workoutRoute" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate"),
+        "workoutRouteEnd" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate", "parentCanonicalId"),
+        "workoutRouteLocations" to setOf("canonicalId", "canonicalType", "deleted", "device", "id", "kind", "lineage", "metadata", "recordVersion", "schemaVersion", "source", "sourceRecord", "type", "startDate", "endDate", "parentCanonicalId", "sequence")
+    )
+    val sourceRecordPropertyNames = setOf("id", "store", "type", "version")
+    val sourcePropertyNames = setOf("bundleIdentifier", "name")
+    val lineagePropertyNames = setOf("package", "recordId", "store")
+    val quantityPropertyNames = setOf("canonical", "original", "unit", "value")
+    val valuePropertyNames = setOf("description", "unit", "value")
 }

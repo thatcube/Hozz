@@ -74,7 +74,9 @@ safe replacement.
 Canonical import staging is connection-local and disappears only with its
 owning database connection. Export digest, manifest, count, and payload are read
 inside one SQLite snapshot. Individual NDJSON records are limited to 512 KiB so
-the full canonical row remains below API 28 CursorWindow limits.
+the full canonical row remains below API 28 CursorWindow limits. Timeline and
+export pages also stop at a 512 KiB cumulative raw-record budget; callers keep
+paging until an empty result rather than treating a short page as end-of-data.
 
 | Hozz canonical type | Apple source | Health Connect target | Fidelity |
 | --- | --- | --- | --- |

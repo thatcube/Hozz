@@ -97,6 +97,132 @@ final class ReceiveTests: XCTestCase {
         )
     }
 
+    func testBooleanMetricIsUnreadableRatherThanStoredAsOne() throws {
+        let batch = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                  {"id":"not-a-number","date":"2026-01-01T10:00:00.000Z","qty":true}
+                ]}]}}
+                """.utf8
+            )
+        )
+
+        XCTAssertTrue(batch.records.isEmpty)
+        XCTAssertEqual(batch.unreadableCount, 1)
+    }
+
+    func testHozzMetricsUseStableIdsAndKeepHeartAndSleepValues() throws {
+        let payload = Data(
+            """
+            {"data":{"metrics":[
+              {"name":"heart_rate","units":"bpm","data":[
+                {"id":"heart-1","date":"2026-01-01T10:00:00.000Z","Min":62,"Avg":62,"Max":62}]},
+              {"name":"sleep_analysis","units":"hr","data":[
+                {"id":"sleep-1","startDate":"2026-01-01T11:00:00.000Z","endDate":"2026-01-01T12:00:00.000Z","qty":1,"value":"Unspecified","rawValue":99}]}
+            ]}}
+            """.utf8
+        )
+
+        let batch = try BatchParser.parse(payload)
+
+        XCTAssertEqual(batch.records.map(\.id), ["heart-1", "sleep-1"])
+        XCTAssertEqual(batch.records.map(\.value), [62, 1])
+        XCTAssertEqual(batch.records.map(\.kind), ["quantity", "category"])
+        let sleepRaw = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: try XCTUnwrap(batch.records.last?.raw)
+            ) as? [String: Any]
+        )
+        XCTAssertEqual((sleepRaw["rawValue"] as? NSNumber)?.doubleValue, 99)
+    }
+
+    func testHozzMetricsDateLessDeletionUsesStableId() throws {
+        let payload = Data(
+            """
+            {"data":{"metrics":[],"deletions":[
+              {"id":"gone","name":"step_count","type":"HKQuantityTypeIdentifierStepCount","date":""}
+            ]}}
+            """.utf8
+        )
+
+        let batch = try BatchParser.parse(payload)
+
+        XCTAssertEqual(batch.deletions, [
+            HealthDeletion(
+                id: "gone",
+                type: "step_count",
+                startDate: nil
+            )
+        ])
+        XCTAssertEqual(batch.unreadableCount, 0)
+    }
+
+    func testStableDeletionDoesNotRemoveAnotherSampleAtTheSameTime() async throws {
+        let store = try makeStore()
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"keep","date":"2026-01-01 10:00:00 +0000","qty":80},
+                      {"id":"gone","date":"2026-01-01 10:00:00 +0000","qty":120}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "samples"
+        )
+
+        let result = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[],"deletions":[
+                      {"id":"gone","name":"step_count","type":"step_count","date":"2026-01-01 10:00:00 +0000"}
+                    ]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "deletion"
+        )
+
+        XCTAssertEqual(result.deleted, 1)
+        let remaining = try await store.samples(type: "step_count")
+        XCTAssertEqual(remaining.map(\.id), ["keep"])
+    }
+
+    func testStableMetricIdAtomicallyReplacesLegacyAlias() async throws {
+        let store = try makeStore()
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"2026-01-01 10:00:00 +0000","qty":120}]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "legacy"
+        )
+
+        let result = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"stable","date":"2026-01-01 05:00:00 -0500","qty":120}]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "stable"
+        )
+
+        XCTAssertEqual(result.stored, 1)
+        let samples = try await store.samples(type: "step_count")
+        XCTAssertEqual(samples.map(\.id), ["stable"])
+    }
+
     /// A connection test is a valid request carrying no samples. Reporting it
     /// as unreadable would tell the user their setup is broken at exactly the
     /// moment they are checking that it works.

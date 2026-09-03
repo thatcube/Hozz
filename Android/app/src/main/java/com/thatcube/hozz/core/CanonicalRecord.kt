@@ -318,13 +318,23 @@ object CanonicalRecordParser {
             validateStrict(line)
             return line
         }
+        val kind = raw.string("kind")
+            ?: throw ArchiveFormatException("A run record has no kind.")
+        val allowed = GeneratedContract.runPropertyNamesByKind[kind]
+            ?: throw ArchiveFormatException("Run record kind $kind is not supported.")
         val normalized = sorted(
-            JsonObject(
-                raw + (
-                    "schemaVersion" to
-                        JsonPrimitive(GeneratedContract.SCHEMA_VERSION)
-                ),
-            ),
+            buildJsonObject {
+                raw.forEach { (key, value) ->
+                    if (key !in GeneratedContract.recordPropertyNames) put(key, value)
+                }
+                put("kind", kind)
+                put("schemaVersion", GeneratedContract.SCHEMA_VERSION)
+                allowed.forEach { key ->
+                    if (key != "kind" && key != "schemaVersion") {
+                        raw[key]?.let { put(key, it) }
+                    }
+                }
+            },
         ).toString()
         validateStrict(normalized)
         return normalized
@@ -348,6 +358,17 @@ object CanonicalRecordParser {
         if (kind in runKinds) {
             validateRunRecord(jsonObject, kind)
             return
+        }
+        GeneratedContract.canonicalPropertyNamesByKind[kind]?.let { allowed ->
+            val disallowed = jsonObject.keys.filter {
+                it in GeneratedContract.recordPropertyNames && it !in allowed
+            }
+            if (disallowed.isNotEmpty()) {
+                throw ArchiveFormatException(
+                    "Canonical record kind $kind contains fields owned by another kind: " +
+                        disallowed.sorted().joinToString(),
+                )
+            }
         }
         val canonicalId = jsonObject.nonblank("canonicalId")
         jsonObject.nonblank("canonicalType")
@@ -496,6 +517,16 @@ object CanonicalRecordParser {
     }
 
     private fun validateRunRecord(jsonObject: JsonObject, kind: String) {
+        val allowed = GeneratedContract.runPropertyNamesByKind[kind]
+            ?: throw ArchiveFormatException("Run record kind $kind is not supported.")
+        val disallowed = jsonObject.keys
+            .filter { it in GeneratedContract.recordPropertyNames && it !in allowed }
+        if (disallowed.isNotEmpty()) {
+            throw ArchiveFormatException(
+                "Run record kind $kind contains fields owned by another kind: " +
+                    disallowed.sorted().joinToString(),
+            )
+        }
         when (kind) {
             "manifest" -> {
                 jsonObject.nonblank("run")
@@ -504,10 +535,16 @@ object CanonicalRecordParser {
             "resume" -> {
                 jsonObject.nonblank("run")
                 jsonObject.strictInstant("resumedAt")
+                if (jsonObject.containsKey("records")) {
+                    strictLong(jsonObject, "records", minimum = 0)
+                }
             }
             "typeSummary" -> {
                 jsonObject.nonblank("type")
                 jsonObject.nonblank("state")
+                if (jsonObject.containsKey("records")) {
+                    strictLong(jsonObject, "records", minimum = 0)
+                }
             }
             "typeError" -> {
                 jsonObject.nonblank("type")

@@ -114,6 +114,45 @@ final class UnfinishedExportTests: XCTestCase {
         )
     }
 
+    private func eraseArchiveContractVersion(
+        store: HozzStore,
+        runID: UUID,
+        run: Bool = true,
+        parts: Bool = true
+    ) async throws {
+        let databaseURL = await store.databaseURL
+        await store.close()
+
+        var handle: OpaquePointer?
+        XCTAssertEqual(sqlite3_open(databaseURL.path, &handle), SQLITE_OK)
+        defer { sqlite3_close(handle) }
+        let runKey = runID.uuidString.lowercased()
+        if run {
+            XCTAssertEqual(
+                sqlite3_exec(
+                    handle,
+                    "UPDATE export_run SET contract_version = NULL WHERE id = '\(runKey)';",
+                    nil,
+                    nil,
+                    nil
+                ),
+                SQLITE_OK
+            )
+        }
+        if parts {
+            XCTAssertEqual(
+                sqlite3_exec(
+                    handle,
+                    "UPDATE export_part SET contract_version = NULL WHERE run_id = '\(runKey)';",
+                    nil,
+                    nil,
+                    nil
+                ),
+                SQLITE_OK
+            )
+        }
+    }
+
     // MARK: - The bug
 
     /// The run was offered, the person tapped Continue, and it threw.
@@ -139,6 +178,103 @@ final class UnfinishedExportTests: XCTestCase {
         XCTAssertTrue(
             try XCTUnwrap(obstruction).contains("cannot be continued safely")
         )
+    }
+
+    func testAPreContractRunIsRejectedWithoutDiscardingOwedWork() async throws {
+        var store = try makeStore()
+        let run = try await leaveUnfinishedRun(store: store)
+        let partNames = try await store.partFileNames(runID: run.id)
+        let storedStream = try await store.streamRecord(
+            scope: .run(run.id),
+            type: steps
+        )
+        let anchor = try XCTUnwrap(storedStream?.committedAnchor)
+        try await eraseArchiveContractVersion(store: store, runID: run.id)
+
+        store = try makeStore()
+        let engine = makeEngine(
+            store: store,
+            source: ScriptedHealthDataSource(streams: [steps: [upsert("s-1")]])
+        )
+        let found = try await engine.resumableRun()
+        let resumable = try XCTUnwrap(found)
+        XCTAssertNil(resumable.contractVersion)
+        let obstruction = try await engine.resumeObstruction(for: resumable)
+        XCTAssertNotNil(obstruction)
+
+        do {
+            _ = try await engine.export(format: .ndjson) { _ in }
+            XCTFail("A pre-contract run must not be resumed as strict v1.")
+        } catch let error as HealthExportEngineError {
+            XCTAssertEqual(
+                error,
+                .incompatibleContractVersion(
+                    stored: nil,
+                    supported: HozzHealthArchiveContract.schemaVersion
+                )
+            )
+        }
+
+        let preservedPartNames = try await store.partFileNames(runID: run.id)
+        XCTAssertEqual(
+            preservedPartNames,
+            partNames,
+            "Rejecting a legacy run must not discard sealed archive bytes."
+        )
+        let preservedStream = try await store.streamRecord(
+            scope: .run(run.id),
+            type: steps
+        )
+        XCTAssertEqual(
+            preservedStream?.committedAnchor,
+            anchor,
+            "Rejecting a legacy run must not discard its acquisition cursor."
+        )
+        let preservedRun = try await store.resumableRun()
+        XCTAssertEqual(preservedRun?.id, run.id)
+    }
+
+    func testAPreContractPartIsRejectedBeforeResumeMutatesTheRun() async throws {
+        var store = try makeStore()
+        let run = try await leaveUnfinishedRun(store: store)
+        let partNames = try await store.partFileNames(runID: run.id)
+        try await eraseArchiveContractVersion(
+            store: store,
+            runID: run.id,
+            run: false
+        )
+
+        store = try makeStore()
+        let engine = makeEngine(
+            store: store,
+            source: ScriptedHealthDataSource(streams: [steps: [upsert("s-1")]])
+        )
+        let found = try await engine.resumableRun()
+        let resumable = try XCTUnwrap(found)
+        XCTAssertEqual(
+            resumable.contractVersion,
+            HozzHealthArchiveContract.schemaVersion
+        )
+        let obstruction = try await engine.resumeObstruction(for: resumable)
+        XCTAssertNotNil(obstruction)
+
+        do {
+            _ = try await engine.export(format: .ndjson) { _ in }
+            XCTFail("A legacy part must be rejected before resume.")
+        } catch let error as HealthExportEngineError {
+            XCTAssertEqual(
+                error,
+                .incompatibleContractVersion(
+                    stored: nil,
+                    supported: HozzHealthArchiveContract.schemaVersion
+                )
+            )
+        }
+
+        let preservedPartNames = try await store.partFileNames(runID: run.id)
+        XCTAssertEqual(preservedPartNames, partNames)
+        let preservedRun = try await store.resumableRun()
+        XCTAssertEqual(preservedRun?.state, .paused)
     }
 
     /// The stale run is found first on every attempt, so without this a build

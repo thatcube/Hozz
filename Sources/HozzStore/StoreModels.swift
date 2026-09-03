@@ -287,6 +287,7 @@ public struct ExportRunRecord: Equatable, Sendable {
     public let sampleEncodingErrorCount: Int
     public let failureReason: String?
     public let finalFileName: String?
+    public let contractVersion: Int?
 
     public init(
         id: UUID,
@@ -300,7 +301,8 @@ public struct ExportRunRecord: Equatable, Sendable {
         catalogVersion: String,
         sampleEncodingErrorCount: Int,
         failureReason: String?,
-        finalFileName: String?
+        finalFileName: String?,
+        contractVersion: Int? = nil
     ) {
         self.id = id
         self.state = state
@@ -314,6 +316,7 @@ public struct ExportRunRecord: Equatable, Sendable {
         self.sampleEncodingErrorCount = sampleEncodingErrorCount
         self.failureReason = failureReason
         self.finalFileName = finalFileName
+        self.contractVersion = contractVersion
     }
 }
 
@@ -328,6 +331,7 @@ public struct ExportPartRecord: Equatable, Sendable {
     public let recordCount: Int
     public let createdAt: Date
     public let sealedAt: Date?
+    public let contractVersion: Int?
 
     public init(
         runID: UUID,
@@ -339,7 +343,8 @@ public struct ExportPartRecord: Equatable, Sendable {
         crc32: UInt32 = 0,
         recordCount: Int,
         createdAt: Date,
-        sealedAt: Date?
+        sealedAt: Date?,
+        contractVersion: Int? = nil
     ) {
         self.runID = runID
         self.sequence = sequence
@@ -351,6 +356,7 @@ public struct ExportPartRecord: Equatable, Sendable {
         self.recordCount = recordCount
         self.createdAt = createdAt
         self.sealedAt = sealedAt
+        self.contractVersion = contractVersion
     }
 }
 

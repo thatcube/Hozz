@@ -1,5 +1,16 @@
 import Foundation
 
+public enum HealthAutoExportPayloadError: Error, LocalizedError, Equatable {
+    case unsupportedRecord(kind: String, type: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedRecord(let kind, let type):
+            "Health Auto Export compatibility cannot represent \(kind) record \(type) without losing its value. Use the Hozz schema for this destination."
+        }
+    }
+}
+
 /// Builds a payload using Health Auto Export's published field names.
 ///
 /// This exists for one reason: the people most likely to try Hozz already have
@@ -17,6 +28,8 @@ import Foundation
 /// the `data.metrics[].{name, units, data}` envelope, the
 /// `yyyy-MM-dd HH:mm:ss Z` timestamp, `qty`, the capitalised `Min`/`Avg`/`Max`
 /// on heart rate points, and the sleep point's `startDate`/`endDate`/`value`.
+/// Hozz adds the stable source `id` to every point so a later tombstone can
+/// identify exactly what it supersedes; existing consumers ignore that key.
 ///
 /// **What is deliberately not claimed.** Hozz sends the individual samples
 /// HealthKit returned rather than hourly or daily rollups, because that is the
@@ -64,6 +77,13 @@ public enum HealthAutoExportPayloadBuilder {
                 continue
             }
 
+            guard record.value != nil else {
+                throw HealthAutoExportPayloadError.unsupportedRecord(
+                    kind: record.kind,
+                    type: record.typeIdentifier
+                )
+            }
+
             let name = record.metricName
             let units = self.units(for: name, unit: record.unit)
             metrics[name, default: (units: units, points: [])].points.append(
@@ -107,6 +127,7 @@ public enum HealthAutoExportPayloadBuilder {
         }
 
         var point: [String: Any] = [
+            "id": record.identifier,
             "date": formatter.string(for: record.startDate) ?? record.startDate
         ]
         if let value = record.value {
@@ -139,14 +160,17 @@ public enum HealthAutoExportPayloadBuilder {
         formatter: PointFormatter
     ) -> [String: Any] {
         var point: [String: Any] = [
+            "id": record.identifier,
             "startDate": formatter.string(for: record.startDate) ?? record.startDate,
             "endDate": formatter.string(for: record.endDate) ?? record.endDate
         ]
         if let hours = formatter.hours(from: record.startDate, to: record.endDate) {
             point["qty"] = hours
         }
-        if let stage = record.value.map({ sleepStage(Int($0)) }) {
+        if let rawStage = record.value {
+            let stage = sleepStage(Int(rawStage))
             point["value"] = stage
+            point["rawValue"] = rawStage
         }
         if let source = record.sourceName {
             point["source"] = source

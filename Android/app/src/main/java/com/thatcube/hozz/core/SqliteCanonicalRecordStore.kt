@@ -341,23 +341,57 @@ class SqliteCanonicalRecordStore(
         }
     }
 
-    override suspend fun timeline(limit: Int): List<CanonicalRecord> =
-        readableDatabase.query(
+    override suspend fun timelinePage(
+        after: TimelineCursor?,
+        limit: Int,
+    ): TimelinePage {
+        val time = after?.sortTime?.toString()
+        val selection = when {
+            after == null -> "tombstone = 0"
+            time == null ->
+                "tombstone = 0 AND COALESCE(end_time, start_time) IS NULL " +
+                    "AND canonical_id > ?"
+            else ->
+                "tombstone = 0 AND (" +
+                    "COALESCE(end_time, start_time) < ? OR " +
+                    "(COALESCE(end_time, start_time) = ? AND canonical_id > ?) OR " +
+                    "COALESCE(end_time, start_time) IS NULL)"
+        }
+        val arguments = when {
+            after == null -> null
+            time == null -> arrayOf(after.canonicalId)
+            else -> arrayOf(time, time, after.canonicalId)
+        }
+        val records = readableDatabase.query(
             "canonical_record",
             null,
-            "tombstone = 0",
+            selection,
+            arguments,
             null,
             null,
-            null,
-            "COALESCE(end_time, start_time) DESC",
+            "COALESCE(end_time, start_time) DESC, canonical_id",
             limit.coerceIn(1, 1_000).toString(),
         ).use { cursor ->
             buildList {
+                var pageBytes = 0
                 while (cursor.moveToNext()) {
-                    add(cursor.record())
+                    val record = cursor.record()
+                    val bytes = record.rawJson.toByteArray().size
+                    if (isNotEmpty() && pageBytes + bytes > PAGE_RAW_BYTES) {
+                        break
+                    }
+                    add(record)
+                    pageBytes += bytes
                 }
             }
         }
+        return TimelinePage(
+            records = records,
+            nextCursor = records.lastOrNull()?.let {
+                TimelineCursor(it.endTime ?: it.startTime, it.canonicalId)
+            },
+        )
+    }
 
     override suspend fun recordsPage(
         afterCanonicalId: String?,
@@ -384,8 +418,15 @@ class SqliteCanonicalRecordStore(
             limit.coerceIn(1, 1_000).toString(),
         ).use { cursor ->
             buildList {
+                var pageBytes = 0
                 while (cursor.moveToNext()) {
-                    add(cursor.record())
+                    val record = cursor.record()
+                    val bytes = record.rawJson.toByteArray().size
+                    if (isNotEmpty() && pageBytes + bytes > PAGE_RAW_BYTES) {
+                        break
+                    }
+                    add(record)
+                    pageBytes += bytes
                 }
             }
         }
@@ -440,16 +481,21 @@ class SqliteCanonicalRecordStore(
             limit.coerceIn(1, 1_000).toString(),
         ).use { cursor ->
             buildList {
+                var pageBytes = 0
                 while (cursor.moveToNext()) {
-                    add(
-                        ArchiveRunRecord(
+                    val record = ArchiveRunRecord(
                             kind = cursor.string("kind"),
                             rawJson = cursor.string("raw_json"),
                             fingerprint = cursor.string("fingerprint"),
                             occurrence = cursor.int("occurrence"),
                             ordinal = cursor.long("sequence"),
-                        ),
-                    )
+                        )
+                    val bytes = record.rawJson.toByteArray().size
+                    if (isNotEmpty() && pageBytes + bytes > PAGE_RAW_BYTES) {
+                        break
+                    }
+                    add(record)
+                    pageBytes += bytes
                 }
             }
         }
@@ -1020,6 +1066,7 @@ class SqliteCanonicalRecordStore(
         index(name).let { if (isNull(it)) null else getLong(it) }
 
     private companion object {
+        const val PAGE_RAW_BYTES = 512 * 1_024
         fun createStageTable(database: SQLiteDatabase) {
             database.execSQL(
                 """

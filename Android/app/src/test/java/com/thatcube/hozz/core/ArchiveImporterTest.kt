@@ -3,7 +3,12 @@ package com.thatcube.hozz.core
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.util.zip.ZipEntry
+import java.util.zip.ZipInputStream
 import java.util.zip.ZipOutputStream
+import com.networknt.schema.InputFormat
+import com.networknt.schema.SchemaLocation
+import com.networknt.schema.SchemaRegistry
+import com.networknt.schema.SpecificationVersion
 import com.thatcube.hozz.generated.GeneratedContract
 import com.thatcube.hozz.projection.ProjectionPlanner
 import kotlinx.coroutines.runBlocking
@@ -589,10 +594,80 @@ class ArchiveImporterTest {
     }
 
     @Test
+    fun everyRunKindStripsWrongKindSchemaFieldsAndPassesIndependentSchema() =
+        runBlocking {
+            val legacy = listOf(
+                """{"canonicalId":42,"kind":"manifest","run":"run-a","createdAt":"2026-01-01T00:00:00Z"}""",
+                """{"canonicalId":42,"kind":"resume","run":"run-a","resumedAt":"2026-01-01T00:01:00Z","records":1}""",
+                """{"canonicalId":42,"kind":"typeSummary","type":"steps","state":"anchorClosed","records":1}""",
+                """{"canonicalId":42,"kind":"typeError","type":"heart","message":"failed"}""",
+                """{"canonicalId":42,"kind":"typeCoverage","type":"steps","state":"anchorClosed","complete":true,"observedAt":"2026-01-01T00:02:00Z"}""",
+                """{"canonicalId":42,"kind":"completion","run":"run-a","completedAt":"2026-01-01T00:03:00Z","records":5}""",
+            ).joinToString("\n", postfix = "\n")
+            val store = InMemoryCanonicalRecordStore()
+            ArchiveImporter(store).import(ByteArrayInputStream(legacy.toByteArray()))
+            val output = ByteArrayOutputStream()
+
+            CanonicalArchiveExporter(store).export(output)
+
+            assertIndependentSchemaValid(output.toByteArray())
+            assertFalse(recordStream(output.toByteArray()).contains("\"canonicalId\""))
+        }
+
+    @Test
+    fun strictRunRejectsSchemaFieldsOwnedByAnotherKind() {
+        var rejected = false
+        try {
+            CanonicalRecordParser.validateStrict(
+                """{"kind":"manifest","schemaVersion":1,"run":"run-a","createdAt":"2026-01-01T00:00:00Z","records":7}""",
+            )
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+    }
+
+    @Test
+    fun strictKnownCanonicalKindRejectsSchemaFieldsOwnedByAnotherKind() {
+        val malformed =
+            """
+            {"canonicalId":"apple.healthkit:wrong-fields","canonicalType":"activity.steps","complete":true,"endDate":"2026-01-01T00:01:00Z","id":"wrong-fields","kind":"quantity","lineage":[{"recordId":"wrong-fields","store":"apple.healthkit"}],"quantity":{"unit":"count","value":1},"recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"wrong-fields","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent()
+        var rejected = false
+        try {
+            CanonicalRecordParser.validateStrict(malformed)
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+    }
+
+    @Test
+    fun futureCanonicalKindRetainsSchemaNamedFields() = runBlocking {
+        val future =
+            """
+            {"canonicalId":"future.store:record-1","canonicalType":"future.measurement","endDate":"2026-01-01T00:01:00Z","id":"record-1","kind":"futureMeasurement","lineage":[{"recordId":"record-1","store":"future.store"}],"recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"record-1","store":"future.store","type":"FutureType"},"startDate":"2026-01-01T00:00:00Z","state":"critical","type":"FutureType"}
+            """.trimIndent()
+        val source = InMemoryCanonicalRecordStore()
+        ArchiveImporter(source).import(
+            ByteArrayInputStream(versionedZip("$future\n".toByteArray(), 1)),
+        )
+        val output = ByteArrayOutputStream()
+
+        CanonicalArchiveExporter(source).export(output)
+
+        assertIndependentSchemaValid(output.toByteArray())
+        val emitted = Json.parseToJsonElement(
+            recordStream(output.toByteArray()).trim(),
+        ).jsonObject
+        assertEquals("critical", emitted["state"]!!.jsonPrimitive.content)
+    }
+
+    @Test
     fun malformedLegacyOwnedFieldsNormalizeToStableStrictV1() = runBlocking {
         val legacy =
             """
-            {"canonicalId":"apple.healthkit:legacy-normalized","device":[],"endDate":"2026-01-01T00:01:00Z","id":"legacy-normalized","kind":"quantity","lineage":["bad",{"firstNote":"kept-1","package":"","recordId":"legacy-normalized","store":"apple.healthkit"},{"package":42,"recordId":"legacy-normalized","secondNote":"kept-2","store":"apple.healthkit"}],"metadata":"bad","quantity":{"original":{"description":"source text","unit":"native"},"unit":"count","value":1},"recordVersion":1,"schemaVersion":1,"source":"bad","sourceRecord":"bad","startDate":"2026-01-01T00:00:00Z","type":"steps","vendorExtension":"kept"}
+            {"canonicalId":"apple.healthkit:legacy-normalized","complete":"yes","createdAt":"wrong-kind","device":[],"endDate":"2026-01-01T00:01:00Z","id":"legacy-normalized","kind":"quantity","lineage":["bad",{"firstNote":"kept-1","package":"","recordId":"legacy-normalized","store":"apple.healthkit"},{"package":42,"recordId":"legacy-normalized","secondNote":"kept-2","store":"apple.healthkit"}],"metadata":"bad","quantity":{"original":{"description":"source text","unit":"native"},"unit":"count","value":1},"recordVersion":1,"records":"wrong-kind","run":"wrong-kind","schemaVersion":1,"source":"bad","sourceRecord":"bad","startDate":"2026-01-01T00:00:00Z","type":"steps","vendorExtension":"kept"}
             """.trimIndent()
         val source = InMemoryCanonicalRecordStore()
         ArchiveImporter(source).import(
@@ -606,6 +681,7 @@ class ArchiveImporterTest {
         CanonicalArchiveExporter(target).export(second)
 
         assertTrue(first.toByteArray().contentEquals(second.toByteArray()))
+        assertIndependentSchemaValid(first.toByteArray())
         val normalized = CanonicalArchiveExporter(target)
             .canonicalJson(target.allRecords().single())
         val objectValue = Json.parseToJsonElement(normalized).jsonObject
@@ -641,8 +717,45 @@ class ArchiveImporterTest {
             "kept",
             objectValue["vendorExtension"]!!.jsonPrimitive.content,
         )
+        for (key in listOf("complete", "createdAt", "records", "run")) {
+            assertFalse(objectValue.containsKey(key))
+        }
         CanonicalRecordParser.validateStrict(normalized)
     }
+
+    private fun assertIndependentSchemaValid(archive: ByteArray) {
+        val schemaId =
+            "https://hozz.brando.page/schema/hozz/v1/canonical-record.schema.json"
+        val schemaText = requireNotNull(
+            javaClass.getResourceAsStream("/hozz/v1/canonical-record.schema.json"),
+        ).use { it.reader().readText() }
+        val registry = SchemaRegistry.withDefaultDialect(
+            SpecificationVersion.DRAFT_2020_12,
+        ) { builder ->
+            builder.schemas(mapOf(schemaId to schemaText))
+        }
+        val schema = registry.getSchema(SchemaLocation.of(schemaId))
+        val records = recordStream(archive)
+
+        records.lineSequence().filter(String::isNotBlank).forEachIndexed {
+                index,
+                line,
+            ->
+            val errors = schema.validate(line, InputFormat.JSON) { context ->
+                context.executionConfig { config ->
+                    config.formatAssertionsEnabled(true)
+                }
+            }
+            assertTrue("record $index failed independent schema validation: $errors", errors.isEmpty())
+        }
+    }
+
+    private fun recordStream(archive: ByteArray): String =
+        ZipInputStream(ByteArrayInputStream(archive)).use { zip ->
+            generateSequence { zip.nextEntry }
+                .first { it.name.endsWith(".ndjson") }
+            zip.readBytes().toString(Charsets.UTF_8)
+        }
 
     @Test
     fun legacyLineageWithoutOriginNormalizesToSourceOrigin() = runBlocking {

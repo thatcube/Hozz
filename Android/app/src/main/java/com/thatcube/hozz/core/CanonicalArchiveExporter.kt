@@ -82,20 +82,56 @@ class CanonicalArchiveExporter(
         }
 
     private fun runJson(record: ArchiveRunRecord): String {
-        val line = CanonicalRecordParser.normalizedRunLine(record.rawJson)
+        val raw = Json.parseToJsonElement(record.rawJson).jsonObject
+        val kind = raw.stringValue("kind")
+            ?: throw ArchiveFormatException("A run record has no kind.")
+        val allowed = GeneratedContract.runPropertyNamesByKind[kind]
+            ?: throw ArchiveFormatException("Run record kind $kind is not supported.")
+        val hasOnlyKindFields = raw.keys
+            .filter { it in GeneratedContract.recordPropertyNames }
+            .all { it in allowed }
+        val line = if (raw.containsKey("schemaVersion") && hasOnlyKindFields) {
+            CanonicalRecordParser.validateStrict(record.rawJson)
+            record.rawJson
+        } else {
+            val normalized = buildJsonObject {
+                raw.forEach { (key, value) ->
+                    if (key !in GeneratedContract.recordPropertyNames) put(key, value)
+                }
+                put("kind", kind)
+                put("schemaVersion", GeneratedContract.SCHEMA_VERSION)
+                allowed.forEach { key ->
+                    if (key != "kind" && key != "schemaVersion") {
+                        raw[key]?.let { put(key, it) }
+                    }
+                }
+            }
+            sorted(normalized).toString()
+        }
         if (line.toByteArray().size > MAX_CANONICAL_RECORD_BYTES) {
             throw ArchiveFormatException(
                 "A normalized run record exceeds the 512 KiB limit.",
             )
         }
+        CanonicalRecordParser.validateStrict(line)
         return line
     }
 
     internal fun canonicalJson(record: CanonicalRecord): String {
         val raw = Json.parseToJsonElement(record.rawJson).jsonObject
+        val allowedFields =
+            GeneratedContract.canonicalPropertyNamesByKind[record.kind]
+        val preserveUnknownKindFields = allowedFields == null
+        fun allows(field: String): Boolean =
+            allowedFields == null || field in allowedFields
         val normalized = buildJsonObject {
             raw.forEach { (key, value) ->
-                if (key !in rebuiltKeys) put(key, value)
+                if (
+                    preserveUnknownKindFields ||
+                    key !in GeneratedContract.recordPropertyNames
+                ) {
+                    put(key, value)
+                }
             }
             put("schemaVersion", GeneratedContract.SCHEMA_VERSION)
             put("canonicalId", record.canonicalId)
@@ -108,12 +144,20 @@ class CanonicalArchiveExporter(
             }
             put("id", record.canonicalId.removePrefix(prefix))
             put("type", record.type)
-            record.parentCanonicalId?.let { put("parentCanonicalId", it) }
-            record.resolutionCanonicalId?.let {
+            record.parentCanonicalId?.takeIf { allows("parentCanonicalId") }?.let {
+                put("parentCanonicalId", it)
+            }
+            record.resolutionCanonicalId?.takeIf {
+                allows("resolutionCanonicalId")
+            }?.let {
                 put("resolutionCanonicalId", it)
             }
-            record.startTime?.let { put("startDate", it.toString()) }
-            record.endTime?.let { put("endDate", it.toString()) }
+            record.startTime?.takeIf { allows("startDate") }?.let {
+                put("startDate", it.toString())
+            }
+            record.endTime?.takeIf { allows("endDate") }?.let {
+                put("endDate", it.toString())
+            }
             if (record.tombstone) {
                 put("deleted", true)
             }
@@ -121,7 +165,9 @@ class CanonicalArchiveExporter(
                 "sourceRecord",
                 buildJsonObject {
                     (raw["sourceRecord"] as? JsonObject)?.forEach { (key, value) ->
-                        if (key !in sourceRecordKeys) put(key, value)
+                        if (key !in GeneratedContract.sourceRecordPropertyNames) {
+                            put(key, value)
+                        }
                     }
                     put("store", record.sourceStore)
                     put("id", record.sourceRecordId)
@@ -173,7 +219,9 @@ class CanonicalArchiveExporter(
                                 add(
                             buildJsonObject {
                                 prior?.forEach { (key, value) ->
-                                    if (key !in lineageKeys) put(key, value)
+                                    if (key !in GeneratedContract.lineagePropertyNames) {
+                                        put(key, value)
+                                    }
                                 }
                                 put("store", lineage.store)
                                 lineage.packageName?.let { put("package", it) }
@@ -195,7 +243,9 @@ class CanonicalArchiveExporter(
                 "source",
                 buildJsonObject {
                     (raw["source"] as? JsonObject)?.forEach { (key, value) ->
-                        put(key, value)
+                        if (key !in GeneratedContract.sourcePropertyNames) {
+                            put(key, value)
+                        }
                     }
                     record.sourceBundleIdentifier?.let {
                         put("bundleIdentifier", it)
@@ -205,13 +255,15 @@ class CanonicalArchiveExporter(
             )
             objectValue(record.deviceJson)?.let { put("device", it) }
             objectValue(record.metadataJson)?.let { put("metadata", it) }
-            record.canonicalValue?.let { canonical ->
+            record.canonicalValue?.takeIf { allows("quantity") }?.let { canonical ->
                 val existing = raw["quantity"] as? JsonObject
                 put(
                     "quantity",
                     buildJsonObject {
                         existing?.forEach { (key, value) ->
-                            if (key !in quantityKeys) put(key, value)
+                            if (key !in GeneratedContract.quantityPropertyNames) {
+                                put(key, value)
+                            }
                         }
                         put("unit", canonical.unit ?: "")
                         put("value", canonical.value)
@@ -231,8 +283,12 @@ class CanonicalArchiveExporter(
                     },
                 )
             }
-            record.categoryValue?.let { put("value", it) }
-            record.activityType?.let { put("activityType", it) }
+            record.categoryValue?.takeIf { allows("value") }?.let {
+                put("value", it)
+            }
+            record.activityType?.takeIf { allows("activityType") }?.let {
+                put("activityType", it)
+            }
             if (record.kind == "characteristics") {
                 record.startTime?.let { put("readAt", it.toString()) }
                 put(
@@ -250,6 +306,7 @@ class CanonicalArchiveExporter(
             }
             (raw["sequence"] as? kotlinx.serialization.json.JsonPrimitive)
                 ?.longOrNull
+                ?.takeIf { allows("sequence") }
                 ?.let { put("sequence", it) }
         }
         val line = sorted(normalized).toString()
@@ -268,7 +325,9 @@ class CanonicalArchiveExporter(
     ): JsonElement =
         buildJsonObject {
             existing?.forEach { (key, nestedValue) ->
-                if (key !in valueKeys) put(key, nestedValue)
+                if (key !in GeneratedContract.valuePropertyNames) {
+                    put(key, nestedValue)
+                }
             }
             put("value", value.value)
             put("unit", value.unit ?: "")
@@ -281,7 +340,9 @@ class CanonicalArchiveExporter(
     ): JsonObject? {
         val normalized = buildJsonObject {
             existing?.forEach { (key, nestedValue) ->
-                if (key !in valueKeys) put(key, nestedValue)
+                if (key !in GeneratedContract.valuePropertyNames) {
+                    put(key, nestedValue)
+                }
             }
             if (value != null) {
                 put("value", value.value)
@@ -343,9 +404,6 @@ class CanonicalArchiveExporter(
 
             page.forEach(consume)
             after = page.last().canonicalId
-            if (page.size < PAGE_SIZE) {
-                return
-            }
         }
     }
 
@@ -361,9 +419,6 @@ class CanonicalArchiveExporter(
             }
             page.forEach(consume)
             after = page.last().ordinal
-            if (page.size < PAGE_SIZE) {
-                return
-            }
         }
     }
 
@@ -371,36 +426,6 @@ class CanonicalArchiveExporter(
         const val PAGE_SIZE = 500
         const val MAX_CANONICAL_RECORD_BYTES = 512 * 1_024
         val sourceNamespacePattern = Regex("^[A-Za-z0-9._-]+$")
-        val rebuiltKeys = setOf(
-            "schemaVersion",
-            "canonicalId",
-            "canonicalType",
-            "recordVersion",
-            "kind",
-            "id",
-            "type",
-            "parentCanonicalId",
-            "resolutionCanonicalId",
-            "deleted",
-            "sourceRecord",
-            "lineage",
-            "source",
-            "device",
-            "metadata",
-            "startDate",
-            "endDate",
-            "readAt",
-            "quantity",
-            "value",
-            "activityType",
-            "characteristics",
-            "message",
-            "sequence",
-        )
-        val sourceRecordKeys = setOf("store", "id", "type", "version")
-        val quantityKeys = setOf("unit", "value", "canonical", "original")
-        val lineageKeys = setOf("store", "package", "recordId")
-        val valueKeys = setOf("unit", "value", "description")
     }
 
     private class CloseShieldOutputStream(

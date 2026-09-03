@@ -3,6 +3,108 @@
   "$id": "https://hozz.brando.page/schema/hozz/v1/canonical-record.schema.json",
   "title": "Hozz canonical record",
   "description": "The versioned, lossless record carried in a Hozz NDJSON archive. Run-level records share the stream and are distinguished by kind.",
+  "x-hozz-run-kind-properties": {
+    "manifest": [
+      "run",
+      "createdAt"
+    ],
+    "resume": [
+      "run",
+      "resumedAt",
+      "records"
+    ],
+    "typeSummary": [
+      "type",
+      "records",
+      "state"
+    ],
+    "typeError": [
+      "type",
+      "message"
+    ],
+    "typeCoverage": [
+      "type",
+      "state",
+      "complete",
+      "observedAt",
+      "deliveredCount",
+      "primedFrom",
+      "primedThrough"
+    ],
+    "completion": [
+      "run",
+      "completedAt",
+      "records"
+    ]
+  },
+  "x-hozz-canonical-common-properties": [
+    "canonicalId",
+    "canonicalType",
+    "deleted",
+    "device",
+    "id",
+    "kind",
+    "lineage",
+    "metadata",
+    "recordVersion",
+    "schemaVersion",
+    "source",
+    "sourceRecord",
+    "type"
+  ],
+  "x-hozz-canonical-kind-properties": {
+    "quantity": ["startDate", "endDate", "quantity"],
+    "category": ["startDate", "endDate", "value"],
+    "workout": ["startDate", "endDate", "activityType"],
+    "deletion": [],
+    "audiogram": ["startDate", "endDate"],
+    "characteristics": ["readAt", "characteristics"],
+    "clinicalRecord": ["startDate", "endDate"],
+    "correlation": ["startDate", "endDate"],
+    "electrocardiogram": ["startDate", "endDate"],
+    "electrocardiogramEnd": [
+      "startDate",
+      "endDate",
+      "parentCanonicalId"
+    ],
+    "electrocardiogramVoltages": [
+      "startDate",
+      "endDate",
+      "parentCanonicalId",
+      "sequence"
+    ],
+    "medicationDose": ["startDate", "endDate"],
+    "quantitySeriesEnd": [
+      "startDate",
+      "endDate",
+      "parentCanonicalId"
+    ],
+    "quantitySeriesReadings": [
+      "startDate",
+      "endDate",
+      "parentCanonicalId",
+      "sequence"
+    ],
+    "sampleEncodingError": [
+      "message",
+      "parentCanonicalId",
+      "resolutionCanonicalId"
+    ],
+    "sample": ["startDate", "endDate"],
+    "stateOfMind": ["startDate", "endDate"],
+    "workoutRoute": ["startDate", "endDate"],
+    "workoutRouteEnd": [
+      "startDate",
+      "endDate",
+      "parentCanonicalId"
+    ],
+    "workoutRouteLocations": [
+      "startDate",
+      "endDate",
+      "parentCanonicalId",
+      "sequence"
+    ]
+  },
   "type": "object",
   "required": [
     "kind",
@@ -202,6 +304,14 @@
     },
     "source": {
       "type": "object",
+      "properties": {
+        "bundleIdentifier": {
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
       "additionalProperties": true
     },
     "device": {

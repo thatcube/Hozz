@@ -129,11 +129,14 @@ public enum HealthExportEngineError: Error, LocalizedError, Equatable, Sendable 
     /// export whatever was really running, and someone told there is an export
     /// they cannot see reasonably concludes the app is broken.
     case busy(ExportWriterLease.Owner)
+    case incompatibleContractVersion(stored: Int?, supported: Int)
 
     public var errorDescription: String? {
         switch self {
         case .busy(let owner):
             "\(owner.activityDescription) Hozz will export as soon as it finishes."
+        case .incompatibleContractVersion(let stored, let supported):
+            "This unfinished export uses archive contract \(stored.map(String.init) ?? "unknown"); this build requires \(supported). Discard it explicitly to start over."
         }
     }
 }
@@ -218,6 +221,13 @@ public actor HealthExportEngine {
     /// taps a button that promises their records are safe and watches it fail
     /// with no idea why or what to do next.
     public func resumeObstruction(for run: ExportRunRecord) async throws -> String? {
+        guard run.contractVersion == HozzHealthArchiveContract.schemaVersion else {
+            return """
+                This unfinished export predates the current archive contract and \
+                cannot be resumed without mixing record formats. Discard it \
+                explicitly to start a new export.
+                """
+        }
         guard HealthExportFormat(rawValue: run.format) != nil else {
             return """
                 This unfinished export was written in a format this version of \
@@ -229,6 +239,13 @@ public actor HealthExportEngine {
                 This unfinished export was written by a version of Hozz that \
                 understood something this one does not, so it cannot be \
                 continued safely. Discard it to start a new one.
+                """
+        }
+        if try await partContractMismatch(runID: run.id) != nil {
+            return """
+                This unfinished export contains archive parts from another \
+                contract and cannot be resumed without mixing record formats. \
+                Discard it explicitly to start a new export.
                 """
         }
         return nil
@@ -289,6 +306,7 @@ public actor HealthExportEngine {
     ) async throws -> HealthExportOutcome {
         let spool = await store.spoolDirectory
         let (run, wasResumed) = try await resolveRun(format: format)
+        let contractVersion = try Self.contractVersion(for: run)
 
         // An unsealed part's bytes were never durable, so it is deleted and the
         // types it touched replay from their last sealed cursor.
@@ -313,7 +331,7 @@ public actor HealthExportEngine {
         if wasResumed {
             try await sink.writeRecord([
                 "kind": "resume",
-                "schemaVersion": 1,
+                "schemaVersion": contractVersion,
                 "run": run.id.uuidString.lowercased(),
                 "resumedAt": Self.timestamp(.now),
                 "completedTypes": settled.count,
@@ -322,7 +340,7 @@ public actor HealthExportEngine {
         } else {
             try await sink.writeRecord([
                 "kind": "manifest",
-                "schemaVersion": 1,
+                "schemaVersion": contractVersion,
                 "run": run.id.uuidString.lowercased(),
                 "catalogVersion": HealthTypeCatalog.version,
                 "createdAt": Self.timestamp(run.startedAt),
@@ -386,6 +404,7 @@ public actor HealthExportEngine {
         settled: inout [HealthTypeKey: StreamRecord],
         progress: @escaping @Sendable (HealthExportProgress) async -> Void
     ) async throws -> HealthExportOutcome {
+        let contractVersion = try Self.contractVersion(for: run)
         var completedTypes = 0
         var failedTypes = 0
         var zeroResultTypes = 0
@@ -485,7 +504,7 @@ public actor HealthExportEngine {
                 completedTypes += 1
                 try await sink.writeRecord([
                     "kind": "typeError",
-                    "schemaVersion": 1,
+                    "schemaVersion": contractVersion,
                     "type": type.rawValue,
                     "coverage": failure.coverageState.rawValue,
                     "message": failure.underlyingDescription
@@ -532,7 +551,7 @@ public actor HealthExportEngine {
                 completedTypes += 1
                 try await sink.writeRecord([
                     "kind": "typeError",
-                    "schemaVersion": 1,
+                    "schemaVersion": contractVersion,
                     "type": type.rawValue,
                     "coverage": CoverageState.tombstoneGapSuspected.rawValue,
                     "message": "Exceeded the per-type query budget."
@@ -559,7 +578,7 @@ public actor HealthExportEngine {
                 }
                 try await sink.writeRecord([
                     "kind": "typeSummary",
-                    "schemaVersion": 1,
+                    "schemaVersion": contractVersion,
                     "type": type.rawValue,
                     "records": report.changeCount,
                     "queries": report.queryCount,
@@ -620,13 +639,14 @@ public actor HealthExportEngine {
         zeroResultTypes: Int,
         failedTypes: Int
     ) async throws -> HealthExportOutcome {
+        let contractVersion = try Self.contractVersion(for: run)
         // Read the durable total rather than this process's counter, so a run
         // that was resumed still accounts for errors sealed before relaunch.
         let encodingErrors = try await store.run(id: run.id)?
             .sampleEncodingErrorCount ?? 0
         try await sink.writeRecord([
             "kind": "completion",
-            "schemaVersion": 1,
+            "schemaVersion": contractVersion,
             "run": run.id.uuidString.lowercased(),
             "completedAt": Self.timestamp(.now),
             "records": await sink.recordCount,
@@ -710,6 +730,18 @@ public actor HealthExportEngine {
         format: HealthExportFormat
     ) async throws -> (ExportRunRecord, Bool) {
         if let existing = try await store.resumableRun() {
+            guard existing.contractVersion == HozzHealthArchiveContract.schemaVersion else {
+                throw HealthExportEngineError.incompatibleContractVersion(
+                    stored: existing.contractVersion,
+                    supported: HozzHealthArchiveContract.schemaVersion
+                )
+            }
+            if let mismatch = try await partContractMismatch(runID: existing.id) {
+                throw HealthExportEngineError.incompatibleContractVersion(
+                    stored: mismatch.stored,
+                    supported: HozzHealthArchiveContract.schemaVersion
+                )
+            }
             // A run this build cannot continue would otherwise fail every
             // export from now on, including a brand new one, because the
             // stale run is found first every time. It is abandoned for the
@@ -728,9 +760,24 @@ public actor HealthExportEngine {
         let run = try await store.createRun(
             format: format.rawValue,
             attemptedTypeCount: types.count,
-            catalogVersion: HealthTypeCatalog.version
+            catalogVersion: HealthTypeCatalog.version,
+            contractVersion: HozzHealthArchiveContract.schemaVersion
         )
         return (run, false)
+    }
+
+    private struct PartContractMismatch {
+        let stored: Int?
+    }
+
+    private func partContractMismatch(
+        runID: UUID
+    ) async throws -> PartContractMismatch? {
+        for version in try await store.partContractVersions(runID: runID)
+        where version != HozzHealthArchiveContract.schemaVersion {
+            return PartContractMismatch(stored: version)
+        }
+        return nil
     }
 
     private func settledStates(
@@ -798,6 +845,16 @@ public actor HealthExportEngine {
         ).format(date)
     }
 
+    private static func contractVersion(for run: ExportRunRecord) throws -> Int {
+        guard run.contractVersion == HozzHealthArchiveContract.schemaVersion else {
+            throw HealthExportEngineError.incompatibleContractVersion(
+                stored: run.contractVersion,
+                supported: HozzHealthArchiveContract.schemaVersion
+            )
+        }
+        return HozzHealthArchiveContract.schemaVersion
+    }
+
     private static func byteCount(of url: URL) throws -> UInt64 {
         let size = try FileManager.default.attributesOfItem(atPath: url.path)[.size]
             as? NSNumber
@@ -817,6 +874,15 @@ public actor HealthExportEngine {
         spool: URL,
         finalURL: URL
     ) throws -> UInt64 {
+        let contractVersion = try Self.contractVersion(for: run)
+        guard parts.allSatisfy({ $0.contractVersion == contractVersion }) else {
+            throw HealthExportEngineError.incompatibleContractVersion(
+                stored: parts.first(where: {
+                    $0.contractVersion != contractVersion
+                })?.contractVersion,
+                supported: contractVersion
+            )
+        }
         let partURLs = parts.map { spool.appending(path: $0.fileName) }
         let baseName = "hozz-health-export-\(run.id.uuidString.lowercased())"
 
@@ -830,7 +896,7 @@ public actor HealthExportEngine {
                 archive in
                 let recordsEntry = "\(baseName).ndjson"
                 let manifest: [String: Any] = [
-                    "schemaVersion": HozzHealthArchiveContract.schemaVersion,
+                    "schemaVersion": contractVersion,
                     "archiveId": run.id.uuidString.lowercased(),
                     "format": HozzHealthArchiveContract.format,
                     "recordSchema": HozzHealthArchiveContract.recordSchema,

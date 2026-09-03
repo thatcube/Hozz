@@ -2,6 +2,7 @@ import contextlib
 import io
 import json
 import sqlite3
+import socket
 import struct
 import tempfile
 import tracemalloc
@@ -610,6 +611,31 @@ class CanonicalIdentityTests(unittest.TestCase):
 
 
 class MigrationTests(unittest.TestCase):
+    def test_legacy_batch_receipts_are_marked_with_unknown_deletion_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receiver.sqlite"
+            db = sqlite3.connect(path)
+            db.execute(
+                """
+                CREATE TABLE batches (
+                    key TEXT PRIMARY KEY,
+                    received_at REAL NOT NULL,
+                    records INTEGER NOT NULL
+                )
+                """
+            )
+            db.execute("INSERT INTO batches VALUES ('old', 0, 1)")
+            db.commit()
+            db.close()
+
+            migrated = connect(path)
+            value = migrated.execute(
+                "SELECT deletions FROM batches WHERE key = 'old'"
+            ).fetchone()[0]
+            migrated.close()
+
+            self.assertEqual(-1, value)
+
     def test_legacy_database_is_migrated_without_losing_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "receiver.sqlite"
@@ -1186,6 +1212,7 @@ class TransactionAndArchiveTests(unittest.TestCase):
                     "name": "steps",
                     "units": "count",
                     "data": [{
+                        "id": "point-1",
                         "date": "2026-01-01T00:00:00Z",
                         "qty": 1,
                     }],
@@ -1356,12 +1383,60 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 ["serve", "--allow-unauthenticated"]
             ).allow_unauthenticated
         )
+        self.assertEqual(
+            "127.0.0.1",
+            parser.parse_args(["serve", "--token", "secret"]).host,
+        )
 
-    def test_compatible_deletion_before_metric_prevents_resurrection(self):
+    def test_plaintext_serve_is_loopback_only(self):
+        self.assertEqual(
+            (None, socket.AF_INET),
+            receiver.serve_security("127.42.0.1", None, None),
+        )
+        self.assertEqual(
+            (None, socket.AF_INET6),
+            receiver.serve_security("::1", None, None),
+        )
+        for host in ("0.0.0.0", "::", "192.168.1.20", "8.8.8.8"):
+            with self.assertRaises(ValueError):
+                receiver.serve_security(host, None, None)
+
+    def test_non_loopback_tls_uses_supplied_trust_material(self):
+        context = mock.Mock()
+        with mock.patch.object(
+            receiver.ssl,
+            "SSLContext",
+            return_value=context,
+        ) as factory:
+            actual, family = receiver.serve_security(
+                "192.168.1.20",
+                "fullchain.pem",
+                "private-key.pem",
+            )
+
+        self.assertIs(context, actual)
+        self.assertEqual(socket.AF_INET, family)
+        factory.assert_called_once_with(receiver.ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain.assert_called_once_with(
+            certfile="fullchain.pem",
+            keyfile="private-key.pem",
+        )
+
+    def test_tls_requires_certificate_and_key_together(self):
+        for certificate, key in (("cert.pem", None), (None, "key.pem")):
+            with self.assertRaises(ValueError):
+                receiver.serve_security("127.0.0.1", certificate, key)
+
+    def test_compatible_blank_date_deletion_is_preserved_with_metric(self):
         date = "2026-01-01T00:00:00Z"
         ingest_compatible(self.db, {
             "data": {
-                "deletions": [{"name": "steps", "date": date}],
+                "deletions": [{
+                    "id": "deleted-id",
+                    "name": "steps",
+                    "type": "steps",
+                    "date": "",
+                }],
             },
         })
         ingest_compatible(self.db, {
@@ -1369,52 +1444,476 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 "metrics": [{
                     "name": "steps",
                     "units": "count",
-                    "data": [{"date": date, "qty": 100}],
+                    "data": [{"id": "deleted-id", "date": date, "qty": 100}],
                 }],
             },
         })
 
-        row = self.db.execute(
-            "SELECT record_version, tombstone FROM samples"
-        ).fetchone()
-        self.assertEqual((2, 1), row)
+        rows = self.db.execute(
+            "SELECT record_version, tombstone FROM samples ORDER BY tombstone"
+        ).fetchall()
+        self.assertEqual([(2, 1)], rows)
 
-    def test_duplicate_legacy_deletion_batch_repairs_missing_tombstone(self):
+    def test_duplicate_legacy_date_less_deletion_refuses_false_repair(self):
         date = "2026-01-01T00:00:00Z"
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": f"steps:{date}",
+                "type": "steps",
+                "kind": "quantity",
+                "startDate": date,
+                "endDate": date,
+                "quantity": {"value": 100, "unit": "count"},
+            })],
+        )
         self.db.execute(
-            "INSERT INTO batches VALUES (?, ?, ?)",
+            "INSERT INTO batches (key, received_at, records) VALUES (?, ?, ?)",
             ("legacy-deletion", 0, 0),
         )
         self.db.commit()
 
-        stored, deleted, duplicate = ingest_compatible(
-            self.db,
-            {
-                "data": {
-                    "deletions": [{"name": "steps", "date": date}],
+        with self.assertRaises(PartialBatch):
+            ingest_compatible(
+                self.db,
+                {
+                    "data": {
+                        "metrics": [{
+                            "name": "steps",
+                            "units": "count",
+                            "data": [{"date": date, "qty": 100}],
+                        }],
+                        "deletions": [{
+                            "id": "deleted-id",
+                            "name": "steps",
+                            "type": "steps",
+                            "date": "",
+                        }],
+                    },
                 },
+                batch_key="legacy-deletion",
+            )
+        self.assertEqual(
+            [(1, 0)],
+            self.db.execute(
+                "SELECT record_version, tombstone FROM samples ORDER BY tombstone"
+            ).fetchall(),
+        )
+
+    def test_duplicate_legacy_dated_deletion_repairs_old_identity(self):
+        date = "2026-01-01T00:00:00Z"
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": f"steps:{date}",
+                "type": "steps",
+                "kind": "quantity",
+                "startDate": date,
+                "endDate": date,
+                "quantity": {"value": 100, "unit": "count"},
+            })],
+        )
+        self.db.execute(
+            "INSERT INTO batches (key, received_at, records) VALUES (?, ?, ?)",
+            ("legacy-dated", 1, 0),
+        )
+        self.db.commit()
+
+        self.assertEqual(
+            (0, 1, True),
+            ingest_compatible(
+                self.db,
+                {
+                    "data": {
+                        "deletions": [{
+                            "id": "unavailable-in-old-row",
+                            "name": "steps",
+                            "type": "steps",
+                            "date": date,
+                        }],
+                    },
+                },
+                batch_key="legacy-dated",
+            ),
+        )
+        self.assertEqual(
+            [(2, 1)],
+            self.db.execute(
+                "SELECT record_version, tombstone FROM samples"
+            ).fetchall(),
+        )
+
+    def test_duplicate_legacy_receipt_migrates_stable_id_before_acknowledging(self):
+        date = "2026-01-01 12:00:00 +0000"
+        legacy_id = f"steps:{date}"
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": legacy_id,
+                "kind": "quantity",
+                "quantity": {"unit": "count", "value": 100},
+                "startDate": date,
+                "type": "steps",
+            })],
+        )
+        self.db.execute(
+            "INSERT INTO batches (key, received_at, records) VALUES (?, ?, ?)",
+            ("legacy-retry", 0, 1),
+        )
+        self.db.commit()
+
+        self.assertEqual(
+            (1, 1, True),
+            ingest_compatible(
+                self.db,
+                {
+                    "data": {
+                        "metrics": [{
+                            "name": "steps",
+                            "units": "count",
+                            "data": [{
+                                "id": "stable-retry",
+                                "date": "2026-01-01 07:00:00 -0500",
+                                "qty": 100,
+                            }],
+                        }],
+                    },
+                },
+                batch_key="legacy-retry",
+            ),
+        )
+        self.assertEqual(
+            [
+                ("apple.healthkit:" + legacy_id, 1),
+                ("healthAutoExport:stable-retry", 0),
+            ],
+            self.db.execute(
+                """
+                SELECT canonical_id, tombstone FROM samples
+                ORDER BY canonical_id
+                """
+            ).fetchall(),
+        )
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT deletions FROM batches WHERE key = 'legacy-retry'"
+            ).fetchone()[0],
+        )
+
+    def test_documented_heart_sleep_workout_and_deletion_shapes(self):
+        envelope = {
+            "data": {
+                "metrics": [
+                    {
+                        "name": "heart_rate",
+                        "units": "bpm",
+                        "data": [{
+                            "id": "heart-1",
+                            "date": "2026-01-01 12:00:00 +0000",
+                            "Min": 62,
+                            "Avg": 62,
+                            "Max": 62,
+                            "source": "Watch",
+                        }],
+                    },
+                    {
+                        "name": "sleep_analysis",
+                        "units": "hr",
+                        "data": [{
+                            "id": "sleep-1",
+                            "startDate": "2026-01-01 00:00:00 +0000",
+                            "endDate": "2026-01-01 01:00:00 +0000",
+                            "qty": 1,
+                            "value": "REM",
+                            "source": "Watch",
+                        }],
+                    },
+                ],
+                "workouts": [{
+                    "id": "workout-1",
+                    "name": "Running",
+                    "start": "2026-01-01 13:00:00 +0000",
+                    "end": "2026-01-01 13:30:00 +0000",
+                    "duration": 1_800,
+                }],
+                "deletions": [{
+                    "id": "deleted-1",
+                    "name": "heart_rate",
+                    "type": "heart_rate",
+                    "date": "",
+                }],
             },
-            batch_key="legacy-deletion",
+        }
+
+        self.assertEqual(
+            (3, 1, False),
+            ingest_compatible(self.db, envelope, batch_key="documented"),
+        )
+        rows = self.db.execute(
+            """
+            SELECT kind, value, minimum, maximum, text_value,
+                   duration_seconds, tombstone
+            FROM samples ORDER BY kind, tombstone
+            """
+        ).fetchall()
+        self.assertIn(("quantity", 62, 62, 62, None, None, 0), rows)
+        self.assertIn(("category", 5, None, None, "REM", 3600, 0), rows)
+        self.assertIn(("workout", 1800, None, None, "Running", 1800, 0), rows)
+        self.assertTrue(any(row[-1] == 1 for row in rows))
+
+    def test_unknown_sleep_stage_preserves_raw_value(self):
+        self.assertEqual(
+            (1, 0, False),
+            ingest_compatible(self.db, {
+                "data": {
+                    "metrics": [{
+                        "name": "sleep_analysis",
+                        "units": "hr",
+                        "data": [{
+                            "id": "sleep-future",
+                            "startDate": "2026-01-01 00:00:00 +0000",
+                            "endDate": "2026-01-01 01:00:00 +0000",
+                            "qty": 1,
+                            "value": "Unspecified",
+                            "rawValue": 99,
+                        }],
+                    }],
+                },
+            }),
+        )
+        self.assertEqual(
+            (99, "Unspecified"),
+            self.db.execute(
+                "SELECT value, text_value FROM samples"
+            ).fetchone(),
+        )
+
+    def test_compatible_source_id_binds_metric_to_retried_deletion(self):
+        point = {
+            "id": "source-record-1",
+            "date": "2026-01-01 12:00:00 +0000",
+            "qty": 100,
+        }
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "steps",
+                    "units": "count",
+                    "data": [point],
+                }],
+            },
+        })
+        deletion = {
+            "data": {
+                "deletions": [{
+                    "id": "source-record-1",
+                    "name": "steps",
+                    "type": "steps",
+                    "date": "",
+                }],
+            },
+        }
+
+        self.assertEqual(
+            (0, 1, False),
+            ingest_compatible(self.db, deletion, batch_key="source-deletion"),
+        )
+        self.assertEqual(
+            (0, 0, True),
+            ingest_compatible(self.db, deletion, batch_key="source-deletion"),
         )
         ingest_compatible(self.db, {
             "data": {
                 "metrics": [{
                     "name": "steps",
                     "units": "count",
-                    "data": [{"date": date, "qty": 100}],
+                    "data": [{
+                        "id": "source-record-2",
+                        "date": "2026-01-01 13:00:00 +0000",
+                        "qty": 200,
+                    }],
                 }],
             },
         })
-
-        self.assertTrue(duplicate)
-        self.assertEqual(0, stored)
-        self.assertEqual(1, deleted)
         self.assertEqual(
-            (2, 1),
-            self.db.execute(
-                "SELECT record_version, tombstone FROM samples"
-            ).fetchone(),
+            (0, 0, True),
+            ingest_compatible(
+                self.db,
+                {
+                    "data": {
+                        "deletions": [{
+                            "id": "source-record-2",
+                            "name": "steps",
+                            "type": "steps",
+                            "date": "",
+                        }],
+                    },
+                },
+                batch_key="source-deletion",
+            ),
         )
+        self.assertEqual(
+            [(2, 1), (1, 0)],
+            self.db.execute(
+                """
+                SELECT record_version, tombstone FROM samples
+                ORDER BY source_id
+                """
+            ).fetchall(),
+        )
+
+    def test_stable_id_retry_tombstones_the_legacy_name_date_alias(self):
+        date = "2026-01-01 12:00:00 +0000"
+        legacy_id = f"steps:{date}"
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": legacy_id,
+                "kind": "quantity",
+                "quantity": {"unit": "count", "value": 100},
+                "startDate": date,
+                "type": "steps",
+            })],
+        )
+        envelope = {
+            "data": {
+                "metrics": [{
+                    "name": "steps",
+                    "units": "count",
+                    "data": [{
+                        "id": "stable-1",
+                        "date": "2026-01-01 07:00:00 -0500",
+                        "qty": 100,
+                    }],
+                }],
+            },
+        }
+
+        self.assertEqual(
+            (1, 1, False),
+            ingest_compatible(self.db, envelope, batch_key="stable-retry"),
+        )
+        self.assertEqual(
+            [
+                ("apple.healthkit:" + legacy_id, 1),
+                ("healthAutoExport:stable-1", 0),
+            ],
+            self.db.execute(
+                """
+                SELECT canonical_id, tombstone FROM samples
+                ORDER BY canonical_id
+                """
+            ).fetchall(),
+        )
+
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [{
+                    "id": "stable-1",
+                    "name": "steps",
+                    "type": "steps",
+                    "date": "",
+                }],
+            },
+        })
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+            ).fetchone()[0],
+        )
+
+    def test_stable_sleep_retires_the_legacy_none_alias(self):
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": "sleep_analysis:None",
+                "kind": "quantity",
+                "quantity": {"unit": "hr", "value": None},
+                "type": "sleep_analysis",
+            })],
+        )
+
+        self.assertEqual(
+            (1, 1, False),
+            ingest_compatible(self.db, {
+                "data": {
+                    "metrics": [{
+                        "name": "sleep_analysis",
+                        "units": "hr",
+                        "data": [{
+                            "id": "sleep-stable",
+                            "startDate": "2026-01-01 00:00:00 +0000",
+                            "endDate": "2026-01-01 01:00:00 +0000",
+                            "qty": 1,
+                            "value": "REM",
+                            "rawValue": 5,
+                        }],
+                    }],
+                },
+            }),
+        )
+        self.assertEqual(
+            [
+                ("apple.healthkit:sleep_analysis:None", 1),
+                ("healthAutoExport:sleep-stable", 0),
+            ],
+            self.db.execute(
+                """
+                SELECT canonical_id, tombstone FROM samples
+                ORDER BY canonical_id
+                """
+            ).fetchall(),
+        )
+
+    def test_idless_compatible_metric_rejects_without_receipt(self):
+        envelope = {
+            "data": {
+                "metrics": [{
+                    "name": "steps",
+                    "units": "count",
+                    "data": [{
+                        "date": "2026-01-01 12:00:00 +0000",
+                        "qty": 100,
+                    }],
+                }],
+            },
+        }
+
+        with self.assertRaises(PartialBatch):
+            ingest_compatible(self.db, envelope, batch_key="idless")
+        self.assertEqual(0, self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0])
+        self.assertEqual(0, self.db.execute("SELECT COUNT(*) FROM batches").fetchone()[0])
+
+    def test_unrepresentable_compatible_item_rolls_back_without_receipt(self):
+        envelope = {
+            "data": {
+                "metrics": [{
+                    "name": "heart_rate",
+                    "units": "bpm",
+                    "data": [{
+                        "id": "heart-aggregate",
+                        "date": "2026-01-01 12:00:00 +0000",
+                        "Min": 60,
+                        "Avg": 62,
+                        "Max": 64,
+                    }],
+                }],
+                "workouts": [{
+                    "id": "workout-1",
+                    "name": "Running",
+                    "start": "2026-01-01 13:00:00 +0000",
+                    "end": "2026-01-01 13:30:00 +0000",
+                    "duration": 1_800,
+                }],
+            },
+        }
+
+        with self.assertRaises(PartialBatch):
+            ingest_compatible(self.db, envelope, batch_key="invalid-hae")
+        self.assertEqual(0, self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0])
+        self.assertEqual(0, self.db.execute("SELECT COUNT(*) FROM batches").fetchone()[0])
 
     def test_malformed_utf8_payload_rejects_atomically(self):
         with self.assertRaises(PartialBatch):

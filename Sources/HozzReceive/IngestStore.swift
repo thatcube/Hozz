@@ -967,6 +967,30 @@ public actor IngestStore {
         var storedAudiograms = 0
 
         for record in batch.records {
+            if let legacyAliasID = record.legacyAliasID,
+               legacyAliasID != record.id {
+                let prefix = "\(record.type):"
+                try database.run(
+                    """
+                    DELETE FROM sample
+                    WHERE type = ?
+                      AND (
+                        id = ?
+                        OR (
+                          start_date = ?
+                          AND substr(id, 1, ?) = ?
+                        )
+                      )
+                    """,
+                    [
+                        .text(record.type),
+                        .text(legacyAliasID),
+                        .text(Timestamps.text(from: record.startDate)),
+                        .integer(Int64(prefix.count)),
+                        .text(prefix)
+                    ]
+                )
+            }
             try database.run(
                 """
                 INSERT INTO sample

@@ -2,7 +2,7 @@
 
 A complete receiver in one file, with no dependencies beyond Python 3.9+.
 
-It accepts Hozz batches over HTTP, or watches a folder Hozz writes into, and
+It accepts Hozz batches over HTTP on loopback or HTTPS on a network, or watches a folder Hozz writes into, and
 keeps a SQLite database you can query with anything — `sqlite3`, pandas, Grafana,
 Datasette, or an AI tool pointed at the file.
 
@@ -10,9 +10,14 @@ Datasette, or an AI tool pointed at the file.
 
 ```bash
 # Listen for a REST destination
-python3 hozz_receiver.py serve --port 8765 --token my-secret
+python3 hozz_receiver.py serve --host 127.0.0.1 --port 8765 --token my-secret
 
-# Or explicitly opt into an unauthenticated listener on a trusted network
+# A LAN listener must use a certificate clients already trust.
+python3 hozz_receiver.py serve --host 192.168.1.20 --port 8765 \
+  --cert /path/to/fullchain.pem --key /path/to/private-key.pem \
+  --token my-secret
+
+# Or explicitly opt into an unauthenticated loopback listener
 python3 hozz_receiver.py serve --allow-unauthenticated
 
 # Or watch a folder that already syncs to this machine
@@ -22,9 +27,16 @@ python3 hozz_receiver.py watch ~/Dropbox/Health
 python3 hozz_receiver.py stats
 ```
 
-Then in Hozz, add a destination pointing at `http://your-computer:8765` with
-`my-secret` as the authorization value, or at the folder — and tap **Send a
-test**.
+Then in Hozz, add a destination pointing at `https://your-computer:8765` with
+`my-secret` as the authorization value and a certificate the phone trusts, or
+at the folder — and tap **Send a test**. Use `http://127.0.0.1:8765` only from
+software on the receiver machine itself.
+
+Plain HTTP is restricted to loopback because a reusable bearer token and health
+payload must not cross a LAN in cleartext. For a non-loopback bind, supply a
+certificate and private key whose trust chain is already installed on the
+phone, or expose the loopback listener through an authenticated TLS tunnel.
+Hozz never generates or silently trusts a self-signed certificate.
 
 ## Why retries are safe
 
@@ -50,6 +62,17 @@ before any part of the archive commits. ZIP entries must use Stored or Deflate;
 encrypted, BZIP2, LZMA, and unknown methods are rejected before decompression.
 Network requests are capped and spooled, while NDJSON and JSON arrays are
 decoded one record at a time.
+
+Health Auto Export metric points must include their source record ID. Without
+it, a later date-less deletion cannot identify the record it supersedes, so the
+receiver rejects the whole batch instead of acknowledging an unrecoverable
+partial history.
+
+Databases written by an older receiver mark prior batch receipts during
+migration. A replay can repair a dated deletion against the old name-and-date
+identity. A date-less deletion cannot be linked to an older synthesized row, so
+that replay fails explicitly and requires a fresh full export rather than
+creating an unrelated tombstone.
 
 ## Ask it things
 

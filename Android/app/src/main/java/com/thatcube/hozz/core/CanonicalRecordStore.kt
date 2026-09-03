@@ -1,5 +1,7 @@
 package com.thatcube.hozz.core
 
+import java.time.Instant
+
 data class MergeResult(
     val inserted: Int = 0,
     val updated: Int = 0,
@@ -29,6 +31,16 @@ data class HealthConnectProjection(
     val healthConnectRecordId: String,
 )
 
+data class TimelineCursor(
+    val sortTime: Instant?,
+    val canonicalId: String,
+)
+
+data class TimelinePage(
+    val records: List<CanonicalRecord>,
+    val nextCursor: TimelineCursor?,
+)
+
 interface CanonicalExportSnapshot {
     fun recordsPage(afterCanonicalId: String?, limit: Int): List<CanonicalRecord>
     fun runRecordsPage(afterSequence: Long?, limit: Int): List<ArchiveRunRecord>
@@ -37,7 +49,12 @@ interface CanonicalExportSnapshot {
 interface CanonicalRecordStore {
     suspend fun upsert(records: List<CanonicalRecord>): MergeResult
     suspend fun beginImport(): CanonicalImportSession
-    suspend fun timeline(limit: Int = 200): List<CanonicalRecord>
+    suspend fun timelinePage(
+        after: TimelineCursor? = null,
+        limit: Int = 200,
+    ): TimelinePage
+    suspend fun timeline(limit: Int = 200): List<CanonicalRecord> =
+        timelinePage(limit = limit).records
     suspend fun recordsPage(afterCanonicalId: String?, limit: Int): List<CanonicalRecord>
     suspend fun recordCount(): Int
     suspend fun allRecords(): List<CanonicalRecord>
@@ -265,13 +282,53 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
         }
     }
 
-    override suspend fun timeline(limit: Int): List<CanonicalRecord> =
-        records.values
+    override suspend fun timelinePage(
+        after: TimelineCursor?,
+        limit: Int,
+    ): TimelinePage {
+        val ordered = records.values
             .asSequence()
             .filterNot(CanonicalRecord::tombstone)
-            .sortedByDescending { it.endTime ?: it.startTime }
+            .filter { record -> isAfter(record, after) }
+            .sortedWith(::compareTimelineRecords)
             .take(limit)
             .toList()
+        return TimelinePage(
+            records = ordered,
+            nextCursor = ordered.lastOrNull()?.let {
+                TimelineCursor(it.endTime ?: it.startTime, it.canonicalId)
+            },
+        )
+    }
+
+    private fun isAfter(record: CanonicalRecord, cursor: TimelineCursor?): Boolean {
+        if (cursor == null) return true
+        val time = record.endTime ?: record.startTime
+        val cursorTime = cursor.sortTime
+        return when {
+            cursorTime == null -> time == null && record.canonicalId > cursor.canonicalId
+            time == null -> true
+            time < cursorTime -> true
+            time > cursorTime -> false
+            else -> record.canonicalId > cursor.canonicalId
+        }
+    }
+
+    private fun compareTimelineRecords(
+        first: CanonicalRecord,
+        second: CanonicalRecord,
+    ): Int {
+        val firstTime = first.endTime ?: first.startTime
+        val secondTime = second.endTime ?: second.startTime
+        return when {
+            firstTime == null && secondTime == null ->
+                first.canonicalId.compareTo(second.canonicalId)
+            firstTime == null -> 1
+            secondTime == null -> -1
+            else -> secondTime.compareTo(firstTime).takeIf { it != 0 }
+                ?: first.canonicalId.compareTo(second.canonicalId)
+        }
+    }
 
     override suspend fun recordsPage(
         afterCanonicalId: String?,

@@ -125,7 +125,7 @@ final class HozzStoreTests: XCTestCase {
 
         for store in stores {
             let version = try await store.schemaVersion()
-            XCTAssertEqual(version, 4)
+            XCTAssertEqual(version, 5)
             await store.close()
         }
     }

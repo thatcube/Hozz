@@ -35,7 +35,7 @@ class HozzCoreService(context: Context) {
     suspend fun snapshot(): HozzCoreSnapshot {
         var after: String? = null
         var projection = ProjectionSummary()
-        do {
+        while (true) {
             val page = store.recordsPage(after, PAGE_SIZE)
             if (page.isEmpty()) {
                 break
@@ -45,13 +45,17 @@ class HozzCoreService(context: Context) {
             )
             projection += ProjectionPlanner.plan(page, ledger).summary()
             after = page.last().canonicalId
-        } while (page.size == PAGE_SIZE)
+        }
+        val timeline = store.timelinePage()
         return HozzCoreSnapshot(
-            timeline = store.timeline(),
+            timeline = timeline.records,
             projection = projection,
             totalRecordCount = store.recordCount(),
         )
     }
+
+    suspend fun timelinePage(after: TimelineCursor?): TimelinePage =
+        store.timelinePage(after)
 
     suspend fun projectionDraftPage(
         afterCanonicalId: String?,

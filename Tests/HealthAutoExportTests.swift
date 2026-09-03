@@ -103,9 +103,34 @@ final class HealthAutoExportTests: XCTestCase {
     func testAnOrdinaryPointCarriesQtyAndSource() throws {
         let point = try firstPoint([record()])
 
+        XCTAssertEqual(point["id"] as? String, "abc-123")
         XCTAssertEqual(point["qty"] as? Double, 8_500)
         XCTAssertEqual(point["source"] as? String, "iPhone")
         XCTAssertNil(point["Avg"])
+    }
+
+    func testARecordWithoutACompatibleValueFailsBeforeDelivery() {
+        let unsupported = record(
+            type: "HKDataTypeStateOfMind",
+            kind: "stateOfMind",
+            value: nil,
+            unit: nil
+        )
+
+        XCTAssertThrowsError(
+            try HealthAutoExportPayloadBuilder.build(
+                records: [unsupported],
+                timeZone: timeZone
+            )
+        ) { error in
+            XCTAssertEqual(
+                error as? HealthAutoExportPayloadError,
+                .unsupportedRecord(
+                    kind: "stateOfMind",
+                    type: "HKDataTypeStateOfMind"
+                )
+            )
+        }
     }
 
     /// Their heart rate points carry a range, with capitalised keys, and no
@@ -168,11 +193,13 @@ final class HealthAutoExportTests: XCTestCase {
         )
         let point = try XCTUnwrap((metric["data"] as? [[String: Any]])?.first)
 
+        XCTAssertEqual(point["id"] as? String, "abc-123")
         XCTAssertEqual(metric["units"] as? String, "hr")
         XCTAssertEqual(point["startDate"] as? String, "2026-02-05 23:00:00 -0800")
         XCTAssertEqual(point["endDate"] as? String, "2026-02-06 00:30:00 -0800")
         XCTAssertEqual(point["qty"] as? Double, 1.5, "Their sleep quantities are hours.")
         XCTAssertEqual(point["value"] as? String, "Core")
+        XCTAssertEqual(point["rawValue"] as? Double, 3)
         XCTAssertNil(point["date"], "Their unaggregated sleep points have no date key.")
     }
 
@@ -193,6 +220,22 @@ final class HealthAutoExportTests: XCTestCase {
             "Unspecified",
             "A stage this build has no name for is still reported honestly."
         )
+    }
+
+    func testAnUnknownSleepStageCarriesItsRawValue() throws {
+        let point = try firstPoint([
+            record(
+                type: "HKCategoryTypeIdentifierSleepAnalysis",
+                kind: "category",
+                value: 99,
+                unit: nil,
+                start: "2026-02-06T07:00:00.000Z",
+                end: "2026-02-06T08:30:00.000Z"
+            )
+        ])
+
+        XCTAssertEqual(point["value"] as? String, "Unspecified")
+        XCTAssertEqual(point["rawValue"] as? Double, 99)
     }
 
     // MARK: - Workouts

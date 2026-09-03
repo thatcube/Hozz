@@ -226,6 +226,54 @@ class SqliteCanonicalRecordStoreTest {
     }
 
     @Test
+    fun largeRowsTraverseInByteBoundedPagesAndRoundTrip() = runBlocking {
+        val padding = "x".repeat(400 * 1_024)
+        val lines = (1..16).map { index ->
+            """
+            {"endDate":"2026-01-01T00:01:00Z","id":"large-$index","kind":"quantity","padding":"$padding","quantity":{"unit":"count","value":$index},"schemaVersion":1,"startDate":"2026-01-01T00:00:00Z","type":"steps"}
+            """.trimIndent()
+        }
+        ArchiveImporter(store).import(
+            ByteArrayInputStream(
+                lines.joinToString("\n", postfix = "\n").toByteArray(),
+            ),
+        )
+        val seen = mutableListOf<String>()
+        var after: String? = null
+        while (true) {
+            val page = store.recordsPage(after, 500)
+            if (page.isEmpty()) break
+            assertTrue(page.sumOf { it.rawJson.toByteArray().size } <= 512 * 1_024)
+            seen += page.map(CanonicalRecord::canonicalId)
+            after = page.last().canonicalId
+        }
+        assertEquals(16, seen.size)
+        assertEquals(seen.sorted(), seen)
+
+        val timelineSeen = mutableSetOf<String>()
+        var timelineCursor: TimelineCursor? = null
+        while (true) {
+            val page = store.timelinePage(timelineCursor, 200)
+            if (page.records.isEmpty()) break
+            assertTrue(
+                page.records.sumOf { it.rawJson.toByteArray().size } <=
+                    512 * 1_024,
+            )
+            timelineSeen += page.records.map(CanonicalRecord::canonicalId)
+            timelineCursor = page.nextCursor
+        }
+        assertEquals(16, timelineSeen.size)
+
+        val output = ByteArrayOutputStream()
+        CanonicalArchiveExporter(store).export(output)
+        val restored = InMemoryCanonicalRecordStore()
+        ArchiveImporter(restored).import(
+            ByteArrayInputStream(output.toByteArray()),
+        )
+        assertEquals(16, restored.recordCount())
+    }
+
+    @Test
     fun staleParentTombstoneDoesNotCascade() = runBlocking {
         val parent = record(version = 3, tombstone = false)
         val child = parent.copy(

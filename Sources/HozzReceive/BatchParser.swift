@@ -1,4 +1,5 @@
 import Foundation
+import CoreFoundation
 import HozzCore
 
 /// One Health sample as it arrives from a phone.
@@ -16,6 +17,7 @@ public struct HealthRecord: Hashable, Sendable {
     public let value: Double?
     public let unit: String?
     public let sourceName: String?
+    public let legacyAliasID: String?
     public let raw: Data
 
     public init(
@@ -27,6 +29,7 @@ public struct HealthRecord: Hashable, Sendable {
         value: Double? = nil,
         unit: String? = nil,
         sourceName: String? = nil,
+        legacyAliasID: String? = nil,
         raw: Data
     ) {
         self.id = id
@@ -37,6 +40,7 @@ public struct HealthRecord: Hashable, Sendable {
         self.value = value
         self.unit = unit
         self.sourceName = sourceName
+        self.legacyAliasID = legacyAliasID
         self.raw = raw
     }
 }
@@ -886,9 +890,9 @@ public enum BatchParser {
         )
     }
 
-    /// The metrics shape carries no per-sample identifier, so one is derived
-    /// from the type and timestamp. That is what makes re-delivering the same
-    /// metric update a row rather than duplicate it.
+    /// New Hozz compatibility payloads carry the HealthKit identifier. Older
+    /// Health Auto Export payloads do not, so those retain the type-and-time
+    /// fallback that makes a replay update rather than duplicate.
     private static func parseMetricsEnvelope(_ text: String) -> ParsedBatch {
         guard
             let data = text.data(using: .utf8),
@@ -905,23 +909,34 @@ public enum BatchParser {
             let units = metric["units"] as? String
             for point in metric["data"] as? [[String: Any]] ?? [] {
                 guard
-                    let dateText = point["date"] as? String,
-                    let date = Timestamps.date(from: dateText)
+                    let dateText = (point["date"] as? String)
+                        ?? (point["startDate"] as? String),
+                    let date = metricsDate(from: dateText)
                 else {
                     unreadable += 1
                     continue
                 }
                 let end = (point["endDate"] as? String)
-                    .flatMap(Timestamps.date(from:)) ?? date
-                let identifier = "\(name):\(dateText)"
-                var object: [String: Any] = [
-                    "id": identifier,
-                    "type": name,
-                    "startDate": dateText
-                ]
-                if let quantity = numeric(point["qty"]) {
-                    object["value"] = quantity
+                    .flatMap(metricsDate(from:)) ?? date
+                let identifier = (point["id"] as? String)
+                    .flatMap { $0.isEmpty ? nil : $0 }
+                    ?? "\(name):\(dateText)"
+                let legacyAliasID = point["id"] == nil
+                    ? nil
+                    : "\(name):\(dateText)"
+                let value = numeric(point["qty"])
+                    ?? numeric(point["Avg"])
+                    ?? numeric(point["rawValue"])
+                guard let value else {
+                    unreadable += 1
+                    continue
                 }
+                var object = point
+                object["id"] = identifier
+                object["type"] = name
+                object["kind"] = name == "sleep_analysis" ? "category" : "quantity"
+                object["startDate"] = dateText
+                object["value"] = value
                 if let units {
                     object["unit"] = units
                 }
@@ -929,12 +944,13 @@ public enum BatchParser {
                     HealthRecord(
                         id: identifier,
                         type: name,
-                        kind: "quantity",
+                        kind: name == "sleep_analysis" ? "category" : "quantity",
                         startDate: date,
                         endDate: end,
-                        value: numeric(point["qty"]),
+                        value: value,
                         unit: units,
                         sourceName: point["source"] as? String,
+                        legacyAliasID: legacyAliasID,
                         raw: (try? JSONSerialization.data(
                             withJSONObject: object,
                             options: [.sortedKeys]
@@ -951,21 +967,20 @@ public enum BatchParser {
             guard
                 let identifier = workout["id"] as? String,
                 let startText = workout["start"] as? String,
-                let start = Timestamps.date(from: startText)
+                let start = metricsDate(from: startText)
             else {
                 unreadable += 1
                 continue
             }
             let end = (workout["end"] as? String)
-                .flatMap(Timestamps.date(from:)) ?? start
+                .flatMap(metricsDate(from:)) ?? start
             let name = workout["name"] as? String ?? "Workout"
-            let object: [String: Any] = [
-                "id": identifier,
-                "type": name,
-                "kind": "workout",
-                "startDate": startText,
-                "endDate": workout["end"] as? String ?? startText
-            ]
+            var object = workout
+            object["id"] = identifier
+            object["type"] = name
+            object["kind"] = "workout"
+            object["startDate"] = startText
+            object["endDate"] = workout["end"] as? String ?? startText
             records.append(
                 HealthRecord(
                     id: identifier,
@@ -986,16 +1001,30 @@ public enum BatchParser {
 
         var deletions: [HealthDeletion] = []
         for deletion in payload["deletions"] as? [[String: Any]] ?? [] {
-            guard
-                let name = (deletion["name"] as? String) ?? (deletion["type"] as? String),
-                let dateText = deletion["date"] as? String,
-                let date = Timestamps.date(from: dateText)
+            guard let name =
+                (deletion["name"] as? String) ?? (deletion["type"] as? String)
             else {
+                unreadable += 1
                 continue
             }
-            deletions.append(
-                HealthDeletion(id: "\(name):\(dateText)", type: name, startDate: date)
-            )
+            let dateText = deletion["date"] as? String
+            let date = dateText.flatMap(metricsDate(from:))
+            if let identifier = (deletion["id"] as? String),
+               !identifier.isEmpty {
+                deletions.append(
+                    HealthDeletion(id: identifier, type: name, startDate: nil)
+                )
+            } else if let dateText, let date {
+                deletions.append(
+                    HealthDeletion(
+                        id: "\(name):\(dateText)",
+                        type: name,
+                        startDate: date
+                    )
+                )
+            } else {
+                unreadable += 1
+            }
         }
 
         return ParsedBatch(
@@ -1054,13 +1083,29 @@ public enum BatchParser {
     }
 
     static func numeric(_ value: Any?) -> Double? {
-        switch value {
+        if let number = value as? NSNumber,
+           CFGetTypeID(number) == CFBooleanGetTypeID() {
+            return nil
+        }
+        return switch value {
         case let number as Double: number
         case let number as Int: Double(number)
         case let number as NSNumber: number.doubleValue
         case let text as String: Double(text)
         default: nil
         }
+    }
+
+    private static func metricsDate(from text: String) -> Date? {
+        if let date = Timestamps.date(from: text) {
+            return date
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .gmt
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+        return formatter.date(from: text)
     }
 }
 
