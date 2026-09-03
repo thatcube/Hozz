@@ -234,6 +234,87 @@ class SqliteCanonicalRecordStoreTest {
         }
 
     @Test
+    fun continuationErrorRequiresEndMarkerButParentDeletionStillWins() =
+        runBlocking {
+            val sourceId = "00000000-0000-0000-0000-000000000123"
+            val endId = CanonicalRecordParser.seriesEndId(
+                sourceId,
+                "HKWorkoutRouteTypeIdentifier",
+            )
+            val errorId = CanonicalRecordParser.encodingFailureId(
+                sourceId,
+                "HKWorkoutRouteTypeIdentifier",
+            )
+            val parent = record(version = 1, tombstone = false).copy(
+                canonicalId = "apple.healthkit:$sourceId",
+                sourceRecordId = sourceId,
+                kind = "workoutRoute",
+                canonicalType = "activity.exercise-route",
+                type = "HKWorkoutRouteTypeIdentifier",
+                lineage = listOf(
+                    SourceLineage("apple.healthkit", recordId = sourceId),
+                ),
+                rawJson =
+                    """{"endDate":"2026-01-01T00:01:00Z","startDate":"2026-01-01T00:00:00Z"}""",
+            )
+            val error = parent.copy(
+                canonicalId = "apple.healthkit:$errorId",
+                parentCanonicalId = parent.canonicalId,
+                resolutionCanonicalId = "apple.healthkit:$endId",
+                recordVersion = 3,
+                kind = "sampleEncodingError",
+                canonicalType = "archive.encoding-error",
+                rawJson = """{"kind":"sampleEncodingError"}""",
+            )
+            val end = parent.copy(
+                canonicalId = "apple.healthkit:$endId",
+                parentCanonicalId = parent.canonicalId,
+                kind = "workoutRouteEnd",
+                canonicalType = "activity.exercise-route-end",
+            )
+
+            store.upsert(listOf(parent, error))
+            assertTrue(
+                !store.allRecords()
+                    .single { it.canonicalId == error.canonicalId }
+                    .tombstone,
+            )
+            store.upsert(listOf(end))
+            assertTrue(
+                store.allRecords()
+                    .single { it.canonicalId == error.canonicalId }
+                    .tombstone,
+            )
+
+            store.close()
+            context.deleteDatabase(databaseName)
+            store = SqliteCanonicalRecordStore(context, databaseName)
+            val session = store.beginImport()
+            session.append(listOf(parent, error.copy(tombstone = true)))
+            session.commit()
+            assertTrue(
+                !store.allRecords()
+                    .single { it.canonicalId == error.canonicalId }
+                    .tombstone,
+            )
+
+            store.close()
+            context.deleteDatabase(databaseName)
+            store = SqliteCanonicalRecordStore(context, databaseName)
+            store.upsert(listOf(parent, error))
+            store.upsert(
+                listOf(
+                    parent.copy(
+                        kind = "deletion",
+                        recordVersion = 2,
+                        tombstone = true,
+                    ),
+                ),
+            )
+            assertTrue(store.allRecords().all(CanonicalRecord::tombstone))
+        }
+
+    @Test
     fun databaseUpgradeReconcilesAnExistingLiveEncodingError() = runBlocking {
         val parent = record(version = 1, tombstone = false).copy(
             canonicalId = "apple.healthkit:upgrade-parent",
@@ -275,6 +356,80 @@ class SqliteCanonicalRecordStoreTest {
         assertTrue(upgraded.getValue(error.canonicalId).tombstone)
         assertTrue(!upgraded.getValue(parent.canonicalId).tombstone)
     }
+
+    @Test
+    fun databaseUpgradeRestoresContinuationErrorHiddenByOldConsumer() =
+        runBlocking {
+            val sourceId = "00000000-0000-0000-0000-000000000126"
+            val endId = CanonicalRecordParser.seriesEndId(
+                sourceId,
+                "HKWorkoutRouteTypeIdentifier",
+            )
+            val errorId = CanonicalRecordParser.encodingFailureId(
+                sourceId,
+                "HKWorkoutRouteTypeIdentifier",
+            )
+            val parent = record(version = 1, tombstone = false).copy(
+                canonicalId = "apple.healthkit:$sourceId",
+                sourceRecordId = sourceId,
+                kind = "workoutRoute",
+                canonicalType = "activity.exercise-route",
+                type = "HKWorkoutRouteTypeIdentifier",
+                lineage = listOf(
+                    SourceLineage("apple.healthkit", recordId = sourceId),
+                ),
+                rawJson =
+                    """{"endDate":"2026-01-01T00:01:00Z","startDate":"2026-01-01T00:00:00Z"}""",
+            )
+            val error = CanonicalRecordParser.parse(
+                """
+                {"canonicalId":"apple.healthkit:$errorId","canonicalType":"archive.encoding-error","id":"$errorId","kind":"sampleEncodingError","lineage":[{"recordId":"$sourceId","store":"apple.healthkit"}],"message":"continuation failed","parentCanonicalId":"apple.healthkit:$sourceId","recordVersion":3,"resolutionCanonicalId":"apple.healthkit:$endId","schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKWorkoutRouteTypeIdentifier"},"type":"HKWorkoutRouteTypeIdentifier"}
+                """.trimIndent(),
+                strictV1 = true,
+            )!!
+            store.upsert(listOf(parent, error))
+            store.close()
+            context.openOrCreateDatabase(databaseName, 0, null).use { database ->
+                database.execSQL(
+                    """
+                    UPDATE canonical_record
+                    SET resolution_canonical_id = NULL,
+                        record_version = 4,
+                        tombstone = 1,
+                        raw_json = ?
+                    WHERE canonical_id = ?
+                    """.trimIndent(),
+                    arrayOf(
+                        error.rawJson.replace(
+                            "\"kind\":",
+                            "\"deleted\":true,\"kind\":",
+                        ),
+                        error.canonicalId,
+                    ),
+                )
+                database.version = 8
+            }
+
+            store = SqliteCanonicalRecordStore(context, databaseName)
+
+            val restored = store.allRecords()
+                .single { it.canonicalId == error.canonicalId }
+            assertTrue(!restored.tombstone)
+            assertTrue(restored.recordVersion > 4)
+            assertEquals(error.resolutionCanonicalId, restored.resolutionCanonicalId)
+
+            val output = ByteArrayOutputStream()
+            CanonicalArchiveExporter(store).export(output)
+            val roundTrip = InMemoryCanonicalRecordStore()
+            ArchiveImporter(roundTrip).import(
+                ByteArrayInputStream(output.toByteArray()),
+            )
+            assertTrue(
+                !roundTrip.allRecords()
+                    .single { it.canonicalId == error.canonicalId }
+                    .tombstone,
+            )
+        }
 
     private fun record(
         version: Long,

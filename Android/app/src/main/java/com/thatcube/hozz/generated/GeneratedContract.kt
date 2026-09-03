@@ -35,6 +35,8 @@ object GeneratedContract {
     const val TARGET_STORE = "healthConnect"
     const val TARGET_PACKAGE = "com.thatcube.hozz"
 
+    fun canonicalId(store: String, id: String): String = "$store:$id"
+
     val recordMappings: Map<String, RecordMapping> = mapOf(
         "HKQuantityTypeIdentifierStepCount" to RecordMapping(sourceIdentifier = "HKQuantityTypeIdentifierStepCount", canonicalType = "activity.steps", sourceKind = "quantity", targetRecord = "StepsRecord", canonicalUnit = "count", quality = MappingQuality.ARCHIVE_ONLY, warningCode = "cumulative-source-overlap"),
         "HKQuantityTypeIdentifierHeartRate" to RecordMapping(sourceIdentifier = "HKQuantityTypeIdentifierHeartRate", canonicalType = "vitals.heart-rate", sourceKind = "quantity", targetRecord = "HeartRateRecord", canonicalUnit = "count/s", quality = MappingQuality.CONDITIONAL, warningCode = "heart-rate-aggregate"),

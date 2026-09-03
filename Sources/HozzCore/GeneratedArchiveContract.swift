@@ -8,6 +8,11 @@ public enum HozzArchiveContract {
     public static let format = "hozz-ndjson"
     public static let recordSchema = "hozz/v1/canonical-record"
     public static let healthConnectPackage = "com.thatcube.hozz"
+    public static let sourceStore = "apple.healthkit"
+
+    public static func canonicalID(store: String, id: String) -> String {
+        "\(store):\(id)"
+    }
 
     public static let healthConnectMappedTypes: Set<String> = [
         "HKQuantityTypeIdentifierStepCount",

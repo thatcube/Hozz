@@ -68,7 +68,8 @@ final class CanonicalSchemaTests: XCTestCase {
 
         XCTAssertEqual(records.count, 3)
         for record in records {
-            XCTAssertNotNil(record["canonicalId"] as? String)
+            let id = try XCTUnwrap(record["id"] as? String)
+            let canonicalID = try XCTUnwrap(record["canonicalId"] as? String)
             XCTAssertNotNil(record["canonicalType"] as? String)
             XCTAssertEqual(record["recordVersion"] as? Int, 1)
             let sourceRecord = try XCTUnwrap(
@@ -80,6 +81,22 @@ final class CanonicalSchemaTests: XCTestCase {
                 sourceRecord["store"] as? String,
                 "apple.healthkit"
             )
+            XCTAssertEqual(
+                canonicalID,
+                HozzArchiveContract.canonicalID(
+                    store: "apple.healthkit",
+                    id: id
+                )
+            )
+            if let parent = record["parentCanonicalId"] as? String {
+                XCTAssertEqual(
+                    parent,
+                    HozzArchiveContract.canonicalID(
+                        store: "apple.healthkit",
+                        id: try XCTUnwrap(sourceRecord["id"] as? String)
+                    )
+                )
+            }
             XCTAssertFalse(
                 (record["lineage"] as? [[String: Any]] ?? []).isEmpty
             )
@@ -107,6 +124,36 @@ final class CanonicalSchemaTests: XCTestCase {
         )
 
         XCTAssertEqual(result.uuidString.lowercased(), vector["recordId"] as? String)
+    }
+
+    func testSeriesCompletionIdentityMatchesCrossPlatformFixture() throws {
+        let vectors = try object(
+            at: schemaRoot.appending(path: "fixtures/identity-vectors.json")
+        )
+        let vector = try XCTUnwrap(
+            vectors["seriesCompletion"] as? [String: Any]
+        )
+        let sourceID = try XCTUnwrap(
+            UUID(uuidString: try XCTUnwrap(vector["sourceRecordId"] as? String))
+        )
+        let sourceType = try XCTUnwrap(vector["sourceType"] as? String)
+        let shape = SeriesShape(
+            typeIdentifier: sourceType,
+            headerKind: "workoutRoute",
+            elementKind: "workoutRouteLocations",
+            endKind: "workoutRouteEnd",
+            elementsKey: "locations",
+            elementsPerRecord: 500,
+            recordsPerPage: 8
+        )
+
+        XCTAssertEqual(
+            SeriesEncoding.completionCanonicalID(
+                shape: shape,
+                sample: sourceID
+            ),
+            vector["canonicalId"] as? String
+        )
     }
 
     private func object(at url: URL) throws -> [String: Any] {

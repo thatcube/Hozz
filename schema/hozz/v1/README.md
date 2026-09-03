@@ -19,6 +19,13 @@ rejected rather than silently fabricating missing provenance. Run-level
 manifest, resume, coverage, error, and completion records keep their own
 kind-specific shape and are preserved verbatim.
 
+Identity is bound, not advisory. For every canonical health record,
+`canonicalId` is exactly `sourceRecord.store + ":" + id`. Parented series
+records and encoding errors use `sourceRecord.store + ":" + sourceRecord.id`
+as `parentCanonicalId`. A continuation error may additionally name the
+deterministic end marker in `resolutionCanonicalId`; the header alone does not
+resolve that error.
+
 `health-connect-mappings.json` is the source of truth for HealthKit-to-Health
 Connect projection. Generated Swift and Kotlin constants must be refreshed with:
 

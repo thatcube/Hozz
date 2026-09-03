@@ -48,10 +48,21 @@ PARENTED_SERIES_KINDS = {
     "workoutRouteEnd",
     "workoutRouteLocations",
 }
+SYNTHETIC_IDENTITY_KINDS = PARENTED_SERIES_KINDS | {
+    "sampleEncodingError",
+    "clinicalRecord",
+}
+SERIES_END_KINDS = {
+    "electrocardiogramEnd",
+    "quantitySeriesEnd",
+    "workoutRouteEnd",
+}
 MAX_ZIP_ENTRIES = 1_024
 MAX_INFLATED_BYTES = 64 * 1_024 * 1_024 * 1_024
 MAX_RECORD_LINES = 50_000_000
 MAX_RECORD_BYTES = 16 * 1_024 * 1_024
+MAX_PENDING_BATCH_BYTES = 64 * 1_024 * 1_024
+MAX_RUN_OCCURRENCE_KEYS = 100_000
 MAX_MANIFEST_BYTES = 256 * 1_024
 MAX_ENTRY_COMPRESSION_RATIO = 200
 MAX_GLOBAL_COMPRESSION_RATIO = 100
@@ -61,12 +72,14 @@ RFC3339 = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
+SOURCE_NAMESPACE = re.compile(r"^[A-Za-z0-9._-]+$")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples (
     canonical_id TEXT PRIMARY KEY,
     source_id    TEXT NOT NULL,
     parent_canonical_id TEXT,
+    resolution_canonical_id TEXT,
     record_version INTEGER NOT NULL,
     tombstone    INTEGER NOT NULL DEFAULT 0,
     type        TEXT NOT NULL,
@@ -126,6 +139,7 @@ def connect(path):
             db.execute("DROP TABLE samples_legacy")
         else:
             create_schema(db)
+            ensure_current_columns(db)
         db.commit()
         return db
     except Exception:
@@ -138,6 +152,19 @@ def create_schema(db):
     for statement in SCHEMA.split(";"):
         if statement.strip():
             db.execute(statement)
+
+
+def ensure_current_columns(db):
+    columns = {
+        row[1] for row in db.execute("PRAGMA table_info(samples)")
+    }
+    if "resolution_canonical_id" not in columns:
+        db.execute(
+            "ALTER TABLE samples ADD COLUMN resolution_canonical_id TEXT"
+        )
+    restore_continuation_errors(db)
+    reconcile_parent_tombstones(db)
+    reconcile_encoding_errors(db)
 
 
 def migrate_legacy_rows(db):
@@ -157,7 +184,7 @@ def migrate_legacy_rows(db):
             record = {}
         if not isinstance(record, dict):
             record = {}
-        identity = record_identity(record)
+        identity = record_identity(record, validate_binding=False)
         if identity is None:
             canonical_id = legacy_canonical_id(source_id, raw)
             migrated_source_id = source_id
@@ -178,15 +205,17 @@ def migrate_legacy_rows(db):
         db.execute(
             """
             INSERT OR IGNORE INTO samples
-                (canonical_id, source_id, parent_canonical_id, record_version,
+                (canonical_id, source_id, parent_canonical_id,
+                 resolution_canonical_id, record_version,
                  tombstone, type, kind, start_date, end_date, value, unit,
                  source, raw)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 canonical_id,
                 migrated_source_id,
                 parent_id,
+                nonempty_text(record.get("resolutionCanonicalId")),
                 version,
                 1 if tombstone else 0,
                 record.get("type") or record_type,
@@ -199,6 +228,7 @@ def migrate_legacy_rows(db):
                 raw,
             ),
         )
+    restore_continuation_errors(db)
     reconcile_parent_tombstones(db)
     reconcile_encoding_errors(db)
 
@@ -253,7 +283,87 @@ def encoding_failure_id(source_id, type_identifier):
     return str(uuid.UUID(bytes=bytes(digest)))
 
 
-def record_identity(record):
+def validate_synthetic_identity(
+    record,
+    kind,
+    top_level_id,
+    source_id,
+    type_identifier,
+):
+    if kind not in SYNTHETIC_IDENTITY_KINDS:
+        return
+    try:
+        canonical_source_id = str(uuid.UUID(source_id))
+    except (ValueError, AttributeError) as error:
+        raise PartialBatch(
+            "synthetic identity requires a UUID source id"
+        ) from error
+    if source_id != canonical_source_id:
+        raise PartialBatch(
+            "synthetic identity requires canonical lowercase UUID text"
+        )
+    if kind == "sampleEncodingError":
+        expected = encoding_failure_id(source_id, type_identifier)
+    elif kind in SERIES_END_KINDS:
+        expected = series_end_id(source_id, type_identifier)
+    elif kind in {
+        "electrocardiogramVoltages",
+        "quantitySeriesReadings",
+        "workoutRouteLocations",
+    }:
+        sequence = record.get("sequence")
+        if (
+            isinstance(sequence, bool)
+            or not isinstance(sequence, int)
+            or sequence < 0
+        ):
+            raise PartialBatch("series page has an invalid sequence")
+        key = {
+            "electrocardiogramVoltages": "voltages",
+            "quantitySeriesReadings": "readings",
+            "workoutRouteLocations": "locations",
+        }[kind]
+        expected = series_record_id(
+            source_id,
+            type_identifier,
+            f"{key}-{sequence}",
+        )
+    elif kind == "clinicalRecord":
+        expected = clinical_record_id(record, source_id)
+    else:
+        return
+    if top_level_id != expected:
+        raise PartialBatch(
+            "synthetic record id does not match its deterministic derivation"
+        )
+
+
+def clinical_record_id(record, source_id):
+    if record.get("identityIsStable") is not True:
+        return source_id
+    source = record.get("source")
+    fhir = record.get("fhir")
+    if not isinstance(source, dict) or not isinstance(fhir, dict):
+        raise PartialBatch("stable clinical identity is missing source or FHIR facts")
+    source_bundle = require_text(source, "bundleIdentifier", "clinical record")
+    resource_type = require_text(fhir, "resourceType", "clinical record")
+    identifier = require_text(fhir, "identifier", "clinical record")
+    digest = bytearray(
+        hashlib.sha256(
+            b"HKClinicalRecord"
+            + source_bundle.encode()
+            + b"\0"
+            + resource_type.encode()
+            + b"\0"
+            + identifier.encode()
+        ).digest()[:16]
+    )
+    digest[6] = (digest[6] & 0x0F) | 0x50
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
+
+
+def record_identity(record, validate_binding=True):
     kind = record.get("kind")
     source_record = record.get("sourceRecord")
     if not isinstance(source_record, dict):
@@ -269,6 +379,23 @@ def record_identity(record):
     if not source_id:
         return None
     source_store = nonempty_text(source_record.get("store")) or SOURCE_STORE
+    if validate_binding and SOURCE_NAMESPACE.fullmatch(source_store) is None:
+        raise PartialBatch("sourceRecord.store is not a valid namespace")
+    top_level_id = nonempty_text(record.get("id"))
+    if (
+        validate_binding
+        and kind in SYNTHETIC_IDENTITY_KINDS
+        and top_level_id is None
+    ):
+        raise PartialBatch("synthetic canonical record has no top-level id")
+    if validate_binding and top_level_id is not None:
+        validate_synthetic_identity(
+            record,
+            kind,
+            top_level_id,
+            source_id,
+            nonempty_text(record.get("type")) or "",
+        )
     canonical_id = nonempty_text(record.get("canonicalId"))
     if not canonical_id:
         record_id = nonempty_text(record.get("id")) or source_id
@@ -278,13 +405,63 @@ def record_identity(record):
                 nonempty_text(record.get("type")) or "",
             )
         canonical_id = f"{source_store}:{record_id}"
+    elif validate_binding:
+        top_level_id = nonempty_text(record.get("id"))
+        if top_level_id is None:
+            raise PartialBatch("a canonical record has no top-level id")
+        expected = canonical_id_for(source_store, top_level_id)
+        if canonical_id != expected:
+            raise PartialBatch(
+                f"canonicalId {canonical_id} does not match {expected}"
+            )
     parent_id = nonempty_text(record.get("parentCanonicalId"))
+    if (
+        validate_binding
+        and kind not in SYNTHETIC_IDENTITY_KINDS
+        and top_level_id is not None
+        and top_level_id != source_id
+    ):
+        raise PartialBatch("top-level id does not match sourceRecord.id")
     if not parent_id and kind == "sampleEncodingError":
         parent_id = f"{source_store}:{source_id}"
     if not parent_id and kind in PARENTED_SERIES_KINDS:
-        sample_id = nonempty_text(record.get("sample"))
-        if sample_id:
-            parent_id = f"{source_store}:{sample_id}"
+        parent_id = canonical_id_for(source_store, source_id)
+    sample_id = nonempty_text(record.get("sample"))
+    if (
+        validate_binding
+        and kind in PARENTED_SERIES_KINDS
+        and sample_id is not None
+        and sample_id != source_id
+    ):
+        raise PartialBatch("sample does not match sourceRecord.id")
+    if (
+        validate_binding
+        and kind in PARENTED_SERIES_KINDS
+        and not series_kind_matches_type(
+            kind,
+            nonempty_text(record.get("type")) or "",
+        )
+    ):
+        raise PartialBatch("series kind does not match source type")
+    if (
+        validate_binding
+        and parent_id is not None
+        and (kind in PARENTED_SERIES_KINDS or kind == "sampleEncodingError")
+        and parent_id != canonical_id_for(source_store, source_id)
+    ):
+        raise PartialBatch("parentCanonicalId does not match source record")
+    resolution_id = nonempty_text(record.get("resolutionCanonicalId"))
+    if (
+        validate_binding
+        and resolution_id is not None
+        and resolution_id != canonical_id_for(
+            source_store,
+            series_end_id(source_id, nonempty_text(record.get("type")) or ""),
+        )
+    ):
+        raise PartialBatch(
+            "resolutionCanonicalId is not the deterministic series end marker"
+        )
     version = record.get("recordVersion")
     if not isinstance(version, int) or isinstance(version, bool):
         if kind == "deletion" or record.get("deleted") is True:
@@ -312,6 +489,43 @@ def epoch_milliseconds(value):
     return int(parsed.timestamp() * 1_000)
 
 
+def series_end_id(source_id, type_identifier):
+    return series_record_id(source_id, type_identifier, "end")
+
+
+def series_record_id(source_id, type_identifier, suffix):
+    try:
+        source_bytes = uuid.UUID(source_id).bytes
+    except (ValueError, AttributeError) as error:
+        raise PartialBatch(
+            "a series completion identity requires a UUID source id"
+        ) from error
+    digest = bytearray(
+        hashlib.sha256(
+            type_identifier.encode() + source_bytes + suffix.encode()
+        ).digest()[:16]
+    )
+    digest[6] = (digest[6] & 0x0F) | 0x50
+    digest[8] = (digest[8] & 0x3F) | 0x80
+    return str(uuid.UUID(bytes=bytes(digest)))
+
+
+def series_end_kind(type_identifier):
+    if type_identifier == "HKWorkoutRouteTypeIdentifier":
+        return "workoutRouteEnd"
+    if type_identifier == "HKDataTypeIdentifierElectrocardiogram":
+        return "electrocardiogramEnd"
+    return "quantitySeriesEnd"
+
+
+def series_kind_matches_type(kind, type_identifier):
+    if type_identifier == "HKWorkoutRouteTypeIdentifier":
+        return kind in {"workoutRouteEnd", "workoutRouteLocations"}
+    if type_identifier == "HKDataTypeIdentifierElectrocardiogram":
+        return kind in {"electrocardiogramEnd", "electrocardiogramVoltages"}
+    return kind in {"quantitySeriesEnd", "quantitySeriesReadings"}
+
+
 def validate_strict_v1(record, line_number):
     prefix = f"line {line_number}"
     kind = require_text(record, "kind", prefix)
@@ -332,9 +546,11 @@ def validate_strict_v1(record, line_number):
     ):
         raise PartialBatch(f"{prefix} has an invalid recordVersion")
     source_type = require_text(record, "type", prefix)
-    for field in ("id", "parentCanonicalId"):
-        if field in record:
-            require_text(record, field, prefix)
+    top_level_id = require_text(record, "id", prefix)
+    if "parentCanonicalId" in record:
+        require_text(record, "parentCanonicalId", prefix)
+    if "resolutionCanonicalId" in record:
+        require_text(record, "resolutionCanonicalId", prefix)
     if "deleted" in record and not isinstance(record["deleted"], bool):
         raise PartialBatch(f"{prefix} has an invalid deleted value")
     for field in ("source", "device", "metadata"):
@@ -344,9 +560,28 @@ def validate_strict_v1(record, line_number):
     if not isinstance(source_record, dict):
         raise PartialBatch(f"{prefix} has no sourceRecord")
     source_store = require_text(source_record, "store", prefix)
+    if SOURCE_NAMESPACE.fullmatch(source_store) is None:
+        raise PartialBatch(f"{prefix} has an invalid source namespace")
     source_id = require_text(source_record, "id", prefix)
+    validate_synthetic_identity(
+        record,
+        kind,
+        top_level_id,
+        source_id,
+        source_type,
+    )
+    expected_canonical_id = canonical_id_for(source_store, top_level_id)
+    if canonical_id != expected_canonical_id:
+        raise PartialBatch(
+            f"{prefix} canonicalId does not match {expected_canonical_id}"
+        )
     if require_text(source_record, "type", prefix) != source_type:
         raise PartialBatch(f"{prefix} sourceRecord.type disagrees with type")
+    if (
+        kind not in SYNTHETIC_IDENTITY_KINDS
+        and top_level_id != source_id
+    ):
+        raise PartialBatch(f"{prefix} id disagrees with sourceRecord.id")
     source_version = source_record.get("version")
     if source_version is not None and (
         isinstance(source_version, bool)
@@ -360,7 +595,9 @@ def validate_strict_v1(record, line_number):
     for item in lineage:
         if not isinstance(item, dict):
             raise PartialBatch(f"{prefix} has a non-object lineage entry")
-        require_text(item, "store", prefix)
+        lineage_store = require_text(item, "store", prefix)
+        if SOURCE_NAMESPACE.fullmatch(lineage_store) is None:
+            raise PartialBatch(f"{prefix} has an invalid lineage namespace")
         for field in ("package", "recordId"):
             if field in item:
                 require_text(item, field, prefix)
@@ -372,6 +609,30 @@ def validate_strict_v1(record, line_number):
     ):
         raise PartialBatch(
             f"{prefix} lineage omits source record {canonical_id}"
+        )
+    if kind in PARENTED_SERIES_KINDS or kind == "sampleEncodingError":
+        expected_parent = canonical_id_for(source_store, source_id)
+        if record.get("parentCanonicalId") != expected_parent:
+            raise PartialBatch(f"{prefix} has an invalid parentCanonicalId")
+    sample_id = record.get("sample")
+    if (
+        kind in PARENTED_SERIES_KINDS
+        and sample_id is not None
+        and sample_id != source_id
+    ):
+        raise PartialBatch(f"{prefix} sample disagrees with sourceRecord.id")
+    if (
+        kind in PARENTED_SERIES_KINDS
+        and not series_kind_matches_type(kind, source_type)
+    ):
+        raise PartialBatch(f"{prefix} series kind disagrees with source type")
+    resolution = record.get("resolutionCanonicalId")
+    if resolution is not None and resolution != canonical_id_for(
+        source_store,
+        series_end_id(source_id, source_type),
+    ):
+        raise PartialBatch(
+            f"{prefix} has an invalid series completion identity"
         )
     validate_kind_fields(record, kind, prefix)
 
@@ -485,6 +746,10 @@ def require_text(record, field, prefix):
     return value
 
 
+def canonical_id_for(store, record_id):
+    return f"{store}:{record_id}"
+
+
 def require_integer(record, field, prefix):
     value = record.get(field)
     if isinstance(value, bool) or not isinstance(value, int):
@@ -576,7 +841,26 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
             fingerprint = hashlib.sha256(
                 f"{scope}\0{stored_line}".encode()
             ).hexdigest()
-            occurrence = occurrences.get(fingerprint, 0)
+            if (
+                fingerprint not in occurrences
+                and len(occurrences) >= MAX_RUN_OCCURRENCE_KEYS
+            ):
+                raise PartialBatch(
+                    "run contains too many distinct record forms"
+                )
+            if fingerprint not in occurrences:
+                first_occurrence = 0
+                if batch_key:
+                    first_occurrence = db.execute(
+                        """
+                        SELECT COALESCE(MAX(occurrence) + 1, 0)
+                        FROM archive_run_records
+                        WHERE fingerprint = ?
+                        """,
+                        (fingerprint,),
+                    ).fetchone()[0]
+                occurrences[fingerprint] = first_occurrence
+            occurrence = occurrences[fingerprint]
             occurrences[fingerprint] = occurrence + 1
             db.execute(
                 """
@@ -597,6 +881,7 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
             continue
         canonical_count += 1
         canonical_id, source_id, parent_id, version = identity
+        resolution_id = nonempty_text(record.get("resolutionCanonicalId"))
         tombstone = kind == "deletion" or record.get("deleted") is True
         if parent_id:
             parent = db.execute(
@@ -613,13 +898,15 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
         cursor = db.execute(
             """
             INSERT INTO samples
-                (canonical_id, source_id, parent_canonical_id, record_version,
+                (canonical_id, source_id, parent_canonical_id,
+                 resolution_canonical_id, record_version,
                  tombstone, type, kind, start_date, end_date, value, unit,
                  source, raw)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(canonical_id) DO UPDATE SET
                 source_id = excluded.source_id,
                 parent_canonical_id = excluded.parent_canonical_id,
+                resolution_canonical_id = excluded.resolution_canonical_id,
                 record_version = excluded.record_version,
                 tombstone = excluded.tombstone,
                 type = excluded.type,
@@ -636,6 +923,7 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
                 canonical_id,
                 source_id,
                 parent_id,
+                resolution_id,
                 version,
                 1 if tombstone else 0,
                 record.get("type", ""),
@@ -674,6 +962,7 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
                         record_version = MAX(record_version, ? + 1)
                     WHERE parent_canonical_id = ?
                       AND kind = 'sampleEncodingError'
+                      AND resolution_canonical_id IS NULL
                     """,
                     (winner[0] if winner else version, canonical_id),
                 )
@@ -683,6 +972,7 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
             "INSERT OR IGNORE INTO batches VALUES (?, ?, ?)",
             (batch_key, time.time(), stored),
         )
+    restore_unresolved_continuation_errors(db)
     reconcile_encoding_errors(db)
     return stored, deleted, False, canonical_count
 
@@ -697,7 +987,10 @@ def reconcile_encoding_errors(db):
                 (
                     SELECT parent.record_version + 1
                     FROM samples AS parent
-                    WHERE parent.canonical_id = child.parent_canonical_id
+                    WHERE parent.canonical_id = COALESCE(
+                        child.resolution_canonical_id,
+                        child.parent_canonical_id
+                    )
                 )
             )
         WHERE child.kind = 'sampleEncodingError'
@@ -705,12 +998,150 @@ def reconcile_encoding_errors(db):
           AND EXISTS (
               SELECT 1
               FROM samples AS parent
-              WHERE parent.canonical_id = child.parent_canonical_id
+              WHERE parent.canonical_id = COALESCE(
+                  child.resolution_canonical_id,
+                  child.parent_canonical_id
+              )
                 AND parent.kind != 'sampleEncodingError'
                 AND parent.tombstone = 0
+                AND (
+                    child.resolution_canonical_id IS NULL
+                    OR (
+                        parent.kind IN (
+                            CASE
+                                WHEN child.type = 'HKWorkoutRouteTypeIdentifier'
+                                    THEN 'workoutRouteEnd'
+                                WHEN child.type = 'HKDataTypeIdentifierElectrocardiogram'
+                                    THEN 'electrocardiogramEnd'
+                                ELSE 'quantitySeriesEnd'
+                            END
+                        )
+                        AND parent.type = child.type
+                        AND parent.parent_canonical_id =
+                            child.parent_canonical_id
+                    )
+                )
           )
         """
     )
+
+
+def restore_unresolved_continuation_errors(db):
+    db.execute(
+        """
+        UPDATE samples AS child
+        SET tombstone = 0,
+            record_version = child.record_version + 1
+        WHERE child.kind = 'sampleEncodingError'
+          AND child.resolution_canonical_id IS NOT NULL
+          AND child.tombstone = 1
+          AND NOT EXISTS (
+              SELECT 1
+              FROM samples AS parent
+              WHERE parent.canonical_id = child.parent_canonical_id
+                AND parent.tombstone = 1
+          )
+          AND NOT EXISTS (
+              SELECT 1
+              FROM samples AS resolver
+              WHERE resolver.canonical_id =
+                        child.resolution_canonical_id
+                AND resolver.type = child.type
+                AND resolver.parent_canonical_id =
+                        child.parent_canonical_id
+                AND resolver.tombstone = 0
+                AND resolver.kind = CASE
+                    WHEN child.type = 'HKWorkoutRouteTypeIdentifier'
+                        THEN 'workoutRouteEnd'
+                    WHEN child.type = 'HKDataTypeIdentifierElectrocardiogram'
+                        THEN 'electrocardiogramEnd'
+                    ELSE 'quantitySeriesEnd'
+                END
+          )
+        """
+    )
+
+
+def restore_continuation_errors(db):
+    rows = db.execute(
+        """
+        SELECT canonical_id, parent_canonical_id, raw, record_version,
+               resolution_canonical_id, tombstone
+        FROM samples
+        WHERE kind = 'sampleEncodingError'
+        """
+    )
+    for (
+        canonical_id,
+        parent_id,
+        raw,
+        stored_version,
+        stored_resolution_id,
+        stored_tombstone,
+    ) in rows:
+        try:
+            record = parse_json(raw)
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        try:
+            record_identity(record)
+        except PartialBatch:
+            continue
+        resolution_id = nonempty_text(record.get("resolutionCanonicalId"))
+        if resolution_id is None:
+            continue
+        if stored_resolution_id is None:
+            db.execute(
+                """
+                UPDATE samples
+                SET resolution_canonical_id = ?
+                WHERE canonical_id = ?
+                """,
+                (resolution_id, canonical_id),
+            )
+        parent = db.execute(
+            "SELECT tombstone FROM samples WHERE canonical_id = ?",
+            (parent_id,),
+        ).fetchone()
+        resolver = db.execute(
+            """
+            SELECT kind, parent_canonical_id, tombstone, type
+            FROM samples
+            WHERE canonical_id = ?
+            """,
+            (resolution_id,),
+        ).fetchone()
+        has_valid_end = (
+            resolver is not None
+            and resolver[0] == series_end_kind(
+                nonempty_text(record.get("type")) or ""
+            )
+            and resolver[1] == parent_id
+            and resolver[2] == 0
+            and resolver[3] == record.get("type")
+        )
+        if (
+            stored_tombstone
+            and (parent is None or parent[0] == 0)
+            and not has_valid_end
+        ):
+            version = record.get("recordVersion")
+            if (
+                isinstance(version, bool)
+                or not isinstance(version, int)
+                or version < 3
+            ):
+                version = 3
+            db.execute(
+                """
+                UPDATE samples
+                SET record_version = ?, tombstone = 0
+                WHERE canonical_id = ?
+                """,
+                (max(stored_version + 1, version), canonical_id),
+            )
 
 
 def reconcile_parent_tombstones(db):
@@ -749,6 +1180,8 @@ def normalize_legacy_run_line(record):
 
 def ingest_payload(db, payload, batch_key=None):
     """Handle NDJSON, a JSON array, or the compatible envelope."""
+    if len(payload) > MAX_PENDING_BATCH_BYTES:
+        raise PartialBatch("payload exceeds the pending import memory budget")
     try:
         text = payload.decode("utf-8").strip()
     except UnicodeDecodeError as error:
@@ -774,6 +1207,16 @@ def ingest_payload(db, payload, batch_key=None):
             pass
 
     return ingest_lines(db, text.splitlines(), batch_key)
+
+
+def parse_content_length(value):
+    try:
+        length = int(value)
+    except (TypeError, ValueError) as error:
+        raise PartialBatch("Content-Length is not a nonnegative integer") from error
+    if length < 0:
+        raise PartialBatch("Content-Length is not a nonnegative integer")
+    return length
 
 
 def ingest_compatible(db, envelope, batch_key=None):
@@ -842,7 +1285,17 @@ def serve(args):
                 if supplied != args.token:
                     return self.finish_with(401, {"error": "unauthorized"})
 
-            length = int(self.headers.get("Content-Length", 0))
+            try:
+                length = parse_content_length(
+                    self.headers.get("Content-Length", 0)
+                )
+            except PartialBatch as error:
+                return self.finish_with(400, {"error": str(error)})
+            if length > MAX_PENDING_BATCH_BYTES:
+                return self.finish_with(
+                    413,
+                    {"error": "payload exceeds the pending import memory budget"},
+                )
             payload = self.rfile.read(length)
             key = self.headers.get("Idempotency-Key")
 
@@ -918,6 +1371,7 @@ def watch(args):
 
 def ingest_file(db, path):
     """A ZIP from a full export, or a plain batch file."""
+    file_batch_key = f"file:{path.name}"
     if path.suffix == ".zip":
         try:
             stored = deleted = canonical_count = line_count = 0
@@ -994,9 +1448,10 @@ def ingest_file(db, path):
                                         )
                                 yield line
 
-                    added, removed, _, read = _ingest_lines(
+                    added, removed, duplicate, read = _ingest_lines(
                         db,
                         lines(),
+                        batch_key=file_batch_key,
                         strict_v1=manifest is not None,
                     )
                     stored += added
@@ -1005,6 +1460,7 @@ def ingest_file(db, path):
                 if (
                     manifest is not None
                     and manifest.get("recordCount") is not None
+                    and not duplicate
                     and canonical_count != manifest["recordCount"]
                 ):
                     raise PartialBatch(
@@ -1016,10 +1472,47 @@ def ingest_file(db, path):
             db.rollback()
             raise
 
-    if path.stat().st_size > MAX_INFLATED_BYTES:
+    file_size = path.stat().st_size
+    if file_size > MAX_INFLATED_BYTES:
         raise PartialBatch("file exceeds the import byte limit")
-    stored, deleted, _ = ingest_payload(db, path.read_bytes())
-    return stored, deleted
+    if file_size <= MAX_PENDING_BATCH_BYTES:
+        stored, deleted, _ = ingest_payload(
+            db,
+            path.read_bytes(),
+            batch_key=file_batch_key,
+        )
+        return stored, deleted
+    try:
+        line_count = 0
+
+        def lines():
+            nonlocal line_count
+            with path.open("rb") as stream:
+                while True:
+                    raw = stream.readline(MAX_RECORD_BYTES + 2)
+                    if not raw:
+                        return
+                    if len(raw.rstrip(b"\r\n")) > MAX_RECORD_BYTES:
+                        raise PartialBatch(
+                            "record exceeds the byte limit"
+                        )
+                    line = decode_utf8(raw, "record")
+                    if line.strip():
+                        line_count += 1
+                        if line_count > MAX_RECORD_LINES:
+                            raise PartialBatch("file contains too many records")
+                    yield line
+
+        stored, deleted, _, _ = _ingest_lines(
+            db,
+            lines(),
+            batch_key=file_batch_key,
+        )
+        db.commit()
+        return stored, deleted
+    except Exception:
+        db.rollback()
+        raise
 
 
 def decode_utf8(payload, field):

@@ -251,7 +251,12 @@ public actor QuantitySeriesExpander {
                         canonicalPayload: try encoder.encodeEncodingFailure(
                             id: sampleID,
                             typeIdentifier: type.rawValue,
-                            message: message
+                            message: message,
+                            resolutionCanonicalID:
+                                SeriesEncoding.completionCanonicalID(
+                                    shape: shape,
+                                    sample: sampleID
+                                )
                         )
                     )
                 )

@@ -192,7 +192,12 @@ public actor SeriesReader<Backend: SeriesBackend> {
                                 canonicalPayload: try encoder.encodeEncodingFailure(
                                     id: sampleID,
                                     typeIdentifier: shape.typeIdentifier,
-                                    message: "The sample changed in Health while it was being read."
+                                    message: "The sample changed in Health while it was being read.",
+                                    resolutionCanonicalID:
+                                        SeriesEncoding.completionCanonicalID(
+                                            shape: shape,
+                                            sample: sampleID
+                                        )
                                 )
                             )
                         )

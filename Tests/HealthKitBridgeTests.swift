@@ -359,4 +359,48 @@ final class HealthKitBridgeTests: XCTestCase {
             success["canonicalId"] as? String
         )
     }
+
+    func testContinuationFailureNamesItsExplicitEndMarker() throws {
+        let sampleID = UUID()
+        let shape = SeriesShape(
+            typeIdentifier: "HKWorkoutRouteTypeIdentifier",
+            headerKind: "workoutRoute",
+            elementKind: "workoutRouteLocations",
+            endKind: "workoutRouteEnd",
+            elementsKey: "locations",
+            elementsPerRecord: 500,
+            recordsPerPage: 8
+        )
+        let resolution = SeriesEncoding.completionCanonicalID(
+            shape: shape,
+            sample: sampleID
+        )
+        let data = try HealthSampleEncoder().encodeEncodingFailure(
+            id: sampleID,
+            typeIdentifier: shape.typeIdentifier,
+            message: "continuation failed",
+            resolutionCanonicalID: resolution
+        )
+        let object = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: data) as? [String: Any]
+        )
+        let recordID = try XCTUnwrap(object["id"] as? String)
+
+        XCTAssertEqual(
+            object["canonicalId"] as? String,
+            HozzArchiveContract.canonicalID(
+                store: "apple.healthkit",
+                id: recordID
+            )
+        )
+        XCTAssertEqual(
+            object["parentCanonicalId"] as? String,
+            HozzArchiveContract.canonicalID(
+                store: "apple.healthkit",
+                id: sampleID.uuidString.lowercased()
+            )
+        )
+        XCTAssertEqual(object["resolutionCanonicalId"] as? String, resolution)
+        XCTAssertEqual(object["recordVersion"] as? Int, 3)
+    }
 }

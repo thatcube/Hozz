@@ -320,7 +320,8 @@ public struct HealthSampleEncoder: Sendable {
     public func encodeEncodingFailure(
         id sourceRecordID: UUID,
         typeIdentifier: String,
-        message: String
+        message: String,
+        resolutionCanonicalID: String? = nil
     ) throws -> Data {
         let failureID = Self.encodingFailureID(
             sourceRecordID: sourceRecordID,
@@ -328,11 +329,11 @@ public struct HealthSampleEncoder: Sendable {
         )
         let recordID = failureID.uuidString.lowercased()
         let sourceID = sourceRecordID.uuidString.lowercased()
-        let object: [String: Any] = [
+        var object: [String: Any] = [
             "kind": "sampleEncodingError",
             "id": recordID,
             "canonicalId": HozzHealthArchiveContract.canonicalID(for: recordID),
-            "recordVersion": 1,
+            "recordVersion": resolutionCanonicalID == nil ? 1 : 3,
             "type": typeIdentifier,
             "canonicalType": HozzHealthArchiveContract.canonicalType(
                 for: typeIdentifier,
@@ -355,6 +356,9 @@ public struct HealthSampleEncoder: Sendable {
                 for: sourceID
             )
         ]
+        if let resolutionCanonicalID {
+            object["resolutionCanonicalId"] = resolutionCanonicalID
+        }
         return try JSONSerialization.data(
             withJSONObject: object,
             options: [.sortedKeys, .withoutEscapingSlashes]

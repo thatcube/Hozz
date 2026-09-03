@@ -870,6 +870,16 @@ final class QuantitySeriesTests: XCTestCase {
             object["parentCanonicalId"] as? String,
             "apple.healthkit:\(sample.uuidString.lowercased())"
         )
+        XCTAssertEqual(object["recordVersion"] as? Int, 3)
+        XCTAssertEqual(
+            object["resolutionCanonicalId"] as? String,
+            SeriesEncoding.completionCanonicalID(
+                shape: QuantitySeriesEncoding.shape(
+                    for: heartRate.rawValue
+                ),
+                sample: sample
+            )
+        )
     }
 
     func testASampleThatShrankUnderTheCursorIsNotWrittenUnderStaleOffsets() async throws {

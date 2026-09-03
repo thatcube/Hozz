@@ -4,5 +4,12 @@
     "sourceType": "HKQuantityTypeIdentifierStepCount",
     "recordId": "313e9ebd-ce39-5783-9bee-35d7cc5ebde7",
     "canonicalId": "apple.healthkit:313e9ebd-ce39-5783-9bee-35d7cc5ebde7"
+  },
+  "seriesCompletion": {
+    "sourceRecordId": "00000000-0000-0000-0000-000000000123",
+    "sourceType": "HKWorkoutRouteTypeIdentifier",
+    "recordId": "8b48bb73-3ae6-5737-b75c-d6d5c13bb2cd",
+    "canonicalId": "apple.healthkit:8b48bb73-3ae6-5737-b75c-d6d5c13bb2cd",
+    "kind": "workoutRouteEnd"
   }
 }

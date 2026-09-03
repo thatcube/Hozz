@@ -4,6 +4,7 @@ import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import com.thatcube.hozz.generated.GeneratedContract
 import com.thatcube.hozz.projection.ProjectionPlanner
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -148,17 +149,23 @@ class ArchiveImporterTest {
     fun newerTombstoneReplacesRecordAndReplayIsIdempotent() = runBlocking {
         val store = InMemoryCanonicalRecordStore()
         val importer = ArchiveImporter(store)
+        val sourceId = "00000000-0000-0000-0000-000000000201"
+        val childId = CanonicalRecordParser.seriesRecordId(
+            sourceId,
+            "HKQuantityTypeIdentifierStepCount",
+            "readings-0",
+        )
         val live =
             """
-            {"canonicalId":"apple.healthkit:record-1","endDate":"2026-01-01T00:01:00Z","id":"record-1","kind":"quantity","quantity":{"unit":"count","value":1},"recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"record-1","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            {"canonicalId":"apple.healthkit:$sourceId","endDate":"2026-01-01T00:01:00Z","id":"$sourceId","kind":"quantity","quantity":{"unit":"count","value":1},"recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
             """.trimIndent()
         val tombstone =
             """
-            {"canonicalId":"apple.healthkit:record-1","id":"record-1","kind":"deletion","recordVersion":2,"schemaVersion":1,"sourceRecord":{"id":"record-1","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
+            {"canonicalId":"apple.healthkit:$sourceId","id":"$sourceId","kind":"deletion","recordVersion":2,"schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
             """.trimIndent()
         val child =
             """
-            {"canonicalId":"apple.healthkit:record-1:detail","canonicalType":"series.readings","endDate":"2026-01-01T00:01:00Z","id":"record-1-detail","kind":"quantitySeriesReadings","parentCanonicalId":"apple.healthkit:record-1","recordVersion":1,"sample":"record-1","schemaVersion":1,"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            {"canonicalId":"apple.healthkit:$childId","canonicalType":"series.readings","endDate":"2026-01-01T00:01:00Z","id":"$childId","kind":"quantitySeriesReadings","parentCanonicalId":"apple.healthkit:$sourceId","recordVersion":1,"sample":"$sourceId","schemaVersion":1,"sequence":0,"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
             """.trimIndent()
 
         importer.import(
@@ -179,19 +186,25 @@ class ArchiveImporterTest {
     @Test
     fun staleParentTombstoneCannotDeleteNewerChildren() = runBlocking {
         val store = InMemoryCanonicalRecordStore()
+        val sourceId = "00000000-0000-0000-0000-000000000202"
+        val childId = CanonicalRecordParser.seriesRecordId(
+            sourceId,
+            "HKQuantityTypeIdentifierStepCount",
+            "readings-0",
+        )
         val liveParent = CanonicalRecordParser.parse(
             """
-            {"canonicalId":"apple.healthkit:parent","canonicalType":"activity.steps","endDate":"2026-01-01T00:01:00Z","id":"parent","kind":"quantity","quantity":{"unit":"count","value":1},"recordVersion":3,"schemaVersion":1,"sourceRecord":{"id":"parent","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            {"canonicalId":"apple.healthkit:$sourceId","canonicalType":"activity.steps","endDate":"2026-01-01T00:01:00Z","id":"$sourceId","kind":"quantity","quantity":{"unit":"count","value":1},"recordVersion":3,"schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
             """.trimIndent(),
         )!!
         val child = CanonicalRecordParser.parse(
             """
-            {"canonicalId":"apple.healthkit:child","canonicalType":"series.readings","endDate":"2026-01-01T00:01:00Z","id":"child","kind":"quantitySeriesReadings","parentCanonicalId":"apple.healthkit:parent","recordVersion":3,"sample":"parent","schemaVersion":1,"sourceRecord":{"id":"parent","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            {"canonicalId":"apple.healthkit:$childId","canonicalType":"series.readings","endDate":"2026-01-01T00:01:00Z","id":"$childId","kind":"quantitySeriesReadings","parentCanonicalId":"apple.healthkit:$sourceId","recordVersion":3,"sample":"$sourceId","schemaVersion":1,"sequence":0,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
             """.trimIndent(),
         )!!
         val staleTombstone = CanonicalRecordParser.parse(
             """
-            {"canonicalId":"apple.healthkit:parent","canonicalType":"activity.steps","id":"parent","kind":"deletion","recordVersion":2,"schemaVersion":1,"sourceRecord":{"id":"parent","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
+            {"canonicalId":"apple.healthkit:$sourceId","canonicalType":"activity.steps","id":"$sourceId","kind":"deletion","recordVersion":2,"schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
             """.trimIndent(),
         )!!
 
@@ -340,9 +353,15 @@ class ArchiveImporterTest {
 
     @Test
     fun reExportKeepsSyntheticRecordIdSeparateFromItsSourceRecordId() {
+        val sourceId = "00000000-0000-0000-0000-000000000203"
+        val syntheticId = CanonicalRecordParser.seriesRecordId(
+            sourceId,
+            "HKQuantityTypeIdentifierHeartRate",
+            "readings-0",
+        )
         val record = CanonicalRecordParser.parse(
             """
-            {"canonicalId":"apple.healthkit:synthetic","canonicalType":"series.readings","endDate":"2026-01-01T00:01:00Z","id":"synthetic","kind":"quantitySeriesReadings","lineage":[{"recordId":"source","store":"apple.healthkit"}],"parentCanonicalId":"apple.healthkit:source","recordVersion":1,"sample":"source","schemaVersion":1,"sourceRecord":{"id":"source","store":"apple.healthkit","type":"HKQuantityTypeIdentifierHeartRate","vendorExtension":"kept"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierHeartRate"}
+            {"canonicalId":"apple.healthkit:$syntheticId","canonicalType":"series.readings","endDate":"2026-01-01T00:01:00Z","id":"$syntheticId","kind":"quantitySeriesReadings","lineage":[{"recordId":"$sourceId","store":"apple.healthkit"}],"parentCanonicalId":"apple.healthkit:$sourceId","recordVersion":1,"sample":"$sourceId","schemaVersion":1,"sequence":0,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKQuantityTypeIdentifierHeartRate","vendorExtension":"kept"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierHeartRate"}
             """.trimIndent(),
         )!!
         val exported = CanonicalArchiveExporter(
@@ -350,9 +369,9 @@ class ArchiveImporterTest {
         ).canonicalJson(record)
         val jsonObject = Json.parseToJsonElement(exported).jsonObject
 
-        assertEquals("synthetic", jsonObject["id"]!!.jsonPrimitive.content)
+        assertEquals(syntheticId, jsonObject["id"]!!.jsonPrimitive.content)
         assertEquals(
-            "source",
+            sourceId,
             jsonObject["sourceRecord"]!!
                 .jsonObject["id"]!!
                 .jsonPrimitive
@@ -377,6 +396,7 @@ class ArchiveImporterTest {
             .jsonObject
         val sourceId = vector["sourceRecordId"]!!.jsonPrimitive.content
         val sourceType = vector["sourceType"]!!.jsonPrimitive.content
+        val errorId = vector["recordId"]!!.jsonPrimitive.content
 
         assertEquals(
             vector["recordId"]!!.jsonPrimitive.content,
@@ -384,7 +404,7 @@ class ArchiveImporterTest {
         )
         val legacyError = CanonicalRecordParser.parse(
             """
-            {"id":"$sourceId","kind":"sampleEncodingError","message":"fixture","schemaVersion":1,"type":"$sourceType"}
+            {"id":"$errorId","kind":"sampleEncodingError","message":"fixture","parentCanonicalId":"apple.healthkit:$sourceId","schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"$sourceType"},"type":"$sourceType"}
             """.trimIndent(),
         )!!
         assertEquals(
@@ -399,9 +419,10 @@ class ArchiveImporterTest {
     fun laterSuccessAndDeletionResolveSyntheticEncodingError() = runBlocking {
         val sourceId = "00000000-0000-0000-0000-0000000000ee"
         val sourceType = "HKQuantityTypeIdentifierStepCount"
+        val errorId = CanonicalRecordParser.encodingFailureId(sourceId, sourceType)
         val error =
             """
-            {"id":"$sourceId","kind":"sampleEncodingError","message":"fixture","schemaVersion":1,"type":"$sourceType"}
+            {"id":"$errorId","kind":"sampleEncodingError","message":"fixture","parentCanonicalId":"apple.healthkit:$sourceId","schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"$sourceType"},"type":"$sourceType"}
             """.trimIndent()
         val success =
             """
@@ -474,6 +495,30 @@ class ArchiveImporterTest {
     }
 
     @Test
+    fun seriesCompletionIdentityMatchesCrossPlatformFixture() {
+        val fixture = requireNotNull(
+            javaClass.getResourceAsStream("/hozz/v1/fixtures/identity-vectors.json"),
+        ).use { it.readBytes().toString(Charsets.UTF_8) }
+        val vector = Json.parseToJsonElement(fixture)
+            .jsonObject["seriesCompletion"]!!
+            .jsonObject
+        val sourceId = vector["sourceRecordId"]!!.jsonPrimitive.content
+        val sourceType = vector["sourceType"]!!.jsonPrimitive.content
+
+        assertEquals(
+            vector["recordId"]!!.jsonPrimitive.content,
+            CanonicalRecordParser.seriesEndId(sourceId, sourceType),
+        )
+        assertEquals(
+            vector["canonicalId"]!!.jsonPrimitive.content,
+            GeneratedContract.canonicalId(
+                GeneratedContract.SOURCE_STORE,
+                CanonicalRecordParser.seriesEndId(sourceId, sourceType),
+            ),
+        )
+    }
+
+    @Test
     fun identicalCoverageLinesFromDifferentRunsRemainDistinct() = runBlocking {
         val coverage =
             """{"kind":"typeCoverage","schemaVersion":1,"type":"steps","state":"anchorClosed","complete":true,"observedAt":"2026-01-01T00:00:01Z"}"""
@@ -491,6 +536,28 @@ class ArchiveImporterTest {
         assertEquals(4, preserved.size)
         assertEquals(2, preserved.count { it.kind == "typeCoverage" })
     }
+
+    @Test
+    fun reenteredRunRetainsOccurrenceCountersWithoutDroppingRecords() =
+        runBlocking {
+            val summary =
+                """{"kind":"typeSummary","schemaVersion":1,"type":"steps","state":"complete"}"""
+            val lines = listOf(
+                """{"kind":"manifest","schemaVersion":1,"run":"run-a","createdAt":"2026-01-01T00:00:00Z"}""",
+                summary,
+                """{"kind":"manifest","schemaVersion":1,"run":"run-b","createdAt":"2026-01-01T00:00:00Z"}""",
+                summary,
+                """{"kind":"manifest","schemaVersion":1,"run":"run-a","createdAt":"2026-01-01T00:00:00Z"}""",
+                summary,
+            ).joinToString("\n", postfix = "\n")
+            val store = InMemoryCanonicalRecordStore()
+
+            ArchiveImporter(store).import(
+                ByteArrayInputStream(lines.toByteArray()),
+            )
+
+            assertEquals(6, store.runRecordsPage(null, 10).size)
+        }
 
     @Test
     fun legacyCoverageIsNormalizedIntoAReimportableV1Archive() = runBlocking {
@@ -585,6 +652,7 @@ class ArchiveImporterTest {
             for (field in listOf(
                 "canonicalId",
                 "canonicalType",
+                "id",
                 "recordVersion",
                 "type",
                 "sourceRecord",
@@ -625,6 +693,15 @@ class ArchiveImporterTest {
             add(
                 JsonObject(
                     valid + (
+                        "canonicalId" to JsonPrimitive(
+                            "apple.healthkit:someone-else",
+                        )
+                    ),
+                ).toString(),
+            )
+            add(
+                JsonObject(
+                    valid + (
                         "lineage" to JsonArray(
                             listOf(JsonPrimitive("not-an-object")),
                         )
@@ -648,6 +725,322 @@ class ArchiveImporterTest {
             assertTrue(invalid, failed)
             assertTrue(store.allRecords().isEmpty())
         }
+    }
+
+    @Test
+    fun substitutedCanonicalTombstoneCannotOverwriteAnotherRecord() = runBlocking {
+        val victim = CanonicalRecordParser.parse(
+            fixture.toString(Charsets.UTF_8).lineSequence().first(),
+            strictV1 = true,
+        )!!
+        val store = InMemoryCanonicalRecordStore()
+        store.upsert(listOf(victim))
+        val malicious =
+            """
+            {"canonicalId":"${victim.canonicalId}","canonicalType":"activity.steps","id":"other","kind":"deletion","lineage":[{"recordId":"other","store":"apple.healthkit"}],"recordVersion":99,"schemaVersion":1,"sourceRecord":{"id":"other","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent()
+        var rejected = false
+
+        try {
+            ArchiveImporter(store).import(
+                ByteArrayInputStream(
+                    versionedZip("$malicious\n".toByteArray(), recordCount = 1),
+                ),
+            )
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+
+        assertTrue(rejected)
+        assertEquals(victim, store.allRecords().single())
+        assertFalse(store.allRecords().single().tombstone)
+
+        val forgedProvenance =
+            """
+            {"canonicalId":"${victim.canonicalId}","canonicalType":"activity.steps","id":"${victim.sourceRecordId}","kind":"deletion","lineage":[{"recordId":"attacker","store":"apple.healthkit"}],"recordVersion":99,"schemaVersion":1,"sourceRecord":{"id":"attacker","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent()
+        rejected = false
+        try {
+            ArchiveImporter(store).import(
+                ByteArrayInputStream(
+                    versionedZip(
+                        "$forgedProvenance\n".toByteArray(),
+                        recordCount = 1,
+                    ),
+                ),
+            )
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+        assertEquals(victim, store.allRecords().single())
+
+        val attackerSource = "00000000-0000-0000-0000-000000000299"
+        val forgedError =
+            """
+            {"canonicalId":"${victim.canonicalId}","canonicalType":"archive.encoding-error","id":"${victim.sourceRecordId}","kind":"sampleEncodingError","lineage":[{"recordId":"$attackerSource","store":"apple.healthkit"}],"message":"forged","parentCanonicalId":"apple.healthkit:$attackerSource","recordVersion":99,"schemaVersion":1,"sourceRecord":{"id":"$attackerSource","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent()
+        rejected = false
+        try {
+            ArchiveImporter(store).import(
+                ByteArrayInputStream(
+                    versionedZip("$forgedError\n".toByteArray(), recordCount = 1),
+                ),
+            )
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+        assertEquals(victim, store.allRecords().single())
+
+        val canonicalSource = "00000000-0000-0000-0000-000000000299"
+        val aliasedSource = canonicalSource.replace("-", "").uppercase()
+        val aliasedErrorId = CanonicalRecordParser.encodingFailureId(
+            canonicalSource,
+            "HKQuantityTypeIdentifierStepCount",
+        )
+        val aliasedError =
+            """
+            {"canonicalId":"apple.healthkit:$aliasedErrorId","canonicalType":"archive.encoding-error","id":"$aliasedErrorId","kind":"sampleEncodingError","lineage":[{"recordId":"$aliasedSource","store":"apple.healthkit"}],"message":"alias","parentCanonicalId":"apple.healthkit:$aliasedSource","recordVersion":99,"schemaVersion":1,"sourceRecord":{"id":"$aliasedSource","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent()
+        rejected = false
+        try {
+            ArchiveImporter(store).import(
+                ByteArrayInputStream(
+                    versionedZip("$aliasedError\n".toByteArray(), recordCount = 1),
+                ),
+            )
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+
+        val ambiguousNamespace =
+            """
+            {"canonicalId":"a:b:c","canonicalType":"activity.steps","id":"c","kind":"deletion","lineage":[{"recordId":"c","store":"a:b"}],"recordVersion":99,"schemaVersion":1,"sourceRecord":{"id":"c","store":"a:b","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent()
+        rejected = false
+        try {
+            CanonicalRecordParser.parse(ambiguousNamespace)
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+
+        val badParent =
+            """
+            {"canonicalId":"apple.healthkit:detail","canonicalType":"series.readings","endDate":"2026-01-01T00:01:00Z","id":"detail","kind":"quantitySeriesReadings","lineage":[{"recordId":"other","store":"apple.healthkit"}],"parentCanonicalId":"${victim.canonicalId}","recordVersion":1,"sample":"other","schemaVersion":1,"sourceRecord":{"id":"other","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent()
+        rejected = false
+        try {
+            ArchiveImporter(store).import(
+                ByteArrayInputStream(
+                    versionedZip("$badParent\n".toByteArray(), recordCount = 1),
+                ),
+            )
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+        assertEquals(victim, store.allRecords().single())
+    }
+
+    @Test
+    fun pendingImportMemoryAndOccurrenceTrackingAreBounded() = runBlocking {
+        val lines = fixture.toString(Charsets.UTF_8)
+            .lineSequence()
+            .filter(String::isNotBlank)
+            .take(2)
+            .toList()
+        val budget = lines.maxOf { it.toByteArray().size }.toLong() + 1
+        val store = InMemoryCanonicalRecordStore()
+        val imported = ArchiveImporter(
+            store,
+            batchSize = 500,
+            limits = ArchiveImportLimits(maxPendingBatchBytes = budget),
+        ).import(
+            ByteArrayInputStream(
+                lines.joinToString("\n", postfix = "\n").toByteArray(),
+            ),
+        )
+        assertTrue(imported.peakPendingBytes <= budget)
+        assertEquals(2, store.recordCount())
+
+        val runStore = InMemoryCanonicalRecordStore()
+        val runLines = """
+            {"kind":"typeSummary","schemaVersion":1,"type":"steps","state":"one"}
+            {"kind":"typeSummary","schemaVersion":1,"type":"heart","state":"two"}
+        """.trimIndent()
+        var rejected = false
+        try {
+            ArchiveImporter(
+                runStore,
+                limits = ArchiveImportLimits(maxRunOccurrenceKeys = 1),
+            ).import(ByteArrayInputStream("$runLines\n".toByteArray()))
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+        assertTrue(runStore.runRecordsPage(null, 10).isEmpty())
+    }
+
+    @Test
+    fun continuationFailureResolvesOnlyOnEndMarkerOrDeletion() = runBlocking {
+        val parentId = "00000000-0000-0000-0000-000000000123"
+        val parent = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:$parentId","canonicalType":"activity.exercise-route","endDate":"2026-01-01T00:01:00Z","id":"$parentId","kind":"workoutRoute","lineage":[{"recordId":"$parentId","store":"apple.healthkit"}],"recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"$parentId","store":"apple.healthkit","type":"HKWorkoutRouteTypeIdentifier"},"startDate":"2026-01-01T00:00:00Z","type":"HKWorkoutRouteTypeIdentifier"}
+            """.trimIndent(),
+            strictV1 = true,
+        )!!
+        val endId = CanonicalRecordParser.seriesEndId(
+            parentId,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        val errorId = CanonicalRecordParser.encodingFailureId(
+            parentId,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        val error = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:$errorId","canonicalType":"archive.encoding-error","id":"$errorId","kind":"sampleEncodingError","lineage":[{"recordId":"$parentId","store":"apple.healthkit"}],"message":"continuation failed","parentCanonicalId":"apple.healthkit:$parentId","recordVersion":3,"resolutionCanonicalId":"apple.healthkit:$endId","schemaVersion":1,"sourceRecord":{"id":"$parentId","store":"apple.healthkit","type":"HKWorkoutRouteTypeIdentifier"},"type":"HKWorkoutRouteTypeIdentifier"}
+            """.trimIndent(),
+            strictV1 = true,
+        )!!
+        val end = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:$endId","canonicalType":"activity.exercise-route-end","endDate":"2026-01-01T00:01:00Z","id":"$endId","kind":"workoutRouteEnd","lineage":[{"recordId":"$parentId","store":"apple.healthkit"}],"parentCanonicalId":"apple.healthkit:$parentId","recordVersion":1,"sample":"$parentId","schemaVersion":1,"sourceRecord":{"id":"$parentId","store":"apple.healthkit","type":"HKWorkoutRouteTypeIdentifier"},"startDate":"2026-01-01T00:00:00Z","type":"HKWorkoutRouteTypeIdentifier"}
+            """.trimIndent(),
+            strictV1 = true,
+        )!!
+        val store = InMemoryCanonicalRecordStore()
+        store.upsert(listOf(parent, error))
+        assertFalse(
+            store.allRecords().single { it.canonicalId == error.canonicalId }.tombstone,
+        )
+        val archive = ByteArrayOutputStream()
+        CanonicalArchiveExporter(store).export(archive)
+        val roundTripStore = InMemoryCanonicalRecordStore()
+        ArchiveImporter(roundTripStore).import(
+            ByteArrayInputStream(archive.toByteArray()),
+        )
+        val roundTripError = roundTripStore.allRecords()
+            .single { it.canonicalId == error.canonicalId }
+        assertFalse(roundTripError.tombstone)
+        assertEquals(error.resolutionCanonicalId, roundTripError.resolutionCanonicalId)
+
+        val wrongEndStore = InMemoryCanonicalRecordStore()
+        wrongEndStore.upsert(
+            listOf(
+                parent,
+                error,
+                end.copy(
+                    kind = "electrocardiogramEnd",
+                    canonicalType = "cardiac.electrocardiogram-end",
+                ),
+            ),
+        )
+        assertFalse(
+            wrongEndStore.allRecords()
+                .single { it.canonicalId == error.canonicalId }
+                .tombstone,
+        )
+        val forgedTombstoneStore = InMemoryCanonicalRecordStore()
+        forgedTombstoneStore.upsert(listOf(parent, error.copy(tombstone = true)))
+        assertFalse(
+            forgedTombstoneStore.allRecords()
+                .single { it.canonicalId == error.canonicalId }
+                .tombstone,
+        )
+
+        val reactivationStore = InMemoryCanonicalRecordStore()
+        val headerError = error.copy(
+            recordVersion = 1,
+            resolutionCanonicalId = null,
+        )
+        reactivationStore.upsert(listOf(headerError, parent))
+        assertTrue(
+            reactivationStore.allRecords()
+                .single { it.canonicalId == error.canonicalId }
+                .tombstone,
+        )
+        reactivationStore.upsert(listOf(error))
+        assertFalse(
+            reactivationStore.allRecords()
+                .single { it.canonicalId == error.canonicalId }
+                .tombstone,
+        )
+
+        store.upsert(listOf(end))
+        assertTrue(
+            store.allRecords().single { it.canonicalId == error.canonicalId }.tombstone,
+        )
+        val resolvedVersion = store.allRecords()
+            .single { it.canonicalId == error.canonicalId }
+            .recordVersion
+        val resolvedArchive = ByteArrayOutputStream()
+        CanonicalArchiveExporter(store).export(resolvedArchive)
+        val resolvedRoundTrip = InMemoryCanonicalRecordStore()
+        ArchiveImporter(resolvedRoundTrip).import(
+            ByteArrayInputStream(resolvedArchive.toByteArray()),
+        )
+        val roundTrippedResolvedError = resolvedRoundTrip.allRecords()
+            .single { it.canonicalId == error.canonicalId }
+        assertTrue(roundTrippedResolvedError.tombstone)
+        assertEquals(resolvedVersion, roundTrippedResolvedError.recordVersion)
+
+        val deletionStore = InMemoryCanonicalRecordStore()
+        deletionStore.upsert(listOf(parent, error))
+        deletionStore.upsert(
+            listOf(
+                parent.copy(
+                    kind = "deletion",
+                    recordVersion = 2,
+                    tombstone = true,
+                ),
+            ),
+        )
+        assertTrue(deletionStore.allRecords().all(CanonicalRecord::tombstone))
+
+        val masquerade = error.rawJson.replace(
+            "apple.healthkit:$endId",
+            parent.canonicalId,
+        )
+        var rejected = false
+        try {
+            CanonicalRecordParser.parse(masquerade, strictV1 = true)
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+
+        val missingSyntheticId =
+            """
+            {"canonicalType":"activity.exercise-route-end","endDate":"2026-01-01T00:01:00Z","kind":"workoutRouteEnd","recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"$parentId","store":"apple.healthkit","type":"HKWorkoutRouteTypeIdentifier"},"startDate":"2026-01-01T00:00:00Z","type":"HKWorkoutRouteTypeIdentifier"}
+            """.trimIndent()
+        rejected = false
+        try {
+            CanonicalRecordParser.parse(missingSyntheticId)
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+    }
+
+    @Test
+    fun legacyParentedRecordUsesSourceRecordIdentityWithoutSampleField() {
+        val sourceId = "00000000-0000-0000-0000-000000000204"
+        val endId = CanonicalRecordParser.seriesEndId(
+            sourceId,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        val record = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:$endId","canonicalType":"activity.exercise-route-end","endDate":"2026-01-01T00:01:00Z","id":"$endId","kind":"workoutRouteEnd","recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKWorkoutRouteTypeIdentifier"},"startDate":"2026-01-01T00:00:00Z","type":"HKWorkoutRouteTypeIdentifier"}
+            """.trimIndent(),
+        )!!
+
+        assertEquals("apple.healthkit:$sourceId", record.parentCanonicalId)
     }
 
     @Test

@@ -33,17 +33,25 @@ class CanonicalIdentityTests(unittest.TestCase):
             ).read_text()
         )
         self.vector = vectors["encodingFailure"]
+        self.series_vector = vectors["seriesCompletion"]
 
     def tearDown(self):
         self.db.close()
         self.directory.cleanup()
 
     def error(self):
+        source_id = self.vector["sourceRecordId"]
         return json.dumps({
-            "id": self.vector["sourceRecordId"],
+            "id": self.vector["recordId"],
             "kind": "sampleEncodingError",
             "message": "fixture",
+            "parentCanonicalId": f"apple.healthkit:{source_id}",
             "schemaVersion": 1,
+            "sourceRecord": {
+                "id": source_id,
+                "store": "apple.healthkit",
+                "type": self.vector["sourceType"],
+            },
             "type": self.vector["sourceType"],
         })
 
@@ -100,12 +108,94 @@ class CanonicalIdentityTests(unittest.TestCase):
             """
         ).fetchall()
 
+    def series_header(self, source_id):
+        return json.dumps({
+            "canonicalId": f"apple.healthkit:{source_id}",
+            "canonicalType": "activity.exercise-route",
+            "endDate": "2026-01-01T00:01:00Z",
+            "id": source_id,
+            "kind": "workoutRoute",
+            "lineage": [{
+                "recordId": source_id,
+                "store": "apple.healthkit",
+            }],
+            "recordVersion": 1,
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": source_id,
+                "store": "apple.healthkit",
+                "type": "HKWorkoutRouteTypeIdentifier",
+            },
+            "startDate": "2026-01-01T00:00:00Z",
+            "type": "HKWorkoutRouteTypeIdentifier",
+        })
+
+    def continuation_error(self, source_id, end_id):
+        error_id = encoding_failure_id(
+            source_id,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        return json.dumps({
+            "canonicalId": f"apple.healthkit:{error_id}",
+            "canonicalType": "archive.encoding-error",
+            "id": error_id,
+            "kind": "sampleEncodingError",
+            "lineage": [{
+                "recordId": source_id,
+                "store": "apple.healthkit",
+            }],
+            "message": "continuation failed",
+            "parentCanonicalId": f"apple.healthkit:{source_id}",
+            "recordVersion": 3,
+            "resolutionCanonicalId": f"apple.healthkit:{end_id}",
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": source_id,
+                "store": "apple.healthkit",
+                "type": "HKWorkoutRouteTypeIdentifier",
+            },
+            "type": "HKWorkoutRouteTypeIdentifier",
+        })
+
+    def series_end(self, source_id, end_id):
+        return json.dumps({
+            "canonicalId": f"apple.healthkit:{end_id}",
+            "canonicalType": "activity.exercise-route-end",
+            "endDate": "2026-01-01T00:01:00Z",
+            "id": end_id,
+            "kind": "workoutRouteEnd",
+            "lineage": [{
+                "recordId": source_id,
+                "store": "apple.healthkit",
+            }],
+            "parentCanonicalId": f"apple.healthkit:{source_id}",
+            "recordVersion": 1,
+            "sample": source_id,
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": source_id,
+                "store": "apple.healthkit",
+                "type": "HKWorkoutRouteTypeIdentifier",
+            },
+            "startDate": "2026-01-01T00:00:00Z",
+            "type": "HKWorkoutRouteTypeIdentifier",
+        })
+
     def test_encoding_failure_identity_matches_shared_fixture(self):
         self.assertEqual(
             self.vector["recordId"],
             encoding_failure_id(
                 self.vector["sourceRecordId"],
                 self.vector["sourceType"],
+            ),
+        )
+
+    def test_series_completion_identity_matches_shared_fixture(self):
+        self.assertEqual(
+            self.series_vector["recordId"],
+            receiver.series_end_id(
+                self.series_vector["sourceRecordId"],
+                self.series_vector["sourceType"],
             ),
         )
 
@@ -136,11 +226,17 @@ class CanonicalIdentityTests(unittest.TestCase):
 
     def test_legacy_series_child_uses_sample_as_parent_for_deletion(self):
         source_id = self.vector["sourceRecordId"]
+        child_id = receiver.series_record_id(
+            source_id,
+            self.vector["sourceType"],
+            "readings-0",
+        )
         child = json.dumps({
-            "id": "child",
+            "id": child_id,
             "kind": "quantitySeriesReadings",
             "sample": source_id,
             "schemaVersion": 1,
+            "sequence": 0,
             "type": self.vector["sourceType"],
         })
 
@@ -152,7 +248,311 @@ class CanonicalIdentityTests(unittest.TestCase):
         self.assertTrue(all(row[3] == 1 for row in rows))
         self.assertEqual(
             f"apple.healthkit:{source_id}",
-            next(row for row in rows if row[0].endswith(":child"))[1],
+            next(row for row in rows if row[0].endswith(child_id))[1],
+        )
+
+    def test_legacy_parented_record_uses_source_record_without_sample(self):
+        source_id = "00000000-0000-0000-0000-000000000204"
+        end_id = receiver.series_end_id(
+            source_id,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        record = {
+            "canonicalId": f"apple.healthkit:{end_id}",
+            "id": end_id,
+            "kind": "workoutRouteEnd",
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": source_id,
+                "store": "apple.healthkit",
+                "type": "HKWorkoutRouteTypeIdentifier",
+            },
+            "type": "HKWorkoutRouteTypeIdentifier",
+        }
+
+        ingest_lines(self.db, [json.dumps(record)])
+
+        self.assertEqual(
+            (f"apple.healthkit:{source_id}",),
+            self.db.execute(
+                "SELECT parent_canonical_id FROM samples"
+            ).fetchone(),
+        )
+
+    def test_continuation_failure_waits_for_end_marker(self):
+        source_id = "00000000-0000-0000-0000-000000000123"
+        end_id = receiver.series_end_id(
+            source_id,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        ingest_lines(
+            self.db,
+            [
+                self.series_header(source_id),
+                self.continuation_error(source_id, end_id),
+            ],
+        )
+        error = self.db.execute(
+            "SELECT tombstone FROM samples WHERE kind = 'sampleEncodingError'"
+        ).fetchone()
+        self.assertEqual((0,), error)
+
+        ingest_lines(self.db, [self.series_end(source_id, end_id)])
+
+        error = self.db.execute(
+            "SELECT tombstone FROM samples WHERE kind = 'sampleEncodingError'"
+        ).fetchone()
+        self.assertEqual((1,), error)
+
+    def test_wrong_series_end_kind_cannot_resolve_failure(self):
+        source_id = "00000000-0000-0000-0000-000000000127"
+        end_id = receiver.series_end_id(
+            source_id,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        wrong_end = json.loads(self.series_end(source_id, end_id))
+        wrong_end["kind"] = "electrocardiogramEnd"
+        wrong_end["canonicalType"] = "cardiac.electrocardiogram-end"
+
+        with self.assertRaises(PartialBatch):
+            ingest_lines(self.db, [json.dumps(wrong_end)])
+
+        ingest_lines(
+            self.db,
+            [
+                self.series_header(source_id),
+                self.continuation_error(source_id, end_id),
+            ],
+        )
+        self.assertEqual(
+            (0,),
+            self.db.execute(
+                "SELECT tombstone FROM samples "
+                "WHERE kind = 'sampleEncodingError'"
+            ).fetchone(),
+        )
+
+    def test_resolved_error_round_trip_preserves_version(self):
+        source_id = "00000000-0000-0000-0000-000000000130"
+        end_id = receiver.series_end_id(
+            source_id,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        error = json.loads(self.continuation_error(source_id, end_id))
+        error["deleted"] = True
+        error["recordVersion"] = 4
+
+        ingest_lines(
+            self.db,
+            [
+                self.series_header(source_id),
+                json.dumps(error),
+                self.series_end(source_id, end_id),
+            ],
+        )
+
+        self.assertEqual(
+            (4, 1),
+            self.db.execute(
+                "SELECT record_version, tombstone FROM samples "
+                "WHERE kind = 'sampleEncodingError'"
+            ).fetchone(),
+        )
+
+    def test_missing_synthetic_id_cannot_fall_back_to_header(self):
+        source_id = "00000000-0000-0000-0000-000000000131"
+        missing_id = {
+            "kind": "workoutRouteEnd",
+            "recordVersion": 99,
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": source_id,
+                "store": "apple.healthkit",
+                "type": "HKWorkoutRouteTypeIdentifier",
+            },
+            "type": "HKWorkoutRouteTypeIdentifier",
+        }
+
+        with self.assertRaises(PartialBatch):
+            ingest_lines(self.db, [json.dumps(missing_id)])
+        self.assertEqual(
+            0,
+            self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+        )
+
+    def test_forged_continuation_tombstone_stays_live_without_end(self):
+        source_id = "00000000-0000-0000-0000-000000000129"
+        end_id = receiver.series_end_id(
+            source_id,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        error = json.loads(self.continuation_error(source_id, end_id))
+        error["deleted"] = True
+
+        ingest_lines(
+            self.db,
+            [self.series_header(source_id), json.dumps(error)],
+        )
+
+        self.assertEqual(
+            (4, 0),
+            self.db.execute(
+                "SELECT record_version, tombstone FROM samples "
+                "WHERE kind = 'sampleEncodingError'"
+            ).fetchone(),
+        )
+
+    def test_parent_deletion_resolves_continuation_failure_without_end(self):
+        source_id = "00000000-0000-0000-0000-000000000124"
+        end_id = receiver.series_end_id(
+            source_id,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        ingest_lines(
+            self.db,
+            [
+                self.series_header(source_id),
+                self.continuation_error(source_id, end_id),
+            ],
+        )
+        deletion = json.loads(self.series_header(source_id))
+        deletion["kind"] = "deletion"
+        deletion["recordVersion"] = 2
+        deletion.pop("startDate")
+        deletion.pop("endDate")
+
+        ingest_lines(self.db, [json.dumps(deletion)])
+
+        self.assertTrue(
+            all(
+                row[0] == 1
+                for row in self.db.execute(
+                    "SELECT tombstone FROM samples"
+                )
+            )
+        )
+
+    def test_continuation_failure_supersedes_resolved_header_error(self):
+        source_id = "00000000-0000-0000-0000-000000000125"
+        end_id = receiver.series_end_id(
+            source_id,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        header_error = json.loads(
+            self.continuation_error(source_id, end_id)
+        )
+        header_error["recordVersion"] = 1
+        header_error.pop("resolutionCanonicalId")
+
+        ingest_lines(self.db, [json.dumps(header_error)])
+        ingest_lines(self.db, [self.series_header(source_id)])
+        self.assertEqual(
+            (2, 1),
+            self.db.execute(
+                "SELECT record_version, tombstone FROM samples "
+                "WHERE kind = 'sampleEncodingError'"
+            ).fetchone(),
+        )
+        ingest_lines(
+            self.db,
+            [self.continuation_error(source_id, end_id)],
+        )
+        self.assertEqual(
+            (3, 0),
+            self.db.execute(
+                "SELECT record_version, tombstone FROM samples "
+                "WHERE kind = 'sampleEncodingError'"
+            ).fetchone(),
+        )
+
+    def test_upgrade_restores_continuation_error_hidden_by_old_consumer(self):
+        source_id = "00000000-0000-0000-0000-000000000126"
+        end_id = receiver.series_end_id(
+            source_id,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        ingest_lines(
+            self.db,
+            [
+                self.series_header(source_id),
+                self.continuation_error(source_id, end_id),
+            ],
+        )
+        raw = self.db.execute(
+            "SELECT raw FROM samples WHERE kind = 'sampleEncodingError'"
+        ).fetchone()[0]
+        raw_object = json.loads(raw)
+        raw_object["deleted"] = True
+        self.db.execute(
+            """
+            UPDATE samples
+            SET resolution_canonical_id = NULL,
+                record_version = 4,
+                tombstone = 1,
+                raw = ?
+            WHERE kind = 'sampleEncodingError'
+            """,
+            (json.dumps(raw_object),),
+        )
+        self.db.commit()
+        self.db.close()
+
+        self.db = connect(self.database)
+
+        self.assertEqual(
+            (5, 0, f"apple.healthkit:{end_id}"),
+            self.db.execute(
+                """
+                SELECT record_version, tombstone, resolution_canonical_id
+                FROM samples
+                WHERE kind = 'sampleEncodingError'
+                """
+            ).fetchone(),
+        )
+        self.db.close()
+        self.db = connect(self.database)
+        self.assertEqual(
+            (5, 0),
+            self.db.execute(
+                "SELECT record_version, tombstone FROM samples "
+                "WHERE kind = 'sampleEncodingError'"
+            ).fetchone(),
+        )
+
+    def test_upgrade_reconciles_live_error_when_end_already_exists(self):
+        source_id = "00000000-0000-0000-0000-000000000128"
+        end_id = receiver.series_end_id(
+            source_id,
+            "HKWorkoutRouteTypeIdentifier",
+        )
+        ingest_lines(
+            self.db,
+            [
+                self.series_header(source_id),
+                self.continuation_error(source_id, end_id),
+                self.series_end(source_id, end_id),
+            ],
+        )
+        self.db.execute(
+            """
+            UPDATE samples
+            SET resolution_canonical_id = NULL,
+                record_version = 3,
+                tombstone = 0
+            WHERE kind = 'sampleEncodingError'
+            """
+        )
+        self.db.commit()
+        self.db.close()
+
+        self.db = connect(self.database)
+
+        self.assertEqual(
+            (4, 1),
+            self.db.execute(
+                "SELECT record_version, tombstone FROM samples "
+                "WHERE kind = 'sampleEncodingError'"
+            ).fetchone(),
         )
 
     def test_late_error_after_deletion_is_tombstoned_immediately(self):
@@ -658,6 +1058,48 @@ class TransactionAndArchiveTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
+    def test_payload_memory_budget_rejects_before_decode(self):
+        with (
+            mock.patch.object(receiver, "MAX_PENDING_BATCH_BYTES", 8),
+            self.assertRaises(PartialBatch),
+        ):
+            receiver.ingest_payload(self.db, b"123456789")
+
+    def test_negative_or_invalid_content_length_is_rejected(self):
+        for value in ("-1", "not-a-number"):
+            with self.assertRaises(PartialBatch):
+                receiver.parse_content_length(value)
+
+    def test_large_plain_ndjson_streams_without_whole_file_buffer(self):
+        path = Path(self.directory.name) / "large.ndjson"
+        records = [
+            {
+                "id": "stream-one",
+                "kind": "quantity",
+                "quantity": {"unit": "count", "value": 1},
+                "schemaVersion": 1,
+                "type": "steps",
+            },
+            {
+                "id": "stream-two",
+                "kind": "quantity",
+                "quantity": {"unit": "count", "value": 2},
+                "schemaVersion": 1,
+                "type": "steps",
+            },
+        ]
+        path.write_text(
+            "".join(json.dumps(record) + "\n" for record in records)
+        )
+
+        with mock.patch.object(receiver, "MAX_PENDING_BATCH_BYTES", 16):
+            self.assertEqual((2, 0), ingest_file(self.db, path))
+
+        self.assertEqual(
+            2,
+            self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+        )
+
     def test_compatible_deletion_before_metric_prevents_resurrection(self):
         date = "2026-01-01T00:00:00Z"
         ingest_compatible(self.db, {
@@ -755,6 +1197,32 @@ class TransactionAndArchiveTests(unittest.TestCase):
         )
         with self.assertRaises(PartialBatch):
             ingest_file(self.db, archive)
+
+        ambiguous_namespace = {
+            "canonicalId": "a:b:c",
+            "canonicalType": "activity.steps",
+            "id": "c",
+            "kind": "deletion",
+            "lineage": [{"recordId": "c", "store": "a:b"}],
+            "recordVersion": 99,
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": "c",
+                "store": "a:b",
+                "type": "steps",
+            },
+            "type": "steps",
+        }
+        archive = Path(self.directory.name) / "ambiguous-namespace.zip"
+        self.write_zip(
+            archive,
+            {
+                "hozz-manifest.json": json.dumps(self.manifest(1)),
+                "records.ndjson": json.dumps(ambiguous_namespace) + "\n",
+            },
+        )
+        with self.assertRaises(PartialBatch):
+            ingest_file(self.db, archive)
         self.assertEqual(
             ["apple.healthkit:legacy"],
             [
@@ -763,6 +1231,170 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 )
             ],
         )
+
+    def test_substituted_strict_tombstone_cannot_overwrite_victim(self):
+        victim = self.strict_record("victim")
+        ingest_lines(self.db, [json.dumps(victim)])
+        malicious = {
+            "canonicalId": "apple.healthkit:victim",
+            "canonicalType": "activity.steps",
+            "id": "other",
+            "kind": "deletion",
+            "lineage": [{
+                "recordId": "other",
+                "store": "apple.healthkit",
+            }],
+            "recordVersion": 99,
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": "other",
+                "store": "apple.healthkit",
+                "type": "steps",
+            },
+            "type": "steps",
+        }
+        archive = Path(self.directory.name) / "substitution.zip"
+        self.write_zip(
+            archive,
+            {
+                "hozz-manifest.json": json.dumps(self.manifest(1)),
+                "records.ndjson": json.dumps(malicious) + "\n",
+            },
+        )
+
+        with self.assertRaises(PartialBatch):
+            ingest_file(self.db, archive)
+
+        self.assertEqual(
+            ("apple.healthkit:victim", 0, 1),
+            self.db.execute(
+                "SELECT canonical_id, tombstone, record_version FROM samples"
+            ).fetchone(),
+        )
+
+        forged_provenance = dict(malicious)
+        forged_provenance["id"] = "victim"
+        forged_provenance["sourceRecord"] = {
+            "id": "attacker",
+            "store": "apple.healthkit",
+            "type": "steps",
+        }
+        forged_provenance["lineage"] = [{
+            "recordId": "attacker",
+            "store": "apple.healthkit",
+        }]
+        archive = Path(self.directory.name) / "forged-provenance.zip"
+        self.write_zip(
+            archive,
+            {
+                "hozz-manifest.json": json.dumps(self.manifest(1)),
+                "records.ndjson": json.dumps(forged_provenance) + "\n",
+            },
+        )
+        with self.assertRaises(PartialBatch):
+            ingest_file(self.db, archive)
+
+        attacker_source = "00000000-0000-0000-0000-000000000299"
+        forged_error = {
+            "canonicalId": "apple.healthkit:victim",
+            "canonicalType": "archive.encoding-error",
+            "id": "victim",
+            "kind": "sampleEncodingError",
+            "lineage": [{
+                "recordId": attacker_source,
+                "store": "apple.healthkit",
+            }],
+            "message": "forged",
+            "parentCanonicalId": f"apple.healthkit:{attacker_source}",
+            "recordVersion": 99,
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": attacker_source,
+                "store": "apple.healthkit",
+                "type": "steps",
+            },
+            "type": "steps",
+        }
+        archive = Path(self.directory.name) / "forged-error.zip"
+        self.write_zip(
+            archive,
+            {
+                "hozz-manifest.json": json.dumps(self.manifest(1)),
+                "records.ndjson": json.dumps(forged_error) + "\n",
+            },
+        )
+        with self.assertRaises(PartialBatch):
+            ingest_file(self.db, archive)
+
+        canonical_source = "00000000-0000-0000-0000-000000000299"
+        aliased_source = canonical_source.replace("-", "").upper()
+        aliased_error_id = encoding_failure_id(
+            canonical_source,
+            "steps",
+        )
+        aliased_error = {
+            "canonicalId": f"apple.healthkit:{aliased_error_id}",
+            "canonicalType": "archive.encoding-error",
+            "id": aliased_error_id,
+            "kind": "sampleEncodingError",
+            "lineage": [{
+                "recordId": aliased_source,
+                "store": "apple.healthkit",
+            }],
+            "message": "alias",
+            "parentCanonicalId": f"apple.healthkit:{aliased_source}",
+            "recordVersion": 99,
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": aliased_source,
+                "store": "apple.healthkit",
+                "type": "steps",
+            },
+            "type": "steps",
+        }
+        archive = Path(self.directory.name) / "aliased-error.zip"
+        self.write_zip(
+            archive,
+            {
+                "hozz-manifest.json": json.dumps(self.manifest(1)),
+                "records.ndjson": json.dumps(aliased_error) + "\n",
+            },
+        )
+        with self.assertRaises(PartialBatch):
+            ingest_file(self.db, archive)
+
+        bad_parent = {
+            "canonicalId": "apple.healthkit:detail",
+            "canonicalType": "series.readings",
+            "endDate": "2026-01-01T00:01:00Z",
+            "id": "detail",
+            "kind": "quantitySeriesReadings",
+            "lineage": [{
+                "recordId": "other",
+                "store": "apple.healthkit",
+            }],
+            "parentCanonicalId": "apple.healthkit:victim",
+            "recordVersion": 1,
+            "sample": "other",
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": "other",
+                "store": "apple.healthkit",
+                "type": "steps",
+            },
+            "startDate": "2026-01-01T00:00:00Z",
+            "type": "steps",
+        }
+        archive = Path(self.directory.name) / "bad-parent.zip"
+        self.write_zip(
+            archive,
+            {
+                "hozz-manifest.json": json.dumps(self.manifest(1)),
+                "records.ndjson": json.dumps(bad_parent) + "\n",
+            },
+        )
+        with self.assertRaises(PartialBatch):
+            ingest_file(self.db, archive)
 
     def test_ignored_zip_bomb_rejects_without_committing_records(self):
         record = self.strict_record("strict")
@@ -922,6 +1554,21 @@ class TransactionAndArchiveTests(unittest.TestCase):
 
         self.assertEqual((1, 0), ingest_file(self.db, archive))
 
+    def test_committed_zip_retry_survives_missing_watcher_receipt(self):
+        archive = Path(self.directory.name) / "retry.zip"
+        self.write_zip(
+            archive,
+            {
+                "hozz-manifest.json": json.dumps(self.manifest(1)),
+                "records.ndjson": (
+                    json.dumps(self.strict_record("retry")) + "\n"
+                ),
+            },
+        )
+
+        self.assertEqual((1, 0), ingest_file(self.db, archive))
+        self.assertEqual((0, 0), ingest_file(self.db, archive))
+
     def test_zip_rejects_undeclared_ndjson_without_committing(self):
         archive = Path(self.directory.name) / "extra-stream.zip"
         self.write_zip(
@@ -986,6 +1633,35 @@ class TransactionAndArchiveTests(unittest.TestCase):
         self.assertEqual(4, len(rows))
         self.assertEqual(2, sum(kind == "typeCoverage" for kind, _ in rows))
 
+    def test_run_occurrence_keys_are_bounded_and_roll_back_atomically(self):
+        lines = [
+            json.dumps({
+                "kind": "typeSummary",
+                "schemaVersion": 1,
+                "state": "one",
+                "type": "steps",
+            }),
+            json.dumps({
+                "kind": "typeSummary",
+                "schemaVersion": 1,
+                "state": "two",
+                "type": "heart",
+            }),
+        ]
+
+        with (
+            mock.patch.object(receiver, "MAX_RUN_OCCURRENCE_KEYS", 1),
+            self.assertRaises(PartialBatch),
+        ):
+            ingest_lines(self.db, lines)
+
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
+
     def test_split_batches_scope_identical_run_records_independently(self):
         summary = json.dumps({
             "kind": "typeSummary",
@@ -1002,6 +1678,47 @@ class TransactionAndArchiveTests(unittest.TestCase):
             "SELECT COUNT(*) FROM archive_run_records"
         ).fetchone()[0]
         self.assertEqual(2, count)
+
+    def test_reentered_explicit_run_across_batches_keeps_occurrences(self):
+        summary = json.dumps({
+            "kind": "typeSummary",
+            "schemaVersion": 1,
+            "state": "complete",
+            "type": "steps",
+        })
+        ingest_lines(
+            self.db,
+            [
+                json.dumps({
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "kind": "manifest",
+                    "run": "shared-run",
+                    "schemaVersion": 1,
+                }),
+                summary,
+            ],
+            batch_key="part-one",
+        )
+        ingest_lines(
+            self.db,
+            [
+                json.dumps({
+                    "kind": "resume",
+                    "resumedAt": "2026-01-01T00:00:01Z",
+                    "run": "shared-run",
+                    "schemaVersion": 1,
+                }),
+                summary,
+            ],
+            batch_key="part-two",
+        )
+
+        self.assertEqual(
+            4,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
 
     def test_legacy_run_normalization_matches_android_form(self):
         legacy = json.dumps({

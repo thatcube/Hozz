@@ -12,7 +12,7 @@ class SqliteCanonicalRecordStore(
     context: Context,
     databaseName: String = "hozz-archive.sqlite",
 ) :
-    SQLiteOpenHelper(context, databaseName, null, 8),
+    SQLiteOpenHelper(context, databaseName, null, 9),
     CanonicalRecordStore {
 
     override fun onCreate(database: SQLiteDatabase) {
@@ -21,6 +21,7 @@ class SqliteCanonicalRecordStore(
             CREATE TABLE canonical_record (
                 canonical_id TEXT PRIMARY KEY,
                 parent_canonical_id TEXT,
+                resolution_canonical_id TEXT,
                 record_version INTEGER NOT NULL,
                 kind TEXT NOT NULL,
                 canonical_type TEXT NOT NULL,
@@ -137,6 +138,26 @@ class SqliteCanonicalRecordStore(
             createRunRecordTables(database)
             createHealthConnectProjectionTable(database)
         }
+        if (oldVersion < 9) {
+            if (!hasColumn(database, "canonical_record", "resolution_canonical_id")) {
+                database.execSQL(
+                    "ALTER TABLE canonical_record ADD COLUMN resolution_canonical_id TEXT",
+                )
+            }
+            if (
+                !hasColumn(
+                    database,
+                    "canonical_record_stage",
+                    "resolution_canonical_id",
+                )
+            ) {
+                database.execSQL(
+                    "ALTER TABLE canonical_record_stage " +
+                        "ADD COLUMN resolution_canonical_id TEXT",
+                )
+            }
+            restoreContinuationErrors(database)
+        }
         reconcileEncodingFailures(database)
     }
 
@@ -234,6 +255,7 @@ class SqliteCanonicalRecordStore(
                             result += mergeOne(database, cursor.record())
                         }
                     }
+                    restoreUnresolvedContinuationErrors(database)
                     reconcileEncodingFailures(database)
                     database.execSQL(
                         """
@@ -476,8 +498,45 @@ class SqliteCanonicalRecordStore(
         for (record in records) {
             result += mergeOne(database, record)
         }
+        restoreUnresolvedContinuationErrors(database)
         reconcileEncodingFailures(database)
         return result
+    }
+
+    private fun restoreUnresolvedContinuationErrors(database: SQLiteDatabase) {
+        database.execSQL(
+            """
+            UPDATE canonical_record AS child
+            SET tombstone = 0,
+                record_version = child.record_version + 1
+            WHERE child.kind = 'sampleEncodingError'
+              AND child.resolution_canonical_id IS NOT NULL
+              AND child.tombstone = 1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM canonical_record AS parent
+                  WHERE parent.canonical_id = child.parent_canonical_id
+                    AND parent.tombstone = 1
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM canonical_record AS resolver
+                  WHERE resolver.canonical_id =
+                            child.resolution_canonical_id
+                    AND resolver.type = child.type
+                    AND resolver.parent_canonical_id =
+                            child.parent_canonical_id
+                    AND resolver.tombstone = 0
+                    AND resolver.kind = CASE
+                        WHEN child.type = 'HKWorkoutRouteTypeIdentifier'
+                            THEN 'workoutRouteEnd'
+                        WHEN child.type = 'HKDataTypeIdentifierElectrocardiogram'
+                            THEN 'electrocardiogramEnd'
+                        ELSE 'quantitySeriesEnd'
+                    END
+              )
+            """.trimIndent(),
+        )
     }
 
     private fun reconcileEncodingFailures(database: SQLiteDatabase) {
@@ -488,22 +547,101 @@ class SqliteCanonicalRecordStore(
                 record_version = MAX(
                     child.record_version + 1,
                     (
-                        SELECT parent.record_version + 1
-                        FROM canonical_record AS parent
-                        WHERE parent.canonical_id = child.parent_canonical_id
+                        SELECT resolver.record_version + 1
+                        FROM canonical_record AS resolver
+                        WHERE resolver.canonical_id = COALESCE(
+                            child.resolution_canonical_id,
+                            child.parent_canonical_id
+                        )
                     )
                 )
             WHERE child.kind = 'sampleEncodingError'
               AND child.tombstone = 0
               AND EXISTS (
                   SELECT 1
-                  FROM canonical_record AS parent
-                  WHERE parent.canonical_id = child.parent_canonical_id
-                    AND parent.kind != 'sampleEncodingError'
-                    AND parent.tombstone = 0
+                  FROM canonical_record AS resolver
+                  WHERE resolver.canonical_id = COALESCE(
+                      child.resolution_canonical_id,
+                      child.parent_canonical_id
+                  )
+                    AND resolver.kind != 'sampleEncodingError'
+                    AND resolver.tombstone = 0
+                    AND (
+                        child.resolution_canonical_id IS NULL
+                        OR (
+                            resolver.kind IN (
+                                CASE
+                                    WHEN child.type = 'HKWorkoutRouteTypeIdentifier'
+                                        THEN 'workoutRouteEnd'
+                                    WHEN child.type = 'HKDataTypeIdentifierElectrocardiogram'
+                                        THEN 'electrocardiogramEnd'
+                                    ELSE 'quantitySeriesEnd'
+                                END
+                            )
+                            AND resolver.type = child.type
+                            AND resolver.parent_canonical_id =
+                                child.parent_canonical_id
+                        )
+                    )
               )
             """.trimIndent(),
         )
+    }
+
+    private fun restoreContinuationErrors(database: SQLiteDatabase) {
+        database.query(
+            "canonical_record",
+            arrayOf(
+                "canonical_id",
+                "parent_canonical_id",
+                "raw_json",
+                "record_version",
+            ),
+            "kind = 'sampleEncodingError'",
+            null,
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                val canonicalId = cursor.getString(0)
+                val parentId = if (cursor.isNull(1)) null else cursor.getString(1)
+                val parsed = try {
+                    CanonicalRecordParser.parse(cursor.getString(2))
+                } catch (_: Exception) {
+                    null
+                } ?: continue
+                val resolutionId = parsed.resolutionCanonicalId ?: continue
+                val parent = parentId?.let { parentState(database, it) }
+                val resolver = parentState(database, resolutionId)
+                val hasValidEnd = resolver != null &&
+                    resolver.kind ==
+                    CanonicalRecordParser.seriesEndKind(parsed.type) &&
+                    resolver.type == parsed.type &&
+                    resolver.parentCanonicalId == parentId &&
+                    !resolver.tombstone
+                val values = ContentValues().apply {
+                    put("resolution_canonical_id", resolutionId)
+                    if (parent?.tombstone != true && !hasValidEnd) {
+                        put(
+                            "record_version",
+                            maxOf(
+                                cursor.getLong(3) + 1,
+                                parsed.recordVersion,
+                                3,
+                            ),
+                        )
+                        put("tombstone", 0)
+                    }
+                }
+                database.update(
+                    "canonical_record",
+                    values,
+                    "canonical_id = ?",
+                    arrayOf(canonicalId),
+                )
+            }
+        }
     }
 
     private fun mergeOne(
@@ -575,6 +713,7 @@ class SqliteCanonicalRecordStore(
                     record_version = MAX(record_version + 1, ? + 1)
                 WHERE parent_canonical_id = ?
                   AND kind = 'sampleEncodingError'
+                  AND resolution_canonical_id IS NULL
                   AND tombstone = 0
                 """.trimIndent(),
                 arrayOf<Any>(
@@ -591,7 +730,13 @@ class SqliteCanonicalRecordStore(
         canonicalId: String,
     ): StoredRecordState? = database.query(
         "canonical_record",
-        arrayOf("record_version", "tombstone", "kind"),
+        arrayOf(
+            "record_version",
+            "tombstone",
+            "kind",
+            "parent_canonical_id",
+            "type",
+        ),
         "canonical_id = ?",
         arrayOf(canonicalId),
         null,
@@ -603,6 +748,12 @@ class SqliteCanonicalRecordStore(
                 recordVersion = cursor.getLong(0),
                 tombstone = cursor.getInt(1) != 0,
                 kind = cursor.getString(2),
+                parentCanonicalId = if (cursor.isNull(3)) {
+                    null
+                } else {
+                    cursor.getString(3)
+                },
+                type = cursor.getString(4),
             )
         } else {
             null
@@ -633,6 +784,7 @@ class SqliteCanonicalRecordStore(
     private fun values(record: CanonicalRecord): ContentValues = ContentValues().apply {
         put("canonical_id", record.canonicalId)
         put("parent_canonical_id", record.parentCanonicalId)
+        put("resolution_canonical_id", record.resolutionCanonicalId)
         put("record_version", record.recordVersion)
         put("kind", record.kind)
         put("canonical_type", record.canonicalType)
@@ -715,6 +867,7 @@ class SqliteCanonicalRecordStore(
         lineage = CanonicalRecordParser.lineage(string("lineage_json")),
         tombstone = int("tombstone") != 0,
         rawJson = string("raw_json"),
+        resolutionCanonicalId = nullableString("resolution_canonical_id"),
     )
 
     private fun Cursor.index(name: String): Int = getColumnIndexOrThrow(name)
@@ -738,6 +891,7 @@ class SqliteCanonicalRecordStore(
                     session_id TEXT NOT NULL,
                     canonical_id TEXT NOT NULL,
                     parent_canonical_id TEXT,
+                    resolution_canonical_id TEXT,
                     record_version INTEGER NOT NULL,
                     kind TEXT NOT NULL,
                     canonical_type TEXT NOT NULL,
@@ -797,10 +951,25 @@ class SqliteCanonicalRecordStore(
             )
         }
 
+        fun hasColumn(
+            database: SQLiteDatabase,
+            table: String,
+            column: String,
+        ): Boolean = database.rawQuery(
+            "PRAGMA table_info($table)",
+            null,
+        ).use { cursor ->
+            val name = cursor.getColumnIndexOrThrow("name")
+            generateSequence { if (cursor.moveToNext()) cursor else null }
+                .any { it.getString(name) == column }
+        }
+
         private data class StoredRecordState(
             val recordVersion: Long,
             val tombstone: Boolean,
             val kind: String,
+            val parentCanonicalId: String?,
+            val type: String,
         )
     }
 

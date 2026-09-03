@@ -115,7 +115,8 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
     private fun merge(records: List<CanonicalRecord>): MergeResult {
         var result = MergeResult()
         for (incoming in records) {
-            val parent = incoming.parentCanonicalId?.let(this.records::get)
+            val parent =
+                incoming.parentCanonicalId?.let(this.records::get)
             val effective = if (parent?.tombstone == true) {
                 incoming.copy(
                     recordVersion = maxOf(
@@ -168,6 +169,7 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
                     if (
                         child.parentCanonicalId == winningParent.canonicalId &&
                         child.kind == "sampleEncodingError" &&
+                        child.resolutionCanonicalId == null &&
                         !child.tombstone
                     ) {
                         child.copy(
@@ -183,24 +185,69 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
                 }
             }
         }
+        restoreUnresolvedContinuationErrors()
         reconcileEncodingFailures()
         return result
+    }
+
+    private fun restoreUnresolvedContinuationErrors() {
+        records.replaceAll { _, record ->
+            val parent = record.parentCanonicalId?.let(records::get)
+            val resolver = record.resolutionCanonicalId?.let(records::get)
+            val hasValidEnd = resolver != null &&
+                resolver.kind ==
+                CanonicalRecordParser.seriesEndKind(record.type) &&
+                resolver.type == record.type &&
+                resolver.parentCanonicalId == record.parentCanonicalId &&
+                !resolver.tombstone
+            if (
+                record.kind == "sampleEncodingError" &&
+                record.resolutionCanonicalId != null &&
+                record.tombstone &&
+                parent?.tombstone != true &&
+                !hasValidEnd
+            ) {
+                record.copy(
+                    recordVersion = record.recordVersion + 1,
+                    tombstone = false,
+                )
+            } else {
+                record
+            }
+        }
     }
 
     private fun reconcileEncodingFailures() {
         records.replaceAll { _, record ->
             val parent = record.parentCanonicalId?.let(records::get)
+            val resolution = record.resolutionCanonicalId?.let(records::get)
+            val resolver = resolution ?: if (
+                record.resolutionCanonicalId == null
+            ) {
+                parent
+            } else {
+                null
+            }
+            val validResolution = resolution != null &&
+                resolution.kind ==
+                CanonicalRecordParser.seriesEndKind(record.type) &&
+                resolution.type == record.type &&
+                resolution.parentCanonicalId == record.parentCanonicalId
             if (
                 record.kind == "sampleEncodingError" &&
                 !record.tombstone &&
-                parent != null &&
-                parent.kind != "sampleEncodingError" &&
-                !parent.tombstone
+                resolver != null &&
+                resolver.kind != "sampleEncodingError" &&
+                (
+                    record.resolutionCanonicalId == null ||
+                        validResolution
+                ) &&
+                !resolver.tombstone
             ) {
                 record.copy(
                     recordVersion = maxOf(
                         record.recordVersion + 1,
-                        parent.recordVersion + 1,
+                        resolver.recordVersion + 1,
                     ),
                     tombstone = true,
                 )
@@ -277,4 +324,5 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
 
     private fun runKey(record: ArchiveRunRecord): String =
         "${record.fingerprint}:${record.occurrence}"
+
 }

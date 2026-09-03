@@ -6,6 +6,7 @@ import com.thatcube.hozz.generated.GeneratedContract
 import com.thatcube.hozz.generated.MappingDisposition
 import com.thatcube.hozz.generated.MappingQuality
 import java.time.Instant
+import kotlin.math.abs
 import kotlin.math.roundToLong
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -359,12 +360,19 @@ object ProjectionPlanner {
             "count/min" -> value.value
             else -> return archiveOnly(record, "invalid-value", "quantity.unit")
         }
+        if (!bpm.isFinite()) {
+            return archiveOnly(record, "invalid-value", "quantity.value")
+        }
         val rounded = bpm.roundToLong()
         val interval = interval(record, allowPoint = true)
             ?: return archiveOnly(record, "invalid-value", "startDate")
-        if (bpm != rounded.toDouble() || rounded !in 1..300) {
+        if (
+            abs(bpm - rounded.toDouble()) > HEART_RATE_ROUNDING_TOLERANCE ||
+            rounded !in 1..300
+        ) {
             return archiveOnly(record, "invalid-value", "quantity.value")
         }
+
         return exact(
             record,
             ProjectionDraft.HeartRate(
@@ -376,6 +384,8 @@ object ProjectionPlanner {
             ),
         )
     }
+
+    private const val HEART_RATE_ROUNDING_TOLERANCE = 1e-9
 
     private fun weight(record: CanonicalRecord): PlannedRecord {
         val value = record.canonicalValue

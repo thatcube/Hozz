@@ -57,6 +57,7 @@ data class CanonicalRecord(
     val lineage: List<SourceLineage>,
     val tombstone: Boolean,
     val rawJson: String,
+    val resolutionCanonicalId: String? = null,
 ) {
     val displayType: String
         get() = type
@@ -106,6 +107,11 @@ object CanonicalRecordParser {
         val topLevelId = jsonObject.string("id")
         val sourceStore = sourceRecord?.string("store")
             ?: GeneratedContract.SOURCE_STORE
+        if (!sourceStore.matches(sourceNamespacePattern)) {
+            throw ArchiveFormatException(
+                "Canonical record has an invalid source namespace.",
+            )
+        }
         val type = sourceRecord?.string("type")
             ?: jsonObject.string("type")
             ?: "HozzRecordType:$kind"
@@ -122,13 +128,91 @@ object CanonicalRecordParser {
             }
             ?: topLevelId
             ?: auxiliarySourceId(jsonObject, kind, line)
+        if (kind in syntheticIdentityKinds && topLevelId == null) {
+            throw ArchiveFormatException(
+                "A synthetic canonical record has no top-level id.",
+            )
+        }
         val canonicalSourceId = when {
             kind == "sampleEncodingError" ->
                 encodingFailureId(sourceId, type)
             else -> topLevelId ?: auxiliarySourceId(jsonObject, kind, line)
         }
-        val canonicalId = jsonObject.string("canonicalId")
-            ?: "$sourceStore:$canonicalSourceId"
+        if (topLevelId != null) {
+            validateSyntheticIdentity(
+                jsonObject,
+                kind,
+                topLevelId,
+                sourceId,
+                type,
+            )
+        }
+        val encodedCanonicalId = jsonObject.string("canonicalId")
+        if (encodedCanonicalId != null) {
+            val encodedId = topLevelId
+                ?: throw ArchiveFormatException(
+                    "A record with canonicalId has no top-level id.",
+                )
+            val expected =
+                GeneratedContract.canonicalId(sourceStore, encodedId)
+            if (encodedCanonicalId != expected) {
+                throw ArchiveFormatException(
+                    "Canonical record $encodedCanonicalId does not match $expected.",
+                )
+            }
+        }
+        val encodedParentCanonicalId =
+            jsonObject.string("parentCanonicalId")
+        val expectedParentCanonicalId =
+            GeneratedContract.canonicalId(sourceStore, sourceId)
+        if (
+            kind !in syntheticIdentityKinds &&
+            topLevelId != null &&
+            topLevelId != sourceId
+        ) {
+            throw ArchiveFormatException(
+                "Canonical source record id does not match its top-level id.",
+            )
+        }
+        if (
+            encodedParentCanonicalId != null &&
+            kind in parentedKinds &&
+            encodedParentCanonicalId != expectedParentCanonicalId
+        ) {
+            throw ArchiveFormatException(
+                "Canonical record parent identity does not match its source record.",
+            )
+        }
+        val sampleId = jsonObject.string("sample")
+        if (
+            kind in seriesRecordKinds &&
+            sampleId != null &&
+            sampleId != sourceId
+        ) {
+            throw ArchiveFormatException(
+                "Canonical record sample does not match its source record.",
+            )
+        }
+        if (kind in seriesRecordKinds && !seriesKindMatchesType(kind, type)) {
+            throw ArchiveFormatException(
+                "Canonical series kind does not match its source type.",
+            )
+        }
+        val resolutionCanonicalId =
+            jsonObject.string("resolutionCanonicalId")
+        if (
+            resolutionCanonicalId != null &&
+            resolutionCanonicalId != GeneratedContract.canonicalId(
+                sourceStore,
+                seriesEndId(sourceId, type),
+            )
+        ) {
+            throw ArchiveFormatException(
+                "Canonical record resolution identity is not its series end marker.",
+            )
+        }
+        val canonicalId = encodedCanonicalId
+            ?: GeneratedContract.canonicalId(sourceStore, canonicalSourceId)
         val encodedCanonicalType = jsonObject.string("canonicalType")
         val canonicalType = GeneratedContract.archiveOnlyCanonicalTypes[kind]
             ?: GeneratedContract.recordMappings[type]?.canonicalType
@@ -186,15 +270,11 @@ object CanonicalRecordParser {
 
         return CanonicalRecord(
             canonicalId = canonicalId,
-            parentCanonicalId = jsonObject.string("parentCanonicalId")
-                ?: if (kind == "sampleEncodingError") {
-                    "$sourceStore:$sourceId"
-                } else {
-                    null
-                }
-                ?: jsonObject.string("sample")?.let {
-                    "${GeneratedContract.SOURCE_STORE}:$it"
-                },
+            parentCanonicalId = if (kind in parentedKinds) {
+                expectedParentCanonicalId
+            } else {
+                encodedParentCanonicalId
+            },
             recordVersion = recordVersion,
             kind = kind,
             canonicalType = canonicalType,
@@ -216,6 +296,7 @@ object CanonicalRecordParser {
             lineage = lineage,
             tombstone = tombstone,
             rawJson = jsonObject.toString(),
+            resolutionCanonicalId = resolutionCanonicalId,
         )
     }
 
@@ -269,9 +350,7 @@ object CanonicalRecordParser {
         jsonObject.nonblank("canonicalType")
         strictLong(jsonObject, "recordVersion", minimum = 1)
         val type = jsonObject.nonblank("type")
-        if (jsonObject.containsKey("id")) {
-            jsonObject.nonblank("id")
-        }
+        val topLevelId = jsonObject.nonblank("id")
         if (jsonObject.containsKey("parentCanonicalId")) {
             jsonObject.nonblank("parentCanonicalId")
         }
@@ -288,11 +367,36 @@ object CanonicalRecordParser {
                 "Canonical record $canonicalId has no sourceRecord.",
             )
         val sourceStore = sourceRecord.nonblank("store")
+        if (!sourceStore.matches(sourceNamespacePattern)) {
+            throw ArchiveFormatException(
+                "Canonical record $canonicalId has an invalid source namespace.",
+            )
+        }
         val sourceId = sourceRecord.nonblank("id")
         val sourceType = sourceRecord.nonblank("type")
+        validateSyntheticIdentity(
+            jsonObject,
+            kind,
+            topLevelId,
+            sourceId,
+            type,
+        )
+        val expectedCanonicalId =
+            GeneratedContract.canonicalId(sourceStore, topLevelId)
+        if (canonicalId != expectedCanonicalId) {
+            throw ArchiveFormatException(
+                "Canonical record $canonicalId does not match source namespace " +
+                    "and top-level id $expectedCanonicalId.",
+            )
+        }
         if (sourceType != type) {
             throw ArchiveFormatException(
                 "Canonical record $canonicalId disagrees with its source type.",
+            )
+        }
+        if (kind !in syntheticIdentityKinds && topLevelId != sourceId) {
+            throw ArchiveFormatException(
+                "Canonical record $canonicalId id disagrees with its source record.",
             )
         }
         if (sourceRecord.containsKey("version")) {
@@ -312,7 +416,12 @@ object CanonicalRecordParser {
                 ?: throw ArchiveFormatException(
                     "Canonical record $canonicalId has a non-object lineage entry.",
                 )
-            entry.nonblank("store")
+            val lineageStore = entry.nonblank("store")
+            if (!lineageStore.matches(sourceNamespacePattern)) {
+                throw ArchiveFormatException(
+                    "Canonical record $canonicalId has an invalid lineage namespace.",
+                )
+            }
             for (field in listOf("package", "recordId")) {
                 if (entry.containsKey(field)) {
                     entry.nonblank(field)
@@ -328,6 +437,42 @@ object CanonicalRecordParser {
             throw ArchiveFormatException(
                 "Canonical record $canonicalId lineage omits its source record.",
             )
+        }
+        if (kind in parentedKinds) {
+            val expectedParent =
+                GeneratedContract.canonicalId(sourceStore, sourceId)
+            if (jsonObject.nonblank("parentCanonicalId") != expectedParent) {
+                throw ArchiveFormatException(
+                    "Canonical record $canonicalId has an invalid parent identity.",
+                )
+            }
+        }
+        if (
+            kind in seriesRecordKinds &&
+            jsonObject.containsKey("sample") &&
+            jsonObject.nonblank("sample") != sourceId
+        ) {
+            throw ArchiveFormatException(
+                "Canonical record $canonicalId sample disagrees with its source record.",
+            )
+        }
+        if (kind in seriesRecordKinds && !seriesKindMatchesType(kind, type)) {
+            throw ArchiveFormatException(
+                "Canonical record $canonicalId series kind disagrees with its type.",
+            )
+        }
+        if (jsonObject.containsKey("resolutionCanonicalId")) {
+            val resolution = jsonObject.nonblank("resolutionCanonicalId")
+            val expectedResolution = GeneratedContract.canonicalId(
+                sourceStore,
+                seriesEndId(sourceId, type),
+            )
+            if (resolution != expectedResolution) {
+                throw ArchiveFormatException(
+                    "Canonical record $canonicalId has an invalid series " +
+                        "completion identity.",
+                )
+            }
         }
         val expected = GeneratedContract.archiveOnlyCanonicalTypes[kind]
             ?: GeneratedContract.recordMappings[type]?.canonicalType
@@ -552,6 +697,7 @@ object CanonicalRecordParser {
         } catch (_: IllegalArgumentException) {
             return "encoding-error:${hash("$type\u0000$sourceId")}"
         }
+
         val sourceBytes = ByteBuffer.allocate(16)
             .putLong(sourceUUID.mostSignificantBits)
             .putLong(sourceUUID.leastSignificantBits)
@@ -567,6 +713,139 @@ object CanonicalRecordParser {
         val buffer = ByteBuffer.wrap(digest)
         return UUID(buffer.long, buffer.long).toString().lowercase()
     }
+
+    internal fun seriesEndId(sourceId: String, type: String): String {
+        return seriesRecordId(sourceId, type, "end")
+    }
+
+    internal fun seriesRecordId(
+        sourceId: String,
+        type: String,
+        suffix: String,
+    ): String {
+        val sourceUUID = try {
+            UUID.fromString(sourceId)
+        } catch (_: IllegalArgumentException) {
+            throw ArchiveFormatException(
+                "A series completion identity requires a UUID source id.",
+            )
+        }
+
+        val sourceBytes = ByteBuffer.allocate(16)
+            .putLong(sourceUUID.mostSignificantBits)
+            .putLong(sourceUUID.leastSignificantBits)
+            .array()
+        val digest = MessageDigest.getInstance("SHA-256").apply {
+            update(type.toByteArray())
+            update(sourceBytes)
+            update(suffix.toByteArray())
+        }.digest().copyOfRange(0, 16)
+        digest[6] = ((digest[6].toInt() and 0x0F) or 0x50).toByte()
+        digest[8] = ((digest[8].toInt() and 0x3F) or 0x80).toByte()
+        val buffer = ByteBuffer.wrap(digest)
+        return UUID(buffer.long, buffer.long).toString().lowercase()
+    }
+
+    private fun validateSyntheticIdentity(
+        jsonObject: JsonObject,
+        kind: String,
+        topLevelId: String,
+        sourceId: String,
+        type: String,
+    ) {
+        if (kind !in syntheticIdentityKinds) return
+        val canonicalSourceId = try {
+            UUID.fromString(sourceId).toString().lowercase()
+        } catch (_: IllegalArgumentException) {
+            throw ArchiveFormatException(
+                "A synthetic identity requires a UUID source id.",
+            )
+        }
+        if (sourceId != canonicalSourceId) {
+            throw ArchiveFormatException(
+                "A synthetic identity requires canonical lowercase UUID text.",
+            )
+        }
+        val expected = when (kind) {
+            "sampleEncodingError" -> encodingFailureId(sourceId, type)
+            "electrocardiogramEnd",
+            "quantitySeriesEnd",
+            "workoutRouteEnd" -> seriesEndId(sourceId, type)
+            "electrocardiogramVoltages" -> seriesRecordId(
+                sourceId,
+                type,
+                "voltages-${strictLong(jsonObject, "sequence", minimum = 0)}",
+            )
+            "quantitySeriesReadings" -> seriesRecordId(
+                sourceId,
+                type,
+                "readings-${strictLong(jsonObject, "sequence", minimum = 0)}",
+            )
+            "workoutRouteLocations" -> seriesRecordId(
+                sourceId,
+                type,
+                "locations-${strictLong(jsonObject, "sequence", minimum = 0)}",
+            )
+            "clinicalRecord" -> clinicalRecordId(jsonObject, sourceId)
+            else -> return
+        }
+        if (topLevelId != expected) {
+            throw ArchiveFormatException(
+                "Canonical synthetic record id does not match its derivation.",
+            )
+        }
+    }
+
+    private fun clinicalRecordId(
+        jsonObject: JsonObject,
+        sourceId: String,
+    ): String {
+        if (jsonObject.boolean("identityIsStable") != true) {
+            return sourceId
+        }
+        val source = jsonObject["source"] as? JsonObject
+            ?: throw ArchiveFormatException(
+                "A stable clinical identity has no source.",
+            )
+        val fhir = jsonObject["fhir"] as? JsonObject
+            ?: throw ArchiveFormatException(
+                "A stable clinical identity has no FHIR facts.",
+            )
+        val sourceBundle = source.nonblank("bundleIdentifier")
+        val resourceType = fhir.nonblank("resourceType")
+        val identifier = fhir.nonblank("identifier")
+        val digest = MessageDigest.getInstance("SHA-256").apply {
+            update("HKClinicalRecord".toByteArray())
+            update(sourceBundle.toByteArray())
+            update(0.toByte())
+            update(resourceType.toByteArray())
+            update(0.toByte())
+            update(identifier.toByteArray())
+        }.digest().copyOfRange(0, 16)
+        digest[6] = ((digest[6].toInt() and 0x0F) or 0x50).toByte()
+        digest[8] = ((digest[8].toInt() and 0x3F) or 0x80).toByte()
+        val buffer = ByteBuffer.wrap(digest)
+        return UUID(buffer.long, buffer.long).toString().lowercase()
+    }
+
+    internal fun seriesEndKind(type: String): String = when (type) {
+        "HKWorkoutRouteTypeIdentifier" -> "workoutRouteEnd"
+        "HKDataTypeIdentifierElectrocardiogram" -> "electrocardiogramEnd"
+        else -> "quantitySeriesEnd"
+    }
+
+    private fun seriesKindMatchesType(kind: String, type: String): Boolean =
+        when (type) {
+            "HKWorkoutRouteTypeIdentifier" ->
+                kind == "workoutRouteEnd" ||
+                    kind == "workoutRouteLocations"
+            "HKDataTypeIdentifierElectrocardiogram" ->
+                kind == "electrocardiogramEnd" ||
+                    kind == "electrocardiogramVoltages"
+            else ->
+                kind == "quantitySeriesEnd" ||
+                    kind == "quantitySeriesReadings"
+        }
 
     private fun hash(value: String): String =
         MessageDigest.getInstance("SHA-256")
@@ -584,6 +863,19 @@ object CanonicalRecordParser {
         is JsonArray -> JsonArray(element.map(::sorted))
         else -> element
     }
+
+    private val parentedKinds = setOf(
+        "sampleEncodingError",
+        "electrocardiogramEnd",
+        "electrocardiogramVoltages",
+        "quantitySeriesEnd",
+        "quantitySeriesReadings",
+        "workoutRouteEnd",
+        "workoutRouteLocations",
+    )
+    private val seriesRecordKinds = parentedKinds - "sampleEncodingError"
+    private val syntheticIdentityKinds = parentedKinds + "clinicalRecord"
+    private val sourceNamespacePattern = Regex("^[A-Za-z0-9._-]+$")
 }
 
 class ArchiveFormatException(message: String) : Exception(message)

@@ -497,6 +497,14 @@ final class WorkoutRouteTests: XCTestCase {
                 typeIdentifier: WorkoutRouteEncoding.typeKey.rawValue
             ).uuidString.lowercased()
         )
+        XCTAssertEqual(records[0]["recordVersion"] as? Int, 3)
+        XCTAssertEqual(
+            records[0]["resolutionCanonicalId"] as? String,
+            SeriesEncoding.completionCanonicalID(
+                shape: WorkoutRouteEncoding.shape,
+                sample: id
+            )
+        )
 
         let after = try SeriesAnchor.decode(batch.proposedAnchor)
         XCTAssertNil(

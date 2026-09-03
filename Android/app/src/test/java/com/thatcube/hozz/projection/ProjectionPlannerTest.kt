@@ -6,6 +6,7 @@ import com.thatcube.hozz.core.HealthConnectProjection
 import com.thatcube.hozz.core.InMemoryCanonicalRecordStore
 import com.thatcube.hozz.core.SourceLineage
 import java.time.Instant
+import kotlin.math.roundToLong
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -185,6 +186,44 @@ class ProjectionPlannerTest {
 
         assertEquals(ProjectionQuality.EXACT, planned.quality)
         assertEquals(instant, (planned.draft as ProjectionDraft.HeartRate).end)
+    }
+
+    @Test
+    fun floatingHeartRateNoiseRoundsOnlyWithinATightTolerance() {
+        val valid = listOf(
+            62.0 / 60.0 to "count/s",
+            62.00000000000001 to "count/min",
+            119.99999999999999 to "count/min",
+        )
+        for ((value, unit) in valid) {
+            val planned = ProjectionPlanner.plan(
+                quantity("heart-$value", "HKQuantityTypeIdentifierHeartRate", value, unit),
+            )
+            assertEquals(value.toString(), ProjectionQuality.EXACT, planned.quality)
+            assertEquals(
+                value.toString(),
+                value.times(if (unit == "count/s") 60 else 1).roundToLong(),
+                (planned.draft as ProjectionDraft.HeartRate).beatsPerMinute,
+            )
+        }
+        val outsideTolerance = ProjectionPlanner.plan(
+            quantity(
+                "heart-imprecise",
+                "HKQuantityTypeIdentifierHeartRate",
+                62.0001,
+                "count/min",
+            ),
+        )
+        assertEquals(ProjectionQuality.ARCHIVE_ONLY, outsideTolerance.quality)
+        val nonfinite = ProjectionPlanner.plan(
+            quantity(
+                "heart-nan",
+                "HKQuantityTypeIdentifierHeartRate",
+                Double.NaN,
+                "count/min",
+            ),
+        )
+        assertEquals(ProjectionQuality.ARCHIVE_ONLY, nonfinite.quality)
     }
 
     @Test

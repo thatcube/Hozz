@@ -58,7 +58,11 @@ enum HozzHealthArchiveContract {
             ?? "archive.raw"
     }
 
+    static func canonicalID(store: String, id: String) -> String {
+        "\(store):\(id)"
+    }
+
     static func canonicalID(for sourceID: String) -> String {
-        "\(sourceStore):\(sourceID)"
+        canonicalID(store: sourceStore, id: sourceID)
     }
 }

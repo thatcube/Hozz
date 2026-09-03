@@ -18,7 +18,8 @@
     },
     "canonicalId": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^[A-Za-z0-9._-]+:.+$",
+      "description": "Must equal sourceRecord.store + ':' + the top-level id. Consumers MUST reject a mismatch."
     },
     "canonicalType": {
       "type": "string",
@@ -26,7 +27,13 @@
     },
     "parentCanonicalId": {
       "type": "string",
-      "minLength": 1
+      "pattern": "^[A-Za-z0-9._-]+:.+$",
+      "description": "For parented series and encoding-error kinds, must equal sourceRecord.store + ':' + sourceRecord.id."
+    },
+    "resolutionCanonicalId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9._-]+:.+$",
+      "description": "Optional explicit completion record whose successful arrival resolves this error. It must use the sourceRecord.store namespace."
     },
     "recordVersion": {
       "type": "integer",
@@ -90,6 +97,10 @@
       "type": "integer",
       "minimum": 0
     },
+    "sequence": {
+      "type": "integer",
+      "minimum": 0
+    },
     "startDate": {
       "type": "string",
       "format": "date-time"
@@ -144,7 +155,7 @@
       "properties": {
         "store": {
           "type": "string",
-          "minLength": 1
+          "pattern": "^[A-Za-z0-9._-]+$"
         },
         "id": {
           "type": "string",
@@ -171,7 +182,7 @@
         "properties": {
           "store": {
             "type": "string",
-            "minLength": 1
+            "pattern": "^[A-Za-z0-9._-]+$"
           },
           "package": {
             "type": "string",
@@ -329,6 +340,7 @@
         "required": [
           "canonicalId",
           "canonicalType",
+          "id",
           "recordVersion",
           "type",
           "sourceRecord",
@@ -459,6 +471,86 @@
         "required": [
           "parentCanonicalId"
         ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "electrocardiogramVoltages",
+              "quantitySeriesReadings",
+              "workoutRouteLocations"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "sequence"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "workoutRouteEnd",
+              "workoutRouteLocations"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "const": "HKWorkoutRouteTypeIdentifier"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "electrocardiogramEnd",
+              "electrocardiogramVoltages"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "const": "HKDataTypeIdentifierElectrocardiogram"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "quantitySeriesEnd",
+              "quantitySeriesReadings"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "type": {
+            "not": {
+              "enum": [
+                "HKWorkoutRouteTypeIdentifier",
+                "HKDataTypeIdentifierElectrocardiogram"
+              ]
+            }
+          }
+        }
       }
     }
   ],

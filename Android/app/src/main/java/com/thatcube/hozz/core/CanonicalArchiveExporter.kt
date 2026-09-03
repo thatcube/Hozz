@@ -80,17 +80,24 @@ class CanonicalArchiveExporter(
     internal fun canonicalJson(record: CanonicalRecord): String {
         val raw = Json.parseToJsonElement(record.rawJson).jsonObject
         val normalized = buildJsonObject {
-            raw.forEach { (key, value) -> put(key, value) }
+            raw.forEach { (key, value) ->
+                if (key != "deleted") put(key, value)
+            }
             put("schemaVersion", GeneratedContract.SCHEMA_VERSION)
             put("canonicalId", record.canonicalId)
             put("canonicalType", record.canonicalType)
             put("recordVersion", record.recordVersion)
             put("kind", record.kind)
-            if (!raw.containsKey("id")) {
-                put("id", record.canonicalId)
+            val prefix = "${record.sourceStore}:"
+            check(record.canonicalId.startsWith(prefix)) {
+                "Canonical ID is outside its source namespace."
             }
+            put("id", record.canonicalId.removePrefix(prefix))
             put("type", record.type)
             record.parentCanonicalId?.let { put("parentCanonicalId", it) }
+            record.resolutionCanonicalId?.let {
+                put("resolutionCanonicalId", it)
+            }
             if (record.tombstone) {
                 put("deleted", true)
             }

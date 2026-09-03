@@ -16,6 +16,7 @@ data class ArchiveImportResult(
     val legacyArchive: Boolean,
     val recordsRead: Int,
     val runRecordsPreserved: Int,
+    val peakPendingBytes: Long,
     val merge: MergeResult,
 )
 
@@ -24,6 +25,8 @@ data class ArchiveImportLimits(
     val maxInflatedBytes: Long = 64L * 1_024 * 1_024 * 1_024,
     val maxRecordLines: Long = 50_000_000,
     val maxRecordBytes: Int = 16 * 1_024 * 1_024,
+    val maxPendingBatchBytes: Long = 64L * 1_024 * 1_024,
+    val maxRunOccurrenceKeys: Int = 100_000,
     val maxManifestBytes: Int = 256 * 1_024,
     val maxEntryCompressionRatio: Long = 200,
     val maxGlobalCompressionRatio: Long = 100,
@@ -71,6 +74,7 @@ class ArchiveImporter(
                     legacyArchive = true,
                     recordsRead = stats.recordsRead,
                     runRecordsPreserved = stats.runRecordsPreserved,
+                    peakPendingBytes = stats.peakPendingBytes,
                 )
             }
             if (
@@ -87,6 +91,7 @@ class ArchiveImporter(
                 legacyArchive = parsed.legacyArchive,
                 recordsRead = parsed.recordsRead,
                 runRecordsPreserved = parsed.runRecordsPreserved,
+                peakPendingBytes = parsed.peakPendingBytes,
                 merge = session.commit(),
             )
         } catch (error: Throwable) {
@@ -167,6 +172,7 @@ class ArchiveImporter(
             legacyArchive = manifest == null,
             recordsRead = stats.recordsRead,
             runRecordsPreserved = stats.runRecordsPreserved,
+            peakPendingBytes = stats.peakPendingBytes,
         )
     }
 
@@ -181,15 +187,41 @@ class ArchiveImporter(
         var nonblankLines = 0L
         var firstStrictFailure: ArchiveFormatException? = null
         var currentRun: String? = null
+        var pendingBytes = 0L
+        var peakPendingBytes = 0L
         val occurrences = mutableMapOf<String, Int>()
         val batch = mutableListOf<CanonicalRecord>()
         val runBatch = mutableListOf<ArchiveRunRecord>()
+
+        suspend fun flushPending() {
+            if (batch.isNotEmpty()) {
+                session.append(batch)
+                batch.clear()
+            }
+            if (runBatch.isNotEmpty()) {
+                session.appendRunRecords(runBatch)
+                runBatch.clear()
+            }
+            pendingBytes = 0
+        }
 
         readLines(input) { line ->
             if (line.isBlank()) {
                 return@readLines
             }
             val rawLine = line.removeSuffix("\r")
+            val rawBytes = rawLine.toByteArray().size.toLong()
+            if (rawBytes > limits.maxPendingBatchBytes) {
+                throw ArchiveFormatException(
+                    "A record exceeds the pending import memory budget.",
+                )
+            }
+            if (
+                pendingBytes > 0 &&
+                pendingBytes + rawBytes > limits.maxPendingBatchBytes
+            ) {
+                flushPending()
+            }
             nonblankLines += 1
             if (nonblankLines > limits.maxRecordLines) {
                 throw ArchiveFormatException(
@@ -218,12 +250,21 @@ class ArchiveImporter(
                 } else {
                     CanonicalRecordParser.normalizedRunLine(rawLine)
                 }
-                CanonicalRecordParser.runIdentifier(storedLine)?.let {
-                    currentRun = it
+                CanonicalRecordParser.runIdentifier(storedLine)?.let { run ->
+                    currentRun = run
                 }
                 val fingerprint = hash(
                     "${currentRun ?: "unscoped"}\u0000$storedLine",
                 )
+                if (
+                    fingerprint !in occurrences &&
+                    occurrences.size >= limits.maxRunOccurrenceKeys
+                ) {
+                    throw ArchiveFormatException(
+                        "A run contains more than " +
+                            "${limits.maxRunOccurrenceKeys} distinct record forms.",
+                    )
+                }
                 val occurrence = occurrences[fingerprint] ?: 0
                 occurrences[fingerprint] = occurrence + 1
                 runBatch += ArchiveRunRecord(
@@ -234,10 +275,9 @@ class ArchiveImporter(
                     ordinal = nonblankLines,
                 )
                 runRecordsPreserved += 1
-                if (runBatch.size >= batchSize) {
-                    session.appendRunRecords(runBatch)
-                    runBatch.clear()
-                }
+                pendingBytes += rawBytes
+                peakPendingBytes = maxOf(peakPendingBytes, pendingBytes)
+                if (batch.size + runBatch.size >= batchSize) flushPending()
                 return@readLines
             }
             val record = try {
@@ -251,21 +291,16 @@ class ArchiveImporter(
             checkNotNull(record)
             recordsRead += 1
             batch += record
-            if (batch.size >= batchSize) {
-                session.append(batch)
-                batch.clear()
-            }
+            pendingBytes += rawBytes
+            peakPendingBytes = maxOf(peakPendingBytes, pendingBytes)
+            if (batch.size + runBatch.size >= batchSize) flushPending()
         }
-        if (batch.isNotEmpty()) {
-            session.append(batch)
-        }
-        if (runBatch.isNotEmpty()) {
-            session.appendRunRecords(runBatch)
-        }
+        flushPending()
         return RecordImportStats(
             recordsRead = recordsRead,
             runRecordsPreserved = runRecordsPreserved,
             strictFailure = firstStrictFailure,
+            peakPendingBytes = peakPendingBytes,
         )
     }
 
@@ -337,6 +372,7 @@ class ArchiveImporter(
         val recordsRead: Int,
         val runRecordsPreserved: Int,
         val strictFailure: ArchiveFormatException?,
+        val peakPendingBytes: Long,
     )
 
     private data class ParsedArchive(
@@ -344,6 +380,7 @@ class ArchiveImporter(
         val legacyArchive: Boolean,
         val recordsRead: Int,
         val runRecordsPreserved: Int,
+        val peakPendingBytes: Long,
     )
 
     private class BoundedInputStream(

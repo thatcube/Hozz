@@ -34,7 +34,10 @@ can tell that the meaning of a column changed rather than having to infer it fro
 the numbers.
 
 **Source identifiers** are normally lowercase HealthKit UUID strings.
-`canonicalId` namespaces that identity for cross-platform merge and projection;
+`canonicalId` is exactly `sourceRecord.store + ":" + id`; receivers reject a
+record that tries to substitute another canonical identity. Parented series
+records bind `parentCanonicalId` to `sourceRecord.store + ":" +
+sourceRecord.id`. This namespaces identity for cross-platform merge and projection;
 synthetic detail/error records have their own deterministic ID and retain the
 source record under `sourceRecord`.
 
@@ -77,7 +80,7 @@ protocol are projections of it. Every record has these fields:
 | `workoutRouteLocations` | `route`, `sequence`, `offset`, `count`, `locations` | One page of route points. |
 | `workoutRouteEnd` | `route`, `locations` | Marks a route as completely written. |
 | `deletion` | — | A versioned tombstone with the same canonical identity as the removed record. |
-| `sampleEncodingError` | `message` | A sample Hozz could not encode, written in its place so the batch never silently omits it. |
+| `sampleEncodingError` | `message`, optional `resolutionCanonicalId` | A sample Hozz could not encode, written in its place so the batch never silently omits it. A continuation failure resolves only when its deterministic end marker arrives or its parent is deleted. |
 | `sample` | — | An `HKSample` subclass this build has no specific handling for. |
 | `typeCoverage` | `state`, `complete`, `deliveredCount`, `primedFrom`, `primedThrough`, `observedAt` | Not a measurement: how completely Hozz has read one type. See below. |
 

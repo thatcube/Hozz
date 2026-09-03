@@ -48,6 +48,15 @@ class GeneratedContractTest {
             assertTrue(fixtureObject.containsKey("canonicalType"))
             assertTrue(fixtureObject.containsKey("sourceRecord"))
             assertTrue(fixtureObject.containsKey("lineage"))
+            val id = fixtureObject["id"]!!.jsonPrimitive.content
+            val store = fixtureObject["sourceRecord"]!!
+                .jsonObject["store"]!!
+                .jsonPrimitive
+                .content
+            assertEquals(
+                GeneratedContract.canonicalId(store, id),
+                fixtureObject["canonicalId"]!!.jsonPrimitive.content,
+            )
         }
     }
 

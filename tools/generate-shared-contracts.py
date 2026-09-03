@@ -191,6 +191,8 @@ object GeneratedContract {{
     const val TARGET_STORE = {quoted(mapping['targetStore'])}
     const val TARGET_PACKAGE = {quoted(mapping['targetPackage'])}
 
+    fun canonicalId(store: String, id: String): String = "$store:$id"
+
     val recordMappings: Map<String, RecordMapping> = mapOf(
 {chr(10).join(records)}
     )
@@ -288,6 +290,11 @@ public enum HozzArchiveContract {{
     public static let format = "hozz-ndjson"
     public static let recordSchema = "hozz/v1/canonical-record"
     public static let healthConnectPackage = {quoted(mapping['targetPackage'])}
+    public static let sourceStore = {quoted(mapping['sourceStore'])}
+
+    public static func canonicalID(store: String, id: String) -> String {{
+        "\\(store):\\(id)"
+    }}
 
     public static let healthConnectMappedTypes: Set<String> = [
 {identifiers}
@@ -365,8 +372,12 @@ enum HozzHealthArchiveContract {{
             ?? "archive.raw"
     }}
 
+    static func canonicalID(store: String, id: String) -> String {{
+        "\\(store):\\(id)"
+    }}
+
     static func canonicalID(for sourceID: String) -> String {{
-        "\\(sourceStore):\\(sourceID)"
+        canonicalID(store: sourceStore, id: sourceID)
     }}
 }}
 """

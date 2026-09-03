@@ -344,6 +344,17 @@ public enum SeriesEncoding {
         )
     }
 
+    public static func completionCanonicalID(
+        shape: SeriesShape,
+        sample: UUID
+    ) -> String {
+        HozzHealthArchiveContract.canonicalID(
+            for: identifier(shape: shape, sample: sample, suffix: "end")
+                .uuidString
+                .lowercased()
+        )
+    }
+
     static func serialize(_ object: [String: Any]) throws -> Data {
         guard JSONSerialization.isValidJSONObject(object) else {
             throw HealthSampleEncodingError.invalidJSONObject
