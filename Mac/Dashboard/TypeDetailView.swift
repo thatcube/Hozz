@@ -17,7 +17,7 @@ struct TypeDetailView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: Dash.gutter) {
+            VStack(alignment: .leading, spacing: HozzMetrics.desktopGutter) {
                 if let series {
                     header(series)
                     if series.hasMixedUnits {
@@ -50,32 +50,15 @@ struct TypeDetailView: View {
     // MARK: - Header
 
     private func header(_ series: TypeSeries) -> some View {
-        HStack(alignment: .lastTextBaseline) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(series.measure.displayName)
-                    .font(.system(size: 26, weight: .semibold, design: .rounded))
-                    .foregroundStyle(HozzPalette.ink)
-                Text(spanCaption(series))
-                    .font(.callout)
-                    .foregroundStyle(HozzPalette.inkSoft)
-                // Said on every visit rather than only when a range comes up
-                // empty. The state that produced the original bug — a type
-                // years behind, charting happily — never opens an empty range
-                // at all, so an explanation that appears only there is an
-                // explanation that never appears when it is needed.
-                Text(
-                    OverviewNarration.completeness(
-                        services.standing(for: type),
-                        latest: services.summaries
-                            .first { $0.type == type }?.latest,
-                        day: Self.day
-                    )
-                )
-                .font(.caption)
-                .foregroundStyle(HozzPalette.inkMuted)
-                .fixedSize(horizontal: false, vertical: true)
-            }
-            Spacer()
+        let completeness = OverviewNarration.completeness(
+            services.standing(for: type),
+            latest: services.summaries.first { $0.type == type }?.latest,
+            day: Self.day
+        )
+        return HozzPageHeader(
+            verbatim: series.measure.displayName,
+            subtitle: spanCaption(series) + "\n" + completeness
+        ) {
             RangePicker(range: $range)
         }
     }
@@ -111,15 +94,12 @@ struct TypeDetailView: View {
 
     /// Two units cannot be added, so nothing is drawn and the reason is given.
     private func mixedUnitsCard(_ series: TypeSeries) -> some View {
-        Card(title: "Two different units in this range") {
+        Card(title: "Mixed units") {
             VStack(alignment: .leading, spacing: 8) {
-                Text(
-                    "Samples here arrived in \(series.units.joined(separator: " and ")). "
-                        + "Combining them would produce a number that is neither, so nothing is charted."
-                )
+                Text("Samples use \(series.units.formatted()). Hozz will not combine them.")
                 .font(.callout)
                 .foregroundStyle(HozzPalette.inkSoft)
-                Text("The records are safe and unchanged — only the summary is withheld.")
+                Text("Records are unchanged; this summary is unavailable.")
                     .font(.caption)
                     .foregroundStyle(HozzPalette.inkMuted)
             }
@@ -185,7 +165,7 @@ struct TypeDetailView: View {
         let unit = series.displayUnit
         return Card(
             title: "Over time",
-            subtitle: "One \(series.granularity.columnNoun) per column, in your local time.",
+            subtitle: "One \(series.granularity.columnNoun) per column · local time",
             accessory: AnyView(
                 Text(unit.label)
                     .font(.caption.weight(.medium))
@@ -304,7 +284,7 @@ struct TypeDetailView: View {
     /// An empty range is a fact about the sweep, not about the person.
     private func emptyRange(_ series: TypeSeries) -> some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Nothing in this range yet.")
+            Text("No data in this range.")
                 .font(.callout.weight(.medium))
                 .foregroundStyle(HozzPalette.ink)
             if let summary = services.summaries.first(where: { $0.type == type }),
@@ -315,8 +295,8 @@ struct TypeDetailView: View {
                 // too, where it is simply not true and quietly suggests more is
                 // coming when nothing is. The phone now says which it is.
                 Text(
-                    "This type does have \(summary.recordCount.formatted(.number)) records, "
-                        + "the most recent from \(Self.day(latest)). "
+                    "\(summary.recordCount.formatted(.number)) records, latest "
+                        + "\(Self.day(latest)). "
                         + OverviewNarration.completeness(
                             services.standing(for: type),
                             latest: nil,
@@ -329,7 +309,7 @@ struct TypeDetailView: View {
                 // A way out rather than a dead end: the records are here, and
                 // the only thing between the reader and them is the window.
                 if range != .all {
-                    Button("Show everything held") { range = .all }
+                    Button("Show all") { range = .all }
                         .buttonStyle(.borderedProminent)
                         .tint(HozzPalette.blue)
                         .padding(.top, 2)
@@ -350,7 +330,7 @@ struct TypeDetailView: View {
         let unit = series.displayUnit
         return Card(
             title: "Distribution",
-            subtitle: "Every individual reading in range, not the daily figures."
+            subtitle: "Individual readings, not daily aggregates."
         ) {
             Chart(buckets) { bucket in
                 BarMark(
@@ -381,7 +361,7 @@ struct TypeDetailView: View {
     private var recentCard: some View {
         Card(
             title: "Most recent readings",
-            subtitle: "Straight from the archive, newest first."
+            subtitle: "Newest first."
         ) {
             if services.recent.isEmpty {
                 Text("None held.")

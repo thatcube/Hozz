@@ -57,11 +57,7 @@ struct WorkoutsView: View {
                             .font(.system(size: 15, weight: .medium))
                             .foregroundStyle(HozzPalette.inkSoft)
                         Text(
-                            """
-                            That is a complete answer, not a fault. Health does \
-                            not say whether a type was declined or is simply \
-                            empty.
-                            """
+                            "Health does not reveal whether this is empty or unshared."
                         )
                         .hozzCaption()
                         .fixedSize(horizontal: false, vertical: true)
@@ -182,7 +178,7 @@ struct WorkoutCard: View {
     private var legs: some View {
         VStack(alignment: .leading, spacing: 8) {
             Divider().overlay(HozzPalette.lineSoft)
-            Text("Each leg")
+            Text("Activities")
                 .hozzLabel()
                 .textCase(.uppercase)
             ForEach(workout.legs) { leg in

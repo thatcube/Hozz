@@ -151,11 +151,11 @@ extension DeliveryEngine {
             let receipt = try await deliverWithoutRecording(batch, to: destination)
             let message = switch destination.kind {
             case .folder:
-                "Wrote \(receipt.artifactName ?? "a test file") successfully."
+                "Wrote \(receipt.artifactName ?? "a test file")."
             case .restAPI:
-                "The destination accepted the test. \(receipt.detail ?? "")"
+                "Test accepted. \(receipt.detail ?? "")"
             case .mqtt:
-                "The broker accepted the test. \(receipt.detail ?? "")"
+                "Test accepted. \(receipt.detail ?? "")"
             }
             let savedEndpointAfter = try await self.destination(
                 id: destination.id
@@ -174,7 +174,7 @@ extension DeliveryEngine {
             )
         } catch let error as DeliveryError {
             return DestinationTestResult(
-                message: error.errorDescription ?? "The test failed.",
+                message: error.errorDescription ?? "Test failed.",
                 endpointURL: nil
             )
         }

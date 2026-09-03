@@ -442,13 +442,13 @@ final class SyncSummaryTests: XCTestCase {
             has not is the whole failure this app is trying to avoid.
             """
         )
-        XCTAssertTrue(summary.contains("Still fetching"))
+        XCTAssertTrue(summary.contains("still arriving"))
     }
 
     func testAQuietPassWithNothingLeftToFetchMaySaySo() {
         XCTAssertEqual(
             SyncViewModel.describe(outcome(delivered: 0)),
-            "Everything was already up to date."
+            "Already up to date."
         )
     }
 
@@ -483,7 +483,7 @@ final class SyncSummaryTests: XCTestCase {
             summary.contains("up to date"),
             "Nothing was established, so nothing may be claimed."
         )
-        XCTAssertTrue(summary.contains("did not get through"))
+        XCTAssertTrue(summary.contains("stopped early"))
     }
 
     func testALockedPhoneIsSaidToBeLockedRatherThanIdle() {
@@ -491,7 +491,7 @@ final class SyncSummaryTests: XCTestCase {
             SyncViewModel.describe(
                 outcome(delivered: 0, primingRemains: true, waitingForUnlock: true)
             ),
-            "Waiting for this iPhone to be unlocked."
+            "Unlock this iPhone to continue."
         )
     }
 }

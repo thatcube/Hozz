@@ -90,6 +90,8 @@ struct RootView: View {
                 Label(section.rawValue, systemImage: section.symbol)
                     .tag(section)
             }
+            .scrollContentBackground(.hidden)
+            .background(HozzPalette.air.opacity(0.72))
             .navigationSplitViewColumnWidth(min: 180, ideal: 200)
         } detail: {
             switch selection {
@@ -103,8 +105,7 @@ struct RootView: View {
                 ActivityView(services: services)
             }
         }
-        // The website's wash, behind the whole window rather than on each pane,
-        // so the panes keep their own material and only the light changes.
-        .background(HozzPalette.surfaceWash)
+        .tint(HozzPalette.blue)
+        .background(HozzSurface())
     }
 }

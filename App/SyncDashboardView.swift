@@ -19,7 +19,7 @@ struct SyncDashboardView: View {
 
     var body: some View {
         HozzScreen {
-            HozzScreenTitle("Automatic export")
+            HozzScreenTitle("Automatic")
 
             statusCard
 
@@ -170,7 +170,7 @@ struct SyncDashboardView: View {
     @ViewBuilder
     private var backfillSection: some View {
         if let backfill = model.backfill, backfill.typesSelected > 0 {
-            HozzSection("First sync through your history") {
+            HozzSection("History") {
                 VStack(alignment: .leading, spacing: 10) {
                     HozzNote(
                         "\(backfill.typesComplete) of \(backfill.typesSelected) "
@@ -195,14 +195,11 @@ struct SyncDashboardView: View {
             // No percentage and no estimate: Health will not say how much a
             // type holds without reading all of it, so both would be invented,
             // and an invented estimate is a promise that gets broken.
-            text = "Hozz reads a little of every type each time, so records "
-                + "keep arriving long before a type is finished. "
-                + "\(backfill.typesStarted) of \(backfill.typesSelected) have "
-                + "started. \(backfill.recordsDelivered.formatted()) records "
-                + "sent so far."
+            text = "\(backfill.typesStarted) of \(backfill.typesSelected) started · "
+                + "\(backfill.recordsDelivered.formatted()) records sent. "
+                + "Each run advances every type."
         } else {
-            text = "Every type you selected has been read to the end. "
-                + "\(backfill.recordsDelivered.formatted()) records sent so far."
+            text = "\(backfill.recordsDelivered.formatted()) records sent."
         }
         if backfill.typesEmpty > 0 {
             // An empty type is a complete export of nothing, not a problem.
@@ -223,27 +220,22 @@ struct SyncDashboardView: View {
     /// device — the same source, failing only where it could not be noticed
     /// by running the tests.
     private var destinationFooter: String {
-        var text = "A destination is a folder or a web address you control. "
-        text += "Hozz has no default and sends nothing until you add one."
+        var text = "Folders or web addresses you control. Nothing is sent until you add one."
         guard model.hasDestinations else { return text }
-        text += "\n\nHozz reads the last few months by date as soon as a "
-        text += "destination exists, then keeps working backwards through "
-        text += "everything older. Fetch them again if you have given Hozz "
-        text += "access to more health types since then; anything already "
-        text += "sent is simply replaced."
+        text += "\n\nFetch recent months again after granting more Health access; "
+        text += "existing records are replaced."
         return text
     }
 
     private var backgroundRealitySection: some View {
-        HozzSection("How background sync behaves") {
+        HozzSection("Background sync") {
             HozzNoteCard {
                 HozzNote(
-                    "Health can only be read while this iPhone is unlocked.",
+                    "Health can only be read while iPhone is unlocked.",
                     icon: .lock
                 )
                 HozzNote(
-                    "iOS decides when Hozz runs. Expect within a few hours, "
-                    + "not instantly.",
+                    "iOS decides when Hozz runs; allow a few hours.",
                     icon: .clock
                 )
                 HozzNote(
@@ -251,8 +243,7 @@ struct SyncDashboardView: View {
                     icon: .alertTriangle
                 )
                 HozzNote(
-                    "Nothing is ever lost. Anything missed is sent on the "
-                    + "next run.",
+                    "Missed records are sent next time.",
                     icon: .circleCheck
                 )
             }

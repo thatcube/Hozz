@@ -182,6 +182,19 @@ public enum HozzMetrics {
 
     /// A control under a finger or a pointer.
     public static let pressedOpacity: Double = 0.82
+
+    /// The wider margin a desktop canvas can carry without reading as a
+    /// stretched phone screen.
+    public static let desktopPageInset: CGFloat = 26
+
+    /// Between dashboard panels on a desktop canvas.
+    public static let desktopGutter: CGFloat = 18
+
+    /// Desktop panels are wider and shallower than phone cards.
+    public static let desktopCardRadius: CGFloat = 14
+
+    /// The stable width of a desktop master list beside its detail.
+    public static let desktopListWidth: CGFloat = 290
 }
 
 // MARK: - Meaning, as colour
@@ -291,6 +304,234 @@ public struct HozzScreenTitle: View {
                 .accessibilityAddTraits(.isHeader)
         }
         .padding(.top, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// A desktop page keeps the shared surface and rhythm while leaving room for
+/// native sidebars, tables, charts, and pointer-sized controls.
+public struct HozzDesktopPage<Content: View>: View {
+    private let content: Content
+
+    public init(@ViewBuilder content: () -> Content) {
+        self.content = content()
+    }
+
+    public var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: HozzMetrics.desktopGutter) {
+                content
+            }
+            .padding(HozzMetrics.desktopPageInset)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .background(HozzSurface())
+    }
+}
+
+/// A desktop page heading. The type language matches iPhone, while its
+/// horizontal composition remains native to a wide window.
+public struct HozzPageHeader<Accessory: View>: View {
+    private let title: Text
+    private let subtitle: Text?
+    private let accessory: Accessory
+    @ScaledMetric(relativeTo: .title2) private var titleSize: CGFloat = 28
+
+    public init(
+        _ title: LocalizedStringKey,
+        subtitle: LocalizedStringKey? = nil,
+        @ViewBuilder accessory: () -> Accessory
+    ) {
+        self.title = Text(title)
+        self.subtitle = subtitle.map { Text($0) }
+        self.accessory = accessory()
+    }
+
+    public init(
+        verbatim title: String,
+        subtitle: String? = nil,
+        @ViewBuilder accessory: () -> Accessory
+    ) {
+        self.title = Text(verbatim: title)
+        self.subtitle = subtitle.map { Text(verbatim: $0) }
+        self.accessory = accessory()
+    }
+
+    public init(
+        _ title: LocalizedStringKey,
+        verbatimSubtitle subtitle: String?,
+        @ViewBuilder accessory: () -> Accessory
+    ) {
+        self.title = Text(title)
+        self.subtitle = subtitle.map { Text(verbatim: $0) }
+        self.accessory = accessory()
+    }
+
+    public var body: some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .lastTextBaseline, spacing: 18) {
+                heading
+                Spacer(minLength: 16)
+                accessory
+            }
+            VStack(alignment: .leading, spacing: 12) {
+                heading
+                HStack {
+                    Spacer(minLength: 0)
+                    accessory
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var heading: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            title
+                .hozzDisplay(size: titleSize)
+                .accessibilityAddTraits(.isHeader)
+            if let subtitle {
+                subtitle
+                    .font(.callout)
+                    .foregroundStyle(HozzPalette.inkSoft)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+    }
+}
+
+extension HozzPageHeader where Accessory == EmptyView {
+    public init(_ title: LocalizedStringKey, subtitle: LocalizedStringKey? = nil) {
+        self.init(title, subtitle: subtitle) { EmptyView() }
+    }
+
+    public init(verbatim title: String, subtitle: String? = nil) {
+        self.init(verbatim: title, subtitle: subtitle) { EmptyView() }
+    }
+
+    public init(_ title: LocalizedStringKey, verbatimSubtitle subtitle: String?) {
+        self.init(title, verbatimSubtitle: subtitle) { EmptyView() }
+    }
+}
+
+/// A titled desktop panel built from the same card surface as iPhone.
+public struct HozzPanel<Content: View>: View {
+    private let title: Text?
+    private let subtitle: Text?
+    private let accessory: AnyView?
+    private let content: Content
+
+    public init(
+        title: LocalizedStringKey? = nil,
+        subtitle: LocalizedStringKey? = nil,
+        accessory: AnyView? = nil,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = title.map { Text($0) }
+        self.subtitle = subtitle.map { Text($0) }
+        self.accessory = accessory
+        self.content = content()
+    }
+
+    public init(
+        verbatimTitle title: String,
+        verbatimSubtitle subtitle: String? = nil,
+        accessory: AnyView? = nil,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = Text(verbatim: title)
+        self.subtitle = subtitle.map { Text(verbatim: $0) }
+        self.accessory = accessory
+        self.content = content()
+    }
+
+    public init(
+        title: LocalizedStringKey,
+        verbatimSubtitle subtitle: String?,
+        accessory: AnyView? = nil,
+        @ViewBuilder content: () -> Content
+    ) {
+        self.title = Text(title)
+        self.subtitle = subtitle.map { Text(verbatim: $0) }
+        self.accessory = accessory
+        self.content = content()
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            if title != nil || subtitle != nil || accessory != nil {
+                HStack(alignment: .firstTextBaseline, spacing: 10) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        if let title {
+                            title
+                                .font(.headline)
+                                .foregroundStyle(HozzPalette.ink)
+                        }
+                        if let subtitle {
+                            subtitle
+                                .font(.caption)
+                                .foregroundStyle(HozzPalette.inkMuted)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    accessory
+                }
+            }
+            content
+        }
+        .hozzCard(
+            padding: HozzMetrics.cardPadding,
+            radius: HozzMetrics.desktopCardRadius
+        )
+    }
+}
+
+/// One dashboard number with its meaning immediately beside it.
+public struct HozzStatTile: View {
+    private let label: String
+    private let value: String
+    private let unit: String?
+    private let caption: String?
+    private let tone: Color
+
+    public init(
+        label: String,
+        value: String,
+        unit: String? = nil,
+        caption: String? = nil,
+        tone: Color = HozzPalette.ink
+    ) {
+        self.label = label
+        self.value = value
+        self.unit = unit
+        self.caption = caption
+        self.tone = tone
+    }
+
+    public var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            Text(label.uppercased())
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(0.7)
+                .foregroundStyle(HozzPalette.inkMuted)
+            HStack(alignment: .firstTextBaseline, spacing: 4) {
+                Text(value)
+                    .font(.system(size: 26, weight: .medium, design: .rounded))
+                    .foregroundStyle(tone)
+                    .monospacedDigit()
+                if let unit, !unit.isEmpty {
+                    Text(unit)
+                        .font(.callout)
+                        .foregroundStyle(HozzPalette.inkSoft)
+                }
+            }
+            if let caption {
+                Text(caption)
+                    .font(.caption2)
+                    .foregroundStyle(HozzPalette.inkMuted)
+            }
+        }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

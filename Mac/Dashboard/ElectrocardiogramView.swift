@@ -19,7 +19,7 @@ struct ElectrocardiogramView: View {
     var body: some View {
         HStack(spacing: 0) {
             list
-                .frame(width: 280)
+                .frame(width: HozzMetrics.desktopListWidth)
             Divider().overlay(HozzPalette.lineSoft)
             detail
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -45,6 +45,7 @@ struct ElectrocardiogramView: View {
             guard let id = selected?.id else { return }
             await services.loadWaveform(id: id)
         }
+        .background(HozzSurface())
     }
 
     private var list: some View {
@@ -100,7 +101,7 @@ struct ElectrocardiogramView: View {
     private var detail: some View {
         if let selected {
             ScrollView {
-                VStack(alignment: .leading, spacing: Dash.gutter) {
+                VStack(alignment: .leading, spacing: HozzMetrics.desktopGutter) {
                     header(selected)
                     statsCard(selected)
                     traceCard(selected)
@@ -111,23 +112,17 @@ struct ElectrocardiogramView: View {
             ContentUnavailableView(
                 "No readings yet",
                 systemImage: "waveform.path.ecg",
-                description: Text("Electrocardiograms appear here once your phone sends them.")
+                description: Text("Received ECGs appear here.")
             )
         }
     }
 
     private func header(_ reading: IngestStore.StoredElectrocardiogram) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Electrocardiogram")
-                .font(.system(size: 26, weight: .semibold, design: .rounded))
-                .foregroundStyle(HozzPalette.ink)
-            Text(
-                reading.startDate.formatted(date: .complete, time: .shortened)
-                    + (reading.sourceName.map { " · \($0)" } ?? "")
-            )
-            .font(.callout)
-            .foregroundStyle(HozzPalette.inkSoft)
-        }
+        HozzPageHeader(
+            "Electrocardiogram",
+            verbatimSubtitle: reading.startDate.formatted(date: .complete, time: .shortened)
+                + (reading.sourceName.map { " · \($0)" } ?? "")
+        )
     }
 
     private func statsCard(_ reading: IngestStore.StoredElectrocardiogram) -> some View {
@@ -167,7 +162,7 @@ struct ElectrocardiogramView: View {
         _ reading: IngestStore.StoredElectrocardiogram
     ) -> String {
         guard let expected = reading.expectedVoltages, expected > 0 else {
-            return "the Watch did not say how many to expect"
+            return "expected count unavailable"
         }
         return reading.isComplete
             ? "all \(expected.formatted(.number)) held"
@@ -178,12 +173,12 @@ struct ElectrocardiogramView: View {
         _ reading: IngestStore.StoredElectrocardiogram
     ) -> some View {
         Card(
-            title: waveformTitle,
-            subtitle: waveformSubtitle(reading)
+            verbatimTitle: waveformTitle,
+            verbatimSubtitle: waveformSubtitle(reading)
         ) {
             if let waveform = services.waveform {
                 if waveform.points.isEmpty {
-                    Text("No voltages have arrived for this reading yet.")
+                    Text("No voltages yet.")
                         .font(.callout)
                         .foregroundStyle(HozzPalette.inkMuted)
                         .frame(height: 200)
@@ -217,38 +212,34 @@ struct ElectrocardiogramView: View {
         _ reading: IngestStore.StoredElectrocardiogram
     ) -> String {
         guard let waveform = services.waveform else {
-            return "Reading the pages held for this recording."
+            return "Loading measurements."
         }
         guard let expected = waveform.expected, expected > 0 else {
-            return "The Watch did not say how many measurements it recorded, "
-                + "so this cannot be confirmed as the whole reading."
+            return "Expected count unavailable; completeness is unknown."
         }
         if waveform.isComplete {
             let seconds = Double(waveform.points.count)
                 / (reading.samplingHertz ?? 512)
-            return "The complete recording — "
-                + "\(expected.formatted(.number)) measurements, "
-                + "about \(seconds.formatted(.number.precision(.fractionLength(0)))) seconds."
+            return "Complete · \(expected.formatted(.number)) measurements · "
+                + "about \(seconds.formatted(.number.precision(.fractionLength(0)))) seconds"
         }
-        return "Only \(waveform.points.count.formatted(.number)) of "
-            + "\(expected.formatted(.number)) measurements have arrived. "
-            + "This is a fragment of the recording, not a short recording."
+        return "\(waveform.points.count.formatted(.number)) of "
+            + "\(expected.formatted(.number)) measurements · fragment, not a short recording"
     }
 
     private func incompleteBanner(_ waveform: IngestStore.Waveform) -> some View {
         HStack(alignment: .top, spacing: 8) {
             Image(systemName: "exclamationmark.triangle")
-                .foregroundStyle(HozzPalette.blue)
+                .foregroundStyle(HozzPalette.warning)
             Text(
-                "Do not read this as a whole recording. Pages are still arriving, "
-                    + "and the shape of a trace missing measurements is not the shape of the heartbeat."
+                "Incomplete—missing measurements can change the trace's shape."
             )
             .font(.caption)
             .foregroundStyle(HozzPalette.inkSoft)
         }
         .padding(10)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(HozzPalette.blueWash.opacity(0.7))
+        .background(HozzPalette.warningWash)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 

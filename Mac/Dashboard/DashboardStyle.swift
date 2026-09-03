@@ -3,105 +3,8 @@ import SwiftUI
 import HozzUI
 import HozzReceive
 
-/// The pieces every dashboard is built from.
-///
-/// The website is a light page: a lot of white, a soft wash where a surface
-/// catches the light, generous space, and a rule so faint it reads as a change
-/// of tone rather than a line. These reproduce that on a desktop canvas rather
-/// than inventing a second visual language for the same product, which is why
-/// nothing here takes a colour that is not a `HozzPalette` token.
-enum Dash {
-    static let cardCorner: CGFloat = 14
-    static let gutter: CGFloat = 18
-    static let pageInset: CGFloat = 26
-}
-
-/// A rounded surface with the site's diagonal wash across it.
-struct Card<Content: View>: View {
-    var title: String?
-    var subtitle: String?
-    var accessory: AnyView?
-    @ViewBuilder var content: Content
-
-    init(
-        title: String? = nil,
-        subtitle: String? = nil,
-        accessory: AnyView? = nil,
-        @ViewBuilder content: () -> Content
-    ) {
-        self.title = title
-        self.subtitle = subtitle
-        self.accessory = accessory
-        self.content = content()
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            if title != nil || subtitle != nil || accessory != nil {
-                HStack(alignment: .firstTextBaseline, spacing: 10) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        if let title {
-                            Text(title)
-                                .font(.headline)
-                                .foregroundStyle(HozzPalette.ink)
-                        }
-                        if let subtitle {
-                            Text(subtitle)
-                                .font(.caption)
-                                .foregroundStyle(HozzPalette.inkMuted)
-                        }
-                    }
-                    Spacer(minLength: 8)
-                    accessory
-                }
-            }
-            content
-        }
-        .padding(16)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .background(HozzPalette.cardWash)
-        .clipShape(RoundedRectangle(cornerRadius: Dash.cardCorner, style: .continuous))
-        .overlay(
-            RoundedRectangle(cornerRadius: Dash.cardCorner, style: .continuous)
-                .strokeBorder(HozzPalette.lineSoft, lineWidth: 1)
-        )
-    }
-}
-
-/// One number, said once, with what it is underneath it.
-struct StatTile: View {
-    let label: String
-    let value: String
-    var unit: String?
-    var caption: String?
-    var tone: Color = HozzPalette.ink
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(label.uppercased())
-                .font(.system(size: 10, weight: .semibold))
-                .tracking(0.7)
-                .foregroundStyle(HozzPalette.inkMuted)
-            HStack(alignment: .firstTextBaseline, spacing: 4) {
-                Text(value)
-                    .font(.system(size: 26, weight: .medium, design: .rounded))
-                    .foregroundStyle(tone)
-                    .monospacedDigit()
-                if let unit, !unit.isEmpty {
-                    Text(unit)
-                        .font(.callout)
-                        .foregroundStyle(HozzPalette.inkSoft)
-                }
-            }
-            if let caption {
-                Text(caption)
-                    .font(.caption2)
-                    .foregroundStyle(HozzPalette.inkMuted)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-    }
-}
+typealias Card<Content: View> = HozzPanel<Content>
+typealias StatTile = HozzStatTile
 
 /// The honesty strip that sits under a chart.
 ///
@@ -145,7 +48,7 @@ struct CoverageRibbon: View {
                     .font(.caption2)
                     .foregroundStyle(HozzPalette.inkMuted)
                 if !isUniform && coverage.daysWithData > 0 {
-                    Text("Paler \(granularity.columnNoun)s are ones fewer days have reached.")
+                    Text("Paler \(granularity.columnNoun)s have fewer days.")
                         .font(.caption2)
                         .foregroundStyle(HozzPalette.inkMuted.opacity(0.85))
                 }
@@ -226,6 +129,6 @@ struct DashboardAxes: ViewModifier {
 extension View {
     /// The standard page padding, applied once.
     func dashboardPage() -> some View {
-        padding(Dash.pageInset)
+        padding(HozzMetrics.desktopPageInset)
     }
 }

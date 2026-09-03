@@ -16,16 +16,16 @@ struct OverviewView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: Dash.gutter) {
+            VStack(alignment: .leading, spacing: HozzMetrics.desktopGutter) {
                 header
                 archiveCard
 
                 LazyVGrid(
                     columns: [
-                        GridItem(.flexible(minimum: 320), spacing: Dash.gutter),
-                        GridItem(.flexible(minimum: 320), spacing: Dash.gutter)
+                        GridItem(.flexible(minimum: 320), spacing: HozzMetrics.desktopGutter),
+                        GridItem(.flexible(minimum: 320), spacing: HozzMetrics.desktopGutter)
                     ],
-                    spacing: Dash.gutter
+                    spacing: HozzMetrics.desktopGutter
                 ) {
                     ForEach(HealthDomain.allCases) { domain in
                         domainCard(domain)
@@ -40,16 +40,7 @@ struct OverviewView: View {
     // MARK: - Header
 
     private var header: some View {
-        HStack(alignment: .lastTextBaseline) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Your health")
-                    .font(.system(size: 30, weight: .semibold, design: .rounded))
-                    .foregroundStyle(HozzPalette.ink)
-                Text(subtitle)
-                    .font(.callout)
-                    .foregroundStyle(HozzPalette.inkSoft)
-            }
-            Spacer()
+        HozzPageHeader("Your health", verbatimSubtitle: subtitle) {
             RangePicker(range: $range)
         }
     }
@@ -63,7 +54,7 @@ struct OverviewView: View {
         if let span = services.archiveSpan {
             text += ", \(Self.year(span.earliest))–\(Self.year(span.latest))"
         }
-        return text + ". All of it on this computer."
+        return text + " · on this Mac"
     }
 
     // MARK: - Archive
@@ -77,8 +68,8 @@ struct OverviewView: View {
     /// picture on the screen, and it makes every thin month afterwards legible.
     private var archiveCard: some View {
         Card(
-            title: "What has arrived",
-            subtitle: "Records received each month. A phone works back through history one type at a time, so the shape here is the sweep's, not your life's."
+            title: "Arrivals",
+            subtitle: "Monthly arrivals show sync progress, not your health."
         ) {
             if services.archiveDensity.isEmpty {
                 Text("Nothing yet.")
@@ -135,12 +126,12 @@ struct OverviewView: View {
                     StatTile(
                         label: "Records",
                         value: services.totalRecords.formatted(.number),
-                        caption: "on this computer"
+                        caption: "on this Mac"
                     )
                     StatTile(
                         label: "Types",
                         value: "\(services.summaries.count)",
-                        caption: "seen so far"
+                        caption: "received"
                     )
                     StatTile(
                         label: "Busiest month",
@@ -178,10 +169,8 @@ struct OverviewView: View {
     private func domainCard(_ domain: HealthDomain) -> some View {
         let snapshots = services.overview[domain] ?? []
         return Card(
-            title: domain.rawValue,
-            subtitle: snapshots.isEmpty
-                ? "Nothing here has arrived yet."
-                : domainCaption(snapshots),
+            verbatimTitle: domain.rawValue,
+            verbatimSubtitle: snapshots.isEmpty ? nil : domainCaption(snapshots),
             accessory: AnyView(
                 Image(systemName: domain.symbol)
                     .font(.title3)
@@ -189,7 +178,7 @@ struct OverviewView: View {
             )
         ) {
             if snapshots.isEmpty {
-                Text("As your phone works back through your history, these appear here.")
+                Text("No records yet.")
                     .font(.caption)
                     .foregroundStyle(HozzPalette.inkMuted)
             } else {

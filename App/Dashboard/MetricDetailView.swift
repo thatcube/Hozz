@@ -134,14 +134,11 @@ struct MetricDetailView: View {
     /// without a conversion table the honest answer is no number at all.
     private var unitConflictNote: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("These readings arrived in more than one unit")
+            Text("Mixed units")
                 .font(.system(size: 15, weight: .medium))
                 .foregroundStyle(HozzPalette.inkSoft)
             Text(
-                """
-                Hozz will not add them together, because a converted figure it \
-                guessed at would look exactly like one it knew.
-                """
+                "Hozz will not combine readings without a known conversion."
             )
             .hozzCaption()
             .fixedSize(horizontal: false, vertical: true)

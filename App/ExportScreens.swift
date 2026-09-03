@@ -27,8 +27,7 @@ struct ExportSetupView: View {
             if !healthDataAvailable {
                 HozzNoteCard {
                     HozzNote(
-                        "Apple Health is unavailable or restricted on this "
-                        + "device.",
+                        "Apple Health is unavailable on this device.",
                         icon: .alertTriangle,
                         tone: .warning
                     )
@@ -107,8 +106,7 @@ struct ExportSetupView: View {
             Text("Export Apple Health")
                 .hozzDisplay(size: 28)
             Text(
-                "Choose your Health access, then save a file directly from "
-                + "this device."
+                "Choose Health access and save a file on this device."
             )
             .hozzBody()
             .fixedSize(horizontal: false, vertical: true)
@@ -128,8 +126,7 @@ struct ExportSetupView: View {
                     HozzNote(obstruction, icon: .alertTriangle, tone: .warning)
                 } else {
                     HozzNote(
-                        "\(resumable.recordCount.formatted()) records are "
-                        + "already saved. Exporting continues from there.",
+                        "\(resumable.recordCount.formatted()) records saved. Continue from there.",
                         icon: .refresh
                     )
                 }
@@ -177,10 +174,7 @@ struct ExportSetupView: View {
                     // export gets an archive that looks broken, and finding
                     // that out afterwards is the whole problem.
                     HozzNote(
-                        "GPX holds routes only. This exports workouts that "
-                        + "recorded GPS and nothing else — no heart rate, no "
-                        + "sleep, no weight. Choose NDJSON or SQLite for "
-                        + "everything.",
+                        "GPX exports workout routes only. Choose NDJSON or SQLite for all data.",
                         icon: .alertTriangle,
                         tone: .warning
                     )
@@ -191,8 +185,7 @@ struct ExportSetupView: View {
                     // unfinished run has already sealed, so the choice belongs
                     // to that run until it finishes or is discarded.
                     HozzNote(
-                        "The unfinished export above set this format. Discard "
-                        + "it to choose another.",
+                        "The unfinished export uses this format. Discard it to change.",
                         icon: .lock
                     )
                 }
@@ -206,19 +199,19 @@ struct ExportSetupView: View {
     private var formatNote: String {
         switch exportFormat {
         case .ndjson:
-            "One record per line. Keeps everything Health returned."
+            "One record per line; preserves all Health fields."
         case .csv:
-            "A spreadsheet per data type. Drops metadata and workout details."
+            "One spreadsheet per type; omits metadata and workout details."
         case .json:
-            "One array. Easiest to read, heaviest to open when large."
+            "One readable array; slower for large exports."
         case .sqlite:
-            "A database you can query. Keeps every record as it was written."
+            "A queryable database preserving every record."
         case .markdown:
-            "A note per day for Obsidian. Drops the records behind the totals."
+            "Daily Obsidian notes; omits records behind totals."
         case .gpx:
-            "One GPX track per workout with GPS, for maps and fitness tools."
+            "One GPX track per workout route."
         case .raw:
-            "Uncompressed. Can be several gigabytes."
+            "Uncompressed; may be several gigabytes."
         }
     }
 
@@ -661,8 +654,7 @@ struct ExportPausedView: View {
             tone: .action,
             title: "Export paused",
             message: message,
-            detail: "\(pause.recordCount.formatted()) records are saved. "
-                + "Continuing picks up where this left off, with no duplicates."
+            detail: "\(pause.recordCount.formatted()) records saved. Continue without duplicates."
         ) {
             VStack(spacing: 10) {
                 Button(action: resumeAction) {
@@ -689,9 +681,9 @@ struct ExportPausedView: View {
     private var message: String {
         switch pause.reason {
         case .deviceLocked:
-            "Health is locked. Unlock this iPhone and Hozz will continue."
+            "Unlock this iPhone to continue."
         case .checkpointed:
-            "Hozz saved its progress so nothing has to be read twice."
+            "Progress is saved."
         }
     }
 }
@@ -774,11 +766,8 @@ struct ExportReadyView: View {
                     }
 
                     Text(
-                        "Most people have no data for most types, so empty is "
-                        + "normal. Apple does not let Hozz tell an empty type "
-                        + "from one you did not share, so the export marks "
-                        + "those as indeterminate rather than claiming they "
-                        + "were read."
+                        "Apple cannot distinguish an empty type from one you did "
+                        + "not share, so both are marked indeterminate."
                     )
                     .hozzCaption()
                     .multilineTextAlignment(.leading)
@@ -835,8 +824,7 @@ struct ExportWaitingView: View {
             icon: .hourglass,
             tone: .action,
             title: "Waiting to start",
-            message: "\(owner.activityDescription) Your export will start as "
-                + "soon as it finishes.",
+            message: "\(owner.activityDescription) Export starts next.",
             detail: nil
         ) {
             Button("Cancel", action: cancelAction)

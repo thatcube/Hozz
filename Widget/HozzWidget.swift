@@ -159,7 +159,7 @@ struct HozzWidgetView: View {
             return "Open Hozz for status"
         }
         guard entry.hasDestination else {
-            return "No destination yet"
+            return "No destination"
         }
         if entry.needsAttention {
             return "Needs attention"
@@ -191,7 +191,7 @@ struct HozzWidget: Widget {
             HozzWidgetView(entry: entry)
         }
         .configurationDisplayName("Health Sync")
-        .description("When Hozz last sent your Health data, and how much.")
+        .description("Last Health sync and record count.")
         .supportedFamilies([.systemSmall, .systemMedium, .accessoryRectangular])
     }
 }

@@ -37,15 +37,15 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
     public var summary: String {
         switch self {
         case .folder:
-            "Syncs to your computer through iCloud, Dropbox, or any folder. No server needed."
+            "Sync through any Files folder. No server needed."
         case .homeAssistant:
-            "Sends metrics straight into Home Assistant as sensors."
+            "Send metrics to Home Assistant sensors."
         case .influxDB:
-            "Writes line protocol straight into InfluxDB, ready to chart in Grafana."
+            "Write line protocol to InfluxDB."
         case .restAPI:
-            "Posts to any endpoint you run."
+            "POST to your endpoint."
         case .mqtt:
-            "Publishes to an MQTT broker on your network."
+            "Publish to your MQTT broker."
         }
     }
 
@@ -145,36 +145,36 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
         switch self {
         case .folder:
             [
-                "Choose a folder in iCloud Drive, Dropbox, OneDrive, or anywhere the Files app can reach.",
-                "Whatever already syncs that folder to your computer does the rest.",
-                "Tap Send a test to confirm it works."
+                "Choose any folder in Files.",
+                "Synced folders reach your computer; local folders stay here.",
+                "Send a test."
             ]
         case .homeAssistant:
             [
-                "In Home Assistant, add a webhook trigger automation, or use the REST API.",
-                "For the API, create a long-lived access token under your profile.",
+                "Add a webhook automation or use Home Assistant's REST API.",
+                "For REST, create a long-lived access token.",
                 "Paste the address here, and put Bearer followed by the token in the field below.",
-                "Tap Send a test — Home Assistant will show the request arriving."
+                "Send a test."
             ]
         case .influxDB:
             [
-                "For InfluxDB 2.x or 3.x, use /api/v2/write and add ?org=, ?bucket=, and ?precision= to the address.",
-                "For InfluxDB 1.8, use /write?db=yourdatabase instead.",
-                "Paste your API token below, written as Token followed by a space and the token itself.",
-                "Set the measurement name and timestamp precision under Details; the precision has to match the one in the address.",
-                "Tap Send a test — InfluxDB writes one point you can query straight away."
+                "InfluxDB 2.x/3.x: use /api/v2/write with org, bucket, and precision.",
+                "InfluxDB 1.8: use /write?db=yourdatabase.",
+                "Enter Token, a space, then your API token below.",
+                "Match Details precision to the address.",
+                "Send a test."
             ]
         case .restAPI:
             [
-                "Point this at any endpoint that accepts a POST.",
-                "Hozz sends an Idempotency-Key header, so retries are safe to accept twice.",
-                "The receiver in the Hozz repository is a working example."
+                "Use any endpoint that accepts POST.",
+                "Hozz includes Idempotency-Key for safe retries.",
+                "The Hozz repository includes a receiver."
             ]
         case .mqtt:
             [
-                "Enter your broker address, for example mqtt://homeassistant.local:1883.",
-                "Add a username and password if your broker requires them.",
-                "Hozz publishes each metric to hozz/<metric> and retains the last value."
+                "Enter the broker address.",
+                "Add credentials if required.",
+                "Each metric publishes to hozz/<metric> with its last value retained."
             ]
         }
     }
@@ -185,11 +185,11 @@ public enum DestinationPreset: String, CaseIterable, Identifiable, Sendable {
         case .folder:
             nil
         case .homeAssistant, .restAPI:
-            "Your phone has to be able to reach this address. On a home network that means being on the same Wi-Fi."
+            "Your iPhone must be able to reach this address."
         case .influxDB:
-            "InfluxDB keeps one point per measurement, tag set, and timestamp, so two samples of the same type from the same source at the same instant become one. Your phone also has to be able to reach this address."
+            "InfluxDB merges matching measurement, tag, and timestamp points. Your iPhone must reach this address."
         case .mqtt:
-            "MQTT keeps no history, so a broker that is offline misses that batch. Hozz retries, but a folder is more forgiving."
+            "MQTT keeps no history. Hozz retries while the broker is offline."
         }
     }
 

@@ -12,12 +12,13 @@ struct WorkoutsView: View {
     var body: some View {
         HStack(spacing: 0) {
             list
-                .frame(width: 300)
+                .frame(width: HozzMetrics.desktopListWidth)
             Divider().overlay(HozzPalette.lineSoft)
             detail
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .task { await services.loadWorkouts() }
+        .background(HozzSurface())
     }
 
     private var list: some View {
@@ -72,7 +73,7 @@ struct WorkoutsView: View {
             ContentUnavailableView(
                 "No workouts yet",
                 systemImage: "figure.run",
-                description: Text("They appear here as your phone sends them.")
+                description: Text("Received workouts appear here.")
             )
         } else {
             ContentUnavailableView(
@@ -108,7 +109,7 @@ struct WorkoutDetailView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: Dash.gutter) {
+            VStack(alignment: .leading, spacing: HozzMetrics.desktopGutter) {
                 header
                 statsCard
                 if let route, !route.isEmpty {
@@ -137,12 +138,11 @@ struct WorkoutDetailView: View {
     private func routeCard(_ route: WorkoutRoute) -> some View {
         Card(
             title: "Route",
-            subtitle: route.isComplete
-                ? "\(route.points.count.formatted(.number)) locations recorded."
+            verbatimSubtitle: route.isComplete
+                ? "\(route.points.count.formatted(.number)) locations"
                 : "\(route.points.count.formatted(.number)) locations recorded, "
-                    + "with \(route.missingPages) "
-                    + (route.missingPages == 1 ? "gap" : "gaps")
-                    + " where pages have not arrived. The line is drawn through what is held."
+                    + "\(route.missingPages) "
+                    + (route.missingPages == 1 ? "page missing" : "pages missing")
         ) {
             Map(initialPosition: .region(Self.region(for: route))) {
                 MapPolyline(coordinates: route.points.map {
@@ -169,11 +169,11 @@ struct WorkoutDetailView: View {
                 // Said plainly rather than left to the map. A straight line
                 // across a gap looks exactly like a road.
                 Label(
-                    "Straight segments may be missing pages rather than the way somebody went.",
+                    "Straight segments can bridge missing route pages.",
                     systemImage: "exclamationmark.circle"
                 )
                 .font(.caption)
-                .foregroundStyle(HozzPalette.inkMuted)
+                .foregroundStyle(HozzPalette.warning)
             }
         }
     }
@@ -202,8 +202,8 @@ struct WorkoutDetailView: View {
 
     private var heartRateCard: some View {
         Card(
-            title: "Heart rate through the session",
-            subtitle: "\(heartRate.count.formatted(.number)) readings, in beats per minute."
+            title: "Heart rate",
+            subtitle: "\(heartRate.count.formatted(.number)) readings · bpm"
         ) {
             Chart(heartRate) { point in
                 LineMark(
@@ -231,20 +231,11 @@ struct WorkoutDetailView: View {
     }
 
     private var header: some View {
-        HStack(alignment: .lastTextBaseline) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text(WorkoutActivity.name(workout.activityType))
-                    .font(.system(size: 26, weight: .semibold, design: .rounded))
-                    .foregroundStyle(HozzPalette.ink)
-                Text(
-                    workout.startDate.formatted(date: .complete, time: .shortened)
-                        + (workout.sourceName.map { " · \($0)" } ?? "")
-                )
-                .font(.callout)
-                .foregroundStyle(HozzPalette.inkSoft)
-            }
-            Spacer()
-        }
+        HozzPageHeader(
+            verbatim: WorkoutActivity.name(workout.activityType),
+            subtitle: workout.startDate.formatted(date: .complete, time: .shortened)
+                + (workout.sourceName.map { " · \($0)" } ?? "")
+        )
     }
 
     private var statsCard: some View {
@@ -333,7 +324,7 @@ struct WorkoutDetailView: View {
     private var legsCard: some View {
         Card(
             title: "Legs",
-            subtitle: "Each part on its own, because an average across a swim, a ride and a run describes none of them."
+            subtitle: "Each activity shown separately."
         ) {
             VStack(spacing: 0) {
                 ForEach(Array(workout.activities.enumerated()), id: \.offset) { index, leg in
@@ -373,11 +364,11 @@ struct WorkoutDetailView: View {
 
     private var allStatisticsCard: some View {
         Card(
-            title: "Everything Health computed",
-            subtitle: "\(workout.statistics.count) statistics, exactly as they arrived."
+            title: "Health statistics",
+            subtitle: "\(workout.statistics.count) values"
         ) {
             if workout.statistics.isEmpty {
-                Text("None recorded for this workout.")
+                Text("None recorded.")
                     .font(.callout)
                     .foregroundStyle(HozzPalette.inkMuted)
             } else {

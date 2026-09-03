@@ -48,16 +48,11 @@ public enum RequestTimeout {
     public static func explanation(for seconds: TimeInterval) -> String {
         switch seconds {
         case ..<30:
-            "Fast to find out something is wrong. Too short for a server that "
-            + "takes its time with a large batch, which would then look broken "
-            + "when it is only slow."
+            "Fast failure detection; may be too short for large batches."
         case 30...300:
-            "Long enough for a home server writing to an SD card, short enough "
-            + "that an unreachable one is noticed the same day."
+            "Suitable for most home servers."
         default:
-            "For a server that genuinely needs minutes. iOS suspends a "
-            + "background app long before an hour is up, so a wait this long "
-            + "usually only completes while Hozz is open on screen."
+            "For very slow servers; usually requires Hozz to stay open."
         }
     }
 }

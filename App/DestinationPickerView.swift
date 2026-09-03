@@ -91,9 +91,8 @@ struct DestinationPickerView: View {
             computersSection
 
             HozzSection(
-                "Where should your Health data go?",
-                footer: "Hozz has no default destination. Nothing leaves this "
-                    + "iPhone until you add one."
+                "Choose a destination",
+                footer: "No default. Nothing leaves until you add one."
             ) {
                 ForEach(DestinationPreset.allCases) { preset in
                     Button {
@@ -230,23 +229,19 @@ struct DestinationPickerView: View {
     private var footerText: String {
         switch browsing {
         case .denied:
-            return "Allow Hozz to find devices on your local network in "
-                + "Settings > Hozz, then come back. You can also add your "
-                + "computer by web address instead."
+            return "Allow Local Network access in Settings, or add a web address."
         case .failed(let reason):
             return reason
         case .idle, .searching:
             if !computers.isEmpty {
-                return "Tap to connect. Hozz sets up the address and the token "
-                    + "for you — nothing to copy across."
+                return "Choose a Mac to connect automatically."
             }
             // Nothing left to offer because everything found is already set up
             // is a success, and should not read like a failure to find it.
             if !model.summaries.isEmpty {
                 return "Every computer Hozz can see is already set up."
             }
-            return "Open Hozz on your Mac and it will appear here. Nothing to "
-                + "type, and nothing to copy across."
+            return "Open Hozz on your Mac to connect automatically."
         }
     }
 
@@ -280,12 +275,12 @@ struct DestinationPickerView: View {
     private func status(for receiver: DiscoveredReceiver) -> String {
         if discovered.contains(where: { $0.id == receiver.id })
             || scanned.contains(where: { $0.id == receiver.id }) {
-            return "Found on this network"
+            return "On this network"
         }
         if reachable[receiver.name] != nil {
-            return "Ready to connect"
+            return "Ready"
         }
-        return checking ? "Checking…" : "Offline — open Hozz on it"
+        return checking ? "Checking…" : "Offline"
     }
 
     /// Connects to a computer and saves a ready-to-use destination.

@@ -256,9 +256,7 @@ struct DestinationEditorView: View {
                     // and it is also the moment the original setting is
                     // replaced. Someone should be able to decide to wait.
                     Text(
-                        "Saving replaces that setting with the one chosen "
-                        + "above. If you would rather keep it until Hozz can "
-                        + "read it again, leave this screen without saving."
+                        "Saving replaces this unknown setting. Cancel to preserve it."
                     )
                 }
             }
@@ -307,8 +305,7 @@ struct DestinationEditorView: View {
                 .disabled(!isValid || isTesting)
             } footer: {
                 Text(
-                    "Sends one tiny file so you can confirm this works now, "
-                    + "instead of finding out days later."
+                    "Sends one small file to verify the destination."
                 )
             }
     }
@@ -347,13 +344,8 @@ struct DestinationEditorView: View {
             if willReplayHistory {
                 HozzLabel(.infoCircle, size: 16) {
                     Text(
-                        "Saving this will send everything again from the "
-                        + "beginning. Readings the later starting point skipped "
-                        + "are still in this iPhone's Health, so moving it back "
-                        + "does not leave them behind — but the destination will "
-                        + "receive a lot at once. Each one carries the same "
-                        + "identifier as before, so anything that stores them "
-                        + "by identifier keeps one copy."
+                        "Saving replays records from the beginning. Stable identifiers "
+                        + "let compatible receivers keep one copy."
                     )
                     .font(.footnote)
                     .foregroundStyle(HozzPalette.inkSoft)
@@ -364,15 +356,8 @@ struct DestinationEditorView: View {
                 .hozzFormHeader()
         } footer: {
             Text(
-                "Separate from how often Hozz syncs. Hozz reads Health with a "
-                + "bookmark rather than a date, so a reading the Health app "
-                + "files under last week is still noticed — but anything dated "
-                + "before the starting point is not delivered to this "
-                + "destination, and is not delivered later either. The date is "
-                + "worked out once and then kept, so it never creeps forward "
-                + "and leaves last night behind. Choosing an earlier starting "
-                + "point sends everything again from the beginning, so nothing "
-                + "is out of reach for good."
+                "This fixed date limits delivery, not Health reads. Retroactive "
+                + "records are still found, but anything dated earlier is not sent."
             )
         }
     }
@@ -425,10 +410,8 @@ struct DestinationEditorView: View {
             if let declared = addressPrecision, declared != precision {
                 HozzLabel(.alertTriangle, size: 16) {
                     Text(
-                        "The address says precision=\(declared.rawValue) but this "
-                        + "is set to \(precision.rawValue). InfluxDB will not "
-                        + "complain — it will file every point in the wrong "
-                        + "decade. Make them match."
+                        "The address uses precision=\(declared.rawValue), but this "
+                        + "setting uses \(precision.rawValue). Make them match."
                     )
                     .font(.footnote)
                     .foregroundStyle(HozzPalette.warning)
@@ -439,13 +422,8 @@ struct DestinationEditorView: View {
                 .hozzFormHeader()
         } footer: {
             Text(
-                "Every sample is written to this measurement, tagged with its "
-                + "type, source, device, and unit. The precision has to match "
-                + "the precision in the address: InfluxDB does not complain "
-                + "about a mismatch, it just files every point in the wrong "
-                + "decade. InfluxDB 2.x and 3.x expect /api/v2/write with org, "
-                + "bucket, and precision in the address and a Token "
-                + "authorization header; 1.8 expects /write?db=yourdatabase."
+                "Each sample includes type, source, device, and unit. Match the "
+                + "address precision. InfluxDB 2.x/3.x use /api/v2/write; 1.8 uses /write."
             )
         }
     }
@@ -471,10 +449,7 @@ struct DestinationEditorView: View {
                 .hozzFormHeader()
         } footer: {
             Text(
-                "A large batch posted to a small computer can take minutes to "
-                + "be accepted. Giving up too early reports a server that is "
-                + "working as one that is broken, and the batch is retried "
-                + "anyway, so nothing is lost either way \u{2014} only time."
+                "Slow servers may need minutes. A timeout retries the batch."
             )
         }
     }
@@ -504,13 +479,8 @@ struct DestinationEditorView: View {
                 .hozzFormHeader()
         } footer: {
             Text(
-                "If your server answers HTTP 413, or times out on a big batch, "
-                + "its limit is smaller than what Hozz is sending. nginx "
-                + "refuses anything over 1 MB unless told otherwise. Splitting "
-                + "sends the same readings in several requests instead. If one "
-                + "of them fails, Hozz stops there, counts none of the batch as "
-                + "delivered, and sends the whole thing again next time, so a "
-                + "half-arrived batch is never recorded as a success."
+                "Use for HTTP 413 or large-batch timeouts. If one request fails, "
+                + "Hozz retries the whole batch and never records partial delivery."
             )
         }
     }
@@ -554,11 +524,8 @@ struct DestinationEditorView: View {
     /// this long spliced together inline in reasonable time — it builds on the
     /// simulator and times out for the device, which is a poor way to find out.
     private var unitsExplanation: String {
-        "Every value Hozz sends carries its own unit, so a reading can never be "
-            + "read as something it is not \u{2014} a converted one also says "
-            + "what it was converted from. Changing this does not rewrite "
-            + "anything already delivered, so a receiver storing a long history "
-            + "will hold both, each labelled correctly."
+        "Every value keeps its unit and original unit after conversion. "
+            + "Changing this does not rewrite earlier deliveries."
     }
 
     private func binding(for family: UnitFamily) -> Binding<String?> {
@@ -582,14 +549,9 @@ struct DestinationEditorView: View {
         } footer: {
             Text(
                 payloadSchema == .hozz
-                    ? "Hozz's own schema, which is what the documentation "
-                    + "describes and what to build anything new against."
-                    : "Sends the field names Health Auto Export publishes, so an "
-                    + "automation or dashboard already built for it keeps "
-                    + "working. Dates become local time in their format rather "
-                    + "than ISO 8601. Hozz sends individual samples rather than "
-                    + "summaries, so a heart rate point carries the same number "
-                    + "in Min, Avg, and Max."
+                    ? "Hozz's documented schema for new integrations."
+                    : "Health Auto Export field names for existing integrations. "
+                    + "Dates use local time; samples are not summaries."
             )
         }
     }
@@ -615,10 +577,7 @@ struct DestinationEditorView: View {
                 .hozzFormHeader()
         } footer: {
             Text(
-                "Pick anywhere the Files app can reach — iCloud Drive, Dropbox, "
-                + "OneDrive, Google Drive, or a server on your network. Whatever "
-                + "already syncs that folder to your computer does the rest, so "
-                + "this keeps working even while your computer is switched off."
+                "Synced folders reach your computer; local folders stay on this iPhone."
             )
         }
     }
@@ -642,10 +601,8 @@ struct DestinationEditorView: View {
                 .hozzFormHeader()
         } footer: {
             Text(
-                "Hozz posts batches here and includes an idempotency key, so a "
-                + "retry after a dropped connection is never stored twice. The "
-                + "token is kept in this iPhone's Keychain and never written to "
-                + "a file, a backup, or a log."
+                "Batches include an idempotency key for safe retries. The token "
+                + "stays in this iPhone's Keychain and out of files and logs."
             )
         }
     }
@@ -687,7 +644,7 @@ struct DestinationEditorView: View {
     private var kindExplanation: LocalizedStringKey {
         switch kind {
         case .folder:
-            "Easiest. No server to run, and it works away from home."
+            "No server required; works away from home."
         case .restAPI:
             "For a database or a service you run yourself."
         case .mqtt:
@@ -698,15 +655,15 @@ struct DestinationEditorView: View {
     private var formatExplanation: LocalizedStringKey {
         switch format {
         case .ndjson:
-            "One record per line. Keeps everything Health returned."
+            "One record per line; preserves all Health fields."
         case .json:
-            "One array per batch. Easy to read and to feed to other tools."
+            "One readable array per batch."
         case .csv:
-            "A spreadsheet. Drops metadata and workout detail."
+            "A spreadsheet; omits metadata and workout details."
         case .metrics:
-            "Grouped by metric, with the latest value for each. What Home Assistant, Grafana, and most dashboards expect."
+            "Latest value per metric for dashboards."
         case .influx:
-            "InfluxDB line protocol, written straight into InfluxDB or Telegraf. No translator in between."
+            "Line protocol for InfluxDB or Telegraf."
         }
     }
 

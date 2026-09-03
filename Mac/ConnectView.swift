@@ -11,44 +11,32 @@ struct ConnectView: View {
     @State private var isChoosingFolder = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 24) {
-                header
+        HozzDesktopPage {
+            header
+            folderSection
 
-                folderSection
-
-                switch services.status {
-                case .starting:
-                    ProgressView("Starting the receiver…")
-                case .failed(let reason):
-                    failure(reason)
-                case .ready:
-                    connectionStatus
-                    if services.devices.isEmpty {
-                        pairing
-                    }
+            switch services.status {
+            case .starting:
+                HozzPanel {
+                    ProgressView("Starting receiver…")
+                }
+            case .failed(let reason):
+                failure(reason)
+            case .ready:
+                connectionStatus
+                if services.devices.isEmpty {
+                    pairing
                 }
             }
-            .padding(28)
-            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .navigationTitle("Connect")
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Receive Health data on this Mac")
-                .font(.title2.weight(.semibold))
-            Text(
-                """
-                Your phone sends directly to this computer over your own \
-                network. Nothing goes through a server, and nothing leaves \
-                your devices.
-                """
-            )
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
-        }
+        HozzPageHeader(
+            "Receive from iPhone",
+            subtitle: "Use a synced folder or local network. Hozz never relays your data."
+        )
     }
 
     /// The path that does not depend on the network allowing anything.
@@ -59,23 +47,35 @@ struct ConnectView: View {
     /// reasonably be asked to arrange, and macOS refuses silently — the app
     /// looks like it is running and simply never receives anything.
     private var folderSection: some View {
-        GroupBox {
+        HozzPanel {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(alignment: .top, spacing: 12) {
                     Image(systemName: services.watchedFolder == nil
                         ? "folder.badge.plus"
                         : "folder.fill.badge.checkmark")
                         .font(.title2)
-                        .foregroundStyle(services.watchedFolder == nil ? Color.secondary : HozzPalette.blue)
+                        .foregroundStyle(
+                            services.watchedFolder == nil
+                                ? HozzPalette.inkMuted
+                                : HozzPalette.blue
+                        )
+                        .frame(width: 38, height: 38)
+                        .background(
+                            services.watchedFolder == nil
+                                ? HozzPalette.neutralWell
+                                : HozzPalette.iconWell,
+                            in: Circle()
+                        )
 
                     VStack(alignment: .leading, spacing: 4) {
                         Text(services.watchedFolder == nil
-                            ? "Receive from a folder"
-                            : "Watching a folder")
+                            ? "Synced folder"
+                            : "Watching \(services.watchedFolder?.lastPathComponent ?? "folder")")
                             .font(.body.weight(.semibold))
+                            .foregroundStyle(HozzPalette.ink)
                         Text(folderDescription)
                             .font(.callout)
-                            .foregroundStyle(.secondary)
+                            .foregroundStyle(HozzPalette.inkSoft)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                     Spacer()
@@ -86,6 +86,7 @@ struct ConnectView: View {
                         isChoosingFolder = true
                     }
                     .buttonStyle(.borderedProminent)
+                    .tint(HozzPalette.actionFill)
 
                     if services.watchedFolder != nil {
                         Button("Stop watching") {
@@ -94,7 +95,6 @@ struct ConnectView: View {
                     }
                 }
             }
-            .padding(8)
         }
         .fileImporter(
             isPresented: $isChoosingFolder,
@@ -109,16 +109,9 @@ struct ConnectView: View {
 
     private var folderDescription: String {
         if let folder = services.watchedFolder {
-            return """
-                \(folder.lastPathComponent) — anything your iPhone writes here \
-                is read automatically.
-                """
+            return "\(folder.lastPathComponent) imports new files automatically."
         }
-        return """
-            Point your iPhone at a folder that syncs to this Mac — iCloud Drive, \
-            Dropbox, anything — and pick the same folder here. This works from \
-            anywhere, including cellular, and needs nothing from your network.
-            """
+        return "Choose the same synced folder on iPhone and Mac. It works from anywhere."
     }
 
     /// Says what is actually known: when data last arrived, and from where.
@@ -130,31 +123,33 @@ struct ConnectView: View {
     /// both true and the thing the user actually wants to know.
     @ViewBuilder
     private var connectionStatus: some View {
-        GroupBox {
+        HozzPanel {
             HStack(alignment: .top, spacing: 12) {
                 Image(systemName: statusSymbol)
                     .font(.title2)
                     .foregroundStyle(statusColour)
+                    .frame(width: 38, height: 38)
+                    .background(statusTone.well, in: Circle())
 
                 VStack(alignment: .leading, spacing: 4) {
                     Text(statusTitle)
                         .font(.body.weight(.semibold))
+                        .foregroundStyle(HozzPalette.ink)
                     Text(statusDetail)
                         .font(.callout)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(HozzPalette.inkSoft)
                         .fixedSize(horizontal: false, vertical: true)
 
                     if services.devices.count > 1 {
                         ForEach(services.devices.dropFirst()) { device in
                             Text("\(device.name) — last \(Self.relative(device.lastSeenAt))")
                                 .font(.caption)
-                                .foregroundStyle(.tertiary)
+                                .foregroundStyle(HozzPalette.inkMuted)
                         }
                     }
                 }
                 Spacer()
             }
-            .padding(8)
         }
     }
 
@@ -184,15 +179,17 @@ struct ConnectView: View {
     }
 
     private var statusColour: Color {
-        guard latest != nil else {
-            return .secondary
-        }
-        return isRecent ? .green : .orange
+        statusTone.color
+    }
+
+    private var statusTone: HozzTone {
+        guard latest != nil else { return .neutral }
+        return isRecent ? .positive : .warning
     }
 
     private var statusTitle: String {
         guard let latest else {
-            return "No data received yet"
+            return "Waiting for iPhone"
         }
         return isRecent
             ? "Receiving from \(latest.name)"
@@ -201,20 +198,14 @@ struct ConnectView: View {
 
     private var statusDetail: String {
         guard let latest else {
-            return """
-                This Mac is listening. Open Hozz on your iPhone, add a \
-                destination, and pick this computer.
-                """
+            return "Add this Mac as a destination on iPhone."
         }
         let count = services.totalRecords.formatted()
         let when = Self.relative(latest.lastSeenAt)
         if isRecent {
-            return "\(count) records · last arrived \(when)"
+            return "\(count) records · last \(when)"
         }
-        return """
-            \(count) records · last arrived \(when). That is normal if the \
-            phone has been away or has nothing new; iOS decides when Hozz runs.
-            """
+        return "\(count) records · last \(when). iOS sends when it can."
     }
 
     private static func relative(_ date: Date) -> String {
@@ -222,21 +213,19 @@ struct ConnectView: View {
     }
 
     private func failure(_ reason: String) -> some View {
-        GroupBox {
+        HozzPanel {
             Label(reason, systemImage: "exclamationmark.triangle")
-                .padding(6)
+                .foregroundStyle(HozzPalette.warning)
         }
     }
 
     @ViewBuilder
     private var pairing: some View {
-        GroupBox("On your iPhone") {
+        HozzPanel(title: "On your iPhone") {
             VStack(alignment: .leading, spacing: 14) {
-                step(1, "Open Hozz, go to Sync, and add a destination.")
-                step(2, "Choose “This Mac” if it appears, or paste the address below.")
-                step(3, "Paste the token as the authorization value.")
+                step(1, "Open Automatic, add a destination, and choose this Mac.")
+                step(2, "If it does not appear, use the address and token below.")
             }
-            .padding(8)
         }
 
         if let url = services.endpointURL {
@@ -262,42 +251,29 @@ struct ConnectView: View {
             }
         )
 
-        GroupBox {
+        HozzPanel {
             VStack(alignment: .leading, spacing: 8) {
                 Label(
-                    """
-                    This Mac is advertising itself as “Hozz on \
-                    \(services.computerName)”, so the phone can usually find it \
-                    without the address.
-                    """,
+                    "Visible to iPhone as “Hozz on \(services.computerName)”.",
                     systemImage: "bonjour"
                 )
                 if services.sharedWithOtherDevices == false {
                     Label(
-                        """
-                        This Mac could not tell your other devices about itself \
-                        through iCloud, so it may not appear on your iPhone by \
-                        name. The address above still works.
-                        """,
+                        "iCloud discovery is unavailable. Use the address above.",
                         systemImage: "exclamationmark.triangle"
                     )
+                    .foregroundStyle(HozzPalette.warning)
                     .fixedSize(horizontal: false, vertical: true)
                 }
             }
-            .padding(6)
         }
 
         HStack(spacing: 8) {
             Image(systemName: "lock.fill")
                 .foregroundStyle(.secondary)
-            Text(
-                """
-                The token stops anything else on your network sending or \
-                reading data. Treat it like a password.
-                """
-            )
+            Text("Treat the token like a password.")
             .font(.callout)
-            .foregroundStyle(.secondary)
+            .foregroundStyle(HozzPalette.inkSoft)
             .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -306,10 +282,11 @@ struct ConnectView: View {
         HStack(alignment: .firstTextBaseline, spacing: 10) {
             Text("\(number)")
                 .font(.caption.monospacedDigit().weight(.bold))
-                .foregroundStyle(.white)
+                .foregroundStyle(HozzPalette.onAction)
                 .frame(width: 20, height: 20)
-                .background(Circle().fill(.tint))
+                .background(Circle().fill(HozzPalette.actionFill))
             Text(text)
+                .foregroundStyle(HozzPalette.inkSoft)
                 .fixedSize(horizontal: false, vertical: true)
         }
     }
@@ -321,7 +298,7 @@ struct ConnectView: View {
         isSecret: Bool = false,
         action: @escaping () -> Void
     ) -> some View {
-        GroupBox(title) {
+        HozzPanel(verbatimTitle: title) {
             HStack {
                 Text(isSecret ? String(repeating: "•", count: 24) : value)
                     .font(.system(.body, design: .monospaced))
@@ -331,8 +308,8 @@ struct ConnectView: View {
                 Spacer()
                 Button(copied ? "Copied" : "Copy", action: action)
                     .buttonStyle(.borderedProminent)
+                    .tint(HozzPalette.actionFill)
             }
-            .padding(6)
         }
     }
 

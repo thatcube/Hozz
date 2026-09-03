@@ -206,14 +206,7 @@ final class MacServices {
         await receiver.onEvent { [weak self] event in
             Task { @MainActor in
                 guard let self else { return }
-                self.events.insert(event, at: 0)
-                if self.events.count > 100 {
-                    self.events.removeLast()
-                }
-                if case .stored = event.outcome {
-                    self.lastReceivedAt = event.at
-                }
-                await self.refresh()
+                await self.record(event)
             }
         }
         await receiver.start()
@@ -235,16 +228,23 @@ final class MacServices {
         self.watcher = watcher
         await watcher.onEvent { [weak self] event in
             Task { @MainActor in
-                self?.events.insert(event, at: 0)
-                if case .stored = event.outcome {
-                    self?.lastReceivedAt = event.at
-                }
-                await self?.refresh()
+                await self?.record(event)
             }
         }
         await watcher.start(folder: folder)
         watchedFolder = folder
         UserDefaults.standard.set(folder.path, forKey: "watchedFolder")
+        await refresh()
+    }
+
+    private func record(_ event: ReceiverEvent) async {
+        events.insert(event, at: 0)
+        if events.count > 100 {
+            events.removeLast(events.count - 100)
+        }
+        if case .stored = event.outcome {
+            lastReceivedAt = event.at
+        }
         await refresh()
     }
 

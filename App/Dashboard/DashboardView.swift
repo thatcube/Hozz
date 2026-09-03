@@ -65,10 +65,7 @@ struct DashboardView: View {
                 .font(.system(size: 17, weight: .semibold))
                 .foregroundStyle(HozzPalette.ink)
             Text(
-                """
-                This device does not provide Health data, so there is nothing \
-                for Hozz to chart. Exporting still works from a device that does.
-                """
+                "This device cannot read Apple Health."
             )
             .hozzCaption()
             .fixedSize(horizontal: false, vertical: true)
@@ -90,11 +87,7 @@ struct DashboardView: View {
                 .font(.system(size: 20, weight: .semibold))
                 .foregroundStyle(HozzPalette.ink)
             Text(
-                """
-                Hozz can chart what Apple Health already holds — steps, sleep, \
-                heart rate, workouts. It is read on this device, drawn on this \
-                device, and sent nowhere.
-                """
+                "Chart steps, sleep, heart rate, and workouts on this device. Nothing is sent."
             )
             .font(.system(size: 14))
             .foregroundStyle(HozzPalette.inkSoft)
@@ -107,7 +100,7 @@ struct DashboardView: View {
                     if model.isRequestingAccess {
                         ProgressView().controlSize(.small)
                     }
-                    Text(model.isRequestingAccess ? "Asking Health…" : "Show my health data")
+                    Text(model.isRequestingAccess ? "Requesting access…" : "Allow Health access")
                         .font(.system(size: 15, weight: .medium))
                 }
                 .frame(maxWidth: .infinity)
@@ -157,10 +150,7 @@ struct DashboardView: View {
             collections
 
             Text(
-                """
-                Read from Apple Health on this device. Hozz sends nothing \
-                anywhere until you add a destination yourself.
-                """
+                "On-device. Nothing is sent until you add a destination."
             )
             .hozzCaption()
             .multilineTextAlignment(.center)
