@@ -9,10 +9,12 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.thatcube.hozz.core.ArchiveFormatException
 import com.thatcube.hozz.core.ArchiveImportResult
-import com.thatcube.hozz.core.CanonicalRecord
 import com.thatcube.hozz.core.HozzCoreService
 import com.thatcube.hozz.core.SafArchiveTransport
 import com.thatcube.hozz.core.SafArchiveSink
+import com.thatcube.hozz.core.TimelineCursor
+import com.thatcube.hozz.core.TimelineItem
+import com.thatcube.hozz.core.TimelineItemPage
 import com.thatcube.hozz.projection.HealthConnectWriter
 import com.thatcube.hozz.projection.ProjectionExecutionResult
 import com.thatcube.hozz.projection.ProjectionExecutor
@@ -28,7 +30,9 @@ import kotlinx.coroutines.withContext
 
 data class HozzUiState(
     val busy: Boolean = false,
-    val timeline: List<CanonicalRecord> = emptyList(),
+    val timeline: List<TimelineItem> = emptyList(),
+    val timelineNextCursor: TimelineCursor? = null,
+    val timelineLoading: Boolean = false,
     val projection: ProjectionSummary = ProjectionSummary(),
     val totalRecordCount: Int = 0,
     val lastImport: ArchiveImportResult? = null,
@@ -36,12 +40,33 @@ data class HozzUiState(
     val healthConnectStatus: Int = HealthConnectClient.SDK_UNAVAILABLE,
 )
 
+internal fun HozzUiState.appending(page: TimelineItemPage): HozzUiState {
+    val existing = timeline.mapTo(hashSetOf()) { it.canonicalId }
+    val additions = page.records.filter { existing.add(it.canonicalId) }
+    return copy(
+        timeline = timeline + additions,
+        timelineNextCursor = page.nextCursor.takeIf {
+            page.records.isNotEmpty()
+        },
+        timelineLoading = false,
+    )
+}
+
+internal data class TimelineLoadRequest(
+    val generation: Long,
+    val cursor: TimelineCursor,
+) {
+    fun isCurrent(currentGeneration: Long, currentCursor: TimelineCursor?): Boolean =
+        generation == currentGeneration && cursor == currentCursor
+}
+
 class HozzViewModel(application: Application) : AndroidViewModel(application) {
     private val core = HozzCoreService(application)
     private val healthConnect = HealthConnectWriter(application)
     private val mutableState = MutableStateFlow(
         HozzUiState(healthConnectStatus = healthConnect.availability),
     )
+    private var timelineGeneration = 0L
 
     val state: StateFlow<HozzUiState> = mutableState.asStateFlow()
 
@@ -102,6 +127,36 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
         mutableState.value = mutableState.value.copy(
             healthConnectStatus = healthConnect.availability,
         )
+    }
+
+    fun loadMoreTimeline() {
+        val cursor = mutableState.value.timelineNextCursor ?: return
+        if (mutableState.value.timelineLoading) return
+        val request = TimelineLoadRequest(timelineGeneration, cursor)
+        mutableState.value = mutableState.value.copy(timelineLoading = true)
+        viewModelScope.launch {
+            try {
+                val page = withContext(Dispatchers.IO) {
+                    core.timelinePage(cursor)
+                }
+                if (!request.isCurrent(
+                        timelineGeneration,
+                        mutableState.value.timelineNextCursor,
+                    )
+                ) {
+                    return@launch
+                }
+                mutableState.value = mutableState.value.appending(page)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: SQLiteException) {
+                mutableState.value = mutableState.value.copy(
+                    timelineLoading = false,
+                    status = error.message
+                        ?: "The next archive records could not be loaded.",
+                )
+            }
+        }
     }
 
     fun exportArchive(uri: Uri) {
@@ -294,10 +349,15 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
         lastImport: ArchiveImportResult? = mutableState.value.lastImport,
         status: String? = mutableState.value.status,
     ) {
+        timelineGeneration += 1
+        val generation = timelineGeneration
         val snapshot = withContext(Dispatchers.IO) { core.snapshot() }
+        if (generation != timelineGeneration) return
         mutableState.value = HozzUiState(
             busy = false,
             timeline = snapshot.timeline,
+            timelineNextCursor = snapshot.timelineNextCursor,
+            timelineLoading = false,
             projection = snapshot.projection,
             totalRecordCount = snapshot.totalRecordCount,
             lastImport = lastImport,

@@ -97,29 +97,32 @@ final class ReceiveTests: XCTestCase {
         )
     }
 
-    func testBooleanMetricIsUnreadableRatherThanStoredAsOne() throws {
-        let batch = try BatchParser.parse(
-            Data(
-                """
-                {"data":{"metrics":[{"name":"step_count","units":"count","data":[
-                  {"id":"not-a-number","date":"2026-01-01T10:00:00.000Z","qty":true}
-                ]}]}}
-                """.utf8
+    func testBooleanMetricRejectsTheWholeCompatibilityEnvelope() {
+        XCTAssertThrowsError(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"not-a-number","date":"2026-01-01T10:00:00.000Z","qty":true}
+                    ]}]}}
+                    """.utf8
+                )
             )
-        )
-
-        XCTAssertTrue(batch.records.isEmpty)
-        XCTAssertEqual(batch.unreadableCount, 1)
+        ) { error in
+            guard case BatchParseError.incompleteCompatibilityEnvelope(1) = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
+        }
     }
 
-    func testHozzMetricsUseStableIdsAndKeepHeartAndSleepValues() throws {
+    func testHozzMetricsUseStableIdsAndKeepHeartAndSleepValues() async throws {
         let payload = Data(
             """
             {"data":{"metrics":[
               {"name":"heart_rate","units":"bpm","data":[
                 {"id":"heart-1","date":"2026-01-01T10:00:00.000Z","Min":62,"Avg":62,"Max":62}]},
               {"name":"sleep_analysis","units":"hr","data":[
-                {"id":"sleep-1","startDate":"2026-01-01T11:00:00.000Z","endDate":"2026-01-01T12:00:00.000Z","qty":1,"value":"Unspecified","rawValue":99}]}
+                {"id":"sleep-1","startDate":"2026-01-01T11:00:00.000Z","endDate":"2026-01-01T12:00:00.000Z","qty":1,"value":"REM","rawValue":5}]}
             ]}}
             """.utf8
         )
@@ -127,14 +130,82 @@ final class ReceiveTests: XCTestCase {
         let batch = try BatchParser.parse(payload)
 
         XCTAssertEqual(batch.records.map(\.id), ["heart-1", "sleep-1"])
-        XCTAssertEqual(batch.records.map(\.value), [62, 1])
+        XCTAssertEqual(batch.records.map(\.value), [62, 5])
         XCTAssertEqual(batch.records.map(\.kind), ["quantity", "category"])
         let sleepRaw = try XCTUnwrap(
             JSONSerialization.jsonObject(
                 with: try XCTUnwrap(batch.records.last?.raw)
             ) as? [String: Any]
         )
-        XCTAssertEqual((sleepRaw["rawValue"] as? NSNumber)?.doubleValue, 99)
+        XCTAssertEqual((sleepRaw["rawValue"] as? NSNumber)?.doubleValue, 5)
+        XCTAssertEqual((sleepRaw["qty"] as? NSNumber)?.doubleValue, 1)
+
+        let store = try makeStore()
+        _ = try await store.ingest(batch, idempotencyKey: "sleep-semantics")
+        let sleepSamples = try await store.samples(type: "sleep_analysis")
+        let sleep = try XCTUnwrap(sleepSamples.first)
+        XCTAssertEqual(sleep.value, 5)
+        XCTAssertEqual(sleep.endDate.timeIntervalSince(sleep.startDate), 3_600)
+    }
+
+    func testDefaultHozzMetricsKeepHeartSleepAndWorkoutMeaning() throws {
+        let payload = Data(
+            """
+            {"data":{
+              "metrics":[
+                {"name":"heart_rate","units":"count/min","data":[
+                  {"date":"2026-01-01T10:00:00.000Z","qty":62}]},
+                {"name":"sleep_analysis","units":"count","data":[
+                  {"date":"2026-01-01T11:00:00.000Z","endDate":"2026-01-01T12:00:00.000Z","qty":3}]}
+              ],
+              "workouts":[
+                {"id":"workout-default","name":"Workout","start":"2026-01-01T13:00:00.000Z","end":"2026-01-01T13:30:00.000Z"}
+              ]
+            }}
+            """.utf8
+        )
+
+        let batch = try BatchParser.parse(payload)
+
+        XCTAssertEqual(batch.records.map(\.value), [62, 3, 1_800])
+        XCTAssertEqual(batch.records.map(\.kind), ["quantity", "category", "workout"])
+        XCTAssertEqual(batch.workoutDetails.first?.duration, 1_800)
+    }
+
+    func testMalformedStableIdentifierRejectsCompatibilityEnvelope() {
+        XCTAssertThrowsError(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"steps","units":"count","data":[
+                      {"id":7,"date":"2026-01-01T10:00:00.000Z","qty":1}
+                    ]}]}}
+                    """.utf8
+                )
+            )
+        )
+    }
+
+    func testNonfiniteMetricRejectsCompatibilityEnvelope() {
+        XCTAssertThrowsError(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"steps","units":"count","data":[
+                      {"id":"not-finite","date":"2026-01-01T10:00:00.000Z","qty":"NaN"}
+                    ]}]}}
+                    """.utf8
+                )
+            )
+        )
+    }
+
+    func testCompatibilityCollectionsWithoutMetricsAreRejected() {
+        XCTAssertThrowsError(
+            try BatchParser.parse(
+                Data(#"{"data":{"workouts":[]}}"#.utf8)
+            )
+        )
     }
 
     func testHozzMetricsDateLessDeletionUsesStableId() throws {
@@ -289,11 +360,11 @@ final class ReceiveTests: XCTestCase {
     /// Regression: workouts travel in their own key of the metrics envelope.
     /// They were dropped without even counting as unreadable, so the receiver
     /// answered 200 and the phone never sent them again.
-    func testWorkoutsInTheMetricsEnvelopeAreKept() throws {
+    func testWorkoutsInTheMetricsEnvelopeKeepDuration() async throws {
         let payload = Data(
             """
             {"data":{"metrics":[],"workouts":[
-              {"id":"w1","name":"Workout","start":"2026-01-01T10:00:00.000Z","end":"2026-01-01T11:00:00.000Z"}
+              {"id":"w1","name":"Workout","start":"2026-01-01T10:00:00.000Z","end":"2026-01-01T11:00:00.000Z","duration":3600}
             ]}}
             """.utf8
         )
@@ -303,6 +374,59 @@ final class ReceiveTests: XCTestCase {
         XCTAssertEqual(batch.records.count, 1, "A workout must not vanish.")
         XCTAssertEqual(batch.records.first?.id, "w1")
         XCTAssertEqual(batch.records.first?.kind, "workout")
+        XCTAssertEqual(batch.records.first?.value, 3_600)
+        XCTAssertEqual(batch.records.first?.unit, "sec")
+        XCTAssertEqual(batch.workoutDetails.first?.duration, 3_600)
+
+        let store = try makeStore()
+        _ = try await store.ingest(batch, idempotencyKey: "workout-duration")
+        let samples = try await store.samples(type: "workout")
+        let workouts = try await store.workouts()
+        XCTAssertEqual(samples.first?.value, 3_600)
+        XCTAssertEqual(workouts.first?.duration, 3_600)
+    }
+
+    func testStableWorkoutTypeReplacesLegacyNameIdentity() async throws {
+        let store = try makeStore()
+        let start = try date("2026-01-01T10:00:00.000Z")
+        let end = try date("2026-01-01T11:00:00.000Z")
+        _ = try await store.ingest(
+            ParsedBatch(
+                records: [
+                    HealthRecord(
+                        id: "w1",
+                        type: "Workout",
+                        kind: "workout",
+                        startDate: start,
+                        endDate: end,
+                        value: 3_600,
+                        unit: "sec",
+                        raw: Data()
+                    )
+                ],
+                deletions: [],
+                unreadableCount: 0
+            ),
+            idempotencyKey: "legacy-workout"
+        )
+        let upgraded = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[],"workouts":[
+                  {"id":"w1","name":"Running","start":"2026-01-01T10:00:00.000Z","end":"2026-01-01T11:00:00.000Z","duration":3600}
+                ]}}
+                """.utf8
+            )
+        )
+
+        _ = try await store.ingest(upgraded, idempotencyKey: "stable-workout")
+
+        let legacy = try await store.samples(type: "Workout")
+        let current = try await store.samples(type: "workout")
+        let total = try await store.totalRecordCount()
+        XCTAssertTrue(legacy.isEmpty)
+        XCTAssertEqual(current.count, 1)
+        XCTAssertEqual(total, 1)
     }
 
     func testDeletionsAreParsed() throws {

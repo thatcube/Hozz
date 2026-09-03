@@ -16,6 +16,7 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
@@ -29,6 +30,8 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -36,12 +39,12 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.health.connect.client.HealthConnectClient
 import com.thatcube.hozz.HozzUiState
-import com.thatcube.hozz.core.CanonicalRecord
-import com.thatcube.hozz.projection.ProjectionPlanner
+import com.thatcube.hozz.core.TimelineItem
 import com.thatcube.hozz.projection.ProjectionQuality
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -52,14 +55,41 @@ fun HozzScreen(
     onImport: () -> Unit,
     onWriteHealthConnect: () -> Unit,
     onExport: () -> Unit,
+    onLoadMoreTimeline: () -> Unit,
 ) {
+    val listState = rememberLazyListState()
+    val nearTimelineEnd by remember {
+        derivedStateOf {
+            val layout = listState.layoutInfo
+            val last = layout.visibleItemsInfo.lastOrNull()?.index ?: return@derivedStateOf false
+            val hasScrolled = listState.firstVisibleItemIndex > 0 ||
+                listState.firstVisibleItemScrollOffset > 0
+            hasScrolled && last >= layout.totalItemsCount - 3
+        }
+    }
+    LaunchedEffect(
+        nearTimelineEnd,
+        state.timelineNextCursor,
+        state.timelineLoading,
+    ) {
+        if (
+            nearTimelineEnd &&
+            state.timelineNextCursor != null &&
+            !state.timelineLoading &&
+            !state.busy
+        ) {
+            onLoadMoreTimeline()
+        }
+    }
     Surface(modifier = Modifier.fillMaxSize()) {
         LazyColumn(
+            state = listState,
             modifier = Modifier
                 .fillMaxSize()
                 .statusBarsPadding()
                 .navigationBarsPadding()
-                .padding(horizontal = 20.dp),
+                .padding(horizontal = 20.dp)
+                .testTag("timeline-list"),
             verticalArrangement = Arrangement.spacedBy(14.dp),
         ) {
             item {
@@ -115,12 +145,25 @@ fun HozzScreen(
                     )
                 }
                 item {
-                    Text(
-                        text = "Timeline",
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.padding(top = 8.dp),
-                    )
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 8.dp),
+                        verticalAlignment = Alignment.Bottom,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Text(
+                            text = "Timeline",
+                            style = MaterialTheme.typography.titleLarge,
+                            fontWeight = FontWeight.SemiBold,
+                        )
+                        Text(
+                            text = "${state.timeline.size} records shown",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.testTag("timeline-count"),
+                        )
+                    }
                 }
                 if (state.timeline.isEmpty()) {
                     item {
@@ -132,9 +175,26 @@ fun HozzScreen(
                 } else {
                     items(
                         items = state.timeline,
-                        key = CanonicalRecord::canonicalId,
+                        key = TimelineItem::canonicalId,
                     ) { record ->
                         TimelineRow(record)
+                    }
+                    if (state.timelineNextCursor != null) {
+                        item {
+                            TextButton(
+                                onClick = onLoadMoreTimeline,
+                                enabled = !state.timelineLoading && !state.busy,
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text(
+                                    if (state.timelineLoading) {
+                                        "Loading more records…"
+                                    } else {
+                                        "Load more records"
+                                    }
+                                )
+                            }
+                        }
                     }
                 }
             }
@@ -384,8 +444,7 @@ private fun Count(label: String, value: Int) {
 }
 
 @Composable
-private fun TimelineRow(record: CanonicalRecord) {
-    val projection = ProjectionPlanner.plan(record)
+private fun TimelineRow(record: TimelineItem) {
     Card(
         colors = CardDefaults.cardColors(
             containerColor = MaterialTheme.colorScheme.surface,
@@ -401,7 +460,7 @@ private fun TimelineRow(record: CanonicalRecord) {
                 modifier = Modifier
                     .size(10.dp)
                     .background(
-                        when (projection.quality) {
+                        when (record.projectionQuality) {
                             ProjectionQuality.EXACT ->
                                 MaterialTheme.colorScheme.secondary
                             ProjectionQuality.LOSSY ->
@@ -433,7 +492,7 @@ private fun TimelineRow(record: CanonicalRecord) {
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
-            ProjectionBadge(projection.quality)
+            ProjectionBadge(record.projectionQuality)
         }
     }
 }

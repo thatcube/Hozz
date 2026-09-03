@@ -388,7 +388,7 @@ public actor HealthReceiver {
         let batch: ParsedBatch
         do {
             batch = try BatchParser.parse(request.body)
-        } catch is BatchParseError {
+        } catch BatchParseError.connectionTest {
             record(ReceiverEvent(outcome: .connectionTest))
             return HTTPResponse(status: 200, json: ["ok": true, "test": true])
         } catch {

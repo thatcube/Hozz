@@ -77,6 +77,8 @@ inside one SQLite snapshot. Individual NDJSON records are limited to 512 KiB so
 the full canonical row remains below API 28 CursorWindow limits. Timeline and
 export pages also stop at a 512 KiB cumulative raw-record budget; callers keep
 paging until an empty result rather than treating a short page as end-of-data.
+The Compose timeline retains that cursor and appends the next bounded page near
+the end of a scroll, with an explicit load-more control as an accessible fallback.
 
 | Hozz canonical type | Apple source | Health Connect target | Fidelity |
 | --- | --- | --- | --- |

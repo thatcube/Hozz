@@ -5,9 +5,24 @@ import com.thatcube.hozz.projection.ProjectionPlan
 import com.thatcube.hozz.projection.ProjectionPlanner
 import com.thatcube.hozz.projection.PlannedRecord
 import com.thatcube.hozz.projection.ProjectionSummary
+import com.thatcube.hozz.projection.ProjectionQuality
+import java.time.Instant
+
+data class TimelineItem(
+    val canonicalId: String,
+    val displayType: String,
+    val endTime: Instant?,
+    val projectionQuality: ProjectionQuality,
+)
+
+data class TimelineItemPage(
+    val records: List<TimelineItem>,
+    val nextCursor: TimelineCursor?,
+)
 
 data class HozzCoreSnapshot(
-    val timeline: List<CanonicalRecord>,
+    val timeline: List<TimelineItem>,
+    val timelineNextCursor: TimelineCursor?,
     val projection: ProjectionSummary,
     val totalRecordCount: Int,
 )
@@ -48,14 +63,15 @@ class HozzCoreService(context: Context) {
         }
         val timeline = store.timelinePage()
         return HozzCoreSnapshot(
-            timeline = timeline.records,
+            timeline = timeline.asDisplayPage().records,
+            timelineNextCursor = timeline.nextCursor,
             projection = projection,
             totalRecordCount = store.recordCount(),
         )
     }
 
-    suspend fun timelinePage(after: TimelineCursor?): TimelinePage =
-        store.timelinePage(after)
+    suspend fun timelinePage(after: TimelineCursor?): TimelineItemPage =
+        store.timelinePage(after).asDisplayPage()
 
     suspend fun projectionDraftPage(
         afterCanonicalId: String?,
@@ -89,6 +105,19 @@ class HozzCoreService(context: Context) {
     fun close() {
         store.close()
     }
+
+    private fun TimelinePage.asDisplayPage(): TimelineItemPage =
+        TimelineItemPage(
+            records = records.map { record ->
+                TimelineItem(
+                    canonicalId = record.canonicalId,
+                    displayType = record.displayType,
+                    endTime = record.endTime,
+                    projectionQuality = ProjectionPlanner.plan(record).quality,
+                )
+            },
+            nextCursor = nextCursor,
+        )
 
     private companion object {
         const val PAGE_SIZE = 500

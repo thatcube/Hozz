@@ -967,6 +967,16 @@ public actor IngestStore {
         var storedAudiograms = 0
 
         for record in batch.records {
+            if let legacyTypeAlias = record.legacyTypeAlias,
+               legacyTypeAlias != record.type {
+                try database.run(
+                    """
+                    DELETE FROM sample
+                    WHERE id = ? AND kind = 'workout' AND type != ?
+                    """,
+                    [.text(record.id), .text(record.type)]
+                )
+            }
             if let legacyAliasID = record.legacyAliasID,
                legacyAliasID != record.id {
                 let prefix = "\(record.type):"

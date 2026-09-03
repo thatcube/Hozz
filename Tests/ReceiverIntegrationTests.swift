@@ -194,6 +194,68 @@ final class ReceiverIntegrationTests: XCTestCase {
         XCTAssertEqual(total, 1)
     }
 
+    func testMixedCompatibilityBatchRejectsWithoutReceiptAndCanRetry() async throws {
+        let mixed = """
+            {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+              {"id":"valid","date":"2026-01-01T10:00:00.000Z","qty":120},
+              {"id":"invalid","date":"2026-01-01T11:00:00.000Z","qty":true}
+            ]}]}}
+            """
+
+        let rejected = try await post(
+            body: mixed,
+            token: token,
+            idempotencyKey: "compatibility-partial"
+        )
+
+        XCTAssertEqual(rejected.status, 400)
+        let rejectedCount = try await store.totalRecordCount()
+        XCTAssertEqual(rejectedCount, 0)
+
+        let valid = """
+            {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+              {"id":"valid","date":"2026-01-01T10:00:00.000Z","qty":120}
+            ]}]}}
+            """
+        let retry = try await post(
+            body: valid,
+            token: token,
+            idempotencyKey: "compatibility-partial"
+        )
+
+        XCTAssertEqual(retry.status, 200)
+        XCTAssertEqual(retry.json["duplicate"] as? Bool, false)
+        let retryCount = try await store.totalRecordCount()
+        XCTAssertEqual(retryCount, 1)
+    }
+
+    func testMalformedCompatibilityJSONRejectsWithoutReceiptAndCanRetry() async throws {
+        let rejected = try await post(
+            body: #"{"data":{"metrics":["#,
+            token: token,
+            idempotencyKey: "malformed-compatibility"
+        )
+
+        XCTAssertEqual(rejected.status, 400)
+        let rejectedCount = try await store.totalRecordCount()
+        XCTAssertEqual(rejectedCount, 0)
+
+        let retry = try await post(
+            body: """
+                {"data":{"metrics":[{"name":"steps","units":"count","data":[
+                  {"id":"valid","date":"2026-01-01T10:00:00.000Z","qty":1}
+                ]}]}}
+                """,
+            token: token,
+            idempotencyKey: "malformed-compatibility"
+        )
+
+        XCTAssertEqual(retry.status, 200)
+        XCTAssertEqual(retry.json["duplicate"] as? Bool, false)
+        let retryCount = try await store.totalRecordCount()
+        XCTAssertEqual(retryCount, 1)
+    }
+
     /// A connection test has to succeed visibly, or the user checking their
     /// setup is told it is broken when it is not.
     func testAConnectionTestSucceeds() async throws {

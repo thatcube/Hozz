@@ -55,6 +55,7 @@ class MainActivity : ComponentActivity() {
                     onExport = {
                         archiveCreator.launch("hozz-canonical-archive.zip")
                     },
+                    onLoadMoreTimeline = viewModel::loadMoreTimeline,
                 )
             }
         }
