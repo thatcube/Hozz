@@ -10,7 +10,8 @@
       "sourceKind": "quantity",
       "targetRecord": "StepsRecord",
       "canonicalUnit": "count",
-      "quality": "exact"
+      "quality": "archiveOnly",
+      "warningCode": "cumulative-source-overlap"
     },
     {
       "sourceIdentifier": "HKQuantityTypeIdentifierHeartRate",
@@ -42,7 +43,8 @@
       "canonicalType": "sleep.stage",
       "sourceKind": "category",
       "targetRecord": "SleepSessionRecord",
-      "quality": "conditional"
+      "quality": "archiveOnly",
+      "warningCode": "sleep-session-required"
     },
     {
       "sourceIdentifier": "HKQuantityTypeIdentifierDistanceWalkingRunning",
@@ -50,7 +52,8 @@
       "sourceKind": "quantity",
       "targetRecord": "DistanceRecord",
       "canonicalUnit": "m",
-      "quality": "exact"
+      "quality": "archiveOnly",
+      "warningCode": "cumulative-source-overlap"
     },
     {
       "sourceIdentifier": "HKQuantityTypeIdentifierActiveEnergyBurned",
@@ -58,7 +61,8 @@
       "sourceKind": "quantity",
       "targetRecord": "ActiveCaloriesBurnedRecord",
       "canonicalUnit": "kcal",
-      "quality": "exact"
+      "quality": "archiveOnly",
+      "warningCode": "cumulative-source-overlap"
     },
     {
       "sourceIdentifier": "HKWorkoutTypeIdentifier",
@@ -182,8 +186,11 @@
   },
   "warningMessages": {
     "heart-rate-aggregate": "Health Connect needs individual heart-rate readings; this archive record is an aggregate and cannot be projected exactly.",
+    "clinical-snapshot-incomplete": "Clinical records remain archive-only, and Apple extraction is not considered complete until full-scan deletions are reconciled.",
+    "cumulative-source-overlap": "Overlapping cumulative records from multiple Apple sources can inflate Health Connect totals after attribution collapses to Hozz.",
     "sleep-core-to-light": "Apple's Core sleep stage is projected as Health Connect Light sleep.",
     "sleep-in-bed-overlap": "In-bed intervals stay in the Hozz archive because Health Connect sleep-stage overlap semantics differ.",
+    "sleep-session-required": "Individual Apple sleep stages stay archive-only until Hozz can assemble complete non-overlapping Health Connect sleep sessions.",
     "workout-activity-generalized": "The Apple workout activity has no exact Health Connect exercise type and is projected as Other workout.",
     "workout-details-archive-only": "Workout events, statistics, route relationships, or multi-sport legs remain only in the Hozz archive.",
     "source-store-loop": "This record already came from this Health Connect package and will not be written back to it.",

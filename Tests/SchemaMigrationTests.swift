@@ -617,7 +617,7 @@ final class SchemaMigrationTests: XCTestCase {
 
         let store = try HozzStore(directory: directory)
         let version = try await store.schemaVersion()
-        XCTAssertEqual(version, 3)
+        XCTAssertEqual(version, 4)
 
         let database = try SQLiteDatabase(url: databaseURL)
         defer { database.close() }
@@ -647,6 +647,7 @@ final class SchemaMigrationTests: XCTestCase {
         )
         XCTAssertTrue(tables.contains("destination"))
         XCTAssertTrue(tables.contains("delivery_state"))
+        XCTAssertTrue(tables.contains("canonical_record_version"))
         XCTAssertTrue(
             tables.contains("prime_state"),
             """
@@ -663,7 +664,7 @@ final class SchemaMigrationTests: XCTestCase {
         for _ in 0..<3 {
             let store = try HozzStore(directory: directory)
             let version = try await store.schemaVersion()
-            XCTAssertEqual(version, 3)
+            XCTAssertEqual(version, 4)
         }
     }
 }

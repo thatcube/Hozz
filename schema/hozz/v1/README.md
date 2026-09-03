@@ -3,12 +3,21 @@
 `archive-manifest.schema.json` describes the `hozz-manifest.json` sidecar in a
 versioned Hozz NDJSON ZIP. `canonical-record.schema.json` describes each NDJSON
 line. The stream intentionally retains run records such as `manifest`,
-`typeSummary`, and `completion`; consumers skip them when building a health
-timeline.
+`typeSummary`, `typeError`, `typeCoverage`, and `completion`; consumers skip
+them when building a health timeline but must preserve them for coverage and
+failure reporting.
 
 The sidecar is additive. Readers must continue accepting legacy Hozz exports
 that contain one `.ndjson` member and carry their version only in the first
 `kind: "manifest"` line.
+
+The compatibility rule is one-way: raw NDJSON and a ZIP with no sidecar are
+legacy inputs and may be normalized from older Apple-only fields. Once
+`hozz-manifest.json` declares v1, every canonical health record must carry its
+canonical ID/type/version, source record, and lineage. A versioned archive is
+rejected rather than silently fabricating missing provenance. Run-level
+manifest, resume, coverage, error, and completion records keep their own
+kind-specific shape and are preserved verbatim.
 
 `health-connect-mappings.json` is the source of truth for HealthKit-to-Health
 Connect projection. Generated Swift and Kotlin constants must be refreshed with:

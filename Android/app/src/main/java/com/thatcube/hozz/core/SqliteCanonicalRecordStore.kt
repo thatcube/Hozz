@@ -12,7 +12,7 @@ class SqliteCanonicalRecordStore(
     context: Context,
     databaseName: String = "hozz-archive.sqlite",
 ) :
-    SQLiteOpenHelper(context, databaseName, null, 5),
+    SQLiteOpenHelper(context, databaseName, null, 8),
     CanonicalRecordStore {
 
     override fun onCreate(database: SQLiteDatabase) {
@@ -50,6 +50,8 @@ class SqliteCanonicalRecordStore(
             """.trimIndent(),
         )
         createStageTable(database)
+        createRunRecordTables(database)
+        createHealthConnectProjectionTable(database)
         database.execSQL(
             """
             CREATE INDEX canonical_record_timeline
@@ -125,11 +127,23 @@ class SqliteCanonicalRecordStore(
                 )
             }
         }
+        if (oldVersion < 6) {
+            createRunRecordTables(database)
+        }
+        if (oldVersion < 7) {
+            createHealthConnectProjectionTable(database)
+        }
+        if (oldVersion < 8) {
+            createRunRecordTables(database)
+            createHealthConnectProjectionTable(database)
+        }
+        reconcileEncodingFailures(database)
     }
 
     override fun onOpen(database: SQLiteDatabase) {
         super.onOpen(database)
         database.delete("canonical_record_stage", null, null)
+        database.delete("archive_run_record_stage", null, null)
     }
 
     override suspend fun upsert(records: List<CanonicalRecord>): MergeResult {
@@ -182,6 +196,25 @@ class SqliteCanonicalRecordStore(
                 }
             }
 
+            override suspend fun appendRunRecords(records: List<ArchiveRunRecord>) {
+                check(!finished)
+                val database = writableDatabase
+                database.beginTransaction()
+                try {
+                    for (record in records) {
+                        database.insertWithOnConflict(
+                            "archive_run_record_stage",
+                            null,
+                            runStageValues(sessionId, record),
+                            SQLiteDatabase.CONFLICT_REPLACE,
+                        )
+                    }
+                    database.setTransactionSuccessful()
+                } finally {
+                    database.endTransaction()
+                }
+            }
+
             override suspend fun commit(): MergeResult {
                 check(!finished)
                 val database = writableDatabase
@@ -201,8 +234,25 @@ class SqliteCanonicalRecordStore(
                             result += mergeOne(database, cursor.record())
                         }
                     }
+                    reconcileEncodingFailures(database)
+                    database.execSQL(
+                        """
+                        INSERT OR IGNORE INTO archive_run_record
+                            (fingerprint, occurrence, kind, raw_json)
+                        SELECT fingerprint, occurrence, kind, raw_json
+                        FROM archive_run_record_stage
+                        WHERE session_id = ?
+                        ORDER BY ordinal
+                        """.trimIndent(),
+                        arrayOf(sessionId),
+                    )
                     database.delete(
                         "canonical_record_stage",
+                        "session_id = ?",
+                        arrayOf(sessionId),
+                    )
+                    database.delete(
+                        "archive_run_record_stage",
                         "session_id = ?",
                         arrayOf(sessionId),
                     )
@@ -218,6 +268,11 @@ class SqliteCanonicalRecordStore(
                 if (!finished) {
                     writableDatabase.delete(
                         "canonical_record_stage",
+                        "session_id = ?",
+                        arrayOf(sessionId),
+                    )
+                    writableDatabase.delete(
+                        "archive_run_record_stage",
                         "session_id = ?",
                         arrayOf(sessionId),
                     )
@@ -291,6 +346,128 @@ class SqliteCanonicalRecordStore(
             }
         }
 
+    override suspend fun runRecordsPage(
+        afterSequence: Long?,
+        limit: Int,
+    ): List<ArchiveRunRecord> =
+        readableDatabase.query(
+            "archive_run_record",
+            null,
+            afterSequence?.let { "sequence > ?" },
+            afterSequence?.let { arrayOf(it.toString()) },
+            null,
+            null,
+            "sequence",
+            limit.coerceIn(1, 1_000).toString(),
+        ).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) {
+                    add(
+                        ArchiveRunRecord(
+                            kind = cursor.string("kind"),
+                            rawJson = cursor.string("raw_json"),
+                            fingerprint = cursor.string("fingerprint"),
+                            occurrence = cursor.int("occurrence"),
+                            ordinal = cursor.long("sequence"),
+                        ),
+                    )
+                }
+            }
+        }
+
+    override suspend fun healthConnectProjections(
+        canonicalIds: Set<String>,
+    ): Map<String, HealthConnectProjection> {
+        if (canonicalIds.isEmpty()) {
+            return emptyMap()
+        }
+        val placeholders = canonicalIds.joinToString(",") { "?" }
+        return readableDatabase.rawQuery(
+            """
+            SELECT canonical_id, target_record, canonical_version,
+                   health_connect_record_id
+            FROM health_connect_projection
+            WHERE canonical_id IN ($placeholders)
+            """.trimIndent(),
+            canonicalIds.toTypedArray(),
+        ).use { cursor ->
+            buildMap {
+                while (cursor.moveToNext()) {
+                    val projection = HealthConnectProjection(
+                        canonicalId = cursor.getString(0),
+                        targetRecord = cursor.getString(1),
+                        canonicalVersion = cursor.getLong(2),
+                        healthConnectRecordId = cursor.getString(3),
+                    )
+                    put(projection.canonicalId, projection)
+                }
+            }
+        }
+    }
+
+    override suspend fun saveHealthConnectProjections(
+        projections: List<HealthConnectProjection>,
+    ) {
+        if (projections.isEmpty()) {
+            return
+        }
+        val database = writableDatabase
+        database.beginTransaction()
+        try {
+            for (projection in projections) {
+                database.execSQL(
+                    """
+                    INSERT INTO health_connect_projection
+                        (canonical_id, target_record, canonical_version,
+                         health_connect_record_id)
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(canonical_id) DO UPDATE SET
+                        target_record = excluded.target_record,
+                        canonical_version = excluded.canonical_version,
+                        health_connect_record_id =
+                            excluded.health_connect_record_id
+                    WHERE excluded.canonical_version >=
+                          health_connect_projection.canonical_version
+                    """.trimIndent(),
+                    arrayOf<Any>(
+                        projection.canonicalId,
+                        projection.targetRecord,
+                        projection.canonicalVersion,
+                        projection.healthConnectRecordId,
+                    ),
+                )
+            }
+            database.setTransactionSuccessful()
+        } finally {
+            database.endTransaction()
+        }
+    }
+
+    override suspend fun removeHealthConnectProjections(
+        projections: List<HealthConnectProjection>,
+    ) {
+        if (projections.isEmpty()) {
+            return
+        }
+        val database = writableDatabase
+        database.beginTransaction()
+        try {
+            for (projection in projections) {
+                database.delete(
+                    "health_connect_projection",
+                    "canonical_id = ? AND health_connect_record_id = ?",
+                    arrayOf(
+                        projection.canonicalId,
+                        projection.healthConnectRecordId,
+                    ),
+                )
+            }
+            database.setTransactionSuccessful()
+        } finally {
+            database.endTransaction()
+        }
+    }
+
     private fun mergeIntoCanonical(
         database: SQLiteDatabase,
         records: List<CanonicalRecord>,
@@ -299,7 +476,34 @@ class SqliteCanonicalRecordStore(
         for (record in records) {
             result += mergeOne(database, record)
         }
+        reconcileEncodingFailures(database)
         return result
+    }
+
+    private fun reconcileEncodingFailures(database: SQLiteDatabase) {
+        database.execSQL(
+            """
+            UPDATE canonical_record AS child
+            SET tombstone = 1,
+                record_version = MAX(
+                    child.record_version + 1,
+                    (
+                        SELECT parent.record_version + 1
+                        FROM canonical_record AS parent
+                        WHERE parent.canonical_id = child.parent_canonical_id
+                    )
+                )
+            WHERE child.kind = 'sampleEncodingError'
+              AND child.tombstone = 0
+              AND EXISTS (
+                  SELECT 1
+                  FROM canonical_record AS parent
+                  WHERE parent.canonical_id = child.parent_canonical_id
+                    AND parent.kind != 'sampleEncodingError'
+                    AND parent.tombstone = 0
+              )
+            """.trimIndent(),
+        )
     }
 
     private fun mergeOne(
@@ -308,10 +512,13 @@ class SqliteCanonicalRecordStore(
     ): MergeResult {
         val effective = record.parentCanonicalId
             ?.let { parentState(database, it) }
-            ?.takeIf { it.second }
-            ?.let { (parentVersion, _) ->
+            ?.takeIf(StoredRecordState::tombstone)
+            ?.let { parent ->
                 record.copy(
-                    recordVersion = maxOf(record.recordVersion, parentVersion),
+                    recordVersion = maxOf(
+                        record.recordVersion,
+                        parent.recordVersion,
+                    ),
                     tombstone = true,
                 )
             }
@@ -344,7 +551,7 @@ class SqliteCanonicalRecordStore(
             else -> MergeResult(ignored = 1)
         }
         val winningParent = parentState(database, effective.canonicalId)
-        if (winningParent?.second == true) {
+        if (winningParent?.tombstone == true) {
             database.execSQL(
                 """
                 UPDATE canonical_record
@@ -352,7 +559,28 @@ class SqliteCanonicalRecordStore(
                     record_version = MAX(record_version, ?)
                 WHERE parent_canonical_id = ?
                 """.trimIndent(),
-                arrayOf<Any>(winningParent.first, effective.canonicalId),
+                arrayOf<Any>(
+                    winningParent.recordVersion,
+                    effective.canonicalId,
+                ),
+            )
+        } else if (
+            winningParent != null &&
+            winningParent.kind != "sampleEncodingError"
+        ) {
+            database.execSQL(
+                """
+                UPDATE canonical_record
+                SET tombstone = 1,
+                    record_version = MAX(record_version + 1, ? + 1)
+                WHERE parent_canonical_id = ?
+                  AND kind = 'sampleEncodingError'
+                  AND tombstone = 0
+                """.trimIndent(),
+                arrayOf<Any>(
+                    winningParent.recordVersion,
+                    effective.canonicalId,
+                ),
             )
         }
         return result
@@ -361,9 +589,9 @@ class SqliteCanonicalRecordStore(
     private fun parentState(
         database: SQLiteDatabase,
         canonicalId: String,
-    ): Pair<Long, Boolean>? = database.query(
+    ): StoredRecordState? = database.query(
         "canonical_record",
-        arrayOf("record_version", "tombstone"),
+        arrayOf("record_version", "tombstone", "kind"),
         "canonical_id = ?",
         arrayOf(canonicalId),
         null,
@@ -371,7 +599,11 @@ class SqliteCanonicalRecordStore(
         null,
     ).use { cursor ->
         if (cursor.moveToFirst()) {
-            cursor.getLong(0) to (cursor.getInt(1) != 0)
+            StoredRecordState(
+                recordVersion = cursor.getLong(0),
+                tombstone = cursor.getInt(1) != 0,
+                kind = cursor.getString(2),
+            )
         } else {
             null
         }
@@ -433,6 +665,18 @@ class SqliteCanonicalRecordStore(
         record: CanonicalRecord,
     ): ContentValues = ContentValues(values(record)).apply {
         put("session_id", sessionId)
+    }
+
+    private fun runStageValues(
+        sessionId: String,
+        record: ArchiveRunRecord,
+    ): ContentValues = ContentValues().apply {
+        put("session_id", sessionId)
+        put("ordinal", record.ordinal)
+        put("fingerprint", record.fingerprint)
+        put("occurrence", record.occurrence)
+        put("kind", record.kind)
+        put("raw_json", record.rawJson)
     }
 
     private fun Cursor.record(): CanonicalRecord = CanonicalRecord(
@@ -524,5 +768,52 @@ class SqliteCanonicalRecordStore(
                 """.trimIndent(),
             )
         }
+
+        fun createRunRecordTables(database: SQLiteDatabase) {
+            database.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS archive_run_record (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    fingerprint TEXT NOT NULL,
+                    occurrence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    UNIQUE (fingerprint, occurrence)
+                )
+                """.trimIndent(),
+            )
+            database.execSQL(
+                """
+                CREATE TABLE IF NOT EXISTS archive_run_record_stage (
+                    session_id TEXT NOT NULL,
+                    ordinal INTEGER NOT NULL,
+                    fingerprint TEXT NOT NULL,
+                    occurrence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    PRIMARY KEY (session_id, fingerprint, occurrence)
+                )
+                """.trimIndent(),
+            )
+        }
+
+        private data class StoredRecordState(
+            val recordVersion: Long,
+            val tombstone: Boolean,
+            val kind: String,
+        )
+    }
+
+    fun createHealthConnectProjectionTable(database: SQLiteDatabase) {
+        database.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS health_connect_projection (
+                canonical_id TEXT PRIMARY KEY,
+                target_record TEXT NOT NULL,
+                canonical_version INTEGER NOT NULL,
+                health_connect_record_id TEXT NOT NULL
+            )
+            """.trimIndent(),
+        )
     }
 }

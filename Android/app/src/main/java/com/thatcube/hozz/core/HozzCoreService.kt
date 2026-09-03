@@ -3,6 +3,7 @@ package com.thatcube.hozz.core
 import android.content.Context
 import com.thatcube.hozz.projection.ProjectionPlan
 import com.thatcube.hozz.projection.ProjectionPlanner
+import com.thatcube.hozz.projection.PlannedRecord
 import com.thatcube.hozz.projection.ProjectionSummary
 
 data class HozzCoreSnapshot(
@@ -12,7 +13,7 @@ data class HozzCoreSnapshot(
 )
 
 data class ProjectionDraftPage(
-    val drafts: List<com.thatcube.hozz.projection.ProjectionDraft>,
+    val operations: List<PlannedRecord>,
     val nextCanonicalId: String?,
 )
 
@@ -39,7 +40,10 @@ class HozzCoreService(context: Context) {
             if (page.isEmpty()) {
                 break
             }
-            projection += ProjectionPlanner.plan(page).summary()
+            val ledger = store.healthConnectProjections(
+                page.mapTo(linkedSetOf(), CanonicalRecord::canonicalId),
+            )
+            projection += ProjectionPlanner.plan(page, ledger).summary()
             after = page.last().canonicalId
         } while (page.size == PAGE_SIZE)
         return HozzCoreSnapshot(
@@ -53,10 +57,26 @@ class HozzCoreService(context: Context) {
         afterCanonicalId: String?,
     ): ProjectionDraftPage {
         val records = store.recordsPage(afterCanonicalId, PAGE_SIZE)
+        val ledger = store.healthConnectProjections(
+            records.mapTo(linkedSetOf(), CanonicalRecord::canonicalId),
+        )
         return ProjectionDraftPage(
-            drafts = ProjectionPlanner.plan(records).drafts,
+            operations = ProjectionPlanner.plan(records, ledger).records
+                .filter { it.draft != null },
             nextCanonicalId = records.lastOrNull()?.canonicalId,
         )
+    }
+
+    suspend fun saveHealthConnectProjections(
+        projections: List<HealthConnectProjection>,
+    ) {
+        store.saveHealthConnectProjections(projections)
+    }
+
+    suspend fun removeHealthConnectProjections(
+        projections: List<HealthConnectProjection>,
+    ) {
+        store.removeHealthConnectProjections(projections)
     }
 
     suspend fun export(sink: ArchiveSink): ArchiveExportResult =

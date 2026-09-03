@@ -27,6 +27,10 @@ class CanonicalArchiveExporter(
         val digest = MessageDigest.getInstance("SHA-256")
         var recordCount = 0
         var createdAt = Instant.EPOCH
+        forEachRunRecord { record ->
+            digest.update(runJson(record).toByteArray())
+            digest.update('\n'.code.toByte())
+        }
         forEachRecord { record ->
             val line = canonicalJson(record)
             digest.update(line.toByteArray())
@@ -56,6 +60,10 @@ class CanonicalArchiveExporter(
             archive.closeEntry()
 
             archive.putNextEntry(entry(recordsEntry))
+            forEachRunRecord { record ->
+                archive.write(runJson(record).toByteArray())
+                archive.write('\n'.code)
+            }
             forEachRecord { record ->
                 archive.write(canonicalJson(record).toByteArray())
                 archive.write('\n'.code)
@@ -63,6 +71,10 @@ class CanonicalArchiveExporter(
             archive.closeEntry()
         }
         return ArchiveExportResult(archiveId, recordCount)
+    }
+
+    private fun runJson(record: ArchiveRunRecord): String {
+        return CanonicalRecordParser.normalizedRunLine(record.rawJson)
     }
 
     internal fun canonicalJson(record: CanonicalRecord): String {
@@ -198,8 +210,26 @@ class CanonicalArchiveExporter(
             if (page.isEmpty()) {
                 return
             }
+
             page.forEach(consume)
             after = page.last().canonicalId
+            if (page.size < PAGE_SIZE) {
+                return
+            }
+        }
+    }
+
+    private suspend fun forEachRunRecord(
+        consume: (ArchiveRunRecord) -> Unit,
+    ) {
+        var after: Long? = null
+        while (true) {
+            val page = store.runRecordsPage(after, PAGE_SIZE)
+            if (page.isEmpty()) {
+                return
+            }
+            page.forEach(consume)
+            after = page.last().ordinal
             if (page.size < PAGE_SIZE) {
                 return
             }

@@ -54,6 +54,10 @@ final class TypeCoverageWireTests: XCTestCase {
         let line = TypeCoverageShape.line(for: report)
 
         XCTAssertEqual(line["kind"] as? String, "typeCoverage")
+        XCTAssertEqual(
+            line["schemaVersion"] as? Int,
+            HozzArchiveContract.schemaVersion
+        )
         XCTAssertEqual(line["type"] as? String, "HKQuantityTypeIdentifierStepCount")
         XCTAssertEqual(line["state"] as? String, "anchorClosed")
         XCTAssertEqual(line["complete"] as? Bool, true)
@@ -61,7 +65,15 @@ final class TypeCoverageWireTests: XCTestCase {
         XCTAssertEqual(line["observedAt"] as? String, Self.observedText)
         XCTAssertEqual(
             Set(line.keys),
-            ["kind", "type", "state", "complete", "deliveredCount", "observedAt"],
+            [
+                "kind",
+                "schemaVersion",
+                "type",
+                "state",
+                "complete",
+                "deliveredCount",
+                "observedAt"
+            ],
             "a key nobody decided to add is a key the receiver was never taught"
         )
     }

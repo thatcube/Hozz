@@ -3,6 +3,7 @@ package com.thatcube.hozz
 import android.app.Application
 import android.database.sqlite.SQLiteException
 import android.net.Uri
+import android.os.RemoteException
 import androidx.health.connect.client.HealthConnectClient
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
@@ -12,11 +13,13 @@ import com.thatcube.hozz.core.CanonicalRecord
 import com.thatcube.hozz.core.HozzCoreService
 import com.thatcube.hozz.core.SafArchiveTransport
 import com.thatcube.hozz.core.SafArchiveSink
-import com.thatcube.hozz.projection.HealthConnectWriteResult
 import com.thatcube.hozz.projection.HealthConnectWriter
+import com.thatcube.hozz.projection.ProjectionExecutionResult
+import com.thatcube.hozz.projection.ProjectionExecutor
 import com.thatcube.hozz.projection.ProjectionSummary
 import java.io.IOException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -74,10 +77,17 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                         append(" updated, ")
                         append(result.merge.ignored)
                         append(" already current.")
+                        if (result.runRecordsPreserved > 0) {
+                            append(" Preserved ")
+                            append(result.runRecordsPreserved)
+                            append(" run and coverage records.")
+                        }
                     },
                 )
             } catch (error: ArchiveFormatException) {
                 fail(error.message ?: "The selected file is not a Hozz archive.")
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: IOException) {
                 fail(error.message ?: "Android could not read the selected archive.")
             } catch (error: SQLiteException) {
@@ -115,6 +125,8 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                 )
             } catch (error: ArchiveFormatException) {
                 fail(error.message ?: "Android could not create the archive.")
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: IOException) {
                 fail(error.message ?: "Android could not write the archive.")
             } catch (error: SecurityException) {
@@ -128,7 +140,7 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
     ) {
         viewModelScope.launch {
             val projection = mutableState.value.projection
-            if (projection.mappedCount == 0) {
+            if (projection.pendingCount == 0) {
                 mutableState.value = mutableState.value.copy(
                     status = "There are no mapped records to write.",
                 )
@@ -143,13 +155,21 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                     projection.targetRecords,
                 )
                 if (missing.isEmpty()) {
-                    writeToHealthConnect()
+                    writeToHealthConnect(
+                        healthConnect.requiredPermissions(projection.targetRecords),
+                    )
                 } else {
                     mutableState.value = mutableState.value.copy(busy = false)
                     requestPermissions(missing)
                 }
             } catch (error: IOException) {
                 fail(error.message ?: "Health Connect could not check permissions.")
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: RemoteException) {
+                fail(error.message ?: "Health Connect could not check permissions.")
             } catch (error: IllegalStateException) {
                 fail(error.message ?: "Health Connect is not available.")
             } catch (error: SecurityException) {
@@ -158,23 +178,23 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun finishHealthConnectPermission(granted: Set<String>) {
+    fun finishHealthConnectPermission(@Suppress("UNUSED_PARAMETER") granted: Set<String>) {
         viewModelScope.launch {
             val projection = mutableState.value.projection
-            if (granted.isEmpty()) {
-                mutableState.value = mutableState.value.copy(
-                    busy = false,
-                    status = "No records were written because write access was not granted.",
-                )
-                return@launch
-            }
             mutableState.value = mutableState.value.copy(
                 busy = true,
                 status = "Confirming Health Connect write access…",
             )
             val missing = try {
                 healthConnect.missingPermissions(projection.targetRecords)
+            } catch (error: CancellationException) {
+                throw error
             } catch (error: IOException) {
+                fail(error.message ?: "Health Connect could not check permissions.")
+                return@launch
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: RemoteException) {
                 fail(error.message ?: "Health Connect could not check permissions.")
                 return@launch
             } catch (error: IllegalStateException) {
@@ -184,42 +204,80 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                 fail("Health Connect refused the permission check.")
                 return@launch
             }
-            if (missing.isNotEmpty()) {
+            val permitted =
+                healthConnect.requiredPermissions(projection.targetRecords) - missing
+            if (permitted.isEmpty()) {
                 mutableState.value = mutableState.value.copy(
                     busy = false,
                     status = "No records were written because write access was not granted.",
                 )
                 return@launch
             }
-            writeToHealthConnect()
+            writeToHealthConnect(permitted)
         }
     }
 
-    private suspend fun writeToHealthConnect() {
+    private suspend fun writeToHealthConnect(
+        permitted: Set<String>,
+    ) {
         mutableState.value = mutableState.value.copy(
             busy = true,
             status = "Writing mapped records to Health Connect…",
         )
         try {
             var after: String? = null
-            var attempted = 0
+            var result = ProjectionExecutionResult()
+            var permissionDeferred = 0
+            val executor = ProjectionExecutor(
+                writer = healthConnect,
+                saveProjections = core::saveHealthConnectProjections,
+                removeProjections = core::removeHealthConnectProjections,
+            )
             do {
                 val page = withContext(Dispatchers.IO) {
                     core.projectionDraftPage(after)
                 }
-                if (page.drafts.isNotEmpty()) {
-                    val result: HealthConnectWriteResult =
-                        withContext(Dispatchers.IO) {
-                            healthConnect.write(page.drafts)
-                        }
-                    attempted += result.attempted
+                val permittedOperations = page.operations.filter { operation ->
+                    val draft = operation.draft ?: return@filter false
+                    val allowed =
+                        healthConnect.requiredPermission(draft) in permitted
+                    if (!allowed) {
+                        permissionDeferred += 1
+                    }
+                    allowed
+                }
+                result += withContext(Dispatchers.IO) {
+                    executor.apply(permittedOperations)
                 }
                 after = page.nextCanonicalId
             } while (after != null)
-            mutableState.value = mutableState.value.copy(
-                busy = false,
-                status = "Health Connect accepted $attempted mapped records.",
+            refresh(
+                status = buildString {
+                    append("Health Connect applied ")
+                    append(result.inserted)
+                    append(" inserts, ")
+                    append(result.updated)
+                    append(" updates, and ")
+                    append(result.deleted)
+                    append(" deletions.")
+                    if (result.failures.isNotEmpty()) {
+                        append(" ")
+                        append(result.failures.size)
+                        append(" records failed and remain pending.")
+                    }
+                    if (permissionDeferred > 0) {
+                        append(" ")
+                        append(permissionDeferred)
+                        append(" records remain pending because write access was not granted.")
+                    }
+                },
             )
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: RemoteException) {
+            fail(error.message ?: "Health Connect could not complete the operation.")
+        } catch (error: SQLiteException) {
+            fail(error.message ?: "The Health Connect projection ledger could not be updated.")
         } catch (error: IOException) {
             fail(error.message ?: "Health Connect did not accept the records.")
         } catch (error: IllegalArgumentException) {

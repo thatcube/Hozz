@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.HorizontalDivider
@@ -26,7 +27,12 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -251,6 +257,35 @@ private fun ProjectionPreview(
     onWriteHealthConnect: () -> Unit,
 ) {
     val plan = state.projection
+    var confirmsDeletion by remember { mutableStateOf(false) }
+    if (confirmsDeletion) {
+        AlertDialog(
+            onDismissRequest = { confirmsDeletion = false },
+            title = { Text("Delete projected records?") },
+            text = {
+                Text(
+                    "This removes ${plan.deleteCount} records previously written " +
+                        "by Hozz from Health Connect. Their canonical records " +
+                        "remain in your Hozz archive.",
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        confirmsDeletion = false
+                        onWriteHealthConnect()
+                    },
+                ) {
+                    Text("Apply deletions")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { confirmsDeletion = false }) {
+                    Text("Cancel")
+                }
+            },
+        )
+    }
     Card(
         shape = RoundedCornerShape(20.dp),
         modifier = Modifier.fillMaxWidth(),
@@ -267,11 +302,38 @@ private fun ProjectionPreview(
                     .padding(vertical = 14.dp),
                 horizontalArrangement = Arrangement.SpaceBetween,
             ) {
+                Count("Insert", plan.insertCount)
+                Count("Update", plan.updateCount)
+                Count("Delete", plan.deleteCount)
+            }
+            HorizontalDivider()
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 12.dp),
+                horizontalArrangement = Arrangement.SpaceBetween,
+            ) {
                 Count("Exact", plan.exactCount)
                 Count("Lossy", plan.lossyCount)
                 Count("Archive only", plan.archiveOnlyCount)
             }
-            HorizontalDivider()
+            if (plan.warningDetails.isNotEmpty()) {
+                HorizontalDivider()
+                Text(
+                    text = "Mapping warnings",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(top = 12.dp),
+                )
+                for (warning in plan.warningDetails) {
+                    Text(
+                        text = "${warning.count} × ${warning.message}",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
+            }
             Text(
                 text = "Hozz remains the complete copy. Health Connect receives only the mapped records you approve.",
                 modifier = Modifier.padding(vertical = 12.dp),
@@ -279,9 +341,15 @@ private fun ProjectionPreview(
                 style = MaterialTheme.typography.bodySmall,
             )
             Button(
-                onClick = onWriteHealthConnect,
+                onClick = {
+                    if (plan.deleteCount > 0) {
+                        confirmsDeletion = true
+                    } else {
+                        onWriteHealthConnect()
+                    }
+                },
                 enabled = !state.busy &&
-                    plan.mappedCount > 0 &&
+                    plan.pendingCount > 0 &&
                     state.healthConnectStatus == HealthConnectClient.SDK_AVAILABLE,
                 modifier = Modifier.fillMaxWidth(),
             ) {
@@ -340,6 +408,8 @@ private fun TimelineRow(record: CanonicalRecord) {
                                 MaterialTheme.colorScheme.error
                             ProjectionQuality.ARCHIVE_ONLY ->
                                 MaterialTheme.colorScheme.onSurfaceVariant
+                            ProjectionQuality.DELETE ->
+                                MaterialTheme.colorScheme.error
                         },
                         CircleShape,
                     ),
@@ -374,11 +444,13 @@ private fun ProjectionBadge(quality: ProjectionQuality) {
         ProjectionQuality.EXACT -> "Mapped"
         ProjectionQuality.LOSSY -> "Lossy"
         ProjectionQuality.ARCHIVE_ONLY -> "Archive only"
+        ProjectionQuality.DELETE -> "Delete"
     }
     val color: Color = when (quality) {
         ProjectionQuality.EXACT -> MaterialTheme.colorScheme.secondary
         ProjectionQuality.LOSSY -> MaterialTheme.colorScheme.error
         ProjectionQuality.ARCHIVE_ONLY -> MaterialTheme.colorScheme.onSurfaceVariant
+        ProjectionQuality.DELETE -> MaterialTheme.colorScheme.error
     }
     Text(
         text = label,

@@ -85,6 +85,7 @@ public enum TypeCoverageShape {
     public static func line(for report: TypeCoverageReport) -> [String: Any] {
         var object: [String: Any] = [
             "kind": kind,
+            "schemaVersion": HozzArchiveContract.schemaVersion,
             "type": report.type,
             "state": report.state.rawValue,
             "complete": report.isComplete,

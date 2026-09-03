@@ -97,6 +97,14 @@ public actor HozzStore {
 
         if version < 1 {
             try database.transaction {
+                let lockedVersion = try database.query(
+                    "PRAGMA user_version;"
+                ) { row in
+                    Int(row.integer(0))
+                }.first ?? 0
+                guard lockedVersion < 1 else {
+                    return
+                }
                 try database.execute(
                     """
                     CREATE TABLE stream_state (
@@ -151,6 +159,14 @@ public actor HozzStore {
 
         if version < 2 {
             try database.transaction {
+                let lockedVersion = try database.query(
+                    "PRAGMA user_version;"
+                ) { row in
+                    Int(row.integer(0))
+                }.first ?? 0
+                guard lockedVersion < 2 else {
+                    return
+                }
                 try database.execute(
                     """
                     CREATE TABLE destination (
@@ -195,6 +211,14 @@ public actor HozzStore {
 
         if version < 3 {
             try database.transaction {
+                let lockedVersion = try database.query(
+                    "PRAGMA user_version;"
+                ) { row in
+                    Int(row.integer(0))
+                }.first ?? 0
+                guard lockedVersion < 3 else {
+                    return
+                }
                 // A separate table, not extra columns on `stream_state`, and
                 // that separation is the feature's central safety property
                 // rather than a filing preference. An anchor is the sweep's
@@ -226,12 +250,97 @@ public actor HozzStore {
                 try database.execute("PRAGMA user_version = 3;")
             }
         }
+
+        if version < 4 {
+            try database.transaction {
+                let lockedVersion = try database.query(
+                    "PRAGMA user_version;"
+                ) { row in
+                    Int(row.integer(0))
+                }.first ?? 0
+                guard lockedVersion < 4 else {
+                    return
+                }
+                try database.execute(
+                    """
+                    CREATE TABLE canonical_record_version (
+                        id TEXT PRIMARY KEY NOT NULL,
+                        version INTEGER NOT NULL
+                    );
+                    """
+                )
+                let hasExportRuns = try database.query(
+                    """
+                    SELECT 1
+                    FROM sqlite_master
+                    WHERE type = 'table' AND name = 'export_run';
+                    """
+                ) { _ in true }.first ?? false
+                if hasExportRuns {
+                    try database.execute(
+                        """
+                        INSERT INTO canonical_record_version (id, version)
+                        SELECT '__legacy_export_floor__',
+                               MAX(
+                                   MAX(
+                                       CAST(max_timestamp * 1000 AS INTEGER),
+                                       1
+                                   )
+                               )
+                        FROM (
+                            SELECT MAX(
+                                started_at,
+                                updated_at,
+                                COALESCE(finished_at, started_at)
+                            ) AS max_timestamp
+                            FROM export_run
+                        )
+                        HAVING COUNT(*) > 0;
+                        """
+                    )
+                }
+                try database.execute("PRAGMA user_version = 4;")
+            }
+        }
     }
 
     public func schemaVersion() throws -> Int {
         try database.query("PRAGMA user_version;") { row in
             Int(row.integer(0))
         }.first ?? 0
+    }
+
+    /// Returns a durable version that cannot move backward with the wall clock.
+    public func nextCanonicalRecordVersion(
+        id: String,
+        observedAt: Date
+    ) throws -> Int64 {
+        try database.transaction {
+            let previous = try database.query(
+                """
+                SELECT MAX(version)
+                FROM canonical_record_version
+                WHERE id IN (?, '__legacy_export_floor__');
+                """,
+                [.text(id)]
+            ) { row in
+                row.integer(0)
+            }.first ?? 0
+            let timestamp = max(
+                Int64(observedAt.timeIntervalSince1970 * 1_000),
+                1
+            )
+            let version = max(previous + 1, timestamp)
+            try database.run(
+                """
+                INSERT INTO canonical_record_version (id, version)
+                VALUES (?, ?)
+                ON CONFLICT(id) DO UPDATE SET version = excluded.version;
+                """,
+                [.text(id), .integer(version)]
+            )
+            return version
+        }
     }
 
     // MARK: - Stream state

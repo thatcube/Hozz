@@ -33,13 +33,62 @@
       "minimum": 1
     },
     "id": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
     },
     "deleted": {
       "type": "boolean"
     },
     "type": {
-      "type": "string"
+      "type": "string",
+      "minLength": 1
+    },
+    "run": {
+      "type": "string",
+      "minLength": 1
+    },
+    "createdAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "resumedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "completedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "observedAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "primedFrom": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "primedThrough": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "deliveredCount": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "state": {
+      "type": "string",
+      "minLength": 1
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1
+    },
+    "records": {
+      "type": "integer",
+      "minimum": 0
     },
     "startDate": {
       "type": "string",
@@ -49,6 +98,19 @@
       "type": "string",
       "format": "date-time"
     },
+    "readAt": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "value": {
+      "type": "integer"
+    },
+    "activityType": {
+      "type": "integer"
+    },
+    "characteristics": {
+      "type": "object"
+    },
     "quantity": {
       "type": "object",
       "required": [
@@ -57,7 +119,8 @@
       ],
       "properties": {
         "unit": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "value": {
           "type": "number"
@@ -80,13 +143,16 @@
       ],
       "properties": {
         "store": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "id": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "type": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "version": {
           "type": "integer",
@@ -104,13 +170,16 @@
         ],
         "properties": {
           "store": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
           "package": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           },
           "recordId": {
-            "type": "string"
+            "type": "string",
+            "minLength": 1
           }
         },
         "additionalProperties": true
@@ -138,7 +207,8 @@
       ],
       "properties": {
         "unit": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "value": {
           "type": "number"
@@ -153,7 +223,8 @@
       "type": "object",
       "properties": {
         "unit": {
-          "type": "string"
+          "type": "string",
+          "minLength": 1
         },
         "value": {
           "type": "number"
@@ -165,5 +236,231 @@
       "additionalProperties": true
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "manifest",
+              "resume",
+              "typeSummary",
+              "typeError",
+              "typeCoverage",
+              "completion"
+            ]
+          }
+        }
+      },
+      "then": {
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "manifest"
+              }
+            },
+            "required": [
+              "run",
+              "createdAt"
+            ]
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "resume"
+              }
+            },
+            "required": [
+              "run",
+              "resumedAt"
+            ]
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "typeSummary"
+              }
+            },
+            "required": [
+              "type",
+              "state"
+            ]
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "typeError"
+              }
+            },
+            "required": [
+              "type",
+              "message"
+            ]
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "typeCoverage"
+              }
+            },
+            "required": [
+              "type",
+              "state",
+              "complete",
+              "observedAt"
+            ]
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "completion"
+              }
+            },
+            "required": [
+              "run",
+              "completedAt",
+              "records"
+            ]
+          }
+        ]
+      },
+      "else": {
+        "required": [
+          "canonicalId",
+          "canonicalType",
+          "recordVersion",
+          "type",
+          "sourceRecord",
+          "lineage"
+        ],
+        "properties": {
+          "lineage": {
+            "minItems": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "not": {
+              "enum": [
+                "manifest",
+                "resume",
+                "typeSummary",
+                "typeError",
+                "typeCoverage",
+                "completion",
+                "deletion",
+                "characteristics",
+                "sampleEncodingError"
+              ]
+            }
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "startDate",
+          "endDate"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "quantity"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "quantity"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "category"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "value"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "workout"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "activityType"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "characteristics"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "readAt",
+          "characteristics"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "const": "sampleEncodingError"
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "message",
+          "parentCanonicalId"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "kind": {
+            "enum": [
+              "electrocardiogramEnd",
+              "electrocardiogramVoltages",
+              "quantitySeriesEnd",
+              "quantitySeriesReadings",
+              "workoutRouteEnd",
+              "workoutRouteLocations"
+            ]
+          }
+        }
+      },
+      "then": {
+        "required": [
+          "parentCanonicalId"
+        ]
+      }
+    }
+  ],
   "additionalProperties": true
 }

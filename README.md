@@ -168,7 +168,9 @@ catalogues or reports as unsupported rather than silently claiming as coverage:
   workout's own statistics are exact.
 - **Clinical (health) records are off by default.** The code to read FHIR
   records from a connected provider is compiled out of the default build, on
-  purpose. Enabling it is a deliberate, documented two-step change — see
+  purpose. That reader is a development spike and does not yet reconcile
+  disappearing records into tombstones, so clinical export is not supported
+  coverage. Its build gates are documented for testing — see
   [CONTRIBUTING.md](CONTRIBUTING.md#enabling-clinical-health-records).
 - **Hozz doesn't write back into Apple Health.** That's a decision, not an
   oversight: Health would permanently stamp restored data as Hozz's, has no way

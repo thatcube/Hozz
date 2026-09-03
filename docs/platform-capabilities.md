@@ -10,7 +10,7 @@ screens.
 | Understand coverage | Reports per-type acquisition state | Reports received coverage | Previews exact, lossy, and archive-only mappings | Empty, denied, incomplete, and unsupported remain distinct states. |
 | Preserve | Keeps a bounded durable spool | Keeps the accumulating local archive | Keeps a versioned canonical local archive with tombstones | Stable IDs and monotonic versions make retries idempotent; unknown fields survive. |
 | View | Health dashboard | Archive browser and analysis | Native Compose summary and timeline | A record stays visible even when a destination cannot represent it. |
-| Project | Sends destination-specific payloads | Exposes queries and exports | Opt-in Health Connect projection | Projection is never the source of truth and every loss is named. |
+| Project | Sends destination-specific payloads | Exposes queries and exports | Opt-in, ledger-backed Health Connect projection | Projection is never the source of truth; inserts, updates, deletions, and every loss are named before approval. |
 | Move onward | Manual export and configured destinations | CSV and folder access | Saves a new canonical Hozz archive through the system picker | Transports are replaceable and user-controlled; no hosted relay is assumed. |
 
 ## Gaps revealed by Android

@@ -55,6 +55,10 @@ final class ClinicalRecordTests: XCTestCase {
     /// The constraint that matters most: a binary carrying the health-records
     /// entitlement before Apple approves it is rejected outright.
     func testClinicalRecordsAreCompiledOutOfTheDefaultBuild() {
+        XCTAssertFalse(
+            ClinicalRecordsSupport.hasDeletionSafeSnapshot,
+            "Clinical export must stay unavailable until removed records produce tombstones."
+        )
         #if HOZZ_CLINICAL_RECORDS
         XCTAssertTrue(ClinicalRecordsSupport.isBuiltIn)
         #else
@@ -76,7 +80,8 @@ final class ClinicalRecordTests: XCTestCase {
         )
 
         #if HOZZ_CLINICAL_RECORDS
-        XCTAssertEqual(availability, .availableWithPermission)
+        XCTAssertEqual(availability, .snapshotReconciliationUnavailable)
+        XCTAssertFalse(availability.canRead)
         #else
         XCTAssertEqual(availability, .notInThisBuild)
         XCTAssertTrue(

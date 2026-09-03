@@ -33,8 +33,10 @@ read as something it is not, and a receiver comparing an old batch with a new on
 can tell that the meaning of a column changed rather than having to infer it from
 the numbers.
 
-**Identifiers** are lowercase UUID strings. A sample keeps the UUID HealthKit
-gave it, so the same record delivered twice is recognisably the same record.
+**Source identifiers** are normally lowercase HealthKit UUID strings.
+`canonicalId` namespaces that identity for cross-platform merge and projection;
+synthetic detail/error records have their own deterministic ID and retain the
+source record under `sourceRecord`.
 
 **Nothing is null.** A field Hozz has no value for is absent rather than present
 and empty. An absent `device` means HealthKit reported no device, not that Hozz
@@ -49,14 +51,19 @@ protocol are projections of it. Every record has these fields:
 | --- | --- | --- |
 | `schemaVersion` | Integer | Currently `1`. |
 | `catalogVersion` | Integer | Version of Hozz's Health type catalogue. |
-| `id` | String | Lowercase UUID. Stable across redeliveries. |
-| `type` | String | HealthKit type identifier, e.g. `HKQuantityTypeIdentifierHeartRate`. |
+| `canonicalId` | String | Stable Hozz identity across imports and projection retries. |
+| `canonicalType` | String | Source-neutral Hozz type, e.g. `vitals.heart-rate`. |
+| `recordVersion` | Integer | Monotonic Hozz version. Higher versions replace lower ones. |
+| `id` | String | Original or deterministic record identifier. |
+| `type` | String | Original platform type identifier, e.g. `HKQuantityTypeIdentifierHeartRate`. |
 | `kind` | String | See below. |
 | `startDate` | String | ISO 8601 UTC. |
 | `endDate` | String | ISO 8601 UTC. Equals `startDate` for instantaneous samples. |
 | `source` | Object | Where the sample came from. |
 | `device` | Object | Optional. The hardware, when HealthKit named one. |
 | `metadata` | Object | Optional. HealthKit metadata, type-tagged. |
+| `sourceRecord` | Object | Original store, record ID/type, and source version when that platform exposes one. |
+| `lineage` | Array | Stores/adapters this record has traversed. |
 
 ### `kind`
 
@@ -69,7 +76,7 @@ protocol are projections of it. Every record has these fields:
 | `workoutRoute` | `workout` | A GPS route's own record. |
 | `workoutRouteLocations` | `route`, `sequence`, `offset`, `count`, `locations` | One page of route points. |
 | `workoutRouteEnd` | `route`, `locations` | Marks a route as completely written. |
-| `deletion` | — | A tombstone. Carries only `kind`, `id`, `type`, `schemaVersion`. |
+| `deletion` | — | A versioned tombstone with the same canonical identity as the removed record. |
 | `sampleEncodingError` | `message` | A sample Hozz could not encode, written in its place so the batch never silently omits it. |
 | `sample` | — | An `HKSample` subclass this build has no specific handling for. |
 | `typeCoverage` | `state`, `complete`, `deliveredCount`, `primedFrom`, `primedThrough`, `observedAt` | Not a measurement: how completely Hozz has read one type. See below. |
@@ -229,6 +236,7 @@ describes a type rather than a moment.
 ```json
 {
   "kind": "typeCoverage",
+  "schemaVersion": 1,
   "type": "HKQuantityTypeIdentifierStepCount",
   "state": "anchorClosed",
   "complete": true,
@@ -283,10 +291,13 @@ a row of blanks or as a metric named after a type.
 
 ## NDJSON
 Default. One record per line, `\n` terminated, `application/x-ndjson`. Lossless.
+ZIP exports also carry `hozz-manifest.json`, which declares schema v1 and the
+NDJSON member name. Raw NDJSON and older one-member ZIPs remain legacy inputs;
+sidecar-declared v1 records are validated strictly.
 
 ```
-{"catalogVersion":6,"endDate":"2026-08-22T21:10:46.500Z","id":"2f1a…","kind":"quantity","metadata":{},"quantity":{"description":"62.5 count/min","unit":"count/min","value":62.5},"schemaVersion":1,"source":{"bundleIdentifier":"com.apple.health.ABC","name":"Apple Watch","operatingSystem":{"major":26,"minor":5,"patch":0}},"startDate":"2026-08-22T21:10:46.500Z","type":"HKQuantityTypeIdentifierHeartRate"}
-{"id":"9c40…","kind":"deletion","schemaVersion":1,"type":"HKQuantityTypeIdentifierStepCount"}
+{"canonicalId":"apple.healthkit:2f1a…","canonicalType":"vitals.heart-rate","catalogVersion":6,"endDate":"2026-08-22T21:10:46.500Z","id":"2f1a…","kind":"quantity","lineage":[{"recordId":"2f1a…","store":"apple.healthkit"}],"metadata":{},"quantity":{"canonical":{"unit":"count/min","value":62.5},"description":"62.5 count/min","original":{"description":"62.5 count/min"},"unit":"count/min","value":62.5},"recordVersion":1,"schemaVersion":1,"source":{"bundleIdentifier":"com.apple.health.ABC","name":"Apple Watch","operatingSystem":{"major":26,"minor":5,"patch":0}},"sourceRecord":{"id":"2f1a…","store":"apple.healthkit","type":"HKQuantityTypeIdentifierHeartRate"},"startDate":"2026-08-22T21:10:46.500Z","type":"HKQuantityTypeIdentifierHeartRate"}
+{"canonicalId":"apple.healthkit:9c40…","canonicalType":"activity.steps","id":"9c40…","kind":"deletion","lineage":[{"recordId":"9c40…","store":"apple.healthkit"}],"recordVersion":2,"schemaVersion":1,"sourceRecord":{"id":"9c40…","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
 ```
 
 Keys within a record are sorted, so the same records always produce the same

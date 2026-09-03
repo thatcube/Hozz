@@ -40,6 +40,96 @@ final class HozzStoreTests: XCTestCase {
         XCTAssertEqual(reopened, version)
     }
 
+    func testCanonicalRecordVersionSurvivesClockRollbackAndReopen() async throws {
+        let first = try await makeStore()
+        let initial = try await first.nextCanonicalRecordVersion(
+            id: "apple.healthkit:characteristics",
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+        let rollback = try await first.nextCanonicalRecordVersion(
+            id: "apple.healthkit:characteristics",
+            observedAt: Date(timeIntervalSince1970: 50)
+        )
+        await first.close()
+
+        let reopened = try await makeStore()
+        let afterReopen = try await reopened.nextCanonicalRecordVersion(
+            id: "apple.healthkit:characteristics",
+            observedAt: Date(timeIntervalSince1970: 25)
+        )
+
+        XCTAssertEqual(initial, 100_000)
+        XCTAssertEqual(rollback, initial + 1)
+        XCTAssertEqual(afterReopen, rollback + 1)
+    }
+
+    func testVersionFourMigrationStartsAbovePriorExportTime() async throws {
+        let first = try await makeStore()
+        let databaseURL = await first.databaseURL
+        await first.close()
+        let legacy = try SQLiteDatabase(url: databaseURL)
+        try legacy.transaction {
+            try legacy.execute("DROP TABLE canonical_record_version;")
+            try legacy.run(
+                """
+                INSERT INTO export_run
+                    (id, state, format, started_at, updated_at, finished_at,
+                     record_count, attempted_type_count, catalog_version,
+                     sample_encoding_error_count)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+                """,
+                [
+                    .text(UUID().uuidString),
+                    .text("running"),
+                    .text("ndjson"),
+                    .real(202),
+                    .real(100),
+                    .null,
+                    .integer(0),
+                    .integer(0),
+                    .text("test"),
+                    .integer(0)
+                ]
+            )
+            try legacy.execute("PRAGMA user_version = 3;")
+        }
+        legacy.close()
+
+        let migrated = try await makeStore()
+        let version = try await migrated.nextCanonicalRecordVersion(
+            id: "apple.healthkit:characteristics",
+            observedAt: Date(timeIntervalSince1970: 100)
+        )
+
+        XCTAssertEqual(version, 202_001)
+    }
+
+    func testConcurrentFreshMigrationsAreIdempotent() async throws {
+        let storeDirectory = directory.url.appending(path: "store")
+
+        let stores = try await withThrowingTaskGroup(
+            of: HozzStore.self,
+            returning: [HozzStore].self
+        ) { group in
+            for _ in 0..<2 {
+                group.addTask {
+                    try HozzStore(directory: storeDirectory)
+                }
+            }
+            var opened: [HozzStore] = []
+            for try await store in group {
+                opened.append(store)
+            }
+            return opened
+        }
+
+        for store in stores {
+            let version = try await store.schemaVersion()
+            XCTAssertEqual(version, 4)
+            await store.close()
+        }
+    }
+
     func testDatabaseAndSideFilesAreExcludedFromBackup() async throws {
         let store = try await makeStore()
         // Force a write so SQLite creates its write-ahead log beside the file.

@@ -222,7 +222,8 @@ targets:
         # without a clear reason to hold them, and Hozz has nothing to show
         # for the entitlement until the feature is switched on.
         #
-        # To turn it on, change this to:
+        # Once snapshot reconciliation can emit clinical deletions, turning it
+        # on will also require changing this to:
         #     com.apple.developer.healthkit.access: [health-records]
         # and build with HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS.
         com.apple.developer.healthkit.access: []

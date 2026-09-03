@@ -16,20 +16,36 @@ import androidx.health.connect.client.records.metadata.Metadata
 import androidx.health.connect.client.units.Energy
 import androidx.health.connect.client.units.Length
 import androidx.health.connect.client.units.Mass
+import com.thatcube.hozz.core.HealthConnectProjection
 
 data class HealthConnectWriteResult(
     val attempted: Int,
-    val insertedRecordIds: List<String>,
+    val projections: List<HealthConnectProjection>,
 )
 
-class HealthConnectWriter(private val context: Context) {
+interface HealthConnectProjectionWriter {
+    suspend fun writeUpserts(
+        drafts: List<ProjectionDraft>,
+    ): HealthConnectWriteResult
+
+    suspend fun delete(
+        drafts: List<ProjectionDraft.Delete>,
+    ): List<HealthConnectProjection>
+}
+
+class HealthConnectWriter(
+    private val context: Context,
+) : HealthConnectProjectionWriter {
     val availability: Int
         get() = HealthConnectClient.getSdkStatus(context)
 
     fun requiredPermissions(drafts: List<ProjectionDraft>): Set<String> =
         drafts.mapTo(linkedSetOf()) { draft ->
-            HealthPermission.getWritePermission(recordClass(draft))
+            requiredPermission(draft)
         }
+
+    fun requiredPermission(draft: ProjectionDraft): String =
+        HealthPermission.getWritePermission(recordClass(draft))
 
     fun requiredPermissions(targetRecords: Set<String>): Set<String> =
         targetRecords.mapTo(linkedSetOf()) { target ->
@@ -42,28 +58,60 @@ class HealthConnectWriter(private val context: Context) {
             client.permissionController.getGrantedPermissions()
     }
 
-    suspend fun write(drafts: List<ProjectionDraft>): HealthConnectWriteResult {
+    override suspend fun writeUpserts(
+        drafts: List<ProjectionDraft>,
+    ): HealthConnectWriteResult {
         if (drafts.isEmpty()) {
             return HealthConnectWriteResult(0, emptyList())
         }
         val client = client()
-        val inserted = mutableListOf<String>()
-        val deletions = drafts.filterIsInstance<ProjectionDraft.Delete>()
-        for ((target, records) in deletions.groupBy(ProjectionDraft.Delete::targetRecord)) {
-            for (chunk in records.chunked(MAX_INSERT_RECORDS)) {
-                client.deleteRecords(
-                    recordType = recordClass(target),
-                    recordIdsList = emptyList(),
-                    clientRecordIdsList = chunk.map(ProjectionDraft.Delete::canonicalId),
-                )
-            }
-        }
+        val projections = mutableListOf<HealthConnectProjection>()
         val insertions = drafts.filterNot { it is ProjectionDraft.Delete }
         for (chunk in insertions.chunked(MAX_INSERT_RECORDS)) {
             val response = client.insertRecords(chunk.map(::record))
-            inserted += response.recordIdsList
+            require(response.recordIdsList.size == chunk.size) {
+                "Health Connect returned a different number of record IDs."
+            }
+            projections += chunk.zip(response.recordIdsList) { draft, recordId ->
+                HealthConnectProjection(
+                    canonicalId = draft.canonicalId,
+                    targetRecord = draft.targetRecord(),
+                    canonicalVersion = draft.recordVersion,
+                    healthConnectRecordId = recordId,
+                )
+            }
         }
-        return HealthConnectWriteResult(drafts.size, inserted)
+        return HealthConnectWriteResult(insertions.size, projections)
+    }
+
+    override suspend fun delete(
+        drafts: List<ProjectionDraft.Delete>,
+    ): List<HealthConnectProjection> {
+        if (drafts.isEmpty()) {
+            return emptyList()
+        }
+        val client = client()
+        val removed = mutableListOf<HealthConnectProjection>()
+        for ((target, records) in drafts.groupBy(ProjectionDraft.Delete::targetRecord)) {
+            for (chunk in records.chunked(MAX_INSERT_RECORDS)) {
+                client.deleteRecords(
+                    recordType = recordClass(target),
+                    recordIdsList = chunk.map(
+                        ProjectionDraft.Delete::healthConnectRecordId,
+                    ),
+                    clientRecordIdsList = emptyList(),
+                )
+                removed += chunk.map { draft ->
+                    HealthConnectProjection(
+                        canonicalId = draft.canonicalId,
+                        targetRecord = draft.targetRecord,
+                        canonicalVersion = draft.recordVersion,
+                        healthConnectRecordId = draft.healthConnectRecordId,
+                    )
+                }
+            }
+        }
+        return removed
     }
 
     private fun client(): HealthConnectClient {

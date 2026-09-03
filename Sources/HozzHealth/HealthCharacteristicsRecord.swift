@@ -4,24 +4,45 @@ import HozzCore
 
 /// Turns read characteristics into the record that goes into an export.
 ///
-/// The record is deliberately not shaped like a sample. It has no `id`, no
-/// `startDate`, and no source, because a characteristic has none of those
-/// things, and giving it fake ones would make it look like a measurement taken
-/// at export time.
+/// The record is deliberately not shaped like a sample. Its canonical
+/// identity names the characteristics snapshot rather than pretending
+/// HealthKit supplied a sample UUID or measurement date.
 enum HealthCharacteristicsRecord {
     static let kind = "characteristics"
 
     static func make(
-        from characteristics: HealthCharacteristics
+        from characteristics: HealthCharacteristics,
+        recordVersion: Int64
     ) -> [String: any Sendable] {
         var values: [String: any Sendable] = [:]
         for characteristic in characteristics.characteristics {
             values[characteristic.type.rawValue] = object(for: characteristic)
         }
 
+        let sourceID = "characteristics"
+        let sourceType = "HozzRecordType:characteristics"
         return [
             "kind": kind,
-            "schemaVersion": 1,
+            "schemaVersion": HozzHealthArchiveContract.schemaVersion,
+            "id": sourceID,
+            "canonicalId": HozzHealthArchiveContract.canonicalID(for: sourceID),
+            "canonicalType": HozzHealthArchiveContract.canonicalType(
+                for: sourceType,
+                kind: kind
+            ),
+            "recordVersion": recordVersion,
+            "type": sourceType,
+            "sourceRecord": [
+                "store": HozzHealthArchiveContract.sourceStore,
+                "id": sourceID,
+                "type": sourceType
+            ],
+            "lineage": [
+                [
+                    "store": HozzHealthArchiveContract.sourceStore,
+                    "recordId": sourceID
+                ]
+            ],
             "catalogVersion": HealthTypeCatalog.version,
             "readAt": timestamp(characteristics.readAt),
             "characteristics": values

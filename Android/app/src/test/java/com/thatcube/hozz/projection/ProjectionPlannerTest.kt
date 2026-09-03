@@ -2,8 +2,11 @@ package com.thatcube.hozz.projection
 
 import com.thatcube.hozz.core.CanonicalRecord
 import com.thatcube.hozz.core.CanonicalValue
+import com.thatcube.hozz.core.HealthConnectProjection
+import com.thatcube.hozz.core.InMemoryCanonicalRecordStore
 import com.thatcube.hozz.core.SourceLineage
 import java.time.Instant
+import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -35,21 +38,22 @@ class ProjectionPlannerTest {
 
         val plan = ProjectionPlanner.plan(records)
 
-        assertEquals(8, plan.exactCount)
+        assertEquals(4, plan.exactCount)
         assertEquals(0, plan.lossyCount)
-        assertEquals(0, plan.archiveOnlyCount)
-        assertEquals(8, plan.drafts.size)
+        assertEquals(4, plan.archiveOnlyCount)
+        assertEquals(4, plan.drafts.size)
+        assertEquals(4, plan.insertCount)
     }
 
     @Test
-    fun sleepCoreIsLossyAndInBedStaysArchiveOnly() {
+    fun individualSleepStagesStayArchiveOnlyUntilSessionsAreAssembled() {
         val core = ProjectionPlanner.plan(category("core", 3))
         val inBed = ProjectionPlanner.plan(category("bed", 0))
 
-        assertEquals(ProjectionQuality.LOSSY, core.quality)
-        assertEquals("sleep-core-to-light", core.warnings.single().code)
+        assertEquals(ProjectionQuality.ARCHIVE_ONLY, core.quality)
+        assertEquals("sleep-session-required", core.warnings.single().code)
         assertEquals(ProjectionQuality.ARCHIVE_ONLY, inBed.quality)
-        assertEquals("sleep-in-bed-overlap", inBed.warnings.single().code)
+        assertEquals("sleep-session-required", inBed.warnings.single().code)
     }
 
     @Test
@@ -129,13 +133,21 @@ class ProjectionPlannerTest {
             version = 2,
         ).copy(tombstone = true)
 
-        val planned = ProjectionPlanner.plan(record)
+        val ledger = HealthConnectProjection(
+            canonicalId = record.canonicalId,
+            targetRecord = "StepsRecord",
+            canonicalVersion = 1,
+            healthConnectRecordId = "health-connect-id",
+        )
+        val planned = ProjectionPlanner.plan(record, ledger)
 
-        assertEquals(ProjectionQuality.EXACT, planned.quality)
+        assertEquals(ProjectionQuality.DELETE, planned.quality)
+        assertEquals(ProjectionAction.DELETE, planned.action)
         val deletion = planned.draft as ProjectionDraft.Delete
         assertEquals(record.canonicalId, deletion.canonicalId)
         assertEquals(record.recordVersion, deletion.recordVersion)
         assertEquals("StepsRecord", deletion.targetRecord)
+        assertEquals("health-connect-id", deletion.healthConnectRecordId)
     }
 
     @Test
@@ -143,9 +155,9 @@ class ProjectionPlannerTest {
         val draft = ProjectionPlanner.plan(
             quantity(
                 id = "retry",
-                type = "HKQuantityTypeIdentifierStepCount",
+                type = "HKQuantityTypeIdentifierBodyMass",
                 value = 1.0,
-                unit = "count",
+                unit = "kg",
                 version = 7,
             ),
         ).draft!!
@@ -157,6 +169,201 @@ class ProjectionPlannerTest {
         assertEquals(7, first.clientRecordVersion)
         assertEquals(first.clientRecordId, retry.clientRecordId)
         assertEquals(first.clientRecordVersion, retry.clientRecordVersion)
+    }
+
+    @Test
+    fun pointHeartRateIsAValidProjection() {
+        val instant = Instant.parse("2026-01-01T00:00:00Z")
+        val record = quantity(
+            "point-heart",
+            "HKQuantityTypeIdentifierHeartRate",
+            1.0,
+            "count/s",
+        ).copy(startTime = instant, endTime = instant)
+
+        val planned = ProjectionPlanner.plan(record)
+
+        assertEquals(ProjectionQuality.EXACT, planned.quality)
+        assertEquals(instant, (planned.draft as ProjectionDraft.HeartRate).end)
+    }
+
+    @Test
+    fun ledgerClassifiesInsertUpdateCurrentAndUnknownDelete() {
+        val record = quantity(
+            "weight-ledger",
+            "HKQuantityTypeIdentifierBodyMass",
+            1.0,
+            "kg",
+            version = 2,
+        )
+        val older = HealthConnectProjection(
+            record.canonicalId,
+            "WeightRecord",
+            1,
+            "health-id",
+        )
+        val current = older.copy(canonicalVersion = 2)
+
+        assertEquals(ProjectionAction.INSERT, ProjectionPlanner.plan(record).action)
+        assertEquals(
+            ProjectionAction.UPDATE,
+            ProjectionPlanner.plan(record, older).action,
+        )
+        val currentPlan = ProjectionPlanner.plan(record, current)
+        assertEquals(ProjectionAction.NONE, currentPlan.action)
+        assertNull(currentPlan.draft)
+
+        val unknownDelete = ProjectionPlanner.plan(record.copy(tombstone = true))
+        assertEquals(ProjectionAction.NONE, unknownDelete.action)
+        assertNull(unknownDelete.draft)
+    }
+
+    @Test
+    fun cumulativeTypesAreArchiveOnlyRatherThanDoubleCounted() {
+        val records = listOf(
+            quantity("steps", "HKQuantityTypeIdentifierStepCount", 1.0, "count"),
+            quantity(
+                "distance",
+                "HKQuantityTypeIdentifierDistanceWalkingRunning",
+                1.0,
+                "m",
+            ),
+            quantity(
+                "energy",
+                "HKQuantityTypeIdentifierActiveEnergyBurned",
+                1.0,
+                "kcal",
+            ),
+        )
+
+        val summary = ProjectionPlanner.plan(records).summary()
+
+        assertEquals(3, summary.archiveOnlyCount)
+        assertEquals(0, summary.pendingCount)
+        assertEquals(3, summary.warningCounts["cumulative-source-overlap"])
+        assertEquals(3, summary.warningDetails.single().count)
+        assertTrue(
+            summary.warningDetails.single().message.contains("inflate"),
+        )
+
+        val priorProjection = HealthConnectProjection(
+            canonicalId = records.first().canonicalId,
+            targetRecord = "StepsRecord",
+            canonicalVersion = 1,
+            healthConnectRecordId = "unsafe-old-projection",
+        )
+        val cleanup = ProjectionPlanner.plan(records.first(), priorProjection)
+        assertEquals(ProjectionAction.DELETE, cleanup.action)
+        assertEquals(ProjectionQuality.ARCHIVE_ONLY, cleanup.quality)
+    }
+
+    @Test
+    fun newlyInvalidRecordDeletesItsPriorProjectionWithoutHidingWarning() {
+        val record = quantity(
+            "aggregated-heart-rate",
+            "HKQuantityTypeIdentifierHeartRate",
+            60.0,
+            "count/min",
+            version = 2,
+        ).copy(quantityCount = 2)
+        val prior = HealthConnectProjection(
+            canonicalId = record.canonicalId,
+            targetRecord = "HeartRateRecord",
+            canonicalVersion = 1,
+            healthConnectRecordId = "stale-heart-rate",
+        )
+
+        val planned = ProjectionPlanner.plan(record, prior)
+
+        assertEquals(ProjectionQuality.ARCHIVE_ONLY, planned.quality)
+        assertEquals(ProjectionAction.DELETE, planned.action)
+        assertEquals("heart-rate-aggregate", planned.warnings.single().code)
+        assertEquals(
+            "stale-heart-rate",
+            (planned.draft as ProjectionDraft.Delete).healthConnectRecordId,
+        )
+    }
+
+    @Test
+    fun everyArchiveOnlyTransitionCleansUpAnExistingProjection() {
+        val prior = HealthConnectProjection(
+            canonicalId = "apple.healthkit:transition",
+            targetRecord = "WeightRecord",
+            canonicalVersion = 1,
+            healthConnectRecordId = "stale-projection",
+        )
+        val candidates = listOf(
+            quantity(
+                "transition",
+                "HKQuantityTypeIdentifierBodyMass",
+                1.0,
+                "kg",
+                version = 2,
+            ).copy(
+                lineage = listOf(
+                    SourceLineage(
+                        "healthConnect",
+                        "com.thatcube.hozz",
+                        "health-record",
+                    ),
+                ),
+            ),
+            base(
+                "clinicalRecord",
+                "transition",
+                "HKClinicalTypeIdentifierAllergyRecord",
+                version = 2,
+            ),
+            base("sample", "transition", "UnknownType", version = 2),
+            quantity("transition", "UnknownType", 1.0, "count", version = 2),
+        )
+
+        for (record in candidates) {
+            val planned = ProjectionPlanner.plan(record, prior)
+            assertEquals(record.kind, ProjectionAction.DELETE, planned.action)
+            assertTrue(record.kind, planned.warnings.isNotEmpty())
+            assertEquals(
+                "stale-projection",
+                (planned.draft as ProjectionDraft.Delete).healthConnectRecordId,
+            )
+        }
+    }
+
+    @Test
+    fun tombstoneDeleteIsPlannedOnlyOnceFromDurableLedger() = runBlocking {
+        val record = quantity(
+            "delete-once",
+            "HKQuantityTypeIdentifierBodyMass",
+            1.0,
+            "kg",
+            version = 2,
+        ).copy(tombstone = true)
+        val projection = HealthConnectProjection(
+            record.canonicalId,
+            "WeightRecord",
+            1,
+            "health-id",
+        )
+        val store = InMemoryCanonicalRecordStore()
+        store.saveHealthConnectProjections(listOf(projection))
+
+        val first = ProjectionPlanner.plan(
+            record,
+            store.healthConnectProjections(setOf(record.canonicalId))[
+                record.canonicalId
+            ],
+        )
+        assertEquals(ProjectionAction.DELETE, first.action)
+        store.removeHealthConnectProjections(listOf(projection))
+        val replay = ProjectionPlanner.plan(
+            record,
+            store.healthConnectProjections(setOf(record.canonicalId))[
+                record.canonicalId
+            ],
+        )
+
+        assertEquals(ProjectionAction.NONE, replay.action)
+        assertNull(replay.draft)
     }
 
     @Test

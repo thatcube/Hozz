@@ -1,9 +1,13 @@
 package com.thatcube.hozz.core
 
+import android.content.ContentValues
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import java.io.ByteArrayInputStream
+import java.io.ByteArrayOutputStream
 import java.time.Instant
+import java.util.zip.ZipEntry
+import java.util.zip.ZipOutputStream
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -88,6 +92,188 @@ class SqliteCanonicalRecordStoreTest {
         store.upsert(listOf(staleTombstone))
 
         assertTrue(store.allRecords().none(CanonicalRecord::tombstone))
+    }
+
+    @Test
+    fun ignoredLateZipBombRollsBackCanonicalAndRunStaging() = runBlocking {
+        val seed = record(version = 1, tombstone = false)
+        store.upsert(listOf(seed))
+        val manifest =
+            """
+            {"archiveId":"fixture","createdAt":"2026-01-01T00:00:00Z","format":"hozz-ndjson","recordCount":1,"recordSchema":"hozz/v1/canonical-record","recordsEntry":"records.ndjson","schemaVersion":1}
+            """.trimIndent().toByteArray()
+        val records =
+            """
+            {"kind":"typeError","message":"fixture","schemaVersion":1,"type":"heart"}
+            {"canonicalId":"apple.healthkit:new","canonicalType":"activity.steps","endDate":"2026-01-01T00:01:00Z","id":"new","kind":"quantity","lineage":[{"recordId":"new","store":"apple.healthkit"}],"quantity":{"unit":"count","value":1},"recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"new","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent().toByteArray()
+        val zip = ByteArrayOutputStream().also { output ->
+            ZipOutputStream(output).use { archive ->
+                for ((name, bytes) in listOf(
+                    ArchiveManifest.ENTRY_NAME to manifest,
+                    "records.ndjson" to records,
+                    "ignored.bin" to ByteArray(32 * 1_024) { 0 },
+                )) {
+                    archive.putNextEntry(ZipEntry(name))
+                    archive.write(bytes)
+                    archive.closeEntry()
+                }
+            }
+        }.toByteArray()
+        var failed = false
+
+        try {
+            ArchiveImporter(
+                store,
+                batchSize = 1,
+                limits = ArchiveImportLimits(
+                    maxInflatedBytes = 1_000_000,
+                    maxEntryCompressionRatio = 2,
+                    maxGlobalCompressionRatio = 1_000,
+                    entryRatioSlackBytes = 0,
+                    globalRatioSlackBytes = 1_000_000,
+                ),
+            ).import(ByteArrayInputStream(zip))
+        } catch (_: ArchiveFormatException) {
+            failed = true
+        }
+
+        assertTrue(failed)
+        assertEquals(listOf(seed), store.allRecords())
+        assertTrue(store.runRecordsPage(null, 100).isEmpty())
+        store.close()
+        store = SqliteCanonicalRecordStore(context, databaseName)
+        assertEquals(listOf(seed), store.allRecords())
+        assertTrue(store.runRecordsPage(null, 100).isEmpty())
+    }
+
+    @Test
+    fun healthConnectLedgerIsMonotonicPersistentAndConditionallyRemoved() =
+        runBlocking {
+            val first = HealthConnectProjection(
+                canonicalId = "apple.healthkit:weight",
+                targetRecord = "WeightRecord",
+                canonicalVersion = 1,
+                healthConnectRecordId = "health-1",
+            )
+            store.saveHealthConnectProjections(listOf(first))
+            store.saveHealthConnectProjections(
+                listOf(first.copy(canonicalVersion = 0, healthConnectRecordId = "stale")),
+            )
+            assertEquals(
+                first,
+                store.healthConnectProjections(setOf(first.canonicalId))
+                    .getValue(first.canonicalId),
+            )
+
+            val second = first.copy(
+                canonicalVersion = 2,
+                healthConnectRecordId = "health-2",
+            )
+            store.saveHealthConnectProjections(listOf(second))
+            store.close()
+            store = SqliteCanonicalRecordStore(context, databaseName)
+            assertEquals(
+                second,
+                store.healthConnectProjections(setOf(second.canonicalId))
+                    .getValue(second.canonicalId),
+            )
+
+            store.removeHealthConnectProjections(listOf(first))
+            assertEquals(
+                second,
+                store.healthConnectProjections(setOf(second.canonicalId))
+                    .getValue(second.canonicalId),
+            )
+            store.removeHealthConnectProjections(listOf(second))
+            assertTrue(
+                store.healthConnectProjections(setOf(second.canonicalId)).isEmpty(),
+            )
+        }
+
+    @Test
+    fun runRecordsPersistWithoutDuplicatingOnReplay() = runBlocking {
+        val line =
+            """
+            { "kind" : "typeError", "schemaVersion" : 1, "type" : "heart", "message" : "fixture" }
+            """.trimIndent()
+        val importer = ArchiveImporter(store)
+
+        importer.import(ByteArrayInputStream("$line\n".toByteArray()))
+        importer.import(ByteArrayInputStream("$line\n".toByteArray()))
+        store.close()
+        store = SqliteCanonicalRecordStore(context, databaseName)
+
+        val records = store.runRecordsPage(null, 100)
+        assertEquals(1, records.size)
+        assertEquals(line, records.single().rawJson)
+    }
+
+    @Test
+    fun stagedSuccessResolvesEncodingErrorRegardlessOfCanonicalSortOrder() =
+        runBlocking {
+            val parent = record(version = 1, tombstone = false).copy(
+                canonicalId = "apple.healthkit:000-parent",
+                sourceRecordId = "000-parent",
+            )
+            val error = parent.copy(
+                canonicalId = "apple.healthkit:zzz-error",
+                parentCanonicalId = parent.canonicalId,
+                kind = "sampleEncodingError",
+                canonicalType = "archive.encoding-error",
+                rawJson = """{"kind":"sampleEncodingError"}""",
+            )
+            val session = store.beginImport()
+            session.append(listOf(parent, error))
+
+            session.commit()
+
+            val stored = store.allRecords().associateBy(CanonicalRecord::canonicalId)
+            assertTrue(stored.getValue(error.canonicalId).tombstone)
+            assertTrue(!stored.getValue(parent.canonicalId).tombstone)
+        }
+
+    @Test
+    fun databaseUpgradeReconcilesAnExistingLiveEncodingError() = runBlocking {
+        val parent = record(version = 1, tombstone = false).copy(
+            canonicalId = "apple.healthkit:upgrade-parent",
+            sourceRecordId = "upgrade-parent",
+        )
+        val error = parent.copy(
+            canonicalId = "apple.healthkit:upgrade-error",
+            parentCanonicalId = parent.canonicalId,
+            kind = "sampleEncodingError",
+            canonicalType = "archive.encoding-error",
+            rawJson = """{"kind":"sampleEncodingError"}""",
+        )
+        store.upsert(listOf(error))
+        store.close()
+        context.openOrCreateDatabase(databaseName, 0, null).use { database ->
+            database.insertOrThrow(
+                "canonical_record",
+                null,
+                ContentValues().apply {
+                    put("canonical_id", parent.canonicalId)
+                    put("record_version", parent.recordVersion)
+                    put("kind", parent.kind)
+                    put("canonical_type", parent.canonicalType)
+                    put("type", parent.type)
+                    put("source_record_id", parent.sourceRecordId)
+                    put("source_store", parent.sourceStore)
+                    put("lineage_json", """[{"store":"apple.healthkit"}]""")
+                    put("tombstone", 0)
+                    put("raw_json", parent.rawJson)
+                },
+            )
+            database.version = 7
+        }
+
+        store = SqliteCanonicalRecordStore(context, databaseName)
+
+        val upgraded = store.allRecords()
+            .associateBy(CanonicalRecord::canonicalId)
+        assertTrue(upgraded.getValue(error.canonicalId).tombstone)
+        assertTrue(!upgraded.getValue(parent.canonicalId).tombstone)
     }
 
     private fun record(

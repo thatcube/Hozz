@@ -7,6 +7,9 @@ import java.util.zip.ZipOutputStream
 import com.thatcube.hozz.projection.ProjectionPlanner
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
@@ -391,4 +394,410 @@ class ArchiveImporterTest {
         assertEquals("apple.healthkit:$sourceId", legacyError.parentCanonicalId)
         assertEquals(sourceId, legacyError.sourceRecordId)
     }
+
+    @Test
+    fun laterSuccessAndDeletionResolveSyntheticEncodingError() = runBlocking {
+        val sourceId = "00000000-0000-0000-0000-0000000000ee"
+        val sourceType = "HKQuantityTypeIdentifierStepCount"
+        val error =
+            """
+            {"id":"$sourceId","kind":"sampleEncodingError","message":"fixture","schemaVersion":1,"type":"$sourceType"}
+            """.trimIndent()
+        val success =
+            """
+            {"canonicalId":"apple.healthkit:$sourceId","canonicalType":"activity.steps","endDate":"2026-01-01T00:01:00Z","id":"$sourceId","kind":"quantity","lineage":[{"recordId":"$sourceId","store":"apple.healthkit"}],"quantity":{"unit":"count","value":1},"recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"$sourceType"},"startDate":"2026-01-01T00:00:00Z","type":"$sourceType"}
+            """.trimIndent()
+        val deletion =
+            """
+            {"canonicalId":"apple.healthkit:$sourceId","canonicalType":"activity.steps","id":"$sourceId","kind":"deletion","lineage":[{"recordId":"$sourceId","store":"apple.healthkit"}],"recordVersion":2,"schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"$sourceType"},"type":"$sourceType"}
+            """.trimIndent()
+
+        val successStore = InMemoryCanonicalRecordStore()
+        ArchiveImporter(successStore).import(
+            ByteArrayInputStream("$error\n$success\n".toByteArray()),
+        )
+        val successRows = successStore.allRecords()
+        assertEquals(2, successRows.size)
+        assertEquals(1, successRows.count { !it.tombstone })
+        assertTrue(
+            successRows.single { it.kind == "sampleEncodingError" }.tombstone,
+        )
+
+        val deletionStore = InMemoryCanonicalRecordStore()
+        ArchiveImporter(deletionStore).import(
+            ByteArrayInputStream("$error\n$deletion\n".toByteArray()),
+        )
+        assertTrue(deletionStore.allRecords().all(CanonicalRecord::tombstone))
+    }
+
+    @Test
+    fun runRecordsSurviveDeterministicRoundTripVerbatim() = runBlocking {
+        val runLines = listOf(
+            """{ "kind" : "manifest", "schemaVersion" : 1, "run" : "r", "createdAt" : "2026-01-01T00:00:00Z" }""",
+            """{"kind":"resume","schemaVersion":1,"run":"r","resumedAt":"2026-01-01T00:00:01Z"}""",
+            """{"kind":"typeSummary","schemaVersion":1,"type":"steps","state":"authorizationIndeterminate"}""",
+            """{"kind":"typeError","schemaVersion":1,"type":"heart","message":"denied"}""",
+            """{"kind":"typeCoverage","schemaVersion":1,"type":"steps","state":"anchorClosed","complete":true,"observedAt":"2026-01-01T00:00:01Z"}""",
+            """{"kind":"completion","schemaVersion":1,"run":"r","completedAt":"2026-01-01T00:00:02Z","records":3}""",
+        )
+        val payload = (
+            runLines + fixture.toString(Charsets.UTF_8).lineSequence()
+        ).joinToString("\n", postfix = "\n").toByteArray()
+        val sourceStore = InMemoryCanonicalRecordStore()
+        val imported = ArchiveImporter(sourceStore).import(
+            ByteArrayInputStream(
+                versionedZip(payload, recordCount = 3),
+            ),
+        )
+
+        assertEquals(6, imported.runRecordsPreserved)
+        assertEquals(
+            runLines,
+            sourceStore.runRecordsPage(null, 100).map(ArchiveRunRecord::rawJson),
+        )
+
+        val first = ByteArrayOutputStream()
+        val second = ByteArrayOutputStream()
+        CanonicalArchiveExporter(sourceStore).export(first)
+        CanonicalArchiveExporter(sourceStore).export(second)
+        assertTrue(first.toByteArray().contentEquals(second.toByteArray()))
+
+        val targetStore = InMemoryCanonicalRecordStore()
+        ArchiveImporter(targetStore).import(ByteArrayInputStream(first.toByteArray()))
+        val third = ByteArrayOutputStream()
+        CanonicalArchiveExporter(targetStore).export(third)
+        assertTrue(first.toByteArray().contentEquals(third.toByteArray()))
+        assertEquals(
+            runLines,
+            targetStore.runRecordsPage(null, 100).map(ArchiveRunRecord::rawJson),
+        )
+    }
+
+    @Test
+    fun identicalCoverageLinesFromDifferentRunsRemainDistinct() = runBlocking {
+        val coverage =
+            """{"kind":"typeCoverage","schemaVersion":1,"type":"steps","state":"anchorClosed","complete":true,"observedAt":"2026-01-01T00:00:01Z"}"""
+        val store = InMemoryCanonicalRecordStore()
+        val importer = ArchiveImporter(store)
+        for (run in listOf("run-a", "run-b")) {
+            val lines = listOf(
+                """{"kind":"manifest","schemaVersion":1,"run":"$run","createdAt":"2026-01-01T00:00:00Z"}""",
+                coverage,
+            ).joinToString("\n", postfix = "\n")
+            importer.import(ByteArrayInputStream(lines.toByteArray()))
+        }
+
+        val preserved = store.runRecordsPage(null, 100)
+        assertEquals(4, preserved.size)
+        assertEquals(2, preserved.count { it.kind == "typeCoverage" })
+    }
+
+    @Test
+    fun legacyCoverageIsNormalizedIntoAReimportableV1Archive() = runBlocking {
+        val legacyCoverage =
+            """{"kind":"typeCoverage","type":"steps","state":"anchorClosed","complete":true,"observedAt":"2026-01-01T00:00:01Z"}"""
+        val source = InMemoryCanonicalRecordStore()
+        ArchiveImporter(source).import(
+            ByteArrayInputStream("$legacyCoverage\n".toByteArray()),
+        )
+        val output = ByteArrayOutputStream()
+        CanonicalArchiveExporter(source).export(output)
+        val target = InMemoryCanonicalRecordStore()
+        ArchiveImporter(source).import(
+            ByteArrayInputStream(output.toByteArray()),
+        )
+
+        val imported = ArchiveImporter(target).import(
+            ByteArrayInputStream(output.toByteArray()),
+        )
+
+        assertFalse(imported.legacyArchive)
+        assertEquals(1, imported.runRecordsPreserved)
+        assertEquals(1, source.runRecordsPage(null, 10).size)
+        assertTrue(
+            target.runRecordsPage(null, 10).single().rawJson
+                .contains("\"schemaVersion\":1"),
+        )
+    }
+
+    @Test
+    fun explicitFutureRunSchemaIsNeverDowngradedToV1() = runBlocking {
+        val future =
+            """{"kind":"typeSummary","schemaVersion":2,"type":"steps","state":"complete"}"""
+        val store = InMemoryCanonicalRecordStore()
+        var failed = false
+
+        try {
+            ArchiveImporter(store).import(
+                ByteArrayInputStream("$future\n".toByteArray()),
+            )
+        } catch (_: ArchiveFormatException) {
+            failed = true
+        }
+
+        assertTrue(failed)
+        assertTrue(store.runRecordsPage(null, 10).isEmpty())
+    }
+
+    @Test
+    fun validZipAtInflatedLimitIsNotDoubleCounted() = runBlocking {
+        val manifest = manifest(3)
+        val archive = versionedZip(fixture, recordCount = 3)
+        val store = InMemoryCanonicalRecordStore()
+
+        val imported = ArchiveImporter(
+            store,
+            limits = ArchiveImportLimits(
+                maxInflatedBytes = (manifest.size + fixture.size).toLong(),
+                maxEntryCompressionRatio = 10_000,
+                maxGlobalCompressionRatio = 10_000,
+            ),
+        ).import(ByteArrayInputStream(archive))
+
+        assertEquals(3, imported.recordsRead)
+    }
+
+    @Test
+    fun malformedUtf8RejectsWithoutCommittingEarlierRecords() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val valid = fixture.toString(Charsets.UTF_8).lineSequence().first()
+            .toByteArray()
+        val payload = valid + "\n".toByteArray() +
+            byteArrayOf(0xC3.toByte(), 0x28) + "\n".toByteArray()
+        var failed = false
+
+        try {
+            ArchiveImporter(store).import(ByteArrayInputStream(payload))
+        } catch (_: ArchiveFormatException) {
+            failed = true
+        }
+
+        assertTrue(failed)
+        assertTrue(store.allRecords().isEmpty())
+    }
+
+    @Test
+    fun strictV1RejectsMissingOrContradictoryCanonicalFields() = runBlocking {
+        val valid = Json.parseToJsonElement(
+            fixture.toString(Charsets.UTF_8).lineSequence().first(),
+        ).jsonObject
+        val invalidRecords = buildList {
+            for (field in listOf(
+                "canonicalId",
+                "canonicalType",
+                "recordVersion",
+                "type",
+                "sourceRecord",
+                "lineage",
+                "startDate",
+                "endDate",
+                "quantity",
+            )) {
+                add(JsonObject(valid - field).toString())
+            }
+            val sourceRecord = valid["sourceRecord"]!!.jsonObject
+            for (field in listOf("id", "store", "type")) {
+                add(
+                    JsonObject(
+                        valid + (
+                            "sourceRecord" to JsonObject(sourceRecord - field)
+                        ),
+                    ).toString(),
+                )
+            }
+            add(
+                JsonObject(
+                    valid + (
+                        "sourceRecord" to JsonObject(
+                            valid["sourceRecord"]!!.jsonObject +
+                                ("type" to JsonPrimitive("different")),
+                        )
+                    ),
+                ).toString(),
+            )
+            add(JsonObject(valid + ("lineage" to JsonArray(emptyList()))).toString())
+            add(JsonObject(valid + ("recordVersion" to JsonPrimitive(0))).toString())
+            add(JsonObject(valid + ("recordVersion" to JsonPrimitive("1"))).toString())
+            add(JsonObject(valid + ("kind" to JsonPrimitive(""))).toString())
+            add(JsonObject(valid + ("kind" to JsonPrimitive(7))).toString())
+            add(JsonObject(valid + ("startDate" to JsonPrimitive("not-a-date"))).toString())
+            add(JsonObject(valid + ("quantity" to JsonObject(emptyMap()))).toString())
+            add(
+                JsonObject(
+                    valid + (
+                        "lineage" to JsonArray(
+                            listOf(JsonPrimitive("not-an-object")),
+                        )
+                    ),
+                ).toString(),
+            )
+        }
+
+        for (invalid in invalidRecords) {
+            val store = InMemoryCanonicalRecordStore()
+            var failed = false
+            try {
+                ArchiveImporter(store).import(
+                    ByteArrayInputStream(
+                        versionedZip("$invalid\n".toByteArray(), recordCount = 1),
+                    ),
+                )
+            } catch (_: ArchiveFormatException) {
+                failed = true
+            }
+            assertTrue(invalid, failed)
+            assertTrue(store.allRecords().isEmpty())
+        }
+    }
+
+    @Test
+    fun lateManifestRetroactivelyRequiresStrictCanonicalFields() = runBlocking {
+        val legacyOnly =
+            """
+            {"endDate":"2026-01-01T00:01:00Z","id":"legacy","kind":"quantity","quantity":{"unit":"count","value":1},"schemaVersion":1,"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent().toByteArray()
+        val runRecord =
+            """
+            {"kind":"typeError","schemaVersion":1,"type":"heart","message":"must roll back"}
+            """.trimIndent().toByteArray()
+        val archive = zip(
+            listOf(
+                "records.ndjson" to runRecord + "\n".toByteArray() + legacyOnly,
+                ArchiveManifest.ENTRY_NAME to manifest(1),
+            ),
+        )
+        val store = InMemoryCanonicalRecordStore()
+        var failed = false
+
+        try {
+            ArchiveImporter(store).import(ByteArrayInputStream(archive))
+        } catch (_: ArchiveFormatException) {
+            failed = true
+        }
+
+        assertTrue(failed)
+        assertTrue(store.allRecords().isEmpty())
+        assertTrue(store.runRecordsPage(null, 100).isEmpty())
+    }
+
+    @Test
+    fun ignoredLateZipBombRollsBackStagedRecords() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val seed = CanonicalRecordParser.parse(
+            fixture.toString(Charsets.UTF_8).lineSequence().first(),
+        )!!
+        store.upsert(listOf(seed))
+        val before = store.allRecords()
+        val entries = listOf(
+            ArchiveManifest.ENTRY_NAME to manifest(recordCount = 3),
+            "records.ndjson" to fixture,
+            "ignored.bin" to ByteArray(32 * 1_024) { 0 },
+        )
+        var failed = false
+        try {
+            ArchiveImporter(
+                store,
+                batchSize = 1,
+                limits = ArchiveImportLimits(
+                    maxInflatedBytes = 1_000_000,
+                    maxEntryCompressionRatio = 2,
+                    maxGlobalCompressionRatio = 1_000,
+                    entryRatioSlackBytes = 0,
+                    globalRatioSlackBytes = 1_000_000,
+                ),
+            ).import(ByteArrayInputStream(zip(entries)))
+        } catch (_: ArchiveFormatException) {
+            failed = true
+        }
+
+        assertTrue(failed)
+        assertEquals(before, store.allRecords())
+        assertTrue(store.runRecordsPage(null, 100).isEmpty())
+    }
+
+    @Test
+    fun zipEntryInflateAndRecordLimitsIncludeIgnoredContent() = runBlocking {
+        val cases = listOf(
+            ArchiveImportLimits(maxZipEntries = 1),
+            ArchiveImportLimits(maxInflatedBytes = 256),
+            ArchiveImportLimits(maxRecordLines = 2),
+        )
+        for (limits in cases) {
+            val store = InMemoryCanonicalRecordStore()
+            var failed = false
+            try {
+                ArchiveImporter(store, limits = limits).import(
+                    ByteArrayInputStream(
+                        zip(
+                            listOf(
+                                ArchiveManifest.ENTRY_NAME to manifest(3),
+                                "records.ndjson" to fixture,
+                                "ignored.bin" to ByteArray(1_024) { 1 },
+                            ),
+                        ),
+                    ),
+                )
+            } catch (_: ArchiveFormatException) {
+                failed = true
+            }
+            assertTrue(limits.toString(), failed)
+            assertTrue(store.allRecords().isEmpty())
+        }
+    }
+
+    @Test
+    fun splitIgnoredEntriesCannotExploitPerEntryRatioSlack() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val archive = zip(
+            listOf(
+                ArchiveManifest.ENTRY_NAME to manifest(3),
+                "records.ndjson" to fixture,
+                "ignored-1.bin" to ByteArray(4 * 1_024) { 0 },
+                "ignored-2.bin" to ByteArray(4 * 1_024) { 0 },
+            ),
+        )
+        var failed = false
+
+        try {
+            ArchiveImporter(
+                store,
+                limits = ArchiveImportLimits(
+                    maxInflatedBytes = 1_000_000,
+                    maxEntryCompressionRatio = 1_000,
+                    maxGlobalCompressionRatio = 2,
+                    entryRatioSlackBytes = 8 * 1_024,
+                    globalRatioSlackBytes = 4 * 1_024,
+                ),
+            ).import(ByteArrayInputStream(archive))
+        } catch (_: ArchiveFormatException) {
+            failed = true
+        }
+
+        assertTrue(failed)
+        assertTrue(store.allRecords().isEmpty())
+    }
+
+    private fun manifest(recordCount: Int): ByteArray =
+        """
+        {"archiveId":"fixture","createdAt":"2026-01-01T00:00:00Z","format":"hozz-ndjson","recordCount":$recordCount,"recordSchema":"hozz/v1/canonical-record","recordsEntry":"records.ndjson","schemaVersion":1}
+        """.trimIndent().toByteArray()
+
+    private fun versionedZip(records: ByteArray, recordCount: Int): ByteArray =
+        zip(
+            listOf(
+                ArchiveManifest.ENTRY_NAME to manifest(recordCount),
+                "records.ndjson" to records,
+            ),
+        )
+
+    private fun zip(entries: List<Pair<String, ByteArray>>): ByteArray =
+        ByteArrayOutputStream().also { output ->
+            ZipOutputStream(output).use { archive ->
+                for ((name, bytes) in entries) {
+                    archive.putNextEntry(ZipEntry(name))
+                    archive.write(bytes)
+                    archive.closeEntry()
+                }
+            }
+        }.toByteArray()
 }

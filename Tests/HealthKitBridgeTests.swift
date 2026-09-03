@@ -310,4 +310,53 @@ final class HealthKitBridgeTests: XCTestCase {
         )
         XCTAssertEqual(object["recordVersion"] as? Int, 1)
     }
+
+    func testSuccessAndDeletionResolveTheSameEncodingFailureParent() throws {
+        let type = HKQuantityType(.stepCount)
+        let sample = HKQuantitySample(
+            type: type,
+            quantity: HKQuantity(unit: .count(), doubleValue: 1),
+            start: Date(timeIntervalSince1970: 1),
+            end: Date(timeIntervalSince1970: 2)
+        )
+        let encoder = HealthSampleEncoder()
+        let entry = try XCTUnwrap(
+            HealthTypeCatalog.entriesByIdentifier[type.identifier]
+        )
+        let success = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: encoder.encode(sample: sample, catalogEntry: entry)
+            ) as? [String: Any]
+        )
+        let failure = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: encoder.encodeEncodingFailure(
+                    id: sample.uuid,
+                    typeIdentifier: type.identifier,
+                    message: "fixture"
+                )
+            ) as? [String: Any]
+        )
+        let deletion = try XCTUnwrap(
+            JSONSerialization.jsonObject(
+                with: encoder.encodeDeletion(
+                    id: sample.uuid,
+                    typeIdentifier: type.identifier
+                )
+            ) as? [String: Any]
+        )
+
+        XCTAssertNotEqual(
+            failure["canonicalId"] as? String,
+            success["canonicalId"] as? String
+        )
+        XCTAssertEqual(
+            failure["parentCanonicalId"] as? String,
+            success["canonicalId"] as? String
+        )
+        XCTAssertEqual(
+            deletion["canonicalId"] as? String,
+            success["canonicalId"] as? String
+        )
+    }
 }

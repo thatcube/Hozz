@@ -338,9 +338,17 @@ public actor HealthExportEngine {
         // interpretable — a duplicate is cheap, a missing one is not. Each
         // carries its own `readAt`, so the last is the current one.
         if let characteristics {
+            let snapshot = await characteristics.characteristics()
+            let version = try await store.nextCanonicalRecordVersion(
+                id: HozzHealthArchiveContract.canonicalID(
+                    for: "characteristics"
+                ),
+                observedAt: snapshot.readAt
+            )
             try await sink.writeRecord(
                 HealthCharacteristicsRecord.make(
-                    from: await characteristics.characteristics()
+                    from: snapshot,
+                    recordVersion: version
                 )
             )
         }

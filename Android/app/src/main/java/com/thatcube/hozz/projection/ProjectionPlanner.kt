@@ -1,8 +1,10 @@
 package com.thatcube.hozz.projection
 
 import com.thatcube.hozz.core.CanonicalRecord
+import com.thatcube.hozz.core.HealthConnectProjection
 import com.thatcube.hozz.generated.GeneratedContract
 import com.thatcube.hozz.generated.MappingDisposition
+import com.thatcube.hozz.generated.MappingQuality
 import java.time.Instant
 import kotlin.math.roundToLong
 import kotlinx.serialization.json.Json
@@ -13,6 +15,14 @@ enum class ProjectionQuality {
     EXACT,
     LOSSY,
     ARCHIVE_ONLY,
+    DELETE,
+}
+
+enum class ProjectionAction {
+    INSERT,
+    UPDATE,
+    DELETE,
+    NONE,
 }
 
 data class MappingWarning(
@@ -30,6 +40,7 @@ sealed interface ProjectionDraft {
         override val canonicalId: String,
         override val recordVersion: Long,
         val targetRecord: String,
+        val healthConnectRecordId: String,
     ) : ProjectionDraft
 
     data class Steps(
@@ -101,6 +112,7 @@ data class PlannedRecord(
     val quality: ProjectionQuality,
     val draft: ProjectionDraft?,
     val warnings: List<MappingWarning>,
+    val action: ProjectionAction,
 )
 
 data class ProjectionPlan(val records: List<PlannedRecord>) {
@@ -110,6 +122,12 @@ data class ProjectionPlan(val records: List<PlannedRecord>) {
         records.count { it.quality == ProjectionQuality.ARCHIVE_ONLY }
     val drafts: List<ProjectionDraft> = records.mapNotNull(PlannedRecord::draft)
     val warnings: List<MappingWarning> = records.flatMap(PlannedRecord::warnings)
+    val insertCount: Int =
+        records.count { it.action == ProjectionAction.INSERT }
+    val updateCount: Int =
+        records.count { it.action == ProjectionAction.UPDATE }
+    val deleteCount: Int =
+        records.count { it.action == ProjectionAction.DELETE }
 
     fun summary(): ProjectionSummary = ProjectionSummary(
         exactCount = exactCount,
@@ -117,8 +135,17 @@ data class ProjectionPlan(val records: List<PlannedRecord>) {
         archiveOnlyCount = archiveOnlyCount,
         warningCounts = warnings.groupingBy(MappingWarning::code).eachCount(),
         targetRecords = drafts.mapTo(linkedSetOf(), ProjectionDraft::targetRecord),
+        insertCount = insertCount,
+        updateCount = updateCount,
+        deleteCount = deleteCount,
     )
 }
+
+data class WarningDetail(
+    val code: String,
+    val message: String,
+    val count: Int,
+)
 
 data class ProjectionSummary(
     val exactCount: Int = 0,
@@ -126,9 +153,23 @@ data class ProjectionSummary(
     val archiveOnlyCount: Int = 0,
     val warningCounts: Map<String, Int> = emptyMap(),
     val targetRecords: Set<String> = emptySet(),
+    val insertCount: Int = 0,
+    val updateCount: Int = 0,
+    val deleteCount: Int = 0,
 ) {
     val mappedCount: Int
         get() = exactCount + lossyCount
+    val pendingCount: Int
+        get() = insertCount + updateCount + deleteCount
+    val warningDetails: List<WarningDetail>
+        get() = warningCounts.map { (code, count) ->
+            WarningDetail(
+                code = code,
+                message = GeneratedContract.warningMessages[code]
+                    ?: "This record cannot be represented exactly.",
+                count = count,
+            )
+        }.sortedBy(WarningDetail::code)
 
     operator fun plus(other: ProjectionSummary): ProjectionSummary =
         ProjectionSummary(
@@ -140,6 +181,9 @@ data class ProjectionSummary(
                     (warningCounts[code] ?: 0) + (other.warningCounts[code] ?: 0)
                 },
             targetRecords = targetRecords + other.targetRecords,
+            insertCount = insertCount + other.insertCount,
+            updateCount = updateCount + other.updateCount,
+            deleteCount = deleteCount + other.deleteCount,
         )
 }
 
@@ -156,35 +200,90 @@ fun ProjectionDraft.targetRecord(): String = when (this) {
 }
 
 object ProjectionPlanner {
-    fun plan(records: List<CanonicalRecord>): ProjectionPlan =
-        ProjectionPlan(records.map(::plan))
+    fun plan(
+        records: List<CanonicalRecord>,
+        projections: Map<String, HealthConnectProjection> = emptyMap(),
+    ): ProjectionPlan =
+        ProjectionPlan(records.map { record ->
+            plan(record, projections[record.canonicalId])
+        })
 
-    fun plan(record: CanonicalRecord): PlannedRecord {
+    fun plan(
+        record: CanonicalRecord,
+        projection: HealthConnectProjection? = null,
+    ): PlannedRecord {
         if (record.hasVisitedHealthConnectTarget()) {
-            return archiveOnly(record, "source-store-loop", "lineage")
+            return applyProjectionState(
+                archiveOnly(record, "source-store-loop", "lineage"),
+                projection,
+            )
+        }
+        if (record.kind == "clinicalRecord") {
+            return applyProjectionState(
+                archiveOnly(record, "clinical-snapshot-incomplete"),
+                projection,
+            )
         }
         if (record.tombstone) {
-            val target = GeneratedContract.recordMappings[record.type]?.targetRecord
+            val existing = projection
                 ?: return archiveOnly(record, "tombstone")
             return exact(
                 record,
                 ProjectionDraft.Delete(
                     canonicalId = record.canonicalId,
                     recordVersion = record.recordVersion,
-                    targetRecord = target,
+                    targetRecord = existing.targetRecord,
+                    healthConnectRecordId = existing.healthConnectRecordId,
                 ),
+                action = ProjectionAction.DELETE,
             )
         }
         if (record.kind in GeneratedContract.archiveOnlyKinds) {
-            return archiveOnly(record, "unsupported-type")
+            return applyProjectionState(
+                archiveOnly(record, "unsupported-type"),
+                projection,
+            )
         }
         val mapping = GeneratedContract.recordMappings[record.type]
-            ?: return archiveOnly(record, "unsupported-type")
+            ?: return applyProjectionState(
+                archiveOnly(record, "unsupported-type"),
+                projection,
+            )
         if (mapping.sourceKind != record.kind) {
-            return archiveOnly(record, "unsupported-type", "kind")
+            return applyProjectionState(
+                archiveOnly(record, "unsupported-type", "kind"),
+                projection,
+            )
+        }
+        if (mapping.quality == MappingQuality.ARCHIVE_ONLY) {
+            if (projection != null) {
+                return PlannedRecord(
+                    source = record,
+                    quality = ProjectionQuality.ARCHIVE_ONLY,
+                    draft = ProjectionDraft.Delete(
+                        canonicalId = record.canonicalId,
+                        recordVersion = record.recordVersion,
+                        targetRecord = projection.targetRecord,
+                        healthConnectRecordId =
+                            projection.healthConnectRecordId,
+                    ),
+                    warnings = listOf(
+                        warning(
+                            record,
+                            mapping.warningCode ?: "unsupported-type",
+                            null,
+                        ),
+                    ),
+                    action = ProjectionAction.DELETE,
+                )
+            }
+            return archiveOnly(
+                record,
+                mapping.warningCode ?: "unsupported-type",
+            )
         }
 
-        return when (mapping.targetRecord) {
+        val planned = when (mapping.targetRecord) {
             "StepsRecord" -> steps(record)
             "HeartRateRecord" -> heartRate(record)
             "WeightRecord" -> weight(record)
@@ -195,6 +294,37 @@ object ProjectionPlanner {
             "ExerciseSessionRecord" -> exercise(record)
             else -> archiveOnly(record, "unsupported-type")
         }
+        return applyProjectionState(planned, projection)
+    }
+
+    private fun applyProjectionState(
+        planned: PlannedRecord,
+        projection: HealthConnectProjection?,
+    ): PlannedRecord {
+        val draft = planned.draft
+        if (draft == null) {
+            return if (projection == null) {
+                planned
+            } else {
+                planned.copy(
+                    draft = ProjectionDraft.Delete(
+                        canonicalId = planned.source.canonicalId,
+                        recordVersion = planned.source.recordVersion,
+                        targetRecord = projection.targetRecord,
+                        healthConnectRecordId =
+                            projection.healthConnectRecordId,
+                    ),
+                    action = ProjectionAction.DELETE,
+                )
+            }
+        }
+        if (projection == null) {
+            return planned.copy(action = ProjectionAction.INSERT)
+        }
+        if (projection.canonicalVersion >= draft.recordVersion) {
+            return planned.copy(draft = null, action = ProjectionAction.NONE)
+        }
+        return planned.copy(action = ProjectionAction.UPDATE)
     }
 
     private fun steps(record: CanonicalRecord): PlannedRecord {
@@ -230,7 +360,7 @@ object ProjectionPlanner {
             else -> return archiveOnly(record, "invalid-value", "quantity.unit")
         }
         val rounded = bpm.roundToLong()
-        val interval = interval(record)
+        val interval = interval(record, allowPoint = true)
             ?: return archiveOnly(record, "invalid-value", "startDate")
         if (bpm != rounded.toDouble() || rounded !in 1..300) {
             return archiveOnly(record, "invalid-value", "quantity.value")
@@ -382,6 +512,7 @@ object ProjectionPlanner {
                 quality = ProjectionQuality.LOSSY,
                 draft = draft,
                 warnings = warnings,
+                action = ProjectionAction.INSERT,
             )
         } else {
             exact(record, draft)
@@ -395,20 +526,33 @@ object ProjectionPlanner {
         }
     }
 
-    private fun interval(record: CanonicalRecord): Pair<Instant, Instant>? {
+    private fun interval(
+        record: CanonicalRecord,
+        allowPoint: Boolean = false,
+    ): Pair<Instant, Instant>? {
         val start = record.startTime ?: return null
         val end = record.endTime ?: return null
-        return if (start < end) start to end else null
+        return if (start < end || (allowPoint && start == end)) {
+            start to end
+        } else {
+            null
+        }
     }
 
     private fun exact(
         record: CanonicalRecord,
         draft: ProjectionDraft,
+        action: ProjectionAction = ProjectionAction.INSERT,
     ): PlannedRecord = PlannedRecord(
         source = record,
-        quality = ProjectionQuality.EXACT,
+        quality = if (action == ProjectionAction.DELETE) {
+            ProjectionQuality.DELETE
+        } else {
+            ProjectionQuality.EXACT
+        },
         draft = draft,
         warnings = emptyList(),
+        action = action,
     )
 
     private fun lossy(
@@ -421,6 +565,7 @@ object ProjectionPlanner {
         quality = ProjectionQuality.LOSSY,
         draft = draft,
         warnings = listOf(warning(record, code, field)),
+        action = ProjectionAction.INSERT,
     )
 
     private fun archiveOnly(
@@ -432,6 +577,7 @@ object ProjectionPlanner {
         quality = ProjectionQuality.ARCHIVE_ONLY,
         draft = null,
         warnings = listOf(warning(record, code, field)),
+        action = ProjectionAction.NONE,
     )
 
     private fun warning(

@@ -25,13 +25,13 @@ test**.
 
 ## Why retries are safe
 
-- Every record carries HealthKit's own identifier, so storing one twice is an
-  `INSERT OR REPLACE` of identical data.
+- Every record resolves to a stable Hozz canonical ID and monotonic version, so
+  a retry updates the same row and an older replay cannot replace newer state.
 - Every batch carries an `Idempotency-Key`, so a batch that arrives twice —
   which happens whenever a response is lost after the server already committed —
   is recognised and skipped.
-- Deletions arrive as explicit records, so removing something in Health removes
-  it here too.
+- Deletions remain as tombstones and cascade to series/error children, so a
+  later replay cannot resurrect removed data.
 
 Together that means an interrupted sync may repeat work, but your database can
 never end up with a gap or a duplicate.
@@ -40,7 +40,10 @@ never end up with a gap or a duplicate.
 
 NDJSON, a JSON array, a full `.zip` export, and the Health Auto Export shaped
 payload. CSV entries inside a ZIP are skipped, since they are a lossy projection
-of records already present losslessly.
+of records already present losslessly. Run, coverage, and error lines are kept
+verbatim rather than mistaken for measurements. ZIP imports enforce the Hozz v1
+manifest and bounded entry, expansion, record, and compression-ratio limits
+before any part of the archive commits.
 
 ## Ask it things
 
@@ -48,12 +51,12 @@ of records already present losslessly.
 -- Daily step totals
 SELECT substr(start_date, 1, 10) AS day, SUM(value) AS steps
 FROM samples
-WHERE type = 'HKQuantityTypeIdentifierStepCount'
+WHERE type = 'HKQuantityTypeIdentifierStepCount' AND tombstone = 0
 GROUP BY day ORDER BY day DESC LIMIT 30;
 
 -- Resting heart rate trend
 SELECT substr(start_date, 1, 7) AS month, ROUND(AVG(value), 1) AS bpm
 FROM samples
-WHERE type = 'HKQuantityTypeIdentifierRestingHeartRate'
+WHERE type = 'HKQuantityTypeIdentifierRestingHeartRate' AND tombstone = 0
 GROUP BY month ORDER BY month;
 ```

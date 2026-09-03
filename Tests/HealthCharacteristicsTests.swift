@@ -113,6 +113,16 @@ final class HealthCharacteristicsTests: XCTestCase {
 
         let records = try characteristicsRecords(in: result.fileURL)
         XCTAssertEqual(records.count, 1)
+        XCTAssertNotNil(records[0]["canonicalId"] as? String)
+        XCTAssertEqual(
+            records[0]["canonicalType"] as? String,
+            "person.characteristics"
+        )
+        XCTAssertNotNil(records[0]["recordVersion"] as? Int64)
+        XCTAssertNotNil(records[0]["sourceRecord"] as? [String: Any])
+        XCTAssertFalse(
+            (records[0]["lineage"] as? [[String: Any]] ?? []).isEmpty
+        )
         let values = try XCTUnwrap(
             records[0]["characteristics"] as? [String: Any]
         )

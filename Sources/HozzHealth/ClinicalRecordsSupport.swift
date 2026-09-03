@@ -8,8 +8,9 @@ import HozzCore
 /// binary that carries it **before approval is rejected outright**, so it is
 /// not in the default build and neither is the code that would ask for it.
 ///
-/// To turn it on once approval lands, two deliberate steps are needed and
-/// neither happens by accident:
+/// The build and entitlement switches remain separate, but even when both are
+/// present export stays unavailable until full-scan snapshot reconciliation can
+/// emit stable tombstones for records that disappear:
 ///
 /// 1. Build with `HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS`, which is an
 ///    undefined build setting by default. Set it on the `xcodebuild` command
@@ -22,6 +23,10 @@ import HozzCore
 /// missing. Step 2 is the one with consequences, which is why it is a visible
 /// edit to a tracked file rather than a flag someone can leave switched on.
 public enum ClinicalRecordsSupport {
+    /// A clinical full scan cannot be called complete until disappearing
+    /// records produce stable tombstones.
+    public static let hasDeletionSafeSnapshot = false
+
     public static var isBuiltIn: Bool {
         #if HOZZ_CLINICAL_RECORDS
         return true
@@ -53,6 +58,9 @@ public enum ClinicalRecordsSupport {
         /// device does not support health records. Asking anyway would be
         /// fatal, so nothing asks.
         case unsupportedOnThisDevice
+        /// The full-scan reader cannot yet emit tombstones for records that
+        /// disappear, so enabling export would make an incomplete archive.
+        case snapshotReconciliationUnavailable
         /// Readable, once the person chooses which records to share.
         case availableWithPermission
 
@@ -69,6 +77,8 @@ public enum ClinicalRecordsSupport {
                 "Health data is unavailable on this device."
             case .unsupportedOnThisDevice:
                 "This iPhone cannot share health records with Hozz. It says nothing about whether you have any."
+            case .snapshotReconciliationUnavailable:
+                "Clinical export is not available until Hozz can reconcile full snapshots and preserve deletions."
             case .availableWithPermission:
                 "Health will ask which records to share. Hozz exports the ones you choose and cannot see the rest."
             }
@@ -93,6 +103,9 @@ public enum ClinicalRecordsSupport {
         // Asking when this is false does not fail, it raises.
         guard supportsHealthRecords else {
             return .unsupportedOnThisDevice
+        }
+        guard hasDeletionSafeSnapshot else {
+            return .snapshotReconciliationUnavailable
         }
         return .availableWithPermission
     }

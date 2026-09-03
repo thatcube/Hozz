@@ -26,6 +26,8 @@ selfIdentity.plist
 
 # Editors
 *.swp
+__pycache__/
+*.pyc
 
 # Local signing settings; never committed.
 Local.xcconfig

@@ -257,11 +257,14 @@ Turning clinical records on takes two deliberate steps:
 Both build configurations are tested, and a test asserts the flag actually
 reaches the framework it gates. The build flag and the entitlement are separate
 switches, so a build with one and not the other is a crash rather than a disabled
-feature, and that gate is what makes the mismatch harmless. Clinical records are
-read with `HKSampleQuery`, not the anchored drain, because HealthKit does not
-support anchored queries for clinical types. There is no cursor: every record is
-read every time, and the stable identity makes a re-read byte-identical to what a
-receiver already holds.
+feature.
+
+The reader remains a development spike, not supported export coverage.
+HealthKit does not support anchored queries for clinical types, so it must use a
+full snapshot. Hozz does not yet persist and reconcile those snapshots, which
+means it cannot emit a stable tombstone when a clinical record disappears.
+Until that exists, clinical records must not be enabled for release or described
+as a complete/lossless Hozz archive source.
 
 Three things about the data itself:
 

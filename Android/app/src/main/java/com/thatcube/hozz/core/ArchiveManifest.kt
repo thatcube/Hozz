@@ -39,6 +39,13 @@ data class ArchiveManifest(
 
         private fun decode(json: String): ArchiveManifest {
             val jsonObject = Json.parseToJsonElement(json).jsonObject
+            val unknownKeys = jsonObject.keys - allowedKeys
+            if (unknownKeys.isNotEmpty()) {
+                throw ArchiveFormatException(
+                    "The archive manifest contains unknown fields: " +
+                        unknownKeys.sorted().joinToString(),
+                )
+            }
             val schemaVersion = jsonObject["schemaVersion"]?.jsonPrimitive?.intOrNull
                 ?: throw ArchiveFormatException("The archive manifest has no schemaVersion.")
             if (schemaVersion != GeneratedContract.SCHEMA_VERSION) {
@@ -57,10 +64,18 @@ data class ArchiveManifest(
                 )
             }
             val archiveId = jsonObject["archiveId"]?.jsonPrimitive?.contentOrNull
+                ?.takeIf(String::isNotBlank)
                 ?: throw ArchiveFormatException("The archive manifest has no archiveId.")
             val recordsEntry = jsonObject["recordsEntry"]?.jsonPrimitive?.contentOrNull
                 ?: throw ArchiveFormatException("The archive manifest has no recordsEntry.")
-            if (!recordsEntry.endsWith(".ndjson")) {
+            if (
+                recordsEntry.isBlank() ||
+                !recordsEntry.endsWith(".ndjson") ||
+                '/' in recordsEntry ||
+                '\\' in recordsEntry ||
+                recordsEntry == "." ||
+                recordsEntry == ".."
+            ) {
                 throw ArchiveFormatException("The manifest recordsEntry is not NDJSON.")
             }
             val createdAtText = jsonObject["createdAt"]?.jsonPrimitive?.contentOrNull
@@ -91,6 +106,16 @@ data class ArchiveManifest(
                 }
                 count
             }
+            jsonObject["sourcePlatform"]?.let { value ->
+                val platform = (value as? JsonPrimitive)
+                    ?.takeIf(JsonPrimitive::isString)
+                    ?.contentOrNull
+                if (platform.isNullOrBlank()) {
+                    throw ArchiveFormatException(
+                        "The archive manifest sourcePlatform is invalid.",
+                    )
+                }
+            }
             return ArchiveManifest(
                 schemaVersion = schemaVersion,
                 archiveId = archiveId,
@@ -101,5 +126,16 @@ data class ArchiveManifest(
                 recordCount = recordCount,
             )
         }
+
+        private val allowedKeys = setOf(
+            "schemaVersion",
+            "archiveId",
+            "format",
+            "recordSchema",
+            "recordsEntry",
+            "createdAt",
+            "recordCount",
+            "sourcePlatform",
+        )
     }
 }
