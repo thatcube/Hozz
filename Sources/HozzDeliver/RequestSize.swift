@@ -34,17 +34,13 @@ public enum RequestSize {
     public static func explanation(for bytes: Int) -> String {
         switch bytes {
         case ..<(512 * 1_024):
-            "Small enough for almost any server, including one behind a proxy "
-            + "with a tight limit. More requests, each quick."
+            "Fits tight proxy limits; sends more requests."
         case ..<(1_024 * 1_024):
-            "A safe margin under the one-megabyte limit nginx applies unless "
-            + "told otherwise."
+            "Safe below nginx's default 1 MB limit."
         case 1_024 * 1_024:
-            "The default limit for nginx, which sits in front of a great many "
-            + "home servers. Right at it rather than under it."
+            "Matches nginx's default limit."
         default:
-            "For a server you know accepts large bodies. Fewer requests, and "
-            + "less to redo if one of them fails."
+            "For servers that accept large bodies; fewer requests."
         }
     }
 }

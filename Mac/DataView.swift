@@ -38,9 +38,9 @@ struct DataView: View {
         Group {
             if services.summaries.isEmpty && services.characteristics.isEmpty {
                 ContentUnavailableView {
-                    Label("Nothing received yet", systemImage: "tray")
+                    Label("No data yet", systemImage: "tray")
                 } description: {
-                    Text("Once your phone syncs, everything it sends appears here.")
+                    Text("Check Connect if you expected records.")
                 }
             } else {
                 VStack(spacing: 0) {
@@ -52,6 +52,7 @@ struct DataView: View {
             }
         }
         .navigationTitle("Data")
+        .background(HozzSurface())
         .task { await services.refresh() }
     }
 
@@ -193,12 +194,12 @@ struct DataView: View {
                 // as Hozz learns the shape, so the wording says waiting rather
                 // than error — a receiver behind the phone is a temporary
                 // state, and describing it as a loss would be wrong twice.
-                Section("Waiting to be understood") {
+                Section("Waiting for support") {
                     ForEach(services.unhandled) { entry in
                         VStack(alignment: .leading, spacing: 3) {
                             Text("\(entry.count) × \(entry.kind)")
                                 .font(.body.weight(.medium))
-                            Text("Kept safely. A future version of Hozz will read these automatically — nothing needs to be re-sent from your phone.")
+                            Text("Saved until Hozz supports this format; no resend needed.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
@@ -210,7 +211,7 @@ struct DataView: View {
             if services.promotedRecords > 0 {
                 Section {
                     Label(
-                        "\(services.promotedRecords) records that were waiting have now been read and added.",
+                        "\(services.promotedRecords) waiting records added.",
                         systemImage: "checkmark.circle"
                     )
                     .font(.footnote)
@@ -246,7 +247,7 @@ struct DataView: View {
             ContentUnavailableView(
                 "Choose a type",
                 systemImage: "sidebar.left",
-                description: Text("Pick something on the left to see it over time.")
+                description: Text("Select a measurement.")
             )
         }
     }

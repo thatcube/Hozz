@@ -24,11 +24,11 @@ struct MoodView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: Dash.gutter) {
+            VStack(alignment: .leading, spacing: HozzMetrics.desktopGutter) {
                 header
                 if services.moods.isEmpty {
                     Card {
-                        Text("No State of Mind entries have arrived yet.")
+                        Text("No State of Mind entries.")
                             .font(.callout)
                             .foregroundStyle(HozzPalette.inkMuted)
                             .frame(maxWidth: .infinity, minHeight: 120)
@@ -48,14 +48,7 @@ struct MoodView: View {
     }
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            Text("Mood & medication")
-                .font(.system(size: 26, weight: .semibold, design: .rounded))
-                .foregroundStyle(HozzPalette.ink)
-            Text("Valence runs from very unpleasant to very pleasant.")
-                .font(.callout)
-                .foregroundStyle(HozzPalette.inkSoft)
-        }
+        HozzPageHeader("Mood & medication")
     }
 
     private var statsCard: some View {
@@ -94,7 +87,7 @@ struct MoodView: View {
     private var chartCard: some View {
         Card(
             title: "Over time",
-            subtitle: "Daily moods and momentary emotions are drawn apart, because a snapshot and a summary of a whole day are not the same measurement."
+            subtitle: "Daily moods and momentary emotions stay separate."
         ) {
             Chart {
                 RuleMark(y: .value("Neutral", 0))
@@ -173,8 +166,7 @@ struct MoodView: View {
 
     private var associationsCard: some View {
         Card(
-            title: "What they were put down to",
-            subtitle: "Recorded by you alongside the entry."
+            title: "Associations"
         ) {
             Chart(Array(associations.prefix(10)), id: \.0) { item in
                 BarMark(
@@ -202,14 +194,14 @@ struct MoodView: View {
     private var medicationCard: some View {
         Card(
             title: "Medication",
-            subtitle: services.medications.isEmpty
+            verbatimSubtitle: services.medications.isEmpty
                 ? nil
-                : "Counted by what actually happened to each dose."
+                : "Dose statuses stay separate."
         ) {
             if services.medications.isEmpty {
                 // An empty type exported nothing, which is a complete and
                 // successful result. It is not a warning and is not drawn as one.
-                Text("No medication doses have been logged.")
+                Text("No medication doses.")
                     .font(.callout)
                     .foregroundStyle(HozzPalette.inkMuted)
             } else {

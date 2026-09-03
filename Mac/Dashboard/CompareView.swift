@@ -26,7 +26,7 @@ struct CompareView: View {
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: Dash.gutter) {
+            VStack(alignment: .leading, spacing: HozzMetrics.desktopGutter) {
                 header
                 picker
                 if services.comparison.isEmpty {
@@ -36,7 +36,7 @@ struct CompareView: View {
                                 .font(.callout)
                                 .foregroundStyle(HozzPalette.inkSoft)
                             if !services.comparisonTypes.isEmpty, range != .all {
-                                Button("Show everything held") { range = .all }
+                                Button("Show all") { range = .all }
                                     .buttonStyle(.borderedProminent)
                                     .tint(HozzPalette.blue)
                             }
@@ -75,24 +75,13 @@ struct CompareView: View {
     /// something" and "nothing in this window" call for different actions.
     private var emptyReason: String {
         if services.comparisonTypes.isEmpty {
-            return "Choose two or more types above to see them together."
+            return "Choose 2–4 types."
         }
-        return "Nothing chosen here reaches this range yet. A phone works back "
-            + "through history one type at a time, so the newest weeks are "
-            + "often the last to arrive."
+        return "No selected type has data in this range yet."
     }
 
     private var header: some View {
-        HStack(alignment: .lastTextBaseline) {
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Compare")
-                    .font(.system(size: 26, weight: .semibold, design: .rounded))
-                    .foregroundStyle(HozzPalette.ink)
-                Text("Up to four types on one timeline.")
-                    .font(.callout)
-                    .foregroundStyle(HozzPalette.inkSoft)
-            }
-            Spacer()
+        HozzPageHeader("Compare", subtitle: "Up to four types.") {
             RangePicker(range: $range)
         }
     }
@@ -166,7 +155,7 @@ struct CompareView: View {
     private var chartCard: some View {
         Card(
             title: "Together",
-            subtitle: "Each line is scaled to its own range, so shapes can be compared but heights cannot. Real values are in the legend below."
+            subtitle: "Each line has its own scale. Compare shape, not height; values are below."
         ) {
             Chart {
                 ForEach(services.comparison) { entry in
@@ -210,7 +199,7 @@ struct CompareView: View {
     }
 
     private var legendCard: some View {
-        Card(title: "What each line is") {
+        Card(title: "Values") {
             VStack(spacing: 0) {
                 ForEach(Array(services.comparison.enumerated()), id: \.element.id) { index, entry in
                     if index > 0 {
@@ -262,7 +251,7 @@ struct CompareView: View {
                             )
                             .font(.callout.weight(.medium))
                             .foregroundStyle(HozzPalette.inkMuted)
-                            Text("Not enough in this range to draw a line.")
+                            Text("No line in this range.")
                                 .font(.caption2)
                                 .foregroundStyle(HozzPalette.inkMuted)
                         }

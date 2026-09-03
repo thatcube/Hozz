@@ -84,15 +84,10 @@ public enum DeliveryWindow: String, Codable, CaseIterable, Sendable {
     public var explanation: String {
         switch self {
         case .sinceLastDelivery:
-            "Everything Hozz has read from Health and not yet delivered here, "
-            + "however old it is. A reading the Health app filed under last "
-            + "Tuesday this morning still gets sent. Nothing is left out."
+            "Everything not yet delivered, including records Health adds retroactively."
         default:
-            "Hozz works out that date once, now, and then keeps it. Readings "
-            + "dated before it are never sent here; everything from it onwards "
-            + "is, including anything Health files retroactively. The date does "
-            + "not creep forward, so last night's sleep is not left behind "
-            + "because the sync happened this morning."
+            "The start date is fixed now. Earlier records are never sent; later "
+            + "retroactive records are."
         }
     }
 

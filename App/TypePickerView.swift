@@ -57,10 +57,8 @@ struct TypePickerView: View {
             } footer: {
                 Text(
                     selection.isEmpty
-                        ? "Hozz will send every type it has access to."
-                        : "\(selection.count) selected. Fewer types means iOS wakes "
-                          + "Hozz less often, which uses less battery. Turn the "
-                          + "switch above on to send everything instead."
+                        ? "Sends every readable type."
+                        : "\(selection.count) selected. Fewer types use less battery."
                 )
                 .hozzFormFooter()
             }

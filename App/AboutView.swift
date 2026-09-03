@@ -8,30 +8,30 @@ struct AboutView: View {
         HozzScreen {
             introduction
 
-            HozzSection("What Hozz promises") {
+            HozzSection("Promises") {
                 HozzNoteCard {
                     HozzNote(
-                        "Nothing leaves this iPhone until you add a destination",
+                        "Nothing leaves until you add a destination",
                         icon: .shieldLock,
                         tone: .action
                     )
                     HozzNote(
-                        "No account, analytics, or server of ours",
+                        "No account, analytics, or Hozz server",
                         icon: .heartHandshake,
                         tone: .action
                     )
                     HozzNote(
-                        "Credentials stay in this iPhone's Keychain",
+                        "Credentials stay in Keychain",
                         icon: .key,
                         tone: .action
                     )
                     HozzNote(
-                        "Every record, with no gaps and no duplicates",
+                        "Anchored exports avoid gaps and duplicates",
                         icon: .circleCheck,
                         tone: .action
                     )
                     HozzNote(
-                        "Honest about anything it cannot prove",
+                        "Unknown stays unknown",
                         icon: .eye,
                         tone: .action
                     )
@@ -99,12 +99,11 @@ struct AboutView: View {
         VStack(alignment: .leading, spacing: 12) {
             HozzIconView(.heart, size: 32)
                 .foregroundStyle(HozzPalette.blue)
-            Text("Your health data, across the places you use")
+            Text("Your health data, where you use it")
                 .hozzDisplay(size: 26)
                 .fixedSize(horizontal: false, vertical: true)
             Text(
-                "Open source. Today, Hozz reads Apple Health on iPhone and "
-                    + "moves it to places you control."
+                "Open source. Hozz moves Apple Health data to places you control."
             )
             .hozzBody()
             .fixedSize(horizontal: false, vertical: true)

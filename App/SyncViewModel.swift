@@ -84,19 +84,19 @@ final class SyncViewModel {
     /// The single honest sentence shown at the top of the dashboard.
     var overallStatus: String {
         guard hasDestinations else {
-            return "No destination yet. Nothing leaves this iPhone."
+            return "No destination. Nothing leaves this iPhone."
         }
         if isSyncing {
             return "Syncing now…"
         }
         if summaries.contains(where: { $0.state == .needsAttention }) {
-            return "A destination needs your attention."
+            return "A destination needs attention."
         }
         if summaries.contains(where: { $0.state == .retrying }) {
-            return "Retrying a destination that could not be reached."
+            return "Retrying an unreachable destination."
         }
         guard let latest = summaries.compactMap(\.lastSuccessAt).max() else {
-            return "Waiting for the first sync."
+            return "Waiting for first sync."
         }
         return "Last synced \(Self.relative(latest))."
     }
@@ -385,7 +385,7 @@ final class SyncViewModel {
 
     static func describe(_ outcome: SyncOutcome) -> String {
         if outcome.waitingForUnlock {
-            return "Waiting for this iPhone to be unlocked."
+            return "Unlock this iPhone to continue."
         }
         if outcome.deliveredRecords == 0 {
             // "Up to date" is a claim about somebody's whole history, and it is
@@ -395,11 +395,11 @@ final class SyncViewModel {
             // established nothing at all, and one still fetching the recent
             // months has established that it is not finished.
             if outcome.wasInterrupted {
-                return "Hozz did not get through this sync. It will pick up where it left off."
+                return "Sync stopped early. It will resume."
             }
             return outcome.primingRemains
-                ? "Nothing new to send. Still fetching your recent history."
-                : "Everything was already up to date."
+                ? "Nothing new. Recent history is still arriving."
+                : "Already up to date."
         }
         let plural = outcome.deliveredRecords == 1 ? "record" : "records"
         let sent = "Sent \(outcome.deliveredRecords.formatted()) \(plural)."

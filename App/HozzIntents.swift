@@ -11,7 +11,7 @@ import HozzHealth
 struct SyncNowIntent: AppIntent {
     static let title: LocalizedStringResource = "Sync Health Data"
     static let description = IntentDescription(
-        "Sends any new Health data to your destinations now.",
+        "Sends new Health data now.",
         categoryName: "Export"
     )
     /// Running in the app rather than an extension keeps one lease over the
@@ -25,11 +25,11 @@ struct SyncNowIntent: AppIntent {
 
         if outcome.waitingForUnlock {
             return .result(
-                dialog: "Health is locked. Unlock your iPhone and Hozz will continue."
+                dialog: "Unlock your iPhone to continue."
             )
         }
         if outcome.deliveredRecords == 0 {
-            return .result(dialog: "Everything was already up to date.")
+            return .result(dialog: "Already up to date.")
         }
         let plural = outcome.deliveredRecords == 1 ? "record" : "records"
         return .result(
@@ -42,7 +42,7 @@ struct SyncNowIntent: AppIntent {
 struct SyncStatusIntent: AppIntent {
     static let title: LocalizedStringResource = "Check Health Sync Status"
     static let description = IntentDescription(
-        "Reports when Hozz last sent your Health data.",
+        "Reports the last Health sync.",
         categoryName: "Export"
     )
     static let openAppWhenRun: Bool = false
@@ -54,7 +54,7 @@ struct SyncStatusIntent: AppIntent {
 
         guard !destinations.isEmpty else {
             return .result(
-                dialog: "Hozz has no destination yet, so nothing is being sent."
+                dialog: "No destination. Nothing is being sent."
             )
         }
 
@@ -76,10 +76,10 @@ struct SyncStatusIntent: AppIntent {
         }
 
         if needsAttention {
-            return .result(dialog: "A Hozz destination needs your attention.")
+            return .result(dialog: "A Hozz destination needs attention.")
         }
         guard let latest else {
-            return .result(dialog: "Hozz has not completed a sync yet.")
+            return .result(dialog: "No sync has completed yet.")
         }
         let formatter = RelativeDateTimeFormatter()
         formatter.unitsStyle = .full
@@ -97,7 +97,7 @@ struct SyncStatusIntent: AppIntent {
 struct StartFullExportIntent: AppIntent {
     static let title: LocalizedStringResource = "Export All Health Data"
     static let description = IntentDescription(
-        "Opens Hozz and begins a complete export of your Health history.",
+        "Opens Hozz and exports your Health history.",
         categoryName: "Export"
     )
     static let openAppWhenRun: Bool = true

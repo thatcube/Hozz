@@ -22,11 +22,11 @@ public enum OverviewNarration {
     ) -> String {
         guard staleRows > 0 else { return range.windowTitle }
         if staleRows >= totalRows {
-            return "Nothing in \(range.windowNoun) has reached this computer "
-                + "yet — each row shows the most recent stretch that has."
+            return "No records from \(range.windowNoun) reached this computer; "
+                + "rows show their latest received span."
         }
-        return "\(range.windowTitle) — \(staleRows) of \(totalRows) have not "
-            + "reached it yet and show the most recent stretch that has."
+        return "\(range.windowTitle) · \(staleRows) of \(totalRows) rows show "
+            + "an earlier received span."
     }
 
     /// What is known about how completely one type has been read, in full.
@@ -50,21 +50,19 @@ public enum OverviewNarration {
         switch standing {
         case .complete:
             guard let newest else {
-                return "Your phone has finished reading this type: everything "
-                    + "Health holds for it is here."
+                return "Your phone has finished reading this type. Everything "
+                    + "Health holds is here."
             }
-            return "Your phone has finished reading this type, so \(newest) "
-                + "really is your most recent record — not just the most "
-                + "recent one that has arrived."
+            return "Your phone has finished reading this type. \(newest) "
+                + "really is your most recent record."
 
         case .incomplete(let report):
             if let from = report.primedFrom,
                let through = report.primedThrough,
                standing.motion == .arriving {
-                return "Your phone has filled in \(day(from)) to \(day(through)) "
-                    + "directly, and is still working back through everything "
-                    + "older. Those two stretches do not meet yet, so there is "
-                    + "a gap in the middle that is not a gap in your history."
+                return "Your phone read \(day(from))–\(day(through)) directly "
+                    + "and is still working back through older records. The "
+                    + "middle is not here yet, not a gap in your history."
             }
             // A stream that has stopped must not be described as working. The
             // sentence above used to be given to every unfinished type with a
@@ -87,22 +85,18 @@ public enum OverviewNarration {
                 )
             }
             guard let newest else {
-                return "Your phone is still reading this type, so what is here "
-                    + "is not all of it yet."
+                return "Your phone is still reading this type; it is not "
+                    + "complete yet."
             }
-            return "Your phone is still reading this type. It arrives in the "
-                + "order Health stored it rather than in date order, so "
-                + "\(newest) is the newest record that has arrived and not "
-                + "necessarily your newest."
+            return "Your phone is still reading this type. \(newest) is the "
+                + "newest received, not necessarily your newest."
 
         case .untold:
             guard let newest else {
-                return "Your phone has not said whether it has finished "
-                    + "reading this type, so what is here may not be all of it."
+                return "Your phone has not said whether this type is complete."
             }
-            return "Your phone has not said whether it has finished reading "
-                + "this type. \(newest) is the newest record that has arrived, "
-                + "which may or may not be your newest."
+            return "Your phone has not said whether this type is complete. "
+                + "\(newest) may or may not be your newest record."
         }
     }
 
@@ -117,16 +111,15 @@ public enum OverviewNarration {
         strandedGap: (from: String, through: String)? = nil
     ) -> String {
         let held = newest.map {
-            " What is here reaches \($0), and is not necessarily all there is."
+            " Records here reach \($0), not necessarily all there is."
         } ?? ""
         // A hole that has stopped being filled is a different thing from one
         // that is still closing, and saying so is the whole point of telling
         // the two apart. Named after the state's own sentence, because why the
         // reading stopped is what a person can act on.
         let stranded = strandedGap.map {
-            " Everything from \($0.from) to \($0.through) is here, and the "
-                + "older stretch is not — and while this type is stopped that "
-                + "hole will stay where it is."
+            " \($0.from)–\($0.through) is here; older records are not, and "
+                + "while stopped that hole will stay where it is."
         } ?? ""
 
         switch state {
@@ -135,40 +128,34 @@ public enum OverviewNarration {
             // state and a motion disagreeing is not worth a blank screen.
             return "Your phone is still reading this type.\(held)\(stranded)"
         case .authorizationIndeterminate:
-            return "Your phone finished reading this type and Health "
-                + "returned nothing at all. Health answers the same way "
-                + "whether you have no records of it or Hozz was never "
-                + "granted it, so this cannot tell you which.\(held)\(stranded)"
+            return "Health returned nothing. It does not distinguish no records "
+                + "from permission never granted.\(held)\(stranded)"
         case .deviceLockedDeferred:
-            return "Your phone was locked when it last tried to read this "
-                + "type, and will carry on once it is unlocked.\(held)\(stranded)"
+            return "Your phone was locked. Reading resumes after "
+                + "unlock.\(held)\(stranded)"
         case .authorizationDismissed:
             return "Your phone is waiting for permission to read this type. "
-                + "Open Hozz on the phone and allow it, and the rest will "
-                + "follow.\(held)\(stranded)"
+                + "Open Hozz on the phone to continue.\(held)\(stranded)"
         case .limitedAuthorizationWindow:
-            return "Your phone was granted only part of this type's history, "
-                + "so the rest cannot be read at all.\(held)\(stranded)"
+            return "Health granted only part of this type's history; the rest "
+                + "cannot be read.\(held)\(stranded)"
         case .tombstoneGapSuspected:
-            return "Your phone could not read this type through to the end, "
-                + "so what is here may have gaps in the middle as well as at "
-                + "the edges.\(held)\(stranded)"
+            return "Your phone could not finish reading this type, so records "
+                + "may be missing within the range.\(held)\(stranded)"
         case .unsupported:
-            return "Your phone cannot read this type — Health reports it as "
-                + "unavailable or restricted on that device.\(held)\(stranded)"
+            return "Health reports this type unavailable or restricted on your "
+                + "phone.\(held)\(stranded)"
         case .unverifiedOnDevice:
-            return "Your phone has not confirmed this type on this device, so "
-                + "how much of it exists is not established.\(held)\(stranded)"
+            return "Your phone has not confirmed this type, so completeness is "
+                + "unknown.\(held)\(stranded)"
         case .readFailed:
-            return "Your phone's own reading of this type failed, so it has "
-                + "stopped rather than paused. This is a fault in Hozz rather "
-                + "than anything about you or your Health data.\(held)\(stranded)"
+            return "Reading this type failed and stopped rather than paused. "
+                + "This is a fault in Hozz rather than anything about you or "
+                + "your Health data.\(held)\(stranded)"
         case .unknown:
-            return "Your phone sent a status for this type that this copy of "
-                + "Hozz cannot interpret — it may be running a newer version, "
-                + "or it may have met an error it could not classify. Either "
-                + "way, how completely this type has been read is not "
-                + "known.\(held)\(stranded)"
+            return "Your phone sent a status this Hozz cannot interpret. It may "
+                + "use a newer version or report an error it could not "
+                + "classify; completeness is unknown.\(held)\(stranded)"
         }
     }
 }

@@ -234,8 +234,8 @@ final class OverviewNarrationTests: XCTestCase {
         let heading = OverviewNarration.heading(range: .month, staleRows: 7, totalRows: 7)
         XCTAssertEqual(
             heading,
-            "Nothing in the past thirty days has reached this computer yet — "
-                + "each row shows the most recent stretch that has."
+            "No records from the past thirty days reached this computer; "
+                + "rows show their latest received span."
         )
         XCTAssertFalse(heading.hasPrefix(ChartRange.month.windowTitle))
     }
@@ -243,8 +243,7 @@ final class OverviewNarrationTests: XCTestCase {
     func testAHeadingWithSomeStaleRowsCountsThem() {
         XCTAssertEqual(
             OverviewNarration.heading(range: .month, staleRows: 3, totalRows: 7),
-            "Past thirty days — 3 of 7 have not reached it yet and show the "
-                + "most recent stretch that has."
+            "Past thirty days · 3 of 7 rows show an earlier received span."
         )
     }
 
@@ -275,8 +274,8 @@ final class OverviewNarrationTests: XCTestCase {
             XCTAssertEqual(range.windowNoun, pair.1)
             XCTAssertEqual(
                 OverviewNarration.heading(range: range, staleRows: 2, totalRows: 2),
-                "Nothing in \(pair.1) has reached this computer yet — each row "
-                    + "shows the most recent stretch that has."
+                "No records from \(pair.1) reached this computer; rows show "
+                    + "their latest received span."
             )
         }
     }

@@ -50,11 +50,7 @@ struct ElectrocardiogramListView: View {
                             .font(.system(size: 15, weight: .medium))
                             .foregroundStyle(HozzPalette.inkSoft)
                         Text(
-                            """
-                            Electrocardiograms are taken on an Apple Watch. \
-                            Health does not say whether a type was declined or \
-                            is simply empty.
-                            """
+                            "Health does not reveal whether this is empty or unshared."
                         )
                         .hozzCaption()
                         .fixedSize(horizontal: false, vertical: true)
@@ -259,17 +255,10 @@ struct ElectrocardiogramDetailView: View {
     /// reading someone must not take from it.
     private func incompleteNote(_ waveform: ECGWaveform) -> some View {
         VStack(alignment: .leading, spacing: 4) {
-            Label("This trace is incomplete", systemImage: "exclamationmark.triangle")
+            Label("Incomplete trace", systemImage: "exclamationmark.triangle")
                 .font(.system(size: 14, weight: .medium))
                 .foregroundStyle(HozzPalette.warning)
-            Text(
-                """
-                \(waveform.points.count.formatted()) of \
-                \(waveform.expectedCount.formatted()) readings arrived. What is \
-                drawn below is part of the recording, not the whole of it, and \
-                must not be read as a complete heartbeat.
-                """
-            )
+            Text("\(waveform.points.count.formatted()) of \(waveform.expectedCount.formatted()) readings arrived. Missing readings can change the trace's shape.")
             .hozzCaption()
             .fixedSize(horizontal: false, vertical: true)
         }
