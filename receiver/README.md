@@ -12,6 +12,9 @@ Datasette, or an AI tool pointed at the file.
 # Listen for a REST destination
 python3 hozz_receiver.py serve --port 8765 --token my-secret
 
+# Or explicitly opt into an unauthenticated listener on a trusted network
+python3 hozz_receiver.py serve --allow-unauthenticated
+
 # Or watch a folder that already syncs to this machine
 python3 hozz_receiver.py watch ~/Dropbox/Health
 
@@ -43,7 +46,10 @@ payload. CSV entries inside a ZIP are skipped, since they are a lossy projection
 of records already present losslessly. Run, coverage, and error lines are kept
 verbatim rather than mistaken for measurements. ZIP imports enforce the Hozz v1
 manifest and bounded entry, expansion, record, and compression-ratio limits
-before any part of the archive commits.
+before any part of the archive commits. ZIP entries must use Stored or Deflate;
+encrypted, BZIP2, LZMA, and unknown methods are rejected before decompression.
+Network requests are capped and spooled, while NDJSON and JSON arrays are
+decoded one record at a time.
 
 ## Ask it things
 

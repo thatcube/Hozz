@@ -116,6 +116,7 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                         SafArchiveSink(
                             getApplication<Application>().contentResolver,
                             uri,
+                            getApplication<Application>().cacheDir,
                         ),
                     )
                 }

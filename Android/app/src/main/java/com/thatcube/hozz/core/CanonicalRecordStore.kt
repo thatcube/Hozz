@@ -29,6 +29,11 @@ data class HealthConnectProjection(
     val healthConnectRecordId: String,
 )
 
+interface CanonicalExportSnapshot {
+    fun recordsPage(afterCanonicalId: String?, limit: Int): List<CanonicalRecord>
+    fun runRecordsPage(afterSequence: Long?, limit: Int): List<ArchiveRunRecord>
+}
+
 interface CanonicalRecordStore {
     suspend fun upsert(records: List<CanonicalRecord>): MergeResult
     suspend fun beginImport(): CanonicalImportSession
@@ -46,6 +51,9 @@ interface CanonicalRecordStore {
     suspend fun removeHealthConnectProjections(
         projections: List<HealthConnectProjection>,
     )
+    suspend fun <T> withExportSnapshot(
+        block: (CanonicalExportSnapshot) -> T,
+    ): T
 }
 
 interface CanonicalImportSession {
@@ -279,6 +287,41 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
 
     override suspend fun allRecords(): List<CanonicalRecord> =
         records.values.toList()
+
+    override suspend fun <T> withExportSnapshot(
+        block: (CanonicalExportSnapshot) -> T,
+    ): T {
+        val recordSnapshot = records.values
+            .sortedBy(CanonicalRecord::canonicalId)
+        val runSnapshot = runRecords.values
+            .sortedBy(ArchiveRunRecord::ordinal)
+        return block(
+            object : CanonicalExportSnapshot {
+                override fun recordsPage(
+                    afterCanonicalId: String?,
+                    limit: Int,
+                ): List<CanonicalRecord> = recordSnapshot
+                    .asSequence()
+                    .filter {
+                        afterCanonicalId == null ||
+                            it.canonicalId > afterCanonicalId
+                    }
+                    .take(limit)
+                    .toList()
+
+                override fun runRecordsPage(
+                    afterSequence: Long?,
+                    limit: Int,
+                ): List<ArchiveRunRecord> = runSnapshot
+                    .asSequence()
+                    .filter {
+                        afterSequence == null || it.ordinal > afterSequence
+                    }
+                    .take(limit)
+                    .toList()
+            },
+        )
+    }
 
     override suspend fun runRecordsPage(
         afterSequence: Long?,

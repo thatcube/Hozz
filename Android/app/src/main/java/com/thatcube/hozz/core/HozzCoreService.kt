@@ -80,7 +80,7 @@ class HozzCoreService(context: Context) {
     }
 
     suspend fun export(sink: ArchiveSink): ArchiveExportResult =
-        sink.open().use { output -> exporter.export(output) }
+        sink.write(exporter::export)
 
     fun close() {
         store.close()

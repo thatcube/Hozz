@@ -21,6 +21,8 @@ cannot resurrect something removed from Health.
 
 import argparse
 import hashlib
+import hmac
+import io
 import json
 import math
 import os
@@ -28,6 +30,7 @@ import re
 import sqlite3
 import struct
 import sys
+import tempfile
 import time
 import uuid
 import zipfile
@@ -62,6 +65,8 @@ MAX_INFLATED_BYTES = 64 * 1_024 * 1_024 * 1_024
 MAX_RECORD_LINES = 50_000_000
 MAX_RECORD_BYTES = 16 * 1_024 * 1_024
 MAX_PENDING_BATCH_BYTES = 64 * 1_024 * 1_024
+MAX_NETWORK_BODY_BYTES = 8 * 1_024 * 1_024
+MAX_ENVELOPE_BYTES = 1 * 1_024 * 1_024
 MAX_RUN_OCCURRENCE_KEYS = 100_000
 MAX_MANIFEST_BYTES = 256 * 1_024
 MAX_ENTRY_COMPRESSION_RATIO = 200
@@ -73,6 +78,8 @@ RFC3339 = re.compile(
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
 )
 SOURCE_NAMESPACE = re.compile(r"^[A-Za-z0-9._-]+$")
+SUPPORTED_ZIP_METHODS = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
+ZIP_ENCRYPTION_FLAGS = (1 << 0) | (1 << 6) | (1 << 13)
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS samples (
@@ -752,7 +759,12 @@ def canonical_id_for(store, record_id):
 
 def require_integer(record, field, prefix):
     value = record.get(field)
-    if isinstance(value, bool) or not isinstance(value, int):
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, int)
+        or value < -2_147_483_648
+        or value > 2_147_483_647
+    ):
         raise PartialBatch(f"{prefix} has an invalid {field}")
     return value
 
@@ -809,11 +821,16 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
     current_run = f"batch:{batch_key}" if batch_key else None
     occurrences = {}
     for index, line in enumerate(lines):
-        line = line.strip()
-        if not line:
+        if isinstance(line, bytes):
+            original_line = decode_utf8(line, f"line {index + 1}")
+        else:
+            original_line = line
+        original_line = original_line.removesuffix("\n").removesuffix("\r")
+        parse_line = original_line.strip()
+        if not parse_line:
             continue
         try:
-            record = parse_json(line)
+            record = parse_json(parse_line)
         except (json.JSONDecodeError, ValueError) as error:
             # Most often a body truncated by a dropped connection. Refusing the
             # whole batch makes Hozz retry it, which is exactly right.
@@ -836,7 +853,11 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
         if kind in RUN_KINDS:
             if record.get("run"):
                 current_run = record["run"]
-            stored_line = normalize_legacy_run_line(record)
+            stored_line = (
+                original_line
+                if strict_v1 or "schemaVersion" in record
+                else normalize_legacy_run_line(record)
+            )
             scope = current_run or "unscoped"
             fingerprint = hashlib.sha256(
                 f"{scope}\0{stored_line}".encode()
@@ -874,11 +895,9 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
 
         identity = record_identity(record)
         if identity is None:
-            if strict_v1:
-                raise PartialBatch(
-                    f"line {index + 1} has no canonical identity"
-                )
-            continue
+            raise PartialBatch(
+                f"line {index + 1} has no record identity"
+            )
         canonical_count += 1
         canonical_id, source_id, parent_id, version = identity
         resolution_id = nonempty_text(record.get("resolutionCanonicalId"))
@@ -933,7 +952,7 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
                 quantity.get("value", record.get("value")),
                 quantity.get("unit"),
                 source.get("name"),
-                line if isinstance(line, str) else line.decode(),
+                parse_line,
             ),
         )
         winner = db.execute(
@@ -1182,41 +1201,202 @@ def ingest_payload(db, payload, batch_key=None):
     """Handle NDJSON, a JSON array, or the compatible envelope."""
     if len(payload) > MAX_PENDING_BATCH_BYTES:
         raise PartialBatch("payload exceeds the pending import memory budget")
-    try:
-        text = payload.decode("utf-8").strip()
-    except UnicodeDecodeError as error:
-        raise PartialBatch("payload is not valid UTF-8") from error
-    if not text:
+    return ingest_seekable_stream(
+        db,
+        io.BytesIO(payload),
+        len(payload),
+        batch_key,
+    )
+
+
+def ingest_seekable_stream(db, stream, length, batch_key=None):
+    stream.seek(0)
+    first_offset = None
+    scanned = 0
+    while scanned < length:
+        chunk = stream.read(min(64 * 1_024, length - scanned))
+        if not chunk:
+            break
+        for index, value in enumerate(chunk):
+            if not chr(value).isspace():
+                first_offset = scanned + index
+                break
+        if first_offset is not None:
+            break
+        scanned += len(chunk)
+    if first_offset is None:
         return 0, 0, False
-
-    if text.startswith("["):
+    stream.seek(first_offset)
+    prefix = stream.read(min(length - first_offset, 512))
+    stream.seek(first_offset)
+    first = prefix[0]
+    if first == ord("{") and length - first_offset <= MAX_ENVELOPE_BYTES:
+        candidate = stream.read(length - first_offset)
+        stream.seek(first_offset)
         try:
-            return ingest_lines(
-                db,
-                [json.dumps(item) for item in parse_json(text)],
-                batch_key,
-            )
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    if text.startswith("{") and '"data"' in text[:200]:
-        try:
-            envelope = parse_json(text)
+            envelope = parse_json(decode_utf8(candidate, "payload"))
+        except (ValueError, TypeError):
+            envelope = None
+        if is_compatible_envelope(envelope):
             return ingest_compatible(db, envelope, batch_key)
-        except (json.JSONDecodeError, ValueError):
-            pass
 
-    return ingest_lines(db, text.splitlines(), batch_key)
+    if first == ord("["):
+        text = io.TextIOWrapper(stream, encoding="utf-8", errors="strict")
+        lines = iter_json_array_lines(text)
+    else:
+        stream.seek(0)
+        lines = iter_ndjson_lines(stream)
+    try:
+        stored, deleted, duplicate, _ = _ingest_lines(
+            db,
+            lines,
+            batch_key,
+        )
+        db.commit()
+        return stored, deleted, duplicate
+    except Exception:
+        db.rollback()
+        raise
+
+
+def iter_ndjson_lines(stream):
+    count = 0
+    while True:
+        raw = stream.readline(MAX_RECORD_BYTES + 2)
+        if not raw:
+            return
+        content = raw[:-1] if raw.endswith(b"\n") else raw
+        if content.endswith(b"\r"):
+            content = content[:-1]
+        if len(content) > MAX_RECORD_BYTES:
+            raise PartialBatch("record exceeds the byte limit")
+        if raw.strip():
+            count += 1
+            if count > MAX_RECORD_LINES:
+                raise PartialBatch("payload contains too many records")
+        yield raw
+
+
+def iter_json_array_lines(stream):
+    decoder = json.JSONDecoder(
+        parse_constant=lambda value: (_ for _ in ()).throw(
+            ValueError(f"{value} is not valid JSON")
+        )
+    )
+    buffer = ""
+    position = 0
+    eof = False
+
+    def read_more():
+        nonlocal buffer, position, eof
+        if position:
+            buffer = buffer[position:]
+            position = 0
+        chunk = stream.read(64 * 1_024)
+        if chunk == "":
+            eof = True
+        else:
+            buffer += chunk
+        if len(buffer.encode("utf-8")) > MAX_RECORD_BYTES + 64 * 1_024:
+            raise PartialBatch("JSON array item exceeds the byte limit")
+
+    read_more()
+    while True:
+        while position < len(buffer) and buffer[position].isspace():
+            position += 1
+        if position < len(buffer):
+            break
+        if eof:
+            raise PartialBatch("JSON array is empty or incomplete")
+        read_more()
+    if buffer[position] != "[":
+        raise PartialBatch("payload is not a JSON array")
+    position += 1
+    count = 0
+    expect_value = True
+    while True:
+        while True:
+            while position < len(buffer) and buffer[position].isspace():
+                position += 1
+            if position < len(buffer) or eof:
+                break
+            read_more()
+        if position < len(buffer) and buffer[position] == "]":
+            if expect_value and count > 0:
+                raise PartialBatch("JSON array has a trailing separator")
+            position += 1
+            trailing = buffer[position:]
+            while True:
+                chunk = stream.read(64 * 1_024)
+                if chunk == "":
+                    break
+                trailing += chunk
+                if len(trailing) > 64 * 1_024 and trailing.strip():
+                    raise PartialBatch("JSON array has trailing content")
+                if not trailing.strip():
+                    trailing = ""
+            if trailing.strip():
+                raise PartialBatch("JSON array has trailing content")
+            return
+        if not expect_value:
+            if position >= len(buffer) or buffer[position] != ",":
+                raise PartialBatch("JSON array has no item separator")
+            position += 1
+            expect_value = True
+            continue
+        try:
+            item_start = position
+            value, end = decoder.raw_decode(buffer, position)
+        except (json.JSONDecodeError, ValueError) as error:
+            if eof:
+                raise PartialBatch("JSON array item is incomplete") from error
+            read_more()
+            continue
+        position = end
+        if len(buffer[item_start:end].encode("utf-8")) > MAX_RECORD_BYTES:
+            raise PartialBatch("JSON array item exceeds the byte limit")
+        count += 1
+        if count > MAX_RECORD_LINES:
+            raise PartialBatch("payload contains too many records")
+        yield json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        expect_value = False
 
 
 def parse_content_length(value):
-    try:
-        length = int(value)
-    except (TypeError, ValueError) as error:
-        raise PartialBatch("Content-Length is not a nonnegative integer") from error
-    if length < 0:
+    if isinstance(value, int):
+        text = str(value)
+    elif isinstance(value, str):
+        text = value
+    else:
+        text = ""
+    if re.fullmatch(r"[0-9]+", text) is None:
         raise PartialBatch("Content-Length is not a nonnegative integer")
-    return length
+    if len(text) > 20:
+        raise PartialBatch("Content-Length is too large")
+    try:
+        return int(text)
+    except ValueError as error:
+        raise PartialBatch("Content-Length is too large") from error
+
+
+def is_compatible_envelope(value):
+    if not isinstance(value, dict):
+        return False
+    if any(key in value for key in ("kind", "id", "canonicalId", "type")):
+        return False
+    data = value.get("data")
+    if not isinstance(data, dict):
+        return False
+    return (
+        isinstance(data.get("metrics"), list)
+        or isinstance(data.get("deletions"), list)
+    )
+
+
+def nonempty_token(value):
+    if not value:
+        raise argparse.ArgumentTypeError("token must not be empty")
+    return value
 
 
 def ingest_compatible(db, envelope, batch_key=None):
@@ -1280,37 +1460,57 @@ def serve(args):
 
     class Handler(BaseHTTPRequestHandler):
         def do_POST(self):
-            if args.token:
+            if not args.allow_unauthenticated:
                 supplied = self.headers.get("Authorization", "")
-                if supplied != args.token:
+                if not hmac.compare_digest(
+                    supplied.encode("utf-8"),
+                    args.token.encode("utf-8"),
+                ):
                     return self.finish_with(401, {"error": "unauthorized"})
+            if self.headers.get("Transfer-Encoding"):
+                return self.finish_with(
+                    400,
+                    {"error": "Transfer-Encoding is not supported"},
+                )
 
+            lengths = self.headers.get_all("Content-Length", [])
+            if len(lengths) != 1:
+                return self.finish_with(
+                    400,
+                    {"error": "exactly one Content-Length is required"},
+                )
             try:
                 length = parse_content_length(
-                    self.headers.get("Content-Length", 0)
+                    lengths[0]
                 )
             except PartialBatch as error:
                 return self.finish_with(400, {"error": str(error)})
-            if length > MAX_PENDING_BATCH_BYTES:
+            if length > MAX_NETWORK_BODY_BYTES:
                 return self.finish_with(
                     413,
                     {"error": "payload exceeds the pending import memory budget"},
                 )
-            payload = self.rfile.read(length)
             key = self.headers.get("Idempotency-Key")
-
-            # A socket read returns short at EOF, so a connection dropped
-            # mid-post yields a truncated body. Storing part of it and
-            # answering 200 would lose the rest permanently.
-            if len(payload) != length:
-                return self.finish_with(400, {"error": "incomplete body"})
-
-            try:
-                stored, deleted, duplicate = ingest_payload(db, payload, key)
-            except PartialBatch as error:
-                return self.finish_with(400, {"error": str(error)})
-            except Exception as error:  # noqa: BLE001 - report, never crash
-                return self.finish_with(500, {"error": str(error)})
+            with tempfile.TemporaryFile() as body:
+                remaining = length
+                while remaining:
+                    chunk = self.rfile.read(min(remaining, 64 * 1_024))
+                    if not chunk:
+                        return self.finish_with(400, {"error": "incomplete body"})
+                    body.write(chunk)
+                    remaining -= len(chunk)
+                body.seek(0)
+                try:
+                    stored, deleted, duplicate = ingest_seekable_stream(
+                        db,
+                        body,
+                        length,
+                        key,
+                    )
+                except PartialBatch as error:
+                    return self.finish_with(400, {"error": str(error)})
+                except Exception as error:  # noqa: BLE001 - report, never crash
+                    return self.finish_with(500, {"error": str(error)})
 
             if duplicate:
                 print(f"batch {key[:8] if key else '?'} already stored")
@@ -1333,8 +1533,8 @@ def serve(args):
 
     print(f"Hozz receiver listening on http://0.0.0.0:{args.port}")
     print(f"Database: {os.path.abspath(args.database)}")
-    if not args.token:
-        print("No token set. Anyone on your network can post to this.")
+    if args.allow_unauthenticated:
+        print("Unauthenticated access was explicitly enabled.")
     HTTPServer(("0.0.0.0", args.port), Handler).serve_forever()
 
 
@@ -1435,7 +1635,12 @@ def ingest_file(db, path):
                                 raw = stream.readline(MAX_RECORD_BYTES + 2)
                                 if not raw:
                                     return
-                                if len(raw.rstrip(b"\r\n")) > MAX_RECORD_BYTES:
+                                content = (
+                                    raw[:-1] if raw.endswith(b"\n") else raw
+                                )
+                                if content.endswith(b"\r"):
+                                    content = content[:-1]
+                                if len(content) > MAX_RECORD_BYTES:
                                     raise PartialBatch(
                                         "archive record exceeds the byte limit"
                                     )
@@ -1475,44 +1680,14 @@ def ingest_file(db, path):
     file_size = path.stat().st_size
     if file_size > MAX_INFLATED_BYTES:
         raise PartialBatch("file exceeds the import byte limit")
-    if file_size <= MAX_PENDING_BATCH_BYTES:
-        stored, deleted, _ = ingest_payload(
+    with path.open("rb") as stream:
+        stored, deleted, _ = ingest_seekable_stream(
             db,
-            path.read_bytes(),
-            batch_key=file_batch_key,
+            stream,
+            file_size,
+            file_batch_key,
         )
         return stored, deleted
-    try:
-        line_count = 0
-
-        def lines():
-            nonlocal line_count
-            with path.open("rb") as stream:
-                while True:
-                    raw = stream.readline(MAX_RECORD_BYTES + 2)
-                    if not raw:
-                        return
-                    if len(raw.rstrip(b"\r\n")) > MAX_RECORD_BYTES:
-                        raise PartialBatch(
-                            "record exceeds the byte limit"
-                        )
-                    line = decode_utf8(raw, "record")
-                    if line.strip():
-                        line_count += 1
-                        if line_count > MAX_RECORD_LINES:
-                            raise PartialBatch("file contains too many records")
-                    yield line
-
-        stored, deleted, _, _ = _ingest_lines(
-            db,
-            lines(),
-            batch_key=file_batch_key,
-        )
-        db.commit()
-        return stored, deleted
-    except Exception:
-        db.rollback()
-        raise
 
 
 def decode_utf8(payload, field):
@@ -1597,6 +1772,11 @@ def count_central_directory_entries(stream, offset, length, file_size):
         header = stream.read(46)
         if len(header) != 46 or header[:4] != b"PK\x01\x02":
             raise PartialBatch("archive ZIP directory is malformed")
+        flags, method = struct.unpack_from("<HH", header, 8)
+        if flags & ZIP_ENCRYPTION_FLAGS:
+            raise PartialBatch("archive contains an encrypted ZIP entry")
+        if method not in SUPPORTED_ZIP_METHODS:
+            raise PartialBatch("archive uses an unsupported compression method")
         filename_length, extra_length, comment_length = struct.unpack_from(
             "<HHH",
             header,
@@ -1621,6 +1801,10 @@ def validate_zip_entries(infos):
     if total_inflated > MAX_INFLATED_BYTES:
         raise PartialBatch("archive expands beyond the byte limit")
     for info in infos:
+        if info.flag_bits & ZIP_ENCRYPTION_FLAGS:
+            raise PartialBatch("archive contains an encrypted ZIP entry")
+        if info.compress_type not in SUPPORTED_ZIP_METHODS:
+            raise PartialBatch("archive uses an unsupported compression method")
         if (
             info.file_size
             > info.compress_size * MAX_ENTRY_COMPRESSION_RATIO
@@ -1696,14 +1880,24 @@ def stats(args):
         print(f"{kind:<{width}}  {count:>9,}  {span}")
 
 
-def main():
+def build_argument_parser():
     parser = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     parser.add_argument("--database", default="health.db")
     sub = parser.add_subparsers(dest="command", required=True)
 
     serve_parser = sub.add_parser("serve", help="accept batches over HTTP")
     serve_parser.add_argument("--port", type=int, default=8765)
-    serve_parser.add_argument("--token", help="require this Authorization value")
+    authentication = serve_parser.add_mutually_exclusive_group(required=True)
+    authentication.add_argument(
+        "--token",
+        type=nonempty_token,
+        help="require this Authorization value",
+    )
+    authentication.add_argument(
+        "--allow-unauthenticated",
+        action="store_true",
+        help="explicitly accept unauthenticated network writes",
+    )
     serve_parser.set_defaults(func=serve)
 
     watch_parser = sub.add_parser("watch", help="import from a synced folder")
@@ -1715,8 +1909,11 @@ def main():
     stats_parser = sub.add_parser("stats", help="summarise what is stored")
     stats_parser.add_argument("--limit", type=int, default=25)
     stats_parser.set_defaults(func=stats)
+    return parser
 
-    args = parser.parse_args()
+
+def main():
+    args = build_argument_parser().parse_args()
     try:
         args.func(args)
     except KeyboardInterrupt:

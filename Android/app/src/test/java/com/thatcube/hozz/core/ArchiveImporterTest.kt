@@ -11,6 +11,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
@@ -588,6 +589,91 @@ class ArchiveImporterTest {
     }
 
     @Test
+    fun malformedLegacyOwnedFieldsNormalizeToStableStrictV1() = runBlocking {
+        val legacy =
+            """
+            {"canonicalId":"apple.healthkit:legacy-normalized","device":[],"endDate":"2026-01-01T00:01:00Z","id":"legacy-normalized","kind":"quantity","lineage":["bad",{"firstNote":"kept-1","package":"","recordId":"legacy-normalized","store":"apple.healthkit"},{"package":42,"recordId":"legacy-normalized","secondNote":"kept-2","store":"apple.healthkit"}],"metadata":"bad","quantity":{"original":{"description":"source text","unit":"native"},"unit":"count","value":1},"recordVersion":1,"schemaVersion":1,"source":"bad","sourceRecord":"bad","startDate":"2026-01-01T00:00:00Z","type":"steps","vendorExtension":"kept"}
+            """.trimIndent()
+        val source = InMemoryCanonicalRecordStore()
+        ArchiveImporter(source).import(
+            ByteArrayInputStream("$legacy\n".toByteArray()),
+        )
+        val first = ByteArrayOutputStream()
+        CanonicalArchiveExporter(source).export(first)
+        val target = InMemoryCanonicalRecordStore()
+        ArchiveImporter(target).import(ByteArrayInputStream(first.toByteArray()))
+        val second = ByteArrayOutputStream()
+        CanonicalArchiveExporter(target).export(second)
+
+        assertTrue(first.toByteArray().contentEquals(second.toByteArray()))
+        val normalized = CanonicalArchiveExporter(target)
+            .canonicalJson(target.allRecords().single())
+        val objectValue = Json.parseToJsonElement(normalized).jsonObject
+        assertEquals(2, objectValue["lineage"]!!.jsonArray.size)
+        assertEquals(
+            "kept-1",
+            objectValue["lineage"]!!.jsonArray[0]
+                .jsonObject["firstNote"]!!.jsonPrimitive.content,
+        )
+        assertEquals(
+            "kept-2",
+            objectValue["lineage"]!!.jsonArray[1]
+                .jsonObject["secondNote"]!!.jsonPrimitive.content,
+        )
+        assertEquals(
+            "42",
+            objectValue["lineage"]!!.jsonArray[1]
+                .jsonObject["package"]!!.jsonPrimitive.content,
+        )
+        assertFalse(
+            objectValue["lineage"]!!.jsonArray[0]
+                .jsonObject.containsKey("package"),
+        )
+        val original = objectValue["quantity"]!!
+            .jsonObject["original"]!!
+            .jsonObject
+        assertEquals(
+            "source text",
+            original["description"]!!.jsonPrimitive.content,
+        )
+        assertEquals("native", original["unit"]!!.jsonPrimitive.content)
+        assertEquals(
+            "kept",
+            objectValue["vendorExtension"]!!.jsonPrimitive.content,
+        )
+        CanonicalRecordParser.validateStrict(normalized)
+    }
+
+    @Test
+    fun legacyLineageWithoutOriginNormalizesToSourceOrigin() = runBlocking {
+        val legacy =
+            """
+            {"canonicalId":"apple.healthkit:lineage-origin","endDate":"2026-01-01T00:01:00Z","id":"lineage-origin","kind":"quantity","lineage":[{"recordId":"other","store":"invalid:store"}],"quantity":{"unit":"count","value":1},"recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"lineage-origin","store":"apple.healthkit","type":"steps"},"startDate":"2026-01-01T00:00:00Z","type":"steps"}
+            """.trimIndent()
+        val store = InMemoryCanonicalRecordStore()
+        ArchiveImporter(store).import(
+            ByteArrayInputStream("$legacy\n".toByteArray()),
+        )
+
+        val line = CanonicalArchiveExporter(store)
+            .canonicalJson(store.allRecords().single())
+        val lineage = Json.parseToJsonElement(line)
+            .jsonObject["lineage"]!!
+            .jsonArray
+
+        assertEquals(1, lineage.size)
+        assertEquals(
+            "apple.healthkit",
+            lineage.single().jsonObject["store"]!!.jsonPrimitive.content,
+        )
+        assertEquals(
+            "lineage-origin",
+            lineage.single().jsonObject["recordId"]!!.jsonPrimitive.content,
+        )
+        CanonicalRecordParser.validateStrict(line)
+    }
+
+    @Test
     fun explicitFutureRunSchemaIsNeverDowngradedToV1() = runBlocking {
         val future =
             """{"kind":"typeSummary","schemaVersion":2,"type":"steps","state":"complete"}"""
@@ -603,6 +689,32 @@ class ArchiveImporterTest {
         }
 
         assertTrue(failed)
+        assertTrue(store.runRecordsPage(null, 10).isEmpty())
+    }
+
+    @Test
+    fun normalizedLegacyRunCannotGrowPastCanonicalLimit() = runBlocking {
+        val run =
+            """{"kind":"typeSummary","padding":"fixture","state":"complete","type":"steps"}"""
+        val archive = zip(
+            listOf("records.ndjson" to "$run\n".toByteArray()),
+        )
+        val store = InMemoryCanonicalRecordStore()
+        var rejected = false
+
+        try {
+            ArchiveImporter(
+                store,
+                limits = ArchiveImportLimits(
+                    maxLegacyRecordBytes = run.toByteArray().size,
+                    maxCanonicalRecordBytes = run.toByteArray().size,
+                ),
+            ).import(ByteArrayInputStream(archive))
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+
+        assertTrue(rejected)
         assertTrue(store.runRecordsPage(null, 10).isEmpty())
     }
 
@@ -883,6 +995,55 @@ class ArchiveImporterTest {
         assertTrue(rejected)
         assertTrue(runStore.runRecordsPage(null, 10).isEmpty())
     }
+
+    @Test
+    fun acceptedLegacyRecordHasCanonicalNormalizationHeadroom() = runBlocking {
+        val legacy =
+            """
+            {"endDate":"2026-01-01T00:01:00Z","id":"headroom","kind":"quantity","padding":"${"x".repeat(447 * 1_024 + 700)}","quantity":{"unit":"count","value":1},"schemaVersion":1,"startDate":"2026-01-01T00:00:00Z","type":"steps"}
+            """.trimIndent()
+        val store = InMemoryCanonicalRecordStore()
+
+        ArchiveImporter(store).import(
+            ByteArrayInputStream("$legacy\n".toByteArray()),
+        )
+        val normalized = CanonicalArchiveExporter(store)
+            .canonicalJson(store.allRecords().single())
+
+        val archive = ByteArrayOutputStream()
+        CanonicalArchiveExporter(store).export(archive)
+        val restored = InMemoryCanonicalRecordStore()
+        ArchiveImporter(restored).import(
+            ByteArrayInputStream(archive.toByteArray()),
+        )
+        assertTrue(normalized.toByteArray().size <= 512 * 1_024)
+        assertTrue(normalized.toByteArray().size > 448 * 1_024)
+        assertEquals(1, restored.recordCount())
+        CanonicalRecordParser.validateStrict(normalized)
+    }
+
+    @Test
+    fun legacyRecordThatExpandsPastCanonicalLimitRejectsAtomically() =
+        runBlocking {
+            val repeated = "x".repeat(90 * 1_024)
+            val legacy =
+                """
+                {"endDate":"2026-01-01T00:01:00Z","id":"$repeated","kind":"quantity","quantity":{"unit":"count","value":1},"schemaVersion":1,"startDate":"2026-01-01T00:00:00Z","type":"$repeated"}
+                """.trimIndent()
+            val store = InMemoryCanonicalRecordStore()
+            var rejected = false
+
+            try {
+                ArchiveImporter(store).import(
+                    ByteArrayInputStream("$legacy\n".toByteArray()),
+                )
+            } catch (_: ArchiveFormatException) {
+                rejected = true
+            }
+
+            assertTrue(rejected)
+            assertTrue(store.allRecords().isEmpty())
+        }
 
     @Test
     fun continuationFailureResolvesOnlyOnEndMarkerOrDeletion() = runBlocking {

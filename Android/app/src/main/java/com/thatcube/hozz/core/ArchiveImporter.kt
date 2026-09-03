@@ -24,7 +24,8 @@ data class ArchiveImportLimits(
     val maxZipEntries: Long = 1_024,
     val maxInflatedBytes: Long = 64L * 1_024 * 1_024 * 1_024,
     val maxRecordLines: Long = 50_000_000,
-    val maxRecordBytes: Int = 16 * 1_024 * 1_024,
+    val maxLegacyRecordBytes: Int = 448 * 1_024,
+    val maxCanonicalRecordBytes: Int = 512 * 1_024,
     val maxPendingBatchBytes: Long = 64L * 1_024 * 1_024,
     val maxRunOccurrenceKeys: Int = 100_000,
     val maxManifestBytes: Int = 256 * 1_024,
@@ -69,6 +70,7 @@ class ArchiveImporter(
                     strictV1 = false,
                     collectStrictFailure = false,
                 )
+                stats.legacyNormalizationFailure?.let { throw it }
                 ParsedArchive(
                     manifest = null,
                     legacyArchive = true,
@@ -166,6 +168,14 @@ class ArchiveImporter(
             ?: throw ArchiveFormatException("The archive contains no NDJSON records.")
         if (manifest != null) {
             stats.strictFailure?.let { throw it }
+            stats.legacyNormalizationFailure?.let { throw it }
+        } else {
+            if (stats.largestRecordBytes > limits.maxLegacyRecordBytes) {
+                throw ArchiveFormatException(
+                    "A legacy ZIP record exceeds the legacy byte limit.",
+                )
+            }
+            stats.legacyNormalizationFailure?.let { throw it }
         }
         return ParsedArchive(
             manifest = manifest,
@@ -186,12 +196,16 @@ class ArchiveImporter(
         var runRecordsPreserved = 0
         var nonblankLines = 0L
         var firstStrictFailure: ArchiveFormatException? = null
+        var firstLegacyNormalizationFailure: ArchiveFormatException? = null
         var currentRun: String? = null
         var pendingBytes = 0L
         var peakPendingBytes = 0L
         val occurrences = mutableMapOf<String, Int>()
         val batch = mutableListOf<CanonicalRecord>()
         val runBatch = mutableListOf<ArchiveRunRecord>()
+        val normalizer = CanonicalArchiveExporter(
+            InMemoryCanonicalRecordStore(),
+        )
 
         suspend fun flushPending() {
             if (batch.isNotEmpty()) {
@@ -205,12 +219,19 @@ class ArchiveImporter(
             pendingBytes = 0
         }
 
-        readLines(input) { line ->
+        val lineLimit = if (strictV1 || collectStrictFailure) {
+            limits.maxCanonicalRecordBytes
+        } else {
+            limits.maxLegacyRecordBytes
+        }
+        var largestRecordBytes = 0
+        readLines(input, lineLimit) { line ->
             if (line.isBlank()) {
                 return@readLines
             }
             val rawLine = line.removeSuffix("\r")
             val rawBytes = rawLine.toByteArray().size.toLong()
+            largestRecordBytes = maxOf(largestRecordBytes, rawBytes.toInt())
             if (rawBytes > limits.maxPendingBatchBytes) {
                 throw ArchiveFormatException(
                     "A record exceeds the pending import memory budget.",
@@ -249,6 +270,14 @@ class ArchiveImporter(
                     rawLine
                 } else {
                     CanonicalRecordParser.normalizedRunLine(rawLine)
+                }
+                if (
+                    storedLine.toByteArray().size >
+                    limits.maxCanonicalRecordBytes
+                ) {
+                    throw ArchiveFormatException(
+                        "A normalized run record exceeds the canonical limit.",
+                    )
                 }
                 CanonicalRecordParser.runIdentifier(storedLine)?.let { run ->
                     currentRun = run
@@ -289,6 +318,16 @@ class ArchiveImporter(
                 )
             }
             checkNotNull(record)
+            if (firstLegacyNormalizationFailure == null) {
+                try {
+                    normalizer.canonicalJson(record)
+                } catch (error: Exception) {
+                    firstLegacyNormalizationFailure = ArchiveFormatException(
+                        "Record line $nonblankLines cannot be normalized to v1: " +
+                            (error.message ?: error::class.simpleName),
+                    )
+                }
+            }
             recordsRead += 1
             batch += record
             pendingBytes += rawBytes
@@ -301,11 +340,14 @@ class ArchiveImporter(
             runRecordsPreserved = runRecordsPreserved,
             strictFailure = firstStrictFailure,
             peakPendingBytes = peakPendingBytes,
+            largestRecordBytes = largestRecordBytes,
+            legacyNormalizationFailure = firstLegacyNormalizationFailure,
         )
     }
 
     private suspend fun readLines(
         input: InputStream,
+        maxRecordBytes: Int,
         consume: suspend (String) -> Unit,
     ) {
         val line = ByteArrayOutputStream()
@@ -325,10 +367,10 @@ class ArchiveImporter(
                     line.reset()
                 } else {
                     line.write(byte.toInt())
-                    if (line.size() > limits.maxRecordBytes) {
+                    if (line.size() > maxRecordBytes) {
                         throw ArchiveFormatException(
                             "A record exceeds the " +
-                                "${limits.maxRecordBytes / (1_024 * 1_024)} MiB limit.",
+                                "$maxRecordBytes byte limit.",
                         )
                     }
                 }
@@ -373,6 +415,8 @@ class ArchiveImporter(
         val runRecordsPreserved: Int,
         val strictFailure: ArchiveFormatException?,
         val peakPendingBytes: Long,
+        val largestRecordBytes: Int,
+        val legacyNormalizationFailure: ArchiveFormatException?,
     )
 
     private data class ParsedArchive(

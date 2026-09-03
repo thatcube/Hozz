@@ -7,12 +7,14 @@ import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import java.time.Instant
 import java.util.UUID
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class SqliteCanonicalRecordStore(
     context: Context,
     databaseName: String = "hozz-archive.sqlite",
 ) :
-    SQLiteOpenHelper(context, databaseName, null, 9),
+    SQLiteOpenHelper(context, databaseName, null, 10),
     CanonicalRecordStore {
 
     override fun onCreate(database: SQLiteDatabase) {
@@ -50,7 +52,6 @@ class SqliteCanonicalRecordStore(
             )
             """.trimIndent(),
         )
-        createStageTable(database)
         createRunRecordTables(database)
         createHealthConnectProjectionTable(database)
         database.execSQL(
@@ -145,6 +146,7 @@ class SqliteCanonicalRecordStore(
                 )
             }
             if (
+                hasTable(database, "canonical_record_stage") &&
                 !hasColumn(
                     database,
                     "canonical_record_stage",
@@ -158,13 +160,16 @@ class SqliteCanonicalRecordStore(
             }
             restoreContinuationErrors(database)
         }
+        if (oldVersion < 10) {
+            database.execSQL("DROP TABLE IF EXISTS main.canonical_record_stage")
+            database.execSQL("DROP TABLE IF EXISTS main.archive_run_record_stage")
+        }
         reconcileEncodingFailures(database)
     }
 
     override fun onOpen(database: SQLiteDatabase) {
         super.onOpen(database)
-        database.delete("canonical_record_stage", null, null)
-        database.delete("archive_run_record_stage", null, null)
+        createTemporaryStageTables(database)
     }
 
     override suspend fun upsert(records: List<CanonicalRecord>): MergeResult {
@@ -180,46 +185,56 @@ class SqliteCanonicalRecordStore(
     }
 
     override suspend fun beginImport(): CanonicalImportSession {
+        val database = writableDatabase
         val sessionId = UUID.randomUUID().toString()
         return object : CanonicalImportSession {
             private var finished = false
+            private val mutex = Mutex()
+            private var expectedCanonicalCount = 0L
+            private var expectedRunCount = 0L
 
-            override suspend fun append(records: List<CanonicalRecord>) {
-                check(!finished)
-                val database = writableDatabase
-                database.beginTransaction()
-                try {
-                    for (record in records) {
-                        val stagedVersion = existingVersion(
-                            database = database,
-                            table = "canonical_record_stage",
-                            canonicalId = record.canonicalId,
-                            sessionId = sessionId,
-                        )
-                        if (stagedVersion == null) {
-                            database.insertOrThrow(
-                                "canonical_record_stage",
-                                null,
-                                stageValues(sessionId, record),
+            override suspend fun append(records: List<CanonicalRecord>) =
+                mutex.withLock {
+                    check(!finished)
+                    database.beginTransaction()
+                    try {
+                        for (record in records) {
+                            val stagedVersion = existingVersion(
+                                database = database,
+                                table = "canonical_record_stage",
+                                canonicalId = record.canonicalId,
+                                sessionId = sessionId,
                             )
-                        } else if (record.recordVersion > stagedVersion) {
-                            database.update(
-                                "canonical_record_stage",
-                                stageValues(sessionId, record),
-                                "session_id = ? AND canonical_id = ?",
-                                arrayOf(sessionId, record.canonicalId),
-                            )
+                            if (stagedVersion == null) {
+                                database.insertOrThrow(
+                                    "canonical_record_stage",
+                                    null,
+                                    stageValues(sessionId, record),
+                                )
+                            } else if (record.recordVersion > stagedVersion) {
+                                database.update(
+                                    "canonical_record_stage",
+                                    stageValues(sessionId, record),
+                                    "session_id = ? AND canonical_id = ?",
+                                    arrayOf(sessionId, record.canonicalId),
+                                )
+                            }
                         }
+                        expectedCanonicalCount = stageCount(
+                            database,
+                            "canonical_record_stage",
+                            sessionId,
+                        )
+                        database.setTransactionSuccessful()
+                    } finally {
+                        database.endTransaction()
                     }
-                    database.setTransactionSuccessful()
-                } finally {
-                    database.endTransaction()
                 }
-            }
 
-            override suspend fun appendRunRecords(records: List<ArchiveRunRecord>) {
+            override suspend fun appendRunRecords(
+                records: List<ArchiveRunRecord>,
+            ) = mutex.withLock {
                 check(!finished)
-                val database = writableDatabase
                 database.beginTransaction()
                 try {
                     for (record in records) {
@@ -230,17 +245,33 @@ class SqliteCanonicalRecordStore(
                             SQLiteDatabase.CONFLICT_REPLACE,
                         )
                     }
+                    expectedRunCount = stageCount(
+                        database,
+                        "archive_run_record_stage",
+                        sessionId,
+                    )
                     database.setTransactionSuccessful()
                 } finally {
                     database.endTransaction()
                 }
             }
 
-            override suspend fun commit(): MergeResult {
+            override suspend fun commit(): MergeResult = mutex.withLock {
                 check(!finished)
-                val database = writableDatabase
                 database.beginTransaction()
-                try {
+                val result = try {
+                    verifyStageCount(
+                        database,
+                        "canonical_record_stage",
+                        sessionId,
+                        expectedCanonicalCount,
+                    )
+                    verifyStageCount(
+                        database,
+                        "archive_run_record_stage",
+                        sessionId,
+                        expectedRunCount,
+                    )
                     var result = MergeResult()
                     database.query(
                         "canonical_record_stage",
@@ -279,27 +310,33 @@ class SqliteCanonicalRecordStore(
                         arrayOf(sessionId),
                     )
                     database.setTransactionSuccessful()
-                    finished = true
-                    return result
+                    result
                 } finally {
                     database.endTransaction()
                 }
+                finished = true
+                result
             }
 
-            override suspend fun discard() {
-                if (!finished) {
-                    writableDatabase.delete(
+            override suspend fun discard() = mutex.withLock {
+                if (finished) return@withLock
+                database.beginTransaction()
+                try {
+                    database.delete(
                         "canonical_record_stage",
                         "session_id = ?",
                         arrayOf(sessionId),
                     )
-                    writableDatabase.delete(
+                    database.delete(
                         "archive_run_record_stage",
                         "session_id = ?",
                         arrayOf(sessionId),
                     )
-                    finished = true
+                    database.setTransactionSuccessful()
+                } finally {
+                    database.endTransaction()
                 }
+                finished = true
             }
         }
     }
@@ -325,8 +362,18 @@ class SqliteCanonicalRecordStore(
     override suspend fun recordsPage(
         afterCanonicalId: String?,
         limit: Int,
+    ): List<CanonicalRecord> = recordsPage(
+        readableDatabase,
+        afterCanonicalId,
+        limit,
+    )
+
+    private fun recordsPage(
+        database: SQLiteDatabase,
+        afterCanonicalId: String?,
+        limit: Int,
     ): List<CanonicalRecord> =
-        readableDatabase.query(
+        database.query(
             "canonical_record",
             null,
             afterCanonicalId?.let { "canonical_id > ?" },
@@ -371,8 +418,18 @@ class SqliteCanonicalRecordStore(
     override suspend fun runRecordsPage(
         afterSequence: Long?,
         limit: Int,
+    ): List<ArchiveRunRecord> = runRecordsPage(
+        readableDatabase,
+        afterSequence,
+        limit,
+    )
+
+    private fun runRecordsPage(
+        database: SQLiteDatabase,
+        afterSequence: Long?,
+        limit: Int,
     ): List<ArchiveRunRecord> =
-        readableDatabase.query(
+        database.query(
             "archive_run_record",
             null,
             afterSequence?.let { "sequence > ?" },
@@ -396,6 +453,43 @@ class SqliteCanonicalRecordStore(
                 }
             }
         }
+
+    override suspend fun <T> withExportSnapshot(
+        block: (CanonicalExportSnapshot) -> T,
+    ): T {
+        val database = readableDatabase
+        database.execSQL("BEGIN DEFERRED TRANSACTION")
+        return try {
+            val result = block(
+                object : CanonicalExportSnapshot {
+                    override fun recordsPage(
+                        afterCanonicalId: String?,
+                        limit: Int,
+                    ): List<CanonicalRecord> =
+                        this@SqliteCanonicalRecordStore.recordsPage(
+                            database,
+                            afterCanonicalId,
+                            limit,
+                        )
+
+                    override fun runRecordsPage(
+                        afterSequence: Long?,
+                        limit: Int,
+                    ): List<ArchiveRunRecord> =
+                        this@SqliteCanonicalRecordStore.runRecordsPage(
+                            database,
+                            afterSequence,
+                            limit,
+                        )
+                },
+            )
+            database.execSQL("COMMIT")
+            result
+        } catch (error: Throwable) {
+            database.execSQL("ROLLBACK")
+            throw error
+        }
+    }
 
     override suspend fun healthConnectProjections(
         canonicalIds: Set<String>,
@@ -437,27 +531,39 @@ class SqliteCanonicalRecordStore(
         database.beginTransaction()
         try {
             for (projection in projections) {
-                database.execSQL(
+                val currentVersion = database.rawQuery(
                     """
-                    INSERT INTO health_connect_projection
-                        (canonical_id, target_record, canonical_version,
-                         health_connect_record_id)
-                    VALUES (?, ?, ?, ?)
-                    ON CONFLICT(canonical_id) DO UPDATE SET
-                        target_record = excluded.target_record,
-                        canonical_version = excluded.canonical_version,
-                        health_connect_record_id =
-                            excluded.health_connect_record_id
-                    WHERE excluded.canonical_version >=
-                          health_connect_projection.canonical_version
+                    SELECT canonical_version
+                    FROM health_connect_projection
+                    WHERE canonical_id = ?
                     """.trimIndent(),
-                    arrayOf<Any>(
-                        projection.canonicalId,
-                        projection.targetRecord,
-                        projection.canonicalVersion,
+                    arrayOf(projection.canonicalId),
+                ).use { cursor ->
+                    if (cursor.moveToFirst()) cursor.getLong(0) else null
+                }
+                val values = ContentValues().apply {
+                    put("canonical_id", projection.canonicalId)
+                    put("target_record", projection.targetRecord)
+                    put("canonical_version", projection.canonicalVersion)
+                    put(
+                        "health_connect_record_id",
                         projection.healthConnectRecordId,
-                    ),
-                )
+                    )
+                }
+                if (currentVersion == null) {
+                    database.insertOrThrow(
+                        "health_connect_projection",
+                        null,
+                        values,
+                    )
+                } else if (projection.canonicalVersion >= currentVersion) {
+                    database.update(
+                        "health_connect_projection",
+                        values,
+                        "canonical_id = ?",
+                        arrayOf(projection.canonicalId),
+                    )
+                }
             }
             database.setTransactionSuccessful()
         } finally {
@@ -506,31 +612,34 @@ class SqliteCanonicalRecordStore(
     private fun restoreUnresolvedContinuationErrors(database: SQLiteDatabase) {
         database.execSQL(
             """
-            UPDATE canonical_record AS child
+            UPDATE canonical_record
             SET tombstone = 0,
-                record_version = child.record_version + 1
-            WHERE child.kind = 'sampleEncodingError'
-              AND child.resolution_canonical_id IS NOT NULL
-              AND child.tombstone = 1
+                record_version = record_version + 1
+            WHERE kind = 'sampleEncodingError'
+              AND resolution_canonical_id IS NOT NULL
+              AND tombstone = 1
               AND NOT EXISTS (
                   SELECT 1
                   FROM canonical_record AS parent
-                  WHERE parent.canonical_id = child.parent_canonical_id
+                  WHERE parent.canonical_id =
+                            canonical_record.parent_canonical_id
                     AND parent.tombstone = 1
               )
               AND NOT EXISTS (
                   SELECT 1
                   FROM canonical_record AS resolver
                   WHERE resolver.canonical_id =
-                            child.resolution_canonical_id
-                    AND resolver.type = child.type
+                            canonical_record.resolution_canonical_id
+                    AND resolver.type = canonical_record.type
                     AND resolver.parent_canonical_id =
-                            child.parent_canonical_id
+                            canonical_record.parent_canonical_id
                     AND resolver.tombstone = 0
                     AND resolver.kind = CASE
-                        WHEN child.type = 'HKWorkoutRouteTypeIdentifier'
+                        WHEN canonical_record.type =
+                                'HKWorkoutRouteTypeIdentifier'
                             THEN 'workoutRouteEnd'
-                        WHEN child.type = 'HKDataTypeIdentifierElectrocardiogram'
+                        WHEN canonical_record.type =
+                                'HKDataTypeIdentifierElectrocardiogram'
                             THEN 'electrocardiogramEnd'
                         ELSE 'quantitySeriesEnd'
                     END
@@ -542,45 +651,47 @@ class SqliteCanonicalRecordStore(
     private fun reconcileEncodingFailures(database: SQLiteDatabase) {
         database.execSQL(
             """
-            UPDATE canonical_record AS child
+            UPDATE canonical_record
             SET tombstone = 1,
                 record_version = MAX(
-                    child.record_version + 1,
+                    canonical_record.record_version + 1,
                     (
                         SELECT resolver.record_version + 1
                         FROM canonical_record AS resolver
                         WHERE resolver.canonical_id = COALESCE(
-                            child.resolution_canonical_id,
-                            child.parent_canonical_id
+                            canonical_record.resolution_canonical_id,
+                            canonical_record.parent_canonical_id
                         )
                     )
                 )
-            WHERE child.kind = 'sampleEncodingError'
-              AND child.tombstone = 0
+            WHERE kind = 'sampleEncodingError'
+              AND tombstone = 0
               AND EXISTS (
                   SELECT 1
                   FROM canonical_record AS resolver
                   WHERE resolver.canonical_id = COALESCE(
-                      child.resolution_canonical_id,
-                      child.parent_canonical_id
+                      canonical_record.resolution_canonical_id,
+                      canonical_record.parent_canonical_id
                   )
                     AND resolver.kind != 'sampleEncodingError'
                     AND resolver.tombstone = 0
                     AND (
-                        child.resolution_canonical_id IS NULL
+                        canonical_record.resolution_canonical_id IS NULL
                         OR (
                             resolver.kind IN (
                                 CASE
-                                    WHEN child.type = 'HKWorkoutRouteTypeIdentifier'
+                                    WHEN canonical_record.type =
+                                            'HKWorkoutRouteTypeIdentifier'
                                         THEN 'workoutRouteEnd'
-                                    WHEN child.type = 'HKDataTypeIdentifierElectrocardiogram'
+                                    WHEN canonical_record.type =
+                                            'HKDataTypeIdentifierElectrocardiogram'
                                         THEN 'electrocardiogramEnd'
                                     ELSE 'quantitySeriesEnd'
                                 END
                             )
-                            AND resolver.type = child.type
+                            AND resolver.type = canonical_record.type
                             AND resolver.parent_canonical_id =
-                                child.parent_canonical_id
+                                canonical_record.parent_canonical_id
                         )
                     )
               )
@@ -781,6 +892,31 @@ class SqliteCanonicalRecordStore(
         if (cursor.moveToFirst()) cursor.getLong(0) else null
     }
 
+    private fun stageCount(
+        database: SQLiteDatabase,
+        table: String,
+        sessionId: String,
+    ): Long = database.rawQuery(
+        "SELECT COUNT(*) FROM $table WHERE session_id = ?",
+        arrayOf(sessionId),
+    ).use { cursor ->
+        if (cursor.moveToFirst()) cursor.getLong(0) else 0
+    }
+
+    private fun verifyStageCount(
+        database: SQLiteDatabase,
+        table: String,
+        sessionId: String,
+        expected: Long,
+    ) {
+        val actual = stageCount(database, table, sessionId)
+        if (actual != expected) {
+            throw ArchiveFormatException(
+                "The active import staging set changed before commit.",
+            )
+        }
+    }
+
     private fun values(record: CanonicalRecord): ContentValues = ContentValues().apply {
         put("canonical_id", record.canonicalId)
         put("parent_canonical_id", record.parentCanonicalId)
@@ -936,9 +1072,48 @@ class SqliteCanonicalRecordStore(
                 )
                 """.trimIndent(),
             )
+        }
+
+        fun createTemporaryStageTables(database: SQLiteDatabase) {
             database.execSQL(
                 """
-                CREATE TABLE IF NOT EXISTS archive_run_record_stage (
+                CREATE TEMP TABLE IF NOT EXISTS canonical_record_stage (
+                    session_id TEXT NOT NULL,
+                    canonical_id TEXT NOT NULL,
+                    parent_canonical_id TEXT,
+                    resolution_canonical_id TEXT,
+                    record_version INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    canonical_type TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    start_time TEXT,
+                    end_time TEXT,
+                    canonical_value REAL,
+                    canonical_unit TEXT,
+                    canonical_description TEXT,
+                    original_value REAL,
+                    original_unit TEXT,
+                    original_description TEXT,
+                    category_value INTEGER,
+                    activity_type INTEGER,
+                    quantity_count INTEGER,
+                    source_record_id TEXT NOT NULL,
+                    source_record_version INTEGER,
+                    source_store TEXT NOT NULL,
+                    source_bundle_identifier TEXT,
+                    source_name TEXT,
+                    device_json TEXT,
+                    metadata_json TEXT,
+                    lineage_json TEXT NOT NULL,
+                    tombstone INTEGER NOT NULL,
+                    raw_json TEXT NOT NULL,
+                    PRIMARY KEY (session_id, canonical_id)
+                )
+                """.trimIndent(),
+            )
+            database.execSQL(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS archive_run_record_stage (
                     session_id TEXT NOT NULL,
                     ordinal INTEGER NOT NULL,
                     fingerprint TEXT NOT NULL,
@@ -963,6 +1138,15 @@ class SqliteCanonicalRecordStore(
             generateSequence { if (cursor.moveToNext()) cursor else null }
                 .any { it.getString(name) == column }
         }
+
+        fun hasTable(database: SQLiteDatabase, table: String): Boolean =
+            database.rawQuery(
+                """
+                SELECT 1 FROM sqlite_master
+                WHERE type = 'table' AND name = ?
+                """.trimIndent(),
+                arrayOf(table),
+            ).use(Cursor::moveToFirst)
 
         private data class StoredRecordState(
             val recordVersion: Long,

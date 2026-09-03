@@ -64,6 +64,18 @@ the canonical identity/provenance contract must be imported through the
 sidecar-less legacy path; Hozz does not silently reinterpret a malformed v1
 sidecar as legacy.
 
+Android stages a complete export in app-private storage before touching the SAF
+document. The final write uses explicit truncate mode and verifies byte count
+and SHA-256. Generic document providers cannot promise atomic replacement of an
+existing document from an `ACTION_CREATE_DOCUMENT` URI, so Hozz refuses to
+overwrite non-empty documents unless a destination implementation can guarantee
+safe replacement.
+
+Canonical import staging is connection-local and disappears only with its
+owning database connection. Export digest, manifest, count, and payload are read
+inside one SQLite snapshot. Individual NDJSON records are limited to 512 KiB so
+the full canonical row remains below API 28 CursorWindow limits.
+
 | Hozz canonical type | Apple source | Health Connect target | Fidelity |
 | --- | --- | --- | --- |
 | `activity.steps` | Step Count | — | Archive-only until overlapping Apple sources can be resolved without inflating totals |

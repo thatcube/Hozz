@@ -5,9 +5,14 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.OutputStream
 import java.time.Instant
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -75,6 +80,149 @@ class SqliteCanonicalRecordStoreTest {
 
         assertTrue(failed)
         assertTrue(store.allRecords().isEmpty())
+    }
+
+    @Test
+    fun secondStoreInstanceCannotEraseActiveImportStaging() = runBlocking {
+        val session = store.beginImport()
+        val staged = record(version = 1, tombstone = false)
+        session.append(listOf(staged))
+        val second = SqliteCanonicalRecordStore(context, databaseName)
+        try {
+            assertEquals(0, second.recordCount())
+            session.commit()
+            assertEquals(listOf(staged), second.allRecords())
+        } finally {
+            second.close()
+        }
+    }
+
+    @Test
+    fun concurrentImportSessionsRemainIsolated() = runBlocking {
+        val firstSession = store.beginImport()
+        val firstRecord = record(version = 1, tombstone = false)
+        firstSession.append(listOf(firstRecord))
+        val secondStore = SqliteCanonicalRecordStore(context, databaseName)
+        val secondSession = secondStore.beginImport()
+        val secondRecord = firstRecord.copy(
+            canonicalId = "apple.healthkit:second-session",
+            sourceRecordId = "second-session",
+            lineage = listOf(
+                SourceLineage("apple.healthkit", recordId = "second-session"),
+            ),
+        )
+        try {
+            secondSession.append(listOf(secondRecord))
+            firstSession.discard()
+            secondSession.commit()
+
+            assertEquals(listOf(secondRecord), store.allRecords())
+        } finally {
+            secondStore.close()
+        }
+    }
+
+    @Test
+    fun closingOwnerReapsOnlyItsUncommittedTemporaryStaging() = runBlocking {
+        val session = store.beginImport()
+        session.append(listOf(record(version = 1, tombstone = false)))
+        store.close()
+        var commitFailed = false
+        try {
+            session.commit()
+        } catch (_: IllegalStateException) {
+            commitFailed = true
+        } catch (_: android.database.sqlite.SQLiteException) {
+            commitFailed = true
+        }
+        assertTrue(commitFailed)
+
+        store = SqliteCanonicalRecordStore(context, databaseName)
+        assertTrue(store.allRecords().isEmpty())
+    }
+
+    @Test
+    fun exportUsesOneSnapshotAcrossDigestManifestAndPayload() = runBlocking {
+        val first = record(version = 1, tombstone = false)
+        val second = first.copy(
+            canonicalId = "apple.healthkit:second",
+            sourceRecordId = "second",
+            lineage = listOf(
+                SourceLineage("apple.healthkit", recordId = "second"),
+            ),
+        )
+        store.upsert(listOf(first))
+        val writer = SqliteCanonicalRecordStore(context, databaseName)
+        val output = ByteArrayOutputStream()
+        val writing = CountDownLatch(1)
+        val continueWriting = CountDownLatch(1)
+        val blocked = object : OutputStream() {
+            private var firstWrite = true
+
+            override fun write(value: Int) {
+                if (firstWrite) {
+                    firstWrite = false
+                    writing.countDown()
+                    check(continueWriting.await(10, TimeUnit.SECONDS))
+                }
+                output.write(value)
+            }
+
+            override fun write(buffer: ByteArray, offset: Int, length: Int) {
+                for (index in offset until offset + length) {
+                    write(buffer[index].toInt())
+                }
+            }
+        }
+        try {
+            val export = async(Dispatchers.IO) {
+                CanonicalArchiveExporter(store).export(blocked)
+            }
+            assertTrue(writing.await(10, TimeUnit.SECONDS))
+            val concurrentWrite = async(Dispatchers.IO) {
+                writer.upsert(listOf(second))
+            }
+            continueWriting.countDown()
+            val result = export.await()
+            concurrentWrite.await()
+
+            val imported = InMemoryCanonicalRecordStore()
+            val importResult = ArchiveImporter(imported).import(
+                ByteArrayInputStream(output.toByteArray()),
+            )
+            assertEquals(1, result.recordCount)
+            assertEquals(1, importResult.recordsRead)
+            assertEquals(1, imported.recordCount())
+            assertEquals(2, writer.recordCount())
+        } finally {
+            continueWriting.countDown()
+            writer.close()
+        }
+    }
+
+    @Test
+    fun cursorWindowSafeRecordBoundAcceptsBelowAndRejectsAbove() = runBlocking {
+        val under = """
+            {"endDate":"2026-01-01T00:01:00Z","id":"under","kind":"quantity","padding":"${"x".repeat(400 * 1_024)}","quantity":{"unit":"count","value":1},"schemaVersion":1,"startDate":"2026-01-01T00:00:00Z","type":"steps"}
+        """.trimIndent()
+        ArchiveImporter(store).import(
+            ByteArrayInputStream("$under\n".toByteArray()),
+        )
+        assertEquals(1, store.allRecords().size)
+
+        val over = """
+            {"endDate":"2026-01-01T00:01:00Z","id":"over","kind":"quantity","padding":"${"x".repeat(520 * 1_024)}","quantity":{"unit":"count","value":1},"schemaVersion":1,"startDate":"2026-01-01T00:00:00Z","type":"steps"}
+        """.trimIndent()
+        var rejected = false
+        try {
+            ArchiveImporter(store).import(
+                ByteArrayInputStream("$over\n".toByteArray()),
+            )
+        } catch (_: ArchiveFormatException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+        assertEquals(1, store.allRecords().size)
     }
 
     @Test

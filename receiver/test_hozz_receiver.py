@@ -1,7 +1,10 @@
+import contextlib
+import io
 import json
 import sqlite3
 import struct
 import tempfile
+import tracemalloc
 import unittest
 import zipfile
 from pathlib import Path
@@ -1066,7 +1069,14 @@ class TransactionAndArchiveTests(unittest.TestCase):
             receiver.ingest_payload(self.db, b"123456789")
 
     def test_negative_or_invalid_content_length_is_rejected(self):
-        for value in ("-1", "not-a-number"):
+        for value in (
+            "-1",
+            "not-a-number",
+            "+1",
+            " 1",
+            "1_0",
+            "9" * 5_000,
+        ):
             with self.assertRaises(PartialBatch):
                 receiver.parse_content_length(value)
 
@@ -1098,6 +1108,253 @@ class TransactionAndArchiveTests(unittest.TestCase):
         self.assertEqual(
             2,
             self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+        )
+
+    def test_json_array_streams_one_record_at_a_time(self):
+        payload = json.dumps([
+            {
+                "id": "array-one",
+                "kind": "quantity",
+                "quantity": {"unit": "count", "value": 1},
+                "schemaVersion": 1,
+                "type": "steps",
+            },
+            {
+                "id": "array-two",
+                "kind": "quantity",
+                "quantity": {"unit": "count", "value": 2},
+                "schemaVersion": 1,
+                "type": "steps",
+            },
+        ]).encode()
+
+        stored, deleted, duplicate = receiver.ingest_seekable_stream(
+            self.db,
+            io.BytesIO(payload),
+            len(payload),
+            "array",
+        )
+
+        self.assertEqual((2, 0, False), (stored, deleted, duplicate))
+
+    def test_long_leading_whitespace_does_not_hide_payload(self):
+        record = json.dumps({
+            "id": "after-whitespace",
+            "kind": "quantity",
+            "quantity": {"unit": "count", "value": 1},
+            "schemaVersion": 1,
+            "type": "steps",
+        }).encode()
+        payload = b" " * 513 + record
+
+        self.assertEqual(
+            (1, 0, False),
+            receiver.ingest_seekable_stream(
+                self.db,
+                io.BytesIO(payload),
+                len(payload),
+                "whitespace",
+            ),
+        )
+
+    def test_data_extension_is_not_misclassified_as_envelope(self):
+        record = {
+            "data": {},
+            "id": "data-extension",
+            "kind": "quantity",
+            "quantity": {"unit": "count", "value": 1},
+            "schemaVersion": 1,
+            "type": "steps",
+        }
+        payload = json.dumps(record).encode()
+
+        self.assertEqual(
+            (1, 0, False),
+            receiver.ingest_seekable_stream(
+                self.db,
+                io.BytesIO(payload),
+                len(payload),
+                "data-extension",
+            ),
+        )
+
+    def test_envelope_is_classified_structurally_beyond_prefix(self):
+        payload = json.dumps({
+            "padding": "x" * 600,
+            "data": {
+                "metrics": [{
+                    "name": "steps",
+                    "units": "count",
+                    "data": [{
+                        "date": "2026-01-01T00:00:00Z",
+                        "qty": 1,
+                    }],
+                }],
+            },
+        }).encode()
+
+        self.assertEqual(
+            (1, 0, False),
+            receiver.ingest_seekable_stream(
+                self.db,
+                io.BytesIO(payload),
+                len(payload),
+                "envelope",
+            ),
+        )
+
+    def test_oversized_envelope_is_rejected_without_batch_receipt(self):
+        payload = json.dumps({
+            "padding": "x" * receiver.MAX_ENVELOPE_BYTES,
+            "data": {"metrics": []},
+        }).encode()
+
+        with self.assertRaises(PartialBatch):
+            receiver.ingest_seekable_stream(
+                self.db,
+                io.BytesIO(payload),
+                len(payload),
+                "oversized-envelope",
+            )
+        self.assertEqual(
+            0,
+            self.db.execute("SELECT COUNT(*) FROM batches").fetchone()[0],
+        )
+
+    def test_large_ndjson_record_uses_record_not_envelope_limit(self):
+        record = {
+            "id": "large-record",
+            "kind": "quantity",
+            "padding": "x" * (2 * 1_024 * 1_024),
+            "quantity": {"unit": "count", "value": 1},
+            "schemaVersion": 1,
+            "type": "steps",
+        }
+        payload = json.dumps(record).encode()
+
+        self.assertEqual(
+            (1, 0, False),
+            receiver.ingest_seekable_stream(
+                self.db,
+                io.BytesIO(payload),
+                len(payload),
+                "large-record",
+            ),
+        )
+
+    def test_json_array_rejects_trailing_separator_and_content_atomically(self):
+        record = json.dumps({
+            "id": "array-malformed",
+            "kind": "quantity",
+            "quantity": {"unit": "count", "value": 1},
+            "schemaVersion": 1,
+            "type": "steps",
+        })
+        for suffix in (",]", "] trailing"):
+            payload = f"[{record}{suffix}".encode()
+            with self.assertRaises(PartialBatch):
+                receiver.ingest_seekable_stream(
+                    self.db,
+                    io.BytesIO(payload),
+                    len(payload),
+                    f"malformed-{suffix}",
+                )
+        self.assertEqual(
+            0,
+            self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+        )
+
+    def test_json_array_limit_measures_item_not_array_syntax(self):
+        record = json.dumps({
+            "id": "array-limit",
+            "kind": "quantity",
+            "quantity": {"unit": "count", "value": 1},
+            "schemaVersion": 1,
+            "type": "steps",
+        }, separators=(",", ":"))
+        payload = f"[{record}]".encode()
+
+        with mock.patch.object(
+            receiver,
+            "MAX_RECORD_BYTES",
+            len(record.encode()),
+        ):
+            self.assertEqual(
+                (1, 0, False),
+                receiver.ingest_seekable_stream(
+                    self.db,
+                    io.BytesIO(payload),
+                    len(payload),
+                    "array-limit",
+                ),
+            )
+
+    def test_record_size_strips_only_one_line_ending(self):
+        record = json.dumps({
+            "id": "carriage-return",
+            "kind": "quantity",
+            "quantity": {"unit": "count", "value": 1},
+            "schemaVersion": 1,
+            "type": "steps",
+        }, separators=(",", ":")).encode()
+        payload = record + b"\r\r\n"
+
+        with (
+            mock.patch.object(receiver, "MAX_RECORD_BYTES", len(record)),
+            self.assertRaises(PartialBatch),
+        ):
+            receiver.ingest_seekable_stream(
+                self.db,
+                io.BytesIO(payload),
+                len(payload),
+                "carriage-return",
+            )
+
+    def test_streaming_plain_file_peak_is_below_payload_size(self):
+        path = Path(self.directory.name) / "stream-peak.ndjson"
+        padding = "x" * 4_096
+        path.write_text(
+            "".join(
+                json.dumps({
+                    "id": f"peak-{index}",
+                    "kind": "quantity",
+                    "padding": padding,
+                    "quantity": {"unit": "count", "value": index},
+                    "schemaVersion": 1,
+                    "type": "steps",
+                }) + "\n"
+                for index in range(512)
+            )
+        )
+        size = path.stat().st_size
+
+        tracemalloc.start()
+        with mock.patch.object(
+            Path,
+            "read_bytes",
+            side_effect=AssertionError("whole file was buffered"),
+        ):
+            ingest_file(self.db, path)
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+
+        self.assertLess(peak, size)
+
+    def test_serve_requires_explicit_authentication_choice(self):
+        parser = receiver.build_argument_parser()
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["serve"])
+            with self.assertRaises(SystemExit):
+                parser.parse_args(["serve", "--token", ""])
+        self.assertEqual(
+            "secret",
+            parser.parse_args(["serve", "--token", "secret"]).token,
+        )
+        self.assertTrue(
+            parser.parse_args(
+                ["serve", "--allow-unauthenticated"]
+            ).allow_unauthenticated
         )
 
     def test_compatible_deletion_before_metric_prevents_resurrection(self):
@@ -1497,6 +1754,28 @@ class TransactionAndArchiveTests(unittest.TestCase):
         ):
             ingest_file(self.db, archive)
 
+    def test_unsupported_or_encrypted_zip_rejects_before_decompression(self):
+        for name, offset, value in (
+            ("unsupported", 10, 99),
+            ("encrypted", 8, 1),
+        ):
+            archive = Path(self.directory.name) / f"{name}.zip"
+            self.write_zip(archive, {"records.ndjson": ""})
+            payload = bytearray(archive.read_bytes())
+            central = payload.find(b"PK\x01\x02")
+            struct.pack_into("<H", payload, central + offset, value)
+            archive.write_bytes(payload)
+
+            with (
+                mock.patch.object(
+                    receiver.zipfile,
+                    "ZipFile",
+                    side_effect=AssertionError("decompressor was constructed"),
+                ),
+                self.assertRaises(PartialBatch),
+            ):
+                ingest_file(self.db, archive)
+
     def test_zip64_directory_metadata_is_used_for_classic_sentinels(self):
         path = Path(self.directory.name) / "zip64-directory.zip"
         central = b"PK\x01\x02" + bytes(42)
@@ -1553,6 +1832,44 @@ class TransactionAndArchiveTests(unittest.TestCase):
         )
 
         self.assertEqual((1, 0), ingest_file(self.db, archive))
+
+    def test_strict_run_record_preserves_exact_representation(self):
+        run = (
+            '  { "kind" : "typeSummary", "schemaVersion" : 1, '
+            '"type" : "steps", "state" : "complete", "ratio" : 1.00 }  '
+        )
+        archive = Path(self.directory.name) / "verbatim-run.zip"
+        self.write_zip(
+            archive,
+            {
+                "hozz-manifest.json": json.dumps(self.manifest(0)),
+                "records.ndjson": run + "\r\n",
+            },
+        )
+
+        self.assertEqual((0, 0), ingest_file(self.db, archive))
+        self.assertEqual(
+            run,
+            self.db.execute(
+                "SELECT raw FROM archive_run_records"
+            ).fetchone()[0],
+        )
+
+    def test_plain_v1_run_record_preserves_exact_representation(self):
+        run = (
+            ' { "kind" : "typeSummary", "schemaVersion" : 1, '
+            '"type" : "steps", "state" : "complete", "ratio" : 1.00 } '
+        )
+        path = Path(self.directory.name) / "plain-run.ndjson"
+        path.write_text(run + "\n")
+
+        self.assertEqual((0, 0), ingest_file(self.db, path))
+        self.assertEqual(
+            run,
+            self.db.execute(
+                "SELECT raw FROM archive_run_records"
+            ).fetchone()[0],
+        )
 
     def test_committed_zip_retry_survives_missing_watcher_receipt(self):
         archive = Path(self.directory.name) / "retry.zip"

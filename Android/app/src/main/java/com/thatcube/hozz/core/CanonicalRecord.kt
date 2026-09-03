@@ -279,8 +279,11 @@ object CanonicalRecordParser {
             kind = kind,
             canonicalType = canonicalType,
             type = type,
-            startTime = jsonObject.instant("startDate"),
-            endTime = jsonObject.instant("endDate") ?: jsonObject.instant("startDate"),
+            startTime = jsonObject.instant("startDate")
+                ?: jsonObject.instant("readAt"),
+            endTime = jsonObject.instant("endDate")
+                ?: jsonObject.instant("startDate")
+                ?: jsonObject.instant("readAt"),
             canonicalValue = canonicalValue,
             originalValue = originalValue,
             categoryValue = if (kind == "category") jsonObject.int("value") else null,
@@ -552,6 +555,16 @@ object CanonicalRecordParser {
         return value
     }
 
+    private fun strictInt(jsonObject: JsonObject, name: String): Int {
+        val value = strictLong(jsonObject, name)
+        if (value !in Int.MIN_VALUE..Int.MAX_VALUE) {
+            throw ArchiveFormatException(
+                "Record field $name is outside the supported integer range.",
+            )
+        }
+        return value.toInt()
+    }
+
     fun lineageJson(lineage: List<SourceLineage>): String = JsonArray(
         lineage.map { value ->
             buildJsonObject {
@@ -611,12 +624,12 @@ object CanonicalRecordParser {
             "category" -> {
                 jsonObject.strictInstant("startDate")
                 jsonObject.strictInstant("endDate")
-                strictLong(jsonObject, "value")
+                strictInt(jsonObject, "value")
             }
             "workout" -> {
                 jsonObject.strictInstant("startDate")
                 jsonObject.strictInstant("endDate")
-                strictLong(jsonObject, "activityType")
+                strictInt(jsonObject, "activityType")
             }
             "characteristics" -> {
                 jsonObject.strictInstant("readAt")
@@ -878,7 +891,7 @@ object CanonicalRecordParser {
     private val sourceNamespacePattern = Regex("^[A-Za-z0-9._-]+$")
 }
 
-class ArchiveFormatException(message: String) : Exception(message)
+open class ArchiveFormatException(message: String) : Exception(message)
 
 private fun JsonObject.string(name: String): String? =
     this[name]?.jsonPrimitive?.contentOrNull
