@@ -73,6 +73,23 @@ class SqliteCanonicalRecordStoreTest {
         assertTrue(store.allRecords().isEmpty())
     }
 
+    @Test
+    fun staleParentTombstoneDoesNotCascade() = runBlocking {
+        val parent = record(version = 3, tombstone = false)
+        val child = parent.copy(
+            canonicalId = "apple.healthkit:test-record:detail",
+            parentCanonicalId = parent.canonicalId,
+            kind = "quantitySeriesReadings",
+            canonicalType = "series.readings",
+        )
+        val staleTombstone = parent.copy(recordVersion = 2, tombstone = true)
+
+        store.upsert(listOf(parent, child))
+        store.upsert(listOf(staleTombstone))
+
+        assertTrue(store.allRecords().none(CanonicalRecord::tombstone))
+    }
+
     private fun record(
         version: Long,
         tombstone: Boolean,

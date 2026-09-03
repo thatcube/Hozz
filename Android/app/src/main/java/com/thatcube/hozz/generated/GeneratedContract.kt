@@ -100,6 +100,18 @@ object GeneratedContract {
         "workoutRouteLocations" to "activity.exercise-route-locations"
     )
 
+    val sourceCanonicalTypes: Map<String, String> = mapOf(
+        "HKDataTypeIdentifierAudiogram" to "hearing.audiogram",
+        "HKDataTypeIdentifierElectrocardiogram" to "cardiac.electrocardiogram",
+        "HKDataTypeStateOfMind" to "mind.state",
+        "HKMedicationDoseEventTypeIdentifierMedicationDoseEvent" to "medication.dose",
+        "HKWorkoutRouteTypeIdentifier" to "activity.exercise-route"
+    )
+
+    val sourceCanonicalTypePrefixes: Map<String, String> = mapOf(
+        "HKClinicalTypeIdentifier" to "clinical.record"
+    )
+
     val warningMessages: Map<String, String> = mapOf(
         "heart-rate-aggregate" to "Health Connect needs individual heart-rate readings; this archive record is an aggregate and cannot be projected exactly.",
         "invalid-value" to "The record value is outside the range Health Connect accepts.",

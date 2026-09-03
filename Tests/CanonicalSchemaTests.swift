@@ -1,5 +1,6 @@
 import Foundation
 import HozzCore
+@testable import HozzHealth
 import XCTest
 
 final class CanonicalSchemaTests: XCTestCase {
@@ -86,6 +87,26 @@ final class CanonicalSchemaTests: XCTestCase {
         let quantity = try XCTUnwrap(records[0]["quantity"] as? [String: Any])
         XCTAssertNotNil(quantity["canonical"] as? [String: Any])
         XCTAssertNotNil(quantity["original"] as? [String: Any])
+    }
+
+    func testEncodingFailureIdentityMatchesCrossPlatformFixture() throws {
+        let vectors = try object(
+            at: schemaRoot.appending(path: "fixtures/identity-vectors.json")
+        )
+        let vector = try XCTUnwrap(
+            vectors["encodingFailure"] as? [String: Any]
+        )
+        let sourceID = try XCTUnwrap(
+            UUID(uuidString: try XCTUnwrap(vector["sourceRecordId"] as? String))
+        )
+        let sourceType = try XCTUnwrap(vector["sourceType"] as? String)
+
+        let result = HealthSampleEncoder.encodingFailureID(
+            sourceRecordID: sourceID,
+            typeIdentifier: sourceType
+        )
+
+        XCTAssertEqual(result.uuidString.lowercased(), vector["recordId"] as? String)
     }
 
     private func object(at url: URL) throws -> [String: Any] {

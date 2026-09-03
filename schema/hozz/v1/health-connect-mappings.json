@@ -170,6 +170,16 @@
     "workoutRouteEnd": "activity.exercise-route-end",
     "workoutRouteLocations": "activity.exercise-route-locations"
   },
+  "sourceCanonicalTypes": {
+    "HKDataTypeIdentifierAudiogram": "hearing.audiogram",
+    "HKDataTypeIdentifierElectrocardiogram": "cardiac.electrocardiogram",
+    "HKDataTypeStateOfMind": "mind.state",
+    "HKMedicationDoseEventTypeIdentifierMedicationDoseEvent": "medication.dose",
+    "HKWorkoutRouteTypeIdentifier": "activity.exercise-route"
+  },
+  "sourceCanonicalTypePrefixes": {
+    "HKClinicalTypeIdentifier": "clinical.record"
+  },
   "warningMessages": {
     "heart-rate-aggregate": "Health Connect needs individual heart-rate readings; this archive record is an aggregate and cannot be projected exactly.",
     "sleep-core-to-light": "Apple's Core sleep stage is projected as Health Connect Light sleep.",

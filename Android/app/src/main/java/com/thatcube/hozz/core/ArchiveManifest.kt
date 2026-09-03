@@ -3,6 +3,7 @@ package com.thatcube.hozz.core
 import com.thatcube.hozz.generated.GeneratedContract
 import java.time.Instant
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
@@ -69,6 +70,27 @@ data class ArchiveManifest(
             } catch (_: Exception) {
                 throw ArchiveFormatException("The archive manifest createdAt is invalid.")
             }
+            val recordCount = jsonObject["recordCount"]?.let { value ->
+                val primitive = value as? JsonPrimitive
+                    ?: throw ArchiveFormatException(
+                        "The archive manifest recordCount is not an integer.",
+                    )
+                if (primitive.isString) {
+                    throw ArchiveFormatException(
+                        "The archive manifest recordCount is not an integer.",
+                    )
+                }
+                val count = primitive.longOrNull
+                    ?: throw ArchiveFormatException(
+                        "The archive manifest recordCount is not an integer.",
+                    )
+                if (count < 0) {
+                    throw ArchiveFormatException(
+                        "The archive manifest recordCount cannot be negative.",
+                    )
+                }
+                count
+            }
             return ArchiveManifest(
                 schemaVersion = schemaVersion,
                 archiveId = archiveId,
@@ -76,7 +98,7 @@ data class ArchiveManifest(
                 recordSchema = recordSchema,
                 recordsEntry = recordsEntry,
                 createdAt = createdAt,
-                recordCount = jsonObject["recordCount"]?.jsonPrimitive?.longOrNull,
+                recordCount = recordCount,
             )
         }
     }

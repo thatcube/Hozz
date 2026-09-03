@@ -3,6 +3,8 @@ package com.thatcube.hozz.core
 import com.thatcube.hozz.generated.GeneratedContract
 import java.security.MessageDigest
 import java.time.Instant
+import java.nio.ByteBuffer
+import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -96,19 +98,39 @@ object CanonicalRecordParser {
         }
 
         val sourceRecord = jsonObject.objectValue("sourceRecord")
-        val sourceId = sourceRecord?.string("id")
-            ?: jsonObject.string("id")
-            ?: auxiliarySourceId(jsonObject, kind, line)
+        val topLevelId = jsonObject.string("id")
         val sourceStore = sourceRecord?.string("store")
             ?: GeneratedContract.SOURCE_STORE
         val type = sourceRecord?.string("type")
             ?: jsonObject.string("type")
             ?: "HozzRecordType:$kind"
+        val sourceId = sourceRecord?.string("id")
+            ?: when (kind) {
+                "clinicalRecord" -> jsonObject.string("healthKitUUID")
+                "electrocardiogramEnd",
+                "electrocardiogramVoltages",
+                "quantitySeriesEnd",
+                "quantitySeriesReadings",
+                "workoutRouteEnd",
+                "workoutRouteLocations" -> jsonObject.string("sample")
+                else -> null
+            }
+            ?: topLevelId
+            ?: auxiliarySourceId(jsonObject, kind, line)
+        val canonicalSourceId = when {
+            kind == "sampleEncodingError" ->
+                encodingFailureId(sourceId, type)
+            else -> topLevelId ?: auxiliarySourceId(jsonObject, kind, line)
+        }
         val canonicalId = jsonObject.string("canonicalId")
-            ?: "$sourceStore:$sourceId"
+            ?: "$sourceStore:$canonicalSourceId"
         val encodedCanonicalType = jsonObject.string("canonicalType")
         val canonicalType = GeneratedContract.archiveOnlyCanonicalTypes[kind]
             ?: GeneratedContract.recordMappings[type]?.canonicalType
+            ?: GeneratedContract.sourceCanonicalTypes[type]
+            ?: GeneratedContract.sourceCanonicalTypePrefixes.entries
+                .firstOrNull { type.startsWith(it.key) }
+                ?.value
             ?: encodedCanonicalType
             ?: "archive.raw"
         val tombstone = kind == "deletion" ||
@@ -160,6 +182,11 @@ object CanonicalRecordParser {
         return CanonicalRecord(
             canonicalId = canonicalId,
             parentCanonicalId = jsonObject.string("parentCanonicalId")
+                ?: if (kind == "sampleEncodingError") {
+                    "$sourceStore:$sourceId"
+                } else {
+                    null
+                }
                 ?: jsonObject.string("sample")?.let {
                     "${GeneratedContract.SOURCE_STORE}:$it"
                 },
@@ -240,6 +267,33 @@ object CanonicalRecordParser {
             .joinToString("") { "%02x".format(it) }
         return "raw:$digest"
     }
+
+    internal fun encodingFailureId(sourceId: String, type: String): String {
+        val sourceUUID = try {
+            UUID.fromString(sourceId)
+        } catch (_: IllegalArgumentException) {
+            return "encoding-error:${hash("$type\u0000$sourceId")}"
+        }
+        val sourceBytes = ByteBuffer.allocate(16)
+            .putLong(sourceUUID.mostSignificantBits)
+            .putLong(sourceUUID.leastSignificantBits)
+            .array()
+        val digest = MessageDigest.getInstance("SHA-256").apply {
+            update("HozzEncodingFailure".toByteArray())
+            update(0.toByte())
+            update(type.toByteArray())
+            update(sourceBytes)
+        }.digest().copyOfRange(0, 16)
+        digest[6] = ((digest[6].toInt() and 0x0F) or 0x50).toByte()
+        digest[8] = ((digest[8].toInt() and 0x3F) or 0x80).toByte()
+        val buffer = ByteBuffer.wrap(digest)
+        return UUID(buffer.long, buffer.long).toString().lowercase()
+    }
+
+    private fun hash(value: String): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(value.toByteArray())
+            .joinToString("") { "%02x".format(it) }
 }
 
 class ArchiveFormatException(message: String) : Exception(message)

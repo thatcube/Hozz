@@ -343,7 +343,8 @@ class SqliteCanonicalRecordStore(
             }
             else -> MergeResult(ignored = 1)
         }
-        if (effective.tombstone) {
+        val winningParent = parentState(database, effective.canonicalId)
+        if (winningParent?.second == true) {
             database.execSQL(
                 """
                 UPDATE canonical_record
@@ -351,7 +352,7 @@ class SqliteCanonicalRecordStore(
                     record_version = MAX(record_version, ?)
                 WHERE parent_canonical_id = ?
                 """.trimIndent(),
-                arrayOf<Any>(effective.recordVersion, effective.canonicalId),
+                arrayOf<Any>(winningParent.first, effective.canonicalId),
             )
         }
         return result

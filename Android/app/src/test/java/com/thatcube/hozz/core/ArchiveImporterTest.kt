@@ -174,6 +174,31 @@ class ArchiveImporterTest {
     }
 
     @Test
+    fun staleParentTombstoneCannotDeleteNewerChildren() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val liveParent = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:parent","canonicalType":"activity.steps","endDate":"2026-01-01T00:01:00Z","id":"parent","kind":"quantity","quantity":{"unit":"count","value":1},"recordVersion":3,"schemaVersion":1,"sourceRecord":{"id":"parent","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent(),
+        )!!
+        val child = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:child","canonicalType":"series.readings","endDate":"2026-01-01T00:01:00Z","id":"child","kind":"quantitySeriesReadings","parentCanonicalId":"apple.healthkit:parent","recordVersion":3,"sample":"parent","schemaVersion":1,"sourceRecord":{"id":"parent","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent(),
+        )!!
+        val staleTombstone = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:parent","canonicalType":"activity.steps","id":"parent","kind":"deletion","recordVersion":2,"schemaVersion":1,"sourceRecord":{"id":"parent","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent(),
+        )!!
+
+        store.upsert(listOf(liveParent, child))
+        store.upsert(listOf(staleTombstone))
+
+        assertTrue(store.allRecords().none(CanonicalRecord::tombstone))
+    }
+
+    @Test
     fun malformedLateRecordLeavesNoPartialImport() = runBlocking {
         val store = InMemoryCanonicalRecordStore()
         val valid = fixture.toString(Charsets.UTF_8).lineSequence().first()
@@ -276,6 +301,23 @@ class ArchiveImporterTest {
     }
 
     @Test
+    fun nonIntegerManifestRecordCountIsRejected() {
+        for (invalid in listOf("3.5", "\"3\"", "-1")) {
+            var failed = false
+            try {
+                ArchiveManifest.parse(
+                    """
+                    {"archiveId":"fixture","createdAt":"2026-01-01T00:00:00Z","format":"hozz-ndjson","recordCount":$invalid,"recordSchema":"hozz/v1/canonical-record","recordsEntry":"records.ndjson","schemaVersion":1}
+                    """.trimIndent(),
+                )
+            } catch (_: ArchiveFormatException) {
+                failed = true
+            }
+            assertTrue(invalid, failed)
+        }
+    }
+
+    @Test
     fun sourceRecordsWithoutSampleIdentityArePreservedDeterministically() = runBlocking {
         val store = InMemoryCanonicalRecordStore()
         val importer = ArchiveImporter(store)
@@ -320,5 +362,33 @@ class ArchiveImporterTest {
                 .jsonPrimitive
                 .content,
         )
+    }
+
+    @Test
+    fun encodingFailureIdentityMatchesCrossPlatformFixture() {
+        val fixture = requireNotNull(
+            javaClass.getResourceAsStream("/hozz/v1/fixtures/identity-vectors.json"),
+        ).use { it.readBytes() }.toString(Charsets.UTF_8)
+        val vector = Json.parseToJsonElement(fixture)
+            .jsonObject["encodingFailure"]!!
+            .jsonObject
+        val sourceId = vector["sourceRecordId"]!!.jsonPrimitive.content
+        val sourceType = vector["sourceType"]!!.jsonPrimitive.content
+
+        assertEquals(
+            vector["recordId"]!!.jsonPrimitive.content,
+            CanonicalRecordParser.encodingFailureId(sourceId, sourceType),
+        )
+        val legacyError = CanonicalRecordParser.parse(
+            """
+            {"id":"$sourceId","kind":"sampleEncodingError","message":"fixture","schemaVersion":1,"type":"$sourceType"}
+            """.trimIndent(),
+        )!!
+        assertEquals(
+            vector["canonicalId"]!!.jsonPrimitive.content,
+            legacyError.canonicalId,
+        )
+        assertEquals("apple.healthkit:$sourceId", legacyError.parentCanonicalId)
+        assertEquals(sourceId, legacyError.sourceRecordId)
     }
 }

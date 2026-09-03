@@ -34,6 +34,16 @@ enum HozzHealthArchiveContract {
         "workoutRouteEnd": "activity.exercise-route-end",
         "workoutRouteLocations": "activity.exercise-route-locations",
     ]
+    static let sourceCanonicalTypes: [String: String] = [
+        "HKDataTypeIdentifierAudiogram": "hearing.audiogram",
+        "HKDataTypeIdentifierElectrocardiogram": "cardiac.electrocardiogram",
+        "HKDataTypeStateOfMind": "mind.state",
+        "HKMedicationDoseEventTypeIdentifierMedicationDoseEvent": "medication.dose",
+        "HKWorkoutRouteTypeIdentifier": "activity.exercise-route",
+    ]
+    static let sourceCanonicalTypePrefixes: [String: String] = [
+        "HKClinicalTypeIdentifier": "clinical.record",
+    ]
 
     static func canonicalType(
         for sourceIdentifier: String,
@@ -41,6 +51,10 @@ enum HozzHealthArchiveContract {
     ) -> String {
         kind.flatMap { archiveOnlyCanonicalTypes[$0] }
             ?? canonicalTypesBySourceIdentifier[sourceIdentifier]
+            ?? sourceCanonicalTypes[sourceIdentifier]
+            ?? sourceCanonicalTypePrefixes.first(where: {
+                sourceIdentifier.hasPrefix($0.key)
+            })?.value
             ?? "archive.raw"
     }
 

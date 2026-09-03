@@ -68,4 +68,14 @@ public enum HozzArchiveContract {
         "workoutRouteEnd": "activity.exercise-route-end",
         "workoutRouteLocations": "activity.exercise-route-locations",
     ]
+    public static let sourceCanonicalTypes: [String: String] = [
+        "HKDataTypeIdentifierAudiogram": "hearing.audiogram",
+        "HKDataTypeIdentifierElectrocardiogram": "cardiac.electrocardiogram",
+        "HKDataTypeStateOfMind": "mind.state",
+        "HKMedicationDoseEventTypeIdentifierMedicationDoseEvent": "medication.dose",
+        "HKWorkoutRouteTypeIdentifier": "activity.exercise-route",
+    ]
+    public static let sourceCanonicalTypePrefixes: [String: String] = [
+        "HKClinicalTypeIdentifier": "clinical.record",
+    ]
 }

@@ -220,10 +220,32 @@ public enum SeriesEncoding {
 
         let object: [String: Any] = [
             "kind": shape.elementKind,
-            "schemaVersion": 1,
+            "schemaVersion": HozzHealthArchiveContract.schemaVersion,
             "id": id.uuidString.lowercased(),
+            "canonicalId": HozzHealthArchiveContract.canonicalID(
+                for: id.uuidString.lowercased()
+            ),
+            "recordVersion": 1,
+            "canonicalType": HozzHealthArchiveContract.canonicalType(
+                for: shape.typeIdentifier,
+                kind: shape.elementKind
+            ),
             "type": shape.typeIdentifier,
             "sample": sample.uuidString.lowercased(),
+            "parentCanonicalId": HozzHealthArchiveContract.canonicalID(
+                for: sample.uuidString.lowercased()
+            ),
+            "sourceRecord": [
+                "store": HozzHealthArchiveContract.sourceStore,
+                "id": sample.uuidString.lowercased(),
+                "type": shape.typeIdentifier
+            ],
+            "lineage": [
+                [
+                    "store": HozzHealthArchiveContract.sourceStore,
+                    "recordId": sample.uuidString.lowercased()
+                ]
+            ],
             "sequence": sequence,
             "offset": offset,
             "count": elements.count,
@@ -252,10 +274,32 @@ public enum SeriesEncoding {
         let id = identifier(shape: shape, sample: sample, suffix: "end")
         let object: [String: Any] = [
             "kind": shape.endKind,
-            "schemaVersion": 1,
+            "schemaVersion": HozzHealthArchiveContract.schemaVersion,
             "id": id.uuidString.lowercased(),
+            "canonicalId": HozzHealthArchiveContract.canonicalID(
+                for: id.uuidString.lowercased()
+            ),
+            "recordVersion": 1,
+            "canonicalType": HozzHealthArchiveContract.canonicalType(
+                for: shape.typeIdentifier,
+                kind: shape.endKind
+            ),
             "type": shape.typeIdentifier,
             "sample": sample.uuidString.lowercased(),
+            "parentCanonicalId": HozzHealthArchiveContract.canonicalID(
+                for: sample.uuidString.lowercased()
+            ),
+            "sourceRecord": [
+                "store": HozzHealthArchiveContract.sourceStore,
+                "id": sample.uuidString.lowercased(),
+                "type": shape.typeIdentifier
+            ],
+            "lineage": [
+                [
+                    "store": HozzHealthArchiveContract.sourceStore,
+                    "recordId": sample.uuidString.lowercased()
+                ]
+            ],
             shape.elementsKey: elementCount,
             "startDate": timestamp(sampleStart),
             "endDate": timestamp(sampleEnd)

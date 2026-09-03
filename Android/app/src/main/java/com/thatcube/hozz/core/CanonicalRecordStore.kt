@@ -96,13 +96,14 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
                 }
                 else -> result += MergeResult(ignored = 1)
             }
-            if (effective.tombstone) {
+            val winningParent = this.records[effective.canonicalId]
+            if (winningParent?.tombstone == true) {
                 this.records.replaceAll { _, child ->
-                    if (child.parentCanonicalId == effective.canonicalId) {
+                    if (child.parentCanonicalId == winningParent.canonicalId) {
                         child.copy(
                             recordVersion = maxOf(
                                 child.recordVersion,
-                                effective.recordVersion,
+                                winningParent.recordVersion,
                             ),
                             tombstone = true,
                         )
