@@ -140,9 +140,16 @@ CREATE TABLE IF NOT EXISTS archive_run_records (
 CREATE TABLE IF NOT EXISTS compatible_alias_retirement (
     type        TEXT NOT NULL,
     start_epoch INTEGER NOT NULL,
+    end_epoch   INTEGER,
+    value       REAL,
+    unit        TEXT,
+    source      TEXT,
+    kind        TEXT,
     stable_id   TEXT NOT NULL,
     PRIMARY KEY (type, start_epoch, stable_id)
 );
+CREATE INDEX IF NOT EXISTS compatible_alias_retirement_stable
+    ON compatible_alias_retirement (stable_id);
 CREATE TABLE IF NOT EXISTS compatible_unresolved_deletion (
     stable_id   TEXT PRIMARY KEY,
     type        TEXT NOT NULL
@@ -150,6 +157,13 @@ CREATE TABLE IF NOT EXISTS compatible_unresolved_deletion (
 CREATE TABLE IF NOT EXISTS compatible_resolved_deletion (
     stable_id   TEXT PRIMARY KEY
 );
+CREATE TABLE IF NOT EXISTS compatible_alias_identity (
+    stable_id   TEXT NOT NULL,
+    legacy_id   TEXT NOT NULL,
+    PRIMARY KEY (stable_id, legacy_id)
+);
+CREATE INDEX IF NOT EXISTS compatible_alias_identity_legacy
+    ON compatible_alias_identity (legacy_id);
 """
 
 
@@ -179,6 +193,7 @@ def connect(path):
             create_schema(db)
         ensure_current_columns(db)
         ensure_compatible_alias_retirement_schema(db)
+        backfill_compatible_alias_signatures(db)
         backfill_compatible_deletion_state(db)
         db.commit()
         return db
@@ -201,17 +216,24 @@ def ensure_compatible_alias_retirement_schema(db):
     primary_key = [
         row[1] for row in sorted(columns, key=lambda row: row[5]) if row[5]
     ]
-    if primary_key == ["type", "start_epoch", "stable_id"]:
+    column_names = {row[1] for row in columns}
+    expected_columns = {
+        "type", "start_epoch", "end_epoch", "value",
+        "unit", "source", "kind", "stable_id",
+    }
+    if (
+        primary_key == ["type", "start_epoch", "stable_id"]
+        and expected_columns.issubset(column_names)
+    ):
         return
     db.execute(
         """
-        INSERT OR IGNORE INTO compatible_resolved_deletion (stable_id)
-        SELECT canonical_id FROM samples
-        WHERE tombstone = 1
-          AND canonical_id LIKE 'healthAutoExport:%'
-          AND canonical_id NOT IN (
-            SELECT stable_id FROM compatible_unresolved_deletion
-          )
+        DELETE FROM compatible_resolved_deletion
+        WHERE stable_id IN (
+            SELECT canonical_id FROM samples
+            WHERE tombstone = 1
+              AND canonical_id LIKE 'healthAutoExport:%'
+        )
         """
     )
     db.execute(
@@ -220,23 +242,86 @@ def ensure_compatible_alias_retirement_schema(db):
     )
     db.execute(
         """
+        INSERT OR REPLACE INTO compatible_unresolved_deletion
+            (stable_id, type)
+        SELECT old.stable_id, old.type
+        FROM compatible_alias_retirement_old AS old
+        JOIN samples AS tombstone
+          ON tombstone.canonical_id = old.stable_id
+         AND tombstone.tombstone = 1
+        """
+    )
+    db.execute(
+        """
         CREATE TABLE compatible_alias_retirement (
             type        TEXT NOT NULL,
             start_epoch INTEGER NOT NULL,
+            end_epoch   INTEGER,
+            value       REAL,
+            unit        TEXT,
+            source      TEXT,
+            kind        TEXT,
             stable_id   TEXT NOT NULL,
             PRIMARY KEY (type, start_epoch, stable_id)
         )
         """
     )
+    db.execute("DROP TABLE compatible_alias_retirement_old")
     db.execute(
         """
-        INSERT OR IGNORE INTO compatible_alias_retirement
-            (type, start_epoch, stable_id)
-        SELECT type, start_epoch, stable_id
-        FROM compatible_alias_retirement_old
+        CREATE INDEX IF NOT EXISTS compatible_alias_retirement_stable
+        ON compatible_alias_retirement (stable_id)
         """
     )
-    db.execute("DROP TABLE compatible_alias_retirement_old")
+
+
+def backfill_compatible_alias_signatures(db):
+    rows = db.execute(
+        """
+        SELECT canonical_id, type, kind, start_date, end_date,
+               value, unit, source
+        FROM samples
+        WHERE tombstone = 0
+          AND canonical_id LIKE 'healthAutoExport:%'
+          AND start_date IS NOT NULL
+        """
+    ).fetchall()
+    for (
+        stable_id,
+        record_type,
+        kind,
+        start_date,
+        end_date,
+        value,
+        unit,
+        source,
+    ) in rows:
+        try:
+            start_epoch = compatible_epoch_milliseconds(start_date)
+            end_epoch = compatible_epoch_milliseconds(
+                end_date if isinstance(end_date, str) else start_date
+            )
+        except PartialBatch:
+            continue
+        db.execute(
+            """
+            INSERT OR IGNORE INTO compatible_alias_retirement
+                (type, start_epoch, end_epoch, value, unit,
+                 source, kind, stable_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record_type, start_epoch, end_epoch, value,
+                unit, source, kind, stable_id,
+            ),
+        )
+        db.execute(
+            """
+            INSERT OR IGNORE INTO compatible_resolved_deletion (stable_id)
+            VALUES (?)
+            """,
+            (stable_id,),
+        )
 
 
 def backfill_compatible_deletion_state(db):
@@ -260,25 +345,22 @@ def backfill_compatible_deletion_state(db):
         if not isinstance(name, str) or not name:
             continue
         if isinstance(date, str) and date:
-            try:
-                epoch = compatible_epoch_milliseconds(date)
-            except PartialBatch:
-                continue
-            db.execute(
+            resolved = db.execute(
                 """
-                INSERT OR REPLACE INTO compatible_alias_retirement
-                    (type, start_epoch, stable_id)
-                VALUES (?, ?, ?)
-                """,
-                (name, epoch, canonical_id),
-            )
-            db.execute(
-                """
-                INSERT OR IGNORE INTO compatible_resolved_deletion (stable_id)
-                VALUES (?)
+                SELECT 1 FROM compatible_resolved_deletion
+                WHERE stable_id = ?
                 """,
                 (canonical_id,),
-            )
+            ).fetchone()
+            if not resolved:
+                db.execute(
+                    """
+                    INSERT OR REPLACE INTO compatible_unresolved_deletion
+                        (stable_id, type)
+                    VALUES (?, ?)
+                    """,
+                    (canonical_id, name),
+                )
             continue
         resolved = db.execute(
             """
@@ -1082,6 +1164,30 @@ def _ingest_lines(
         tombstone = kind == "deletion" or record.get("deleted") is True
         record_type = record.get("type", "")
         start_date = record.get("startDate")
+        if not tombstone:
+            mapped_stable_ids = db.execute(
+                """
+                SELECT stable_id FROM compatible_alias_identity
+                WHERE legacy_id = ?
+                """,
+                (canonical_id,),
+            ).fetchall()
+            if len(mapped_stable_ids) > 1:
+                raise PartialBatch(
+                    "legacy identity maps to more than one stable record"
+                )
+            if len(mapped_stable_ids) == 1:
+                retired_cursor = db.execute(
+                    """
+                    UPDATE samples
+                    SET tombstone = 1,
+                        record_version = MAX(record_version + 1, ?)
+                    WHERE canonical_id = ? AND tombstone = 0
+                    """,
+                    (version + 1, canonical_id),
+                )
+                deleted += retired_cursor.rowcount
+                continue
         if (
             not tombstone
             and canonical_id.startswith("apple.healthkit:")
@@ -1097,85 +1203,108 @@ def _ingest_lines(
                 raise PartialBatch(
                     "legacy identity cannot be reconciled with a pending deletion"
                 )
-            start_epoch = None
-            if isinstance(start_date, str):
-                try:
-                    start_epoch = compatible_epoch_milliseconds(start_date)
-                except PartialBatch:
-                    pass
-            retired = (
-                start_epoch is not None
-                and db.execute(
-                    """
-                    SELECT 1 FROM compatible_alias_retirement
-                    WHERE type = ? AND start_epoch = ?
-                    """,
-                    (record_type, start_epoch),
-                ).fetchone()
-            )
-            if not retired and start_epoch is not None:
-                for stable_id, stable_start in db.execute(
-                    """
-                    SELECT canonical_id, start_date FROM samples
-                    WHERE type = ? AND tombstone = 0
-                      AND canonical_id LIKE 'healthAutoExport:%'
-                    """,
-                    (record_type,),
+            signature = compatibility_record_signature(record)
+            if signature is None:
+                if (
+                    record_type == "sleep_analysis"
+                    and source_id == "sleep_analysis:None"
+                    and (
+                        db.execute(
+                        """
+                        SELECT 1 FROM samples
+                        WHERE type = 'sleep_analysis' AND tombstone = 0
+                          AND canonical_id LIKE 'healthAutoExport:%'
+                        LIMIT 1
+                        """
+                        ).fetchone()
+                        or db.execute(
+                            """
+                            SELECT 1 FROM compatible_alias_retirement
+                            WHERE type = 'sleep_analysis'
+                            LIMIT 1
+                            """
+                        ).fetchone()
+                        or db.execute(
+                            """
+                            SELECT 1 FROM compatible_unresolved_deletion
+                            WHERE type = 'sleep_analysis'
+                            LIMIT 1
+                            """
+                        ).fetchone()
+                    )
                 ):
-                    try:
-                        same_instant = (
-                            isinstance(stable_start, str)
-                            and compatible_epoch_milliseconds(stable_start)
-                                == start_epoch
+                    raise PartialBatch(
+                        "date-less legacy sleep identity is ambiguous"
+                    )
+            else:
+                retired_ids = db.execute(
+                    """
+                    SELECT stable_id FROM compatible_alias_retirement
+                    WHERE type = ? AND start_epoch = ?
+                      AND end_epoch IS ? AND value IS ? AND unit IS ?
+                      AND source IS ? AND kind IS ?
+                    """,
+                    signature,
+                ).fetchall()
+                if not retired_ids:
+                    matches = []
+                    for candidate in db.execute(
+                        """
+                        SELECT canonical_id, type, start_date, end_date,
+                               value, unit, source, kind
+                        FROM samples
+                        WHERE type = ? AND tombstone = 0
+                          AND canonical_id LIKE 'healthAutoExport:%'
+                        """,
+                        (record_type,),
+                    ):
+                        candidate_signature = compatibility_stored_signature(
+                            candidate[1:]
                         )
-                    except PartialBatch:
-                        same_instant = False
-                    if same_instant:
+                        if candidate_signature == signature:
+                            matches.append(candidate[0])
+                    if len(matches) > 1:
+                        raise PartialBatch(
+                            "legacy identity matches more than one stable record"
+                        )
+                    if len(matches) == 1:
                         db.execute(
                             """
-                            INSERT OR REPLACE INTO compatible_alias_retirement
-                                (type, start_epoch, stable_id)
-                            VALUES (?, ?, ?)
+                            INSERT OR IGNORE INTO compatible_alias_retirement
+                                (type, start_epoch, end_epoch, value, unit,
+                                 source, kind, stable_id)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                             """,
-                            (record_type, start_epoch, stable_id),
+                            (*signature, matches[0]),
                         )
-                        retired = True
-                        break
-            if (
-                not retired
-                and record_type == "sleep_analysis"
-                and source_id == "sleep_analysis:None"
-            ):
-                stable_sleep = db.execute(
-                    """
-                    SELECT canonical_id FROM samples
-                    WHERE type = 'sleep_analysis' AND tombstone = 0
-                      AND canonical_id LIKE 'healthAutoExport:%'
-                    LIMIT 1
-                    """
-                ).fetchone()
-                if stable_sleep:
-                    db.execute(
-                        """
-                        INSERT OR REPLACE INTO compatible_alias_retirement
-                            (type, start_epoch, stable_id)
-                        VALUES ('sleep_analysis', -1, ?)
-                        """,
-                        (stable_sleep[0],),
+                        retired_ids = [(matches[0],)]
+                if len(retired_ids) > 1:
+                    raise PartialBatch(
+                        "legacy identity matches more than one stable record"
                     )
-                    retired = True
-            if retired:
-                retired_cursor = db.execute(
-                    """
-                    UPDATE samples
-                    SET tombstone = 1,
-                        record_version = MAX(record_version + 1, 2)
-                    WHERE canonical_id = ? AND tombstone = 0
-                    """,
-                    (canonical_id,),
-                )
-                deleted += retired_cursor.rowcount
-                continue
+                if len(retired_ids) == 1:
+                    mapped = db.execute(
+                        """
+                        SELECT 1 FROM compatible_alias_identity
+                        WHERE stable_id = ? AND legacy_id = ?
+                        """,
+                        (retired_ids[0][0], canonical_id),
+                    ).fetchone()
+                    if not mapped:
+                        raise PartialBatch(
+                            "legacy identity has no unambiguous stable mapping"
+                        )
+                    retired_cursor = db.execute(
+                        """
+                        UPDATE samples
+                        SET tombstone = 1,
+                            record_version = MAX(record_version + 1, 2)
+                        WHERE canonical_id = ? AND tombstone = 0
+                        """,
+                        (canonical_id,),
+                    )
+                    deleted += retired_cursor.rowcount
+                    continue
         if parent_id:
             parent = db.execute(
                 "SELECT record_version, tombstone FROM samples "
@@ -1936,6 +2065,13 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
             """,
             (canonical_id,),
         ).fetchone()
+        resolved_identity = db.execute(
+            """
+            SELECT 1 FROM compatible_resolved_deletion
+            WHERE stable_id = ?
+            """,
+            (canonical_id,),
+        ).fetchone()
         if stable_row and isinstance(stable_row[0], str):
             legacy_aliases.append(
                 (
@@ -1966,6 +2102,7 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
                 ).fetchone()
                 if (
                     stable_exists is None
+                    and resolved_identity is None
                     and canonical_id not in incoming_stable_ids
                     and legacy_exists is not None
                 ):
@@ -1974,18 +2111,49 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
                     )
                 if (
                     stable_exists is None
+                    and resolved_identity is None
                     and canonical_id not in incoming_stable_ids
                 ):
                     unresolved_deletions.append((canonical_id, name))
             else:
-                legacy_aliases.append(
-                    (
-                        name,
-                        deletion_date,
-                        compatible_epoch_milliseconds(deletion_date),
-                        canonical_id,
+                if (
+                    stable_row
+                    or resolved_identity
+                    or canonical_id in incoming_stable_ids
+                ):
+                    legacy_aliases.append(
+                        (
+                            name,
+                            deletion_date,
+                            compatible_epoch_milliseconds(deletion_date),
+                            canonical_id,
+                        )
                     )
-                )
+                else:
+                    deletion_epoch = compatible_epoch_milliseconds(
+                        deletion_date
+                    )
+                    for (legacy_start,) in db.execute(
+                        """
+                        SELECT start_date FROM samples
+                        WHERE type = ? AND tombstone = 0
+                          AND canonical_id LIKE 'apple.healthkit:%'
+                        """,
+                        (name,),
+                    ):
+                        try:
+                            same_instant = (
+                                isinstance(legacy_start, str)
+                                and compatible_epoch_milliseconds(legacy_start)
+                                    == deletion_epoch
+                            )
+                        except PartialBatch:
+                            same_instant = False
+                        if same_instant:
+                            raise PartialBatch(
+                                "dated deletion cannot identify a legacy record"
+                            )
+                    unresolved_deletions.append((canonical_id, name))
         add_compatible_line(
             deletion_lines,
             deletion_identities,
@@ -2005,7 +2173,30 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
                 "compatibilityRaw": deletion,
             },
         )
-        if repair_legacy_deletions:
+        legacy_date = deletion.get("date")
+        mapped_legacy = (
+            canonical_id_for(
+                "apple.healthkit",
+                f"{name}:{legacy_date}",
+            )
+            if isinstance(legacy_date, str) and legacy_date
+            else None
+        )
+        has_legacy_mapping = bool(
+            mapped_legacy
+            and db.execute(
+                """
+                SELECT 1 FROM compatible_alias_identity
+                WHERE stable_id = ? AND legacy_id = ?
+                """,
+                (canonical_id, mapped_legacy),
+            ).fetchone()
+        )
+        if repair_legacy_deletions and not has_legacy_mapping:
+            raise PartialBatch(
+                "legacy receipt deletion has no proven alias mapping"
+            )
+        if has_legacy_mapping:
             date = require_text(
                 deletion,
                 "date",
@@ -2042,7 +2233,11 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
                 """,
                 (stable_id, record_type),
             )
-        alias_deletions = reconcile_compatible_aliases(db, legacy_aliases)
+        alias_deletions = reconcile_compatible_aliases(
+            db,
+            legacy_aliases,
+            lines,
+        )
         encoded_lines = [
             json.dumps(line, separators=(",", ":"))
             for line in [*lines, *deletion_lines]
@@ -2069,17 +2264,59 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
         raise
 
 
-def reconcile_compatible_aliases(db, aliases):
+def reconcile_compatible_aliases(db, aliases, records):
+    record_signatures = {}
+    for record in records:
+        source_record = record.get("sourceRecord")
+        if not isinstance(source_record, dict):
+            continue
+        stable_id = canonical_id_for(
+            source_record.get("store", "healthAutoExport"),
+            source_record.get("id", record.get("id", "")),
+        )
+        signature = compatibility_record_signature(record)
+        if signature is not None:
+            record_signatures[stable_id] = signature
     targets = {}
     for record_type, date_text, epoch, stable_id in dict.fromkeys(aliases):
-        targets.setdefault(record_type, set()).add((date_text, epoch))
+        signature = record_signatures.get(stable_id)
+        if signature is None:
+            stored = db.execute(
+                """
+                SELECT type, start_epoch, end_epoch, value,
+                       unit, source, kind
+                FROM compatible_alias_retirement
+                WHERE stable_id = ?
+                LIMIT 1
+                """,
+                (stable_id,),
+            ).fetchone()
+            signature = tuple(stored) if stored else None
+        if signature is None:
+            continue
+        existing_signatures = db.execute(
+            """
+            SELECT type, start_epoch, end_epoch, value, unit, source, kind
+            FROM compatible_alias_retirement
+            WHERE stable_id = ?
+            """,
+            (stable_id,),
+        ).fetchall()
+        if existing_signatures and signature not in {
+            tuple(existing) for existing in existing_signatures
+        }:
+            raise PartialBatch(
+                "stable identity conflicts with its preserved alias signature"
+            )
+        targets.setdefault(record_type, {})[stable_id] = signature
         db.execute(
             """
-            INSERT OR REPLACE INTO compatible_alias_retirement
-                (type, start_epoch, stable_id)
-            VALUES (?, ?, ?)
+            INSERT OR IGNORE INTO compatible_alias_retirement
+                (type, start_epoch, end_epoch, value, unit,
+                 source, kind, stable_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (record_type, epoch, stable_id),
+            (*signature, stable_id),
         )
         db.execute(
             """
@@ -2097,32 +2334,96 @@ def reconcile_compatible_aliases(db, aliases):
         )
 
     tombstones = []
-    for record_type, dates in targets.items():
+    for record_type, target_signatures in targets.items():
         rows = db.execute(
             """
-            SELECT source_id, start_date, record_version FROM samples
+            SELECT source_id, start_date, end_date, value, unit,
+                   source, kind, record_version
+            FROM samples
             WHERE type = ? AND tombstone = 0
               AND canonical_id LIKE 'apple.healthkit:%'
             """,
             (record_type,),
         )
-        for source_id, start_date, version in rows:
-            is_legacy_sleep = (
+        candidates = []
+        for (
+            source_id,
+            start_date,
+            end_date,
+            value,
+            unit,
+            source,
+            kind,
+            version,
+        ) in rows:
+            if (
                 record_type == "sleep_analysis"
                 and source_id == "sleep_analysis:None"
-            )
-            same_instant = False
-            if (
+                and target_signatures
+            ):
+                raise PartialBatch(
+                    "date-less legacy sleep identity is ambiguous"
+                )
+            if not (
                 isinstance(start_date, str)
                 and source_id.startswith(f"{record_type}:")
             ):
-                try:
-                    old_epoch = compatible_epoch_milliseconds(start_date)
-                except PartialBatch:
-                    old_epoch = None
-                same_instant = any(old_epoch == epoch for _, epoch in dates)
-            if not is_legacy_sleep and not same_instant:
                 continue
+            try:
+                candidate = compatibility_stored_signature(
+                    (
+                        record_type,
+                        start_date,
+                        end_date,
+                        value,
+                        unit,
+                        source,
+                        kind,
+                    )
+                )
+            except PartialBatch:
+                continue
+            candidates.append((source_id, version, candidate))
+        for source_id, version, candidate in candidates:
+            matching_targets = {
+                stable_id
+                for stable_id, signature in target_signatures.items()
+                if candidate == signature
+            }
+            matching_targets.update(
+                row[0] for row in db.execute(
+                    """
+                    SELECT stable_id FROM compatible_alias_retirement
+                    WHERE type = ? AND start_epoch = ?
+                      AND end_epoch IS ? AND value IS ? AND unit IS ?
+                      AND source IS ? AND kind IS ?
+                    """,
+                    candidate,
+                )
+            )
+            matching_candidates = sum(
+                other_signature == candidate
+                for _, _, other_signature in candidates
+            )
+            if matching_targets and (
+                len(matching_targets) != 1 or matching_candidates != 1
+            ):
+                raise PartialBatch(
+                    "compatible alias identity is ambiguous"
+                )
+            if not matching_targets:
+                continue
+            db.execute(
+                """
+                INSERT OR IGNORE INTO compatible_alias_identity
+                    (stable_id, legacy_id)
+                VALUES (?, ?)
+                """,
+                (
+                    next(iter(matching_targets)),
+                    canonical_id_for("apple.healthkit", source_id),
+                ),
+            )
             tombstones.append(json.dumps({
                 "deleted": True,
                 "id": source_id,
@@ -2150,6 +2451,60 @@ def compatible_epoch_milliseconds(value):
     if parsed.tzinfo is None:
         raise PartialBatch("compatible point timestamp has no time zone")
     return int(parsed.timestamp() * 1_000)
+
+
+def compatibility_record_signature(record):
+    start = record.get("startDate")
+    if not isinstance(start, str):
+        return None
+    try:
+        start_epoch = compatible_epoch_milliseconds(start)
+        end = record.get("endDate")
+        end_epoch = compatible_epoch_milliseconds(
+            end if isinstance(end, str) else start
+        )
+    except PartialBatch:
+        return None
+    quantity = record.get("quantity")
+    if not isinstance(quantity, dict):
+        quantity = {}
+    source = record.get("source")
+    if not isinstance(source, dict):
+        source = {}
+    return (
+        record.get("type", ""),
+        start_epoch,
+        end_epoch,
+        quantity.get("value", record.get("value", record.get("duration"))),
+        quantity.get("unit", record.get("unit")),
+        source.get("name"),
+        record.get("kind"),
+    )
+
+
+def compatibility_stored_signature(values):
+    (
+        record_type,
+        start_date,
+        end_date,
+        value,
+        unit,
+        source,
+        kind,
+    ) = values
+    if not isinstance(start_date, str):
+        return None
+    return (
+        record_type,
+        compatible_epoch_milliseconds(start_date),
+        compatible_epoch_milliseconds(
+            end_date if isinstance(end_date, str) else start_date
+        ),
+        value,
+        unit,
+        source,
+        kind,
+    )
 
 
 def compatibility_quantity(

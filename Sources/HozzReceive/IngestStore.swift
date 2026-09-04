@@ -8,6 +8,27 @@ public struct UnresolvedLegacyAliasError: Error, LocalizedError, Sendable {
     public var errorDescription: String? {
         "A stable deletion for \(type) cannot be matched to a pre-upgrade time-based record without its original date."
     }
+
+}
+
+private struct CompatibilityRecordSignature: Hashable {
+    let type: String
+    let kind: String?
+    let startDate: Date
+    let endDate: Date
+    let value: Double?
+    let unit: String?
+    let sourceName: String?
+
+    init(_ record: HealthRecord) {
+        type = record.type
+        kind = record.kind
+        startDate = record.startDate
+        endDate = record.endDate
+        value = record.value
+        unit = record.unit
+        sourceName = record.sourceName
+    }
 }
 
 /// One reading from inside a quantity series, back out of the store.
@@ -335,6 +356,122 @@ public actor IngestStore {
         try migrateToEight(database, from: version)
         try migrateToNine(database, from: version)
         try migrateToTen(database, from: version)
+        try migrateToEleven(database, from: version)
+    }
+
+    private static func migrateToEleven(
+        _ database: SQLiteDatabase,
+        from version: Int64
+    ) throws {
+        guard version < 11 else {
+            return
+        }
+        try database.transaction {
+            try database.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sample_alias_signature (
+                    stable_id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    kind TEXT,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    value REAL,
+                    unit TEXT,
+                    source_name TEXT
+                );
+                CREATE INDEX IF NOT EXISTS sample_alias_signature_lookup
+                    ON sample_alias_signature (
+                        type, start_time, end_time, kind,
+                        value, unit, source_name
+                    );
+                INSERT OR REPLACE INTO sample_unresolved_legacy_deletion
+                    (stable_id, type)
+                SELECT alias.stable_id,
+                       substr(
+                         alias.legacy_id,
+                         1,
+                         instr(alias.legacy_id, ':') - 1
+                       )
+                FROM sample_identity_alias AS alias
+                JOIN sample_tombstone AS tombstone
+                  ON tombstone.id = alias.stable_id
+                WHERE instr(alias.legacy_id, ':') > 1;
+                INSERT OR IGNORE INTO sample_unresolved_legacy_deletion
+                    (stable_id, type)
+                SELECT
+                    'v10-retirement:' || type || ':' || start_time,
+                    type
+                FROM sample_alias_retirement;
+                DELETE FROM sample_identity_alias;
+                DELETE FROM sample_alias_retirement;
+                INSERT OR IGNORE INTO sample_alias_signature
+                    (stable_id, type, kind, start_time, end_time,
+                     value, unit, source_name)
+                SELECT id, type, kind, start_date, end_date,
+                       value, unit, source_name
+                FROM sample
+                WHERE substr(id, 1, length(type) + 1) != type || ':';
+                INSERT OR REPLACE INTO sample_identity_alias
+                    (stable_id, legacy_id)
+                SELECT stable.id, legacy.id
+                FROM sample AS stable
+                JOIN sample AS legacy
+                  ON legacy.type = stable.type
+                 AND legacy.start_date = stable.start_date
+                 AND legacy.end_date = stable.end_date
+                 AND legacy.kind IS stable.kind
+                 AND legacy.value IS stable.value
+                 AND legacy.unit IS stable.unit
+                 AND legacy.source_name IS stable.source_name
+                 AND legacy.id != stable.id
+                WHERE substr(legacy.id, 1, length(legacy.type) + 1)
+                          = legacy.type || ':'
+                  AND substr(stable.id, 1, length(stable.type) + 1)
+                          != stable.type || ':'
+                  AND (
+                    SELECT COUNT(*) FROM sample AS candidate
+                    WHERE candidate.type = legacy.type
+                      AND candidate.start_date = legacy.start_date
+                      AND candidate.end_date = legacy.end_date
+                      AND candidate.kind IS legacy.kind
+                      AND candidate.value IS legacy.value
+                      AND candidate.unit IS legacy.unit
+                      AND candidate.source_name IS legacy.source_name
+                      AND substr(
+                            candidate.id,
+                            1,
+                            length(candidate.type) + 1
+                          ) != candidate.type || ':'
+                  ) = 1
+                  AND (
+                    SELECT COUNT(*) FROM sample AS candidate
+                    WHERE candidate.type = stable.type
+                      AND candidate.start_date = stable.start_date
+                      AND candidate.end_date = stable.end_date
+                      AND candidate.kind IS stable.kind
+                      AND candidate.value IS stable.value
+                      AND candidate.unit IS stable.unit
+                      AND candidate.source_name IS stable.source_name
+                      AND substr(
+                            candidate.id,
+                            1,
+                            length(candidate.type) + 1
+                          ) = candidate.type || ':'
+                  ) = 1;
+                INSERT OR REPLACE INTO sample_alias_retirement
+                    (type, start_time)
+                SELECT stable.type, stable.start_time
+                FROM sample_identity_alias AS alias
+                JOIN sample_alias_signature AS stable
+                  ON stable.stable_id = alias.stable_id;
+                DELETE FROM sample
+                WHERE id IN (
+                    SELECT legacy_id FROM sample_identity_alias
+                );
+                PRAGMA user_version = 11;
+                """
+            )
+        }
     }
 
     private static func migrateToTen(
@@ -366,6 +503,28 @@ public actor IngestStore {
                     start_time TEXT NOT NULL,
                     PRIMARY KEY (type, start_time)
                 );
+                CREATE TABLE IF NOT EXISTS sample_alias_signature (
+                    stable_id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    kind TEXT,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    value REAL,
+                    unit TEXT,
+                    source_name TEXT
+                );
+                CREATE INDEX IF NOT EXISTS sample_alias_signature_lookup
+                    ON sample_alias_signature (
+                        type, start_time, end_time, kind,
+                        value, unit, source_name
+                    );
+                INSERT OR IGNORE INTO sample_alias_signature
+                    (stable_id, type, kind, start_time, end_time,
+                     value, unit, source_name)
+                SELECT id, type, kind, start_date, end_date,
+                       value, unit, source_name
+                FROM sample
+                WHERE substr(id, 1, length(type) + 1) != type || ':';
                 INSERT OR REPLACE INTO sample_identity_alias
                     (stable_id, legacy_id)
                 SELECT stable.id, legacy.id
@@ -373,35 +532,56 @@ public actor IngestStore {
                 JOIN sample AS legacy
                   ON legacy.type = stable.type
                  AND legacy.start_date = stable.start_date
+                 AND legacy.end_date = stable.end_date
+                 AND legacy.kind IS stable.kind
+                 AND legacy.value IS stable.value
+                 AND legacy.unit IS stable.unit
+                 AND legacy.source_name IS stable.source_name
                  AND legacy.id != stable.id
                 WHERE substr(legacy.id, 1, length(legacy.type) + 1)
                           = legacy.type || ':'
                   AND substr(stable.id, 1, length(stable.type) + 1)
-                          != stable.type || ':';
+                          != stable.type || ':'
+                  AND (
+                    SELECT COUNT(*) FROM sample AS candidate
+                    WHERE candidate.type = legacy.type
+                      AND candidate.start_date = legacy.start_date
+                      AND candidate.end_date = legacy.end_date
+                      AND candidate.kind IS legacy.kind
+                      AND candidate.value IS legacy.value
+                      AND candidate.unit IS legacy.unit
+                      AND candidate.source_name IS legacy.source_name
+                      AND substr(
+                            candidate.id,
+                            1,
+                            length(candidate.type) + 1
+                          ) != candidate.type || ':'
+                  ) = 1
+                  AND (
+                    SELECT COUNT(*) FROM sample AS candidate
+                    WHERE candidate.type = stable.type
+                      AND candidate.start_date = stable.start_date
+                      AND candidate.end_date = stable.end_date
+                      AND candidate.kind IS stable.kind
+                      AND candidate.value IS stable.value
+                      AND candidate.unit IS stable.unit
+                      AND candidate.source_name IS stable.source_name
+                      AND substr(
+                            candidate.id,
+                            1,
+                            length(candidate.type) + 1
+                          ) = candidate.type || ':'
+                  ) = 1;
                 INSERT OR REPLACE INTO sample_alias_retirement
                     (type, start_time)
-                SELECT stable.type, stable.start_date
-                FROM sample AS stable
-                JOIN sample AS legacy
-                  ON legacy.type = stable.type
-                 AND legacy.start_date = stable.start_date
-                 AND legacy.id != stable.id
-                WHERE substr(legacy.id, 1, length(legacy.type) + 1)
-                          = legacy.type || ':'
-                  AND substr(stable.id, 1, length(stable.type) + 1)
-                          != stable.type || ':';
+                SELECT stable.type, stable.start_time
+                FROM sample_identity_alias AS alias
+                JOIN sample_alias_signature AS stable
+                  ON stable.stable_id = alias.stable_id;
                 DELETE FROM sample
-                WHERE substr(id, 1, length(type) + 1) = type || ':'
-                  AND EXISTS (
-                    SELECT 1 FROM sample AS stable
-                    WHERE stable.type = sample.type
-                      AND stable.start_date = sample.start_date
-                      AND substr(
-                            stable.id,
-                            1,
-                            length(stable.type) + 1
-                          ) != stable.type || ':'
-                  );
+                WHERE id IN (
+                    SELECT legacy_id FROM sample_identity_alias
+                );
                 """
             )
             try database.execute("PRAGMA user_version = 10")
@@ -561,6 +741,21 @@ public actor IngestStore {
                     start_time TEXT NOT NULL,
                     PRIMARY KEY (type, start_time)
                 );
+                CREATE TABLE IF NOT EXISTS sample_alias_signature (
+                    stable_id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL,
+                    kind TEXT,
+                    start_time TEXT NOT NULL,
+                    end_time TEXT NOT NULL,
+                    value REAL,
+                    unit TEXT,
+                    source_name TEXT
+                );
+                CREATE INDEX IF NOT EXISTS sample_alias_signature_lookup
+                    ON sample_alias_signature (
+                        type, start_time, end_time, kind,
+                        value, unit, source_name
+                    );
 
                 -- A batch that arrives twice must not be stored twice. The key
                 -- is the content hash the phone sends, so a retried delivery
@@ -1066,6 +1261,16 @@ public actor IngestStore {
         var storedQuantitySeriesPages = 0
         var storedAudiograms = 0
         var deletedIdentities = Set<String>()
+        var incomingStableIDs: [CompatibilityRecordSignature: Set<String>] = [:]
+        var incomingLegacyIDs: [CompatibilityRecordSignature: Set<String>] = [:]
+        for record in batch.records {
+            let signature = CompatibilityRecordSignature(record)
+            if record.isLegacyCompatibilityIdentity {
+                incomingLegacyIDs[signature, default: []].insert(record.id)
+            } else if record.legacyAliasID != nil {
+                incomingStableIDs[signature, default: []].insert(record.id)
+            }
+        }
         func isTombstoned(_ id: String) throws -> Bool {
             try database.query(
                 "SELECT 1 FROM sample_tombstone WHERE id = ? LIMIT 1",
@@ -1120,45 +1325,120 @@ public actor IngestStore {
             )
         }
         for record in batch.records {
-            let retiredInstant = try database.query(
-                """
-                SELECT 1 FROM sample_alias_retirement
-                WHERE type = ? AND start_time = ? LIMIT 1
-                """,
-                [
-                    .text(record.type),
-                    .text(Timestamps.text(from: record.startDate))
-                ],
-                row: { _ in true }
-            ).first ?? false
-            if retiredInstant && record.isLegacyCompatibilityIdentity {
-                continue
-            }
-            let retiredAlias = try database.query(
-                """
-                SELECT 1 FROM sample_identity_alias
-                WHERE legacy_id = ? LIMIT 1
-                """,
-                [.text(record.id)],
-                row: { _ in true }
-            ).first ?? false
-            if retiredAlias {
-                continue
+            var matchedLegacyAliasID: String?
+            if record.legacyAliasID != nil {
+                let existingSignatureCount = try database.query(
+                    """
+                    SELECT COUNT(*) FROM sample_alias_signature
+                    WHERE stable_id = ?
+                    """,
+                    [.text(record.id)],
+                    row: { Int($0.integer(0)) }
+                ).first ?? 0
+                let matchingExistingSignatureCount = try database.query(
+                    """
+                    SELECT COUNT(*) FROM sample_alias_signature
+                    WHERE stable_id = ?
+                      AND type = ?
+                      AND kind IS ?
+                      AND start_time = ?
+                      AND end_time = ?
+                      AND value IS ?
+                      AND unit IS ?
+                      AND source_name IS ?
+                    """,
+                    [
+                        .text(record.id),
+                        .text(record.type),
+                        record.kind.map(SQLiteValue.text) ?? .null,
+                        .text(Timestamps.text(from: record.startDate)),
+                        .text(Timestamps.text(from: record.endDate)),
+                        record.value.map(SQLiteValue.real) ?? .null,
+                        record.unit.map(SQLiteValue.text) ?? .null,
+                        record.sourceName.map(SQLiteValue.text) ?? .null
+                    ],
+                    row: { Int($0.integer(0)) }
+                ).first ?? 0
+                if existingSignatureCount > 0 &&
+                    matchingExistingSignatureCount == 0 {
+                    throw UnresolvedLegacyAliasError(type: record.type)
+                }
             }
             if record.isLegacyCompatibilityIdentity {
-                let matchingStable = try database.query(
+                let mappedStableIDs = try database.query(
                     """
-                    SELECT id FROM sample
-                    WHERE type = ? AND start_date = ? AND id != ?
+                    SELECT stable_id FROM sample_identity_alias
+                    WHERE legacy_id = ?
+                    """,
+                    [.text(record.id)],
+                    row: { $0.text(0) }
+                )
+                if mappedStableIDs.count > 1 {
+                    throw UnresolvedLegacyAliasError(type: record.type)
+                }
+                if mappedStableIDs.count == 1 {
+                    try database.run(
+                        "DELETE FROM sample WHERE id = ?",
+                        [.text(record.id)]
+                    )
+                    try removeSpecializedRecords(for: record.id)
+                    continue
+                }
+            }
+            let matchingSignatureIDs: [String]
+            if record.isLegacyCompatibilityIdentity {
+                matchingSignatureIDs = try database.query(
+                    """
+                    SELECT stable_id FROM sample_alias_signature
+                    WHERE type = ?
+                      AND kind IS ?
+                      AND start_time = ?
+                      AND end_time = ?
+                      AND value IS ?
+                      AND unit IS ?
+                      AND source_name IS ?
                     """,
                     [
                         .text(record.type),
+                        record.kind.map(SQLiteValue.text) ?? .null,
                         .text(Timestamps.text(from: record.startDate)),
-                        .text(record.id)
+                        .text(Timestamps.text(from: record.endDate)),
+                        record.value.map(SQLiteValue.real) ?? .null,
+                        record.unit.map(SQLiteValue.text) ?? .null,
+                        record.sourceName.map(SQLiteValue.text) ?? .null
                     ],
                     row: { $0.text(0) }
-                ).first { !$0.hasPrefix("\(record.type):") }
-                if let matchingStable {
+                )
+            } else {
+                matchingSignatureIDs = []
+            }
+            let signature = CompatibilityRecordSignature(record)
+            var allMatchingStableIDs = Set(matchingSignatureIDs)
+            allMatchingStableIDs.formUnion(incomingStableIDs[signature] ?? [])
+            if record.isLegacyCompatibilityIdentity,
+               allMatchingStableIDs.count > 1 {
+                throw UnresolvedLegacyAliasError(type: record.type)
+            }
+            if
+                record.isLegacyCompatibilityIdentity,
+                allMatchingStableIDs.count == 1,
+                let matchingStable = allMatchingStableIDs.first
+            {
+                    let alreadyMapped = try database.query(
+                        """
+                        SELECT 1 FROM sample_identity_alias
+                        WHERE stable_id = ? AND legacy_id = ?
+                        LIMIT 1
+                        """,
+                        [.text(matchingStable), .text(record.id)],
+                        row: { _ in true }
+                    ).first ?? false
+                    let pairedInBatch =
+                        incomingStableIDs[signature]?.contains(matchingStable)
+                        ?? false
+                    if !alreadyMapped && !pairedInBatch {
+                        throw UnresolvedLegacyAliasError(type: record.type)
+                    }
                     try database.run(
                         """
                         INSERT OR REPLACE INTO sample_identity_alias
@@ -1184,25 +1464,85 @@ public actor IngestStore {
                     )
                     deleted += database.changeCount
                     continue
-                }
             }
             if try isTombstoned(record.id) {
-                if let legacyAliasID = record.legacyAliasID {
-                    let matchingLegacyIDs = Set(
-                        try database.query(
+                if record.legacyAliasID != nil {
+                    let matchedLegacyIDs = try database.query(
                             """
                             SELECT id FROM sample
-                            WHERE type = ? AND start_date = ?
+                            WHERE type = ?
+                              AND kind IS ?
+                              AND start_date = ?
+                              AND end_date = ?
+                              AND value IS ?
+                              AND unit IS ?
+                              AND source_name IS ?
                               AND substr(id, 1, length(type) + 1) = type || ':'
                             """,
                             [
                                 .text(record.type),
-                                .text(Timestamps.text(from: record.startDate))
+                                record.kind.map(SQLiteValue.text) ?? .null,
+                                .text(Timestamps.text(from: record.startDate)),
+                                .text(Timestamps.text(from: record.endDate)),
+                                record.value.map(SQLiteValue.real) ?? .null,
+                                record.unit.map(SQLiteValue.text) ?? .null,
+                                record.sourceName.map(SQLiteValue.text) ?? .null
                             ],
                             row: { $0.text(0) }
                         )
-                    ).union([legacyAliasID])
-                    for matchingLegacyID in matchingLegacyIDs {
+                    var allMatchedLegacyIDs = Set(matchedLegacyIDs)
+                    allMatchedLegacyIDs.formUnion(incomingLegacyIDs[signature] ?? [])
+                    if allMatchedLegacyIDs.count > 1 {
+                        throw UnresolvedLegacyAliasError(type: record.type)
+                    }
+                    let persistedStableIDs = Set(try database.query(
+                        """
+                        SELECT stable_id FROM sample_alias_signature
+                        WHERE type = ?
+                          AND kind IS ?
+                          AND start_time = ?
+                          AND end_time = ?
+                          AND value IS ?
+                          AND unit IS ?
+                          AND source_name IS ?
+                        """,
+                        [
+                            .text(record.type),
+                            record.kind.map(SQLiteValue.text) ?? .null,
+                            .text(Timestamps.text(from: record.startDate)),
+                            .text(Timestamps.text(from: record.endDate)),
+                            record.value.map(SQLiteValue.real) ?? .null,
+                            record.unit.map(SQLiteValue.text) ?? .null,
+                            record.sourceName.map(SQLiteValue.text) ?? .null
+                        ],
+                        row: { $0.text(0) }
+                    ))
+                    let allStableCandidates = persistedStableIDs.union(
+                        incomingStableIDs[signature] ?? []
+                    )
+                    if !allMatchedLegacyIDs.isEmpty &&
+                        allStableCandidates.count != 1 {
+                        throw UnresolvedLegacyAliasError(type: record.type)
+                    }
+                    try database.run(
+                        """
+                        INSERT OR IGNORE INTO sample_alias_signature
+                            (stable_id, type, kind, start_time, end_time,
+                             value, unit, source_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            .text(record.id),
+                            .text(record.type),
+                            record.kind.map(SQLiteValue.text) ?? .null,
+                            .text(Timestamps.text(from: record.startDate)),
+                            .text(Timestamps.text(from: record.endDate)),
+                            record.value.map(SQLiteValue.real) ?? .null,
+                            record.unit.map(SQLiteValue.text) ?? .null,
+                            record.sourceName.map(SQLiteValue.text) ?? .null
+                        ]
+                    )
+                    if let matchingLegacyID = allMatchedLegacyIDs.first {
                         try database.run(
                             """
                             INSERT OR REPLACE INTO sample_tombstone (id, received_at)
@@ -1216,33 +1556,31 @@ public actor IngestStore {
                         )
                         deleted += database.changeCount
                         try removeSpecializedRecords(for: matchingLegacyID)
+                        try database.run(
+                            """
+                            INSERT OR REPLACE INTO sample_identity_alias
+                                (stable_id, legacy_id)
+                            VALUES (?, ?)
+                            """,
+                            [.text(record.id), .text(matchingLegacyID)]
+                        )
+                        try database.run(
+                            """
+                            DELETE FROM sample_unresolved_legacy_deletion
+                            WHERE stable_id = ?
+                            """,
+                            [.text(record.id)]
+                        )
+                    } else {
+                        try database.run(
+                            """
+                            INSERT OR REPLACE INTO sample_unresolved_legacy_deletion
+                                (stable_id, type)
+                            VALUES (?, ?)
+                            """,
+                            [.text(record.id), .text(record.type)]
+                        )
                     }
-                    try database.run(
-                        """
-                        INSERT OR REPLACE INTO sample_identity_alias
-                            (stable_id, legacy_id)
-                        VALUES (?, ?)
-                        """,
-                        [.text(record.id), .text(legacyAliasID)]
-                    )
-                    try database.run(
-                        """
-                        INSERT OR REPLACE INTO sample_alias_retirement
-                            (type, start_time)
-                        VALUES (?, ?)
-                        """,
-                        [
-                            .text(record.type),
-                            .text(Timestamps.text(from: record.startDate))
-                        ]
-                    )
-                    try database.run(
-                        """
-                        DELETE FROM sample_unresolved_legacy_deletion
-                        WHERE stable_id = ?
-                        """,
-                        [.text(record.id)]
-                    )
                 }
                 continue
             }
@@ -1271,27 +1609,72 @@ public actor IngestStore {
             }
             if let legacyAliasID = record.legacyAliasID,
                legacyAliasID != record.id {
-                let prefix = "\(record.type):"
-                try database.run(
+                let matchingLegacyIDs = try database.query(
                     """
-                    DELETE FROM sample
+                    SELECT id FROM sample
                     WHERE type = ?
-                      AND (
-                        id = ?
-                        OR (
-                          start_date = ?
-                          AND substr(id, 1, ?) = ?
-                        )
-                      )
+                      AND substr(id, 1, length(type) + 1) = type || ':'
+                      AND kind IS ?
+                      AND start_date = ?
+                      AND end_date = ?
+                      AND value IS ?
+                      AND unit IS ?
+                      AND source_name IS ?
                     """,
                     [
                         .text(record.type),
-                        .text(legacyAliasID),
+                        record.kind.map(SQLiteValue.text) ?? .null,
                         .text(Timestamps.text(from: record.startDate)),
-                        .integer(Int64(prefix.count)),
-                        .text(prefix)
-                    ]
+                        .text(Timestamps.text(from: record.endDate)),
+                        record.value.map(SQLiteValue.real) ?? .null,
+                        record.unit.map(SQLiteValue.text) ?? .null,
+                        record.sourceName.map(SQLiteValue.text) ?? .null
+                    ],
+                    row: { $0.text(0) }
                 )
+                var allMatchingLegacyIDs = Set(matchingLegacyIDs)
+                allMatchingLegacyIDs.formUnion(incomingLegacyIDs[signature] ?? [])
+                if allMatchingLegacyIDs.count > 1 {
+                    throw UnresolvedLegacyAliasError(type: record.type)
+                }
+                let persistedStableIDs = Set(try database.query(
+                    """
+                    SELECT stable_id FROM sample_alias_signature
+                    WHERE type = ?
+                      AND kind IS ?
+                      AND start_time = ?
+                      AND end_time = ?
+                      AND value IS ?
+                      AND unit IS ?
+                      AND source_name IS ?
+                    """,
+                    [
+                        .text(record.type),
+                        record.kind.map(SQLiteValue.text) ?? .null,
+                        .text(Timestamps.text(from: record.startDate)),
+                        .text(Timestamps.text(from: record.endDate)),
+                        record.value.map(SQLiteValue.real) ?? .null,
+                        record.unit.map(SQLiteValue.text) ?? .null,
+                        record.sourceName.map(SQLiteValue.text) ?? .null
+                    ],
+                    row: { $0.text(0) }
+                ))
+                let allStableCandidates =
+                    persistedStableIDs.union(incomingStableIDs[signature] ?? [])
+                if
+                    !allMatchingLegacyIDs.isEmpty,
+                    allStableCandidates.count != 1
+                {
+                    throw UnresolvedLegacyAliasError(type: record.type)
+                }
+                if allMatchingLegacyIDs.count == 1,
+                   let matchingLegacyID = allMatchingLegacyIDs.first {
+                    try database.run(
+                        "DELETE FROM sample WHERE id = ?",
+                        [.text(matchingLegacyID)]
+                    )
+                    matchedLegacyAliasID = matchingLegacyID
+                }
             }
             try database.run(
                 """
@@ -1322,14 +1705,34 @@ public actor IngestStore {
                     .text(timestamp)
                 ]
             )
-            if let legacyAliasID = record.legacyAliasID {
+            if record.legacyAliasID != nil {
+                if let matchedLegacyAliasID {
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_identity_alias
+                            (stable_id, legacy_id)
+                        VALUES (?, ?)
+                        """,
+                        [.text(record.id), .text(matchedLegacyAliasID)]
+                    )
+                }
                 try database.run(
                     """
-                    INSERT OR REPLACE INTO sample_identity_alias
-                        (stable_id, legacy_id)
-                    VALUES (?, ?)
+                    INSERT OR IGNORE INTO sample_alias_signature
+                        (stable_id, type, kind, start_time, end_time,
+                         value, unit, source_name)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
-                    [.text(record.id), .text(legacyAliasID)]
+                    [
+                        .text(record.id),
+                        .text(record.type),
+                        record.kind.map(SQLiteValue.text) ?? .null,
+                        .text(Timestamps.text(from: record.startDate)),
+                        .text(Timestamps.text(from: record.endDate)),
+                        record.value.map(SQLiteValue.real) ?? .null,
+                        record.unit.map(SQLiteValue.text) ?? .null,
+                        record.sourceName.map(SQLiteValue.text) ?? .null
+                    ]
                 )
                 try database.run(
                     """
@@ -1390,6 +1793,16 @@ public actor IngestStore {
                         row: { $0.text(0) }
                     )
                 )
+                resolvedStableIDs.formUnion(
+                    try database.query(
+                        """
+                        SELECT id FROM sample_tombstone
+                        WHERE id IN (\(stablePlaceholders))
+                        """,
+                        stableIDs.sorted().map(SQLiteValue.text),
+                        row: { $0.text(0) }
+                    )
+                )
             }
             let unresolvedIDs = stableIDs.subtracting(resolvedStableIDs)
             if !unresolvedIDs.isEmpty {
@@ -1425,7 +1838,7 @@ public actor IngestStore {
 
         for deletion in batch.deletions {
             deletedIdentities.insert(deletion.id)
-            var stableAliases = Set(try database.query(
+            let stableAliases = Set(try database.query(
                 """
                 SELECT stable_id FROM sample_identity_alias
                 WHERE legacy_id = ?
@@ -1435,17 +1848,6 @@ public actor IngestStore {
             ))
             if let type = deletion.type, let startDate = deletion.startDate {
                 let normalizedStart = Timestamps.text(from: startDate)
-                stableAliases.formUnion(
-                    try database.query(
-                        """
-                        SELECT id FROM sample
-                        WHERE type = ? AND start_date = ?
-                          AND substr(id, 1, length(type) + 1) != type || ':'
-                        """,
-                        [.text(type), .text(normalizedStart)],
-                        row: { $0.text(0) }
-                    )
-                )
                 try database.run(
                     """
                     INSERT OR REPLACE INTO sample_alias_retirement
@@ -1463,47 +1865,140 @@ public actor IngestStore {
                 [.text(deletion.id)],
                 row: { $0.text(0) }
             ))
-            if let explicitAlias = deletion.legacyAliasID {
-                legacyAliases.insert(explicitAlias)
-            }
-            if let stored = try database.query(
+            if let signature = try database.query(
                 """
-                SELECT type, raw, start_date FROM sample
-                WHERE id = ? LIMIT 1
+                SELECT type, kind, start_time, end_time,
+                       value, unit, source_name
+                FROM sample_alias_signature
+                WHERE stable_id = ?
                 """,
                 [.text(deletion.id)],
-                row: { ($0.text(0), $0.blob(1), $0.text(2)) }
-            ).first,
-               let raw = stored.1,
-               let object = try? JSONSerialization.jsonObject(with: raw)
-                    as? [String: Any],
-               object["id"] is String,
-               let date = (object["date"] as? String)
-                    ?? (object["startDate"] as? String) {
-                legacyAliases.insert("\(stored.0):\(date)")
-                try database.run(
+                row: {
+                    (
+                        $0.text(0), $0.optionalText(1), $0.text(2),
+                        $0.text(3), $0.optionalReal(4),
+                        $0.optionalText(5), $0.optionalText(6)
+                    )
+                }
+            ).first {
+                let candidates = try database.query(
                     """
-                    INSERT OR REPLACE INTO sample_alias_retirement
-                        (type, start_time)
-                    VALUES (?, ?)
+                    SELECT id FROM sample
+                    WHERE type = ?
+                      AND kind IS ?
+                      AND start_date = ?
+                      AND end_date = ?
+                      AND value IS ?
+                      AND unit IS ?
+                      AND source_name IS ?
+                      AND substr(id, 1, length(type) + 1) = type || ':'
                     """,
-                    [.text(stored.0), .text(stored.2)]
+                    [
+                        .text(signature.0),
+                        signature.1.map(SQLiteValue.text) ?? .null,
+                        .text(signature.2),
+                        .text(signature.3),
+                        signature.4.map(SQLiteValue.real) ?? .null,
+                        signature.5.map(SQLiteValue.text) ?? .null,
+                        signature.6.map(SQLiteValue.text) ?? .null
+                    ],
+                    row: { $0.text(0) }
                 )
+                let stableCandidateCount = try database.query(
+                    """
+                    SELECT COUNT(*) FROM sample_alias_signature
+                    WHERE type = ?
+                      AND kind IS ?
+                      AND start_time = ?
+                      AND end_time = ?
+                      AND value IS ?
+                      AND unit IS ?
+                      AND source_name IS ?
+                    """,
+                    [
+                        .text(signature.0),
+                        signature.1.map(SQLiteValue.text) ?? .null,
+                        .text(signature.2),
+                        .text(signature.3),
+                        signature.4.map(SQLiteValue.real) ?? .null,
+                        signature.5.map(SQLiteValue.text) ?? .null,
+                        signature.6.map(SQLiteValue.text) ?? .null
+                    ],
+                    row: { Int($0.integer(0)) }
+                ).first ?? 0
+                if !candidates.isEmpty && (
+                    candidates.count != 1 || stableCandidateCount != 1
+                ) {
+                    throw UnresolvedLegacyAliasError(type: signature.0)
+                }
+                if let candidate = candidates.first {
+                    legacyAliases.insert(candidate)
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_identity_alias
+                            (stable_id, legacy_id)
+                        VALUES (?, ?)
+                        """,
+                        [.text(deletion.id), .text(candidate)]
+                    )
+                }
             }
             if
+                legacyAliases.isEmpty,
+                let explicitAlias = deletion.legacyAliasID
+            {
+                let ambiguousLegacy = try database.query(
+                    """
+                    SELECT 1 FROM sample
+                    WHERE id = ?
+                    LIMIT 1
+                    """,
+                    [.text(explicitAlias)],
+                    row: { _ in true }
+                ).first ?? false
+                if ambiguousLegacy {
+                    throw UnresolvedLegacyAliasError(
+                        type: deletion.type ?? "record"
+                    )
+                }
+            }
+            if
+                legacyAliases.isEmpty,
                 let type = deletion.type,
                 let legacyStartDate = deletion.legacyStartDate
             {
-                try database.run(
+                let prefix = "\(type):"
+                let normalizedConflict = try database.query(
                     """
-                    INSERT OR REPLACE INTO sample_alias_retirement
-                        (type, start_time)
-                    VALUES (?, ?)
+                    SELECT 1 FROM sample
+                    WHERE type = ? AND start_date = ?
+                      AND substr(id, 1, ?) = ?
+                    LIMIT 1
                     """,
                     [
                         .text(type),
-                        .text(Timestamps.text(from: legacyStartDate))
-                    ]
+                        .text(Timestamps.text(from: legacyStartDate)),
+                        .integer(Int64(prefix.count)),
+                        .text(prefix)
+                    ],
+                    row: { _ in true }
+                ).first ?? false
+                if normalizedConflict {
+                    throw UnresolvedLegacyAliasError(type: type)
+                }
+            }
+            if
+                legacyAliases.isEmpty,
+                let type = deletion.type,
+                deletion.legacyStartDate != nil
+            {
+                try database.run(
+                    """
+                    INSERT OR REPLACE INTO sample_unresolved_legacy_deletion
+                        (stable_id, type)
+                    VALUES (?, ?)
+                    """,
+                    [.text(deletion.id), .text(type)]
                 )
             }
             deletedIdentities.formUnion(stableAliases)
@@ -1543,13 +2038,12 @@ public actor IngestStore {
                 )
                 deleted += database.changeCount
             }
-            if let startDate = deletion.startDate, let type = deletion.type {
-                // The metrics shape carries no sample identifier, so a
-                // deletion can only be matched the same way its upserts
-                // were keyed.
+            if deletion.startDate != nil, let type = deletion.type {
+                // A timestamp-only deletion may remove only its exact legacy
+                // identity; stable records require a persisted alias mapping.
                 try database.run(
-                    "DELETE FROM sample WHERE type = ? AND start_date = ?",
-                    [.text(type), .text(Timestamps.text(from: startDate))]
+                    "DELETE FROM sample WHERE type = ? AND id = ?",
+                    [.text(type), .text(deletion.id)]
                 )
             } else {
                 try database.run(
@@ -1557,33 +2051,6 @@ public actor IngestStore {
                     [.text(deletion.id)]
                 )
                 deleted += database.changeCount
-                if
-                    let type = deletion.type,
-                    let legacyStartDate = deletion.legacyStartDate
-                {
-                    let prefix = "\(type):"
-                    try database.run(
-                        """
-                        DELETE FROM sample
-                        WHERE type = ?
-                          AND (
-                            id = ?
-                            OR (
-                              start_date = ?
-                              AND substr(id, 1, ?) = ?
-                            )
-                          )
-                        """,
-                        [
-                            .text(type),
-                            deletion.legacyAliasID.map(SQLiteValue.text) ?? .null,
-                            .text(Timestamps.text(from: legacyStartDate)),
-                            .integer(Int64(prefix.count)),
-                            .text(prefix)
-                        ]
-                    )
-                    deleted += database.changeCount
-                }
             }
             if deletion.startDate != nil {
                 deleted += database.changeCount

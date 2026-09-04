@@ -32,7 +32,7 @@ final class SchemaMigrationTests: XCTestCase {
     }
 
     /// The current schema. Every historical fixture must reach this.
-    private static let currentVersion: Int64 = 10
+    private static let currentVersion: Int64 = 11
 
     // MARK: - The historical schemas, as they actually were
 
@@ -550,6 +550,7 @@ final class SchemaMigrationTests: XCTestCase {
             DROP TABLE sample_identity_alias;
             DROP TABLE sample_unresolved_legacy_deletion;
             DROP TABLE sample_alias_retirement;
+            DROP TABLE sample_alias_signature;
             PRAGMA user_version = 9;
             """
         )
@@ -576,6 +577,44 @@ final class SchemaMigrationTests: XCTestCase {
                 .contains("sample_unresolved_legacy_deletion")
         )
         XCTAssertTrue(try tables(in: databaseURL).contains("sample_alias_retirement"))
+        XCTAssertTrue(try tables(in: databaseURL).contains("sample_alias_signature"))
+    }
+
+    func testVersionTenDatabaseGainsSignatureTable() async throws {
+        let directory = root.appending(path: "version-ten")
+        let store = try IngestStore(directory: directory)
+        await store.close()
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let database = try SQLiteDatabase(url: databaseURL)
+        try database.execute(
+            """
+            DROP TABLE sample_alias_signature;
+            INSERT OR REPLACE INTO sample_tombstone (id, received_at)
+            VALUES ('deleted-before-stable', '2026-01-01T00:00:00.000Z');
+            INSERT OR REPLACE INTO sample_alias_retirement (type, start_time)
+            VALUES ('step_count', '2026-01-01T00:00:00.000Z');
+            PRAGMA user_version = 10;
+            """
+        )
+        database.close()
+
+        let upgraded = try IngestStore(directory: directory)
+        await upgraded.close()
+
+        XCTAssertEqual(try version(of: databaseURL), Self.currentVersion)
+        XCTAssertTrue(try tables(in: databaseURL).contains("sample_alias_signature"))
+        let migrated = try SQLiteDatabase(url: databaseURL)
+        defer { migrated.close() }
+        XCTAssertEqual(
+            try migrated.query(
+                """
+                SELECT COUNT(*) FROM sample_unresolved_legacy_deletion
+                WHERE type = 'step_count'
+                """,
+                row: { $0.integer(0) }
+            ).first,
+            1
+        )
     }
 
     /// Five agents added tables in one evening. Someone adding one to the

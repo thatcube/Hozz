@@ -1496,10 +1496,12 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 }],
             },
         })
-        self.assertEqual(
-            (0, 0, False),
-            ingest_lines(self.db, [legacy], batch_key="legacy-before-stable"),
-        )
+        with self.assertRaises(PartialBatch):
+            ingest_lines(
+                self.db,
+                [legacy],
+                batch_key="legacy-before-stable",
+            )
         self.assertEqual(
             0,
             self.db.execute(
@@ -1593,7 +1595,7 @@ class TransactionAndArchiveTests(unittest.TestCase):
         receiver.backfill_compatible_deletion_state(self.db)
 
         self.assertEqual(
-            1,
+            0,
             self.db.execute(
                 """
                 SELECT COUNT(*) FROM compatible_alias_retirement
@@ -1602,19 +1604,88 @@ class TransactionAndArchiveTests(unittest.TestCase):
             ).fetchone()[0],
         )
         self.assertEqual(
-            0,
+            2,
             self.db.execute(
                 "SELECT COUNT(*) FROM compatible_unresolved_deletion"
             ).fetchone()[0],
         )
         self.assertEqual(
-            2,
+            0,
             self.db.execute(
                 "SELECT COUNT(*) FROM compatible_resolved_deletion"
             ).fetchone()[0],
         )
 
-    def test_dated_deletion_retires_delayed_legacy_alias(self):
+    def test_old_retirement_tombstone_without_raw_becomes_unresolved(self):
+        tombstone = {
+            "canonicalId": "healthAutoExport:deleted",
+            "id": "deleted",
+            "kind": "deletion",
+            "schemaVersion": 1,
+            "recordVersion": 2,
+            "sourceRecord": {
+                "id": "deleted",
+                "store": "healthAutoExport",
+                "type": "steps",
+            },
+            "type": "steps",
+        }
+        ingest_lines(self.db, [json.dumps(tombstone)])
+        self.db.execute("DELETE FROM compatible_resolved_deletion")
+        self.db.execute("DELETE FROM compatible_unresolved_deletion")
+        self.db.execute("DROP TABLE compatible_alias_retirement")
+        self.db.execute(
+            """
+            CREATE TABLE compatible_alias_retirement (
+                type TEXT NOT NULL,
+                start_epoch INTEGER NOT NULL,
+                stable_id TEXT NOT NULL,
+                PRIMARY KEY (type, start_epoch)
+            )
+            """
+        )
+        self.db.execute(
+            """
+            INSERT INTO compatible_alias_retirement
+            VALUES ('steps', 1, 'healthAutoExport:deleted')
+            """
+        )
+
+        receiver.ensure_compatible_alias_retirement_schema(self.db)
+        receiver.backfill_compatible_deletion_state(self.db)
+
+        self.assertEqual(
+            [("healthAutoExport:deleted", "steps")],
+            self.db.execute(
+                """
+                SELECT stable_id, type FROM compatible_unresolved_deletion
+                """
+            ).fetchall(),
+        )
+
+    def test_alias_reverse_lookups_use_indexes(self):
+        identity_plan = " ".join(
+            row[3] for row in self.db.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT stable_id FROM compatible_alias_identity
+                WHERE legacy_id = 'apple.healthkit:legacy'
+                """
+            )
+        )
+        retirement_plan = " ".join(
+            row[3] for row in self.db.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT type FROM compatible_alias_retirement
+                WHERE stable_id = 'healthAutoExport:stable'
+                """
+            )
+        )
+
+        self.assertIn("compatible_alias_identity_legacy", identity_plan)
+        self.assertIn("compatible_alias_retirement_stable", retirement_plan)
+    def test_dated_deletion_blocks_ambiguous_delayed_legacy_alias(self):
         date = "2026-01-01T00:00:00Z"
         ingest_compatible(self.db, {
             "data": {
@@ -1626,20 +1697,19 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 }],
             },
         })
-        result = ingest_lines(
-            self.db,
-            [json.dumps({
-                "id": f"steps:{date}",
-                "type": "steps",
-                "kind": "quantity",
-                "startDate": date,
-                "endDate": date,
-                "quantity": {"value": 100, "unit": "count"},
-            })],
-            batch_key="legacy-after-dated-delete",
-        )
-
-        self.assertEqual((0, 0, False), result)
+        with self.assertRaises(PartialBatch):
+            ingest_lines(
+                self.db,
+                [json.dumps({
+                    "id": f"steps:{date}",
+                    "type": "steps",
+                    "kind": "quantity",
+                    "startDate": date,
+                    "endDate": date,
+                    "quantity": {"value": 100, "unit": "count"},
+                })],
+                batch_key="legacy-after-dated-delete",
+            )
         self.assertEqual(
             0,
             self.db.execute(
@@ -1747,18 +1817,19 @@ class TransactionAndArchiveTests(unittest.TestCase):
         self.db.execute("DELETE FROM compatible_alias_retirement")
         self.db.commit()
 
-        ingest_lines(
-            self.db,
-            [json.dumps({
-                "id": f"step_count:{date}",
-                "type": "step_count",
-                "kind": "quantity",
-                "startDate": date,
-                "endDate": date,
-                "quantity": {"value": 100, "unit": "count"},
-            })],
-            batch_key="delayed-legacy-step",
-        )
+        with self.assertRaises(PartialBatch):
+            ingest_lines(
+                self.db,
+                [json.dumps({
+                    "id": f"step_count:{date}",
+                    "type": "step_count",
+                    "kind": "quantity",
+                    "startDate": date,
+                    "endDate": date,
+                    "quantity": {"value": 100, "unit": "count"},
+                })],
+                batch_key="delayed-legacy-step",
+            )
 
         self.assertEqual(
             [("healthAutoExport:stable-step", 0)],
@@ -1768,6 +1839,198 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 WHERE type = 'step_count' AND tombstone = 0
                 """
             ).fetchall(),
+        )
+
+    def test_same_timestamp_distinct_sources_are_not_aliases(self):
+        date = "2026-01-01T00:00:00Z"
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": f"steps:{date}",
+                "type": "steps",
+                "kind": "quantity",
+                "startDate": date,
+                "endDate": date,
+                "source": {"name": "Watch"},
+                "quantity": {"value": 111, "unit": "count"},
+            })],
+        )
+
+        result = ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "steps",
+                    "units": "count",
+                    "data": [{
+                        "id": "stable-phone",
+                        "date": date,
+                        "qty": 222,
+                        "source": "Phone",
+                    }],
+                }],
+            },
+        })
+
+        self.assertEqual((1, 0, False), result)
+        self.assertEqual(
+            2,
+            self.db.execute(
+                "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+            ).fetchone()[0],
+        )
+
+    def test_two_stable_candidates_reject_one_legacy_alias_atomically(self):
+        date = "2026-01-01T00:00:00Z"
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": f"steps:{date}",
+                "type": "steps",
+                "kind": "quantity",
+                "startDate": date,
+                "endDate": date,
+                "quantity": {"value": 100, "unit": "count"},
+            })],
+        )
+        ambiguous = {
+            "data": {
+                "metrics": [{
+                    "name": "steps",
+                    "units": "count",
+                    "data": [
+                        {"id": "stable-a", "date": date, "qty": 100},
+                        {"id": "stable-b", "date": date, "qty": 100},
+                    ],
+                }],
+            },
+        }
+
+        with self.assertRaises(PartialBatch):
+            ingest_compatible(self.db, ambiguous, batch_key="ambiguous-stable")
+
+        self.assertEqual(
+            [("apple.healthkit:steps:" + date, 0)],
+            self.db.execute(
+                """
+                SELECT canonical_id, tombstone FROM samples
+                WHERE tombstone = 0
+                """
+            ).fetchall(),
+        )
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT 1 FROM batches WHERE key = 'ambiguous-stable'"
+            ).fetchone()
+        )
+
+    def test_mapped_legacy_replay_cannot_change_fields_and_resurrect(self):
+        date = "2026-01-01T00:00:00Z"
+        legacy_id = f"steps:{date}"
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": legacy_id,
+                "type": "steps",
+                "kind": "quantity",
+                "startDate": date,
+                "endDate": date,
+                "source": {"name": "Watch"},
+                "quantity": {"value": 20, "unit": "count"},
+            })],
+        )
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "steps",
+                    "units": "count",
+                    "data": [{
+                        "id": "stable",
+                        "date": date,
+                        "qty": 20,
+                        "source": "Watch",
+                    }],
+                }],
+            },
+        })
+
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "canonicalId": "apple.healthkit:" + legacy_id,
+                "id": legacy_id,
+                "type": "distance",
+                "kind": "quantity",
+                "schemaVersion": 1,
+                "recordVersion": 3,
+                "sourceRecord": {
+                    "id": legacy_id,
+                    "store": "apple.healthkit",
+                    "type": "distance",
+                },
+                "startDate": date,
+                "endDate": date,
+                "source": {"name": "Other"},
+                "quantity": {"value": 999, "unit": "count"},
+            })],
+            batch_key="mutated-mapped-replay",
+        )
+
+        self.assertEqual(
+            [("healthAutoExport:stable", 0)],
+            self.db.execute(
+                """
+                SELECT canonical_id, tombstone FROM samples
+                WHERE tombstone = 0
+                """
+            ).fetchall(),
+        )
+
+    def test_tombstoned_stable_signature_cannot_be_replaced(self):
+        date = "2026-01-01T00:00:00Z"
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [{
+                    "id": "stable",
+                    "name": "steps",
+                    "type": "steps",
+                    "date": "",
+                }],
+            },
+        })
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "steps",
+                    "units": "count",
+                    "data": [{
+                        "id": "stable",
+                        "date": date,
+                        "qty": 20,
+                    }],
+                }],
+            },
+        })
+
+        with self.assertRaises(PartialBatch):
+            ingest_compatible(self.db, {
+                "data": {
+                    "metrics": [{
+                        "name": "steps",
+                        "units": "count",
+                        "data": [{
+                            "id": "stable",
+                            "date": date,
+                            "qty": 999,
+                        }],
+                    }],
+                },
+            })
+
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM compatible_alias_retirement"
+            ).fetchone()[0],
         )
 
     def test_stable_sleep_retires_date_less_legacy_sleep_alias(self):
@@ -1789,16 +2052,17 @@ class TransactionAndArchiveTests(unittest.TestCase):
         self.db.execute("DELETE FROM compatible_alias_retirement")
         self.db.commit()
 
-        ingest_lines(
-            self.db,
-            [json.dumps({
-                "id": "sleep_analysis:None",
-                "type": "sleep_analysis",
-                "kind": "category",
-                "value": 3,
-            })],
-            batch_key="delayed-legacy-sleep",
-        )
+        with self.assertRaises(PartialBatch):
+            ingest_lines(
+                self.db,
+                [json.dumps({
+                    "id": "sleep_analysis:None",
+                    "type": "sleep_analysis",
+                    "kind": "category",
+                    "value": 3,
+                })],
+                batch_key="delayed-legacy-sleep",
+            )
 
         self.assertEqual(
             [("healthAutoExport:stable-sleep", 0)],
@@ -1809,6 +2073,45 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 """
             ).fetchall(),
         )
+
+    def test_deleted_stable_sleep_keeps_date_less_legacy_retryable(self):
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "sleep_analysis",
+                    "units": "hr",
+                    "data": [{
+                        "id": "stable-sleep",
+                        "startDate": "2026-01-01T00:00:00Z",
+                        "endDate": "2026-01-01T01:00:00Z",
+                        "qty": 1,
+                        "value": "Core",
+                    }],
+                }],
+            },
+        })
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [{
+                    "id": "stable-sleep",
+                    "name": "sleep_analysis",
+                    "type": "sleep_analysis",
+                    "date": "",
+                }],
+            },
+        })
+
+        with self.assertRaises(PartialBatch):
+            ingest_lines(
+                self.db,
+                [json.dumps({
+                    "id": "sleep_analysis:None",
+                    "type": "sleep_analysis",
+                    "kind": "category",
+                    "value": 3,
+                })],
+                batch_key="legacy-sleep-after-delete",
+            )
 
     def test_same_batch_stable_replacement_resolves_legacy_before_deletion(self):
         date = "2026-01-01T00:00:00Z"
@@ -1901,7 +2204,7 @@ class TransactionAndArchiveTests(unittest.TestCase):
             ).fetchall(),
         )
 
-    def test_duplicate_legacy_dated_deletion_repairs_old_identity(self):
+    def test_duplicate_legacy_dated_deletion_without_mapping_stays_retryable(self):
         date = "2026-01-01T00:00:00Z"
         ingest_lines(
             self.db,
@@ -1938,8 +2241,7 @@ class TransactionAndArchiveTests(unittest.TestCase):
         )
         self.db.commit()
 
-        self.assertEqual(
-            (0, 2, True),
+        with self.assertRaises(PartialBatch):
             ingest_compatible(
                 self.db,
                 {
@@ -1953,16 +2255,21 @@ class TransactionAndArchiveTests(unittest.TestCase):
                     },
                 },
                 batch_key="legacy-dated",
-            ),
-        )
+            )
         self.assertEqual(
-            [(2, 1), (2, 1)],
+            [(1, 0), (1, 0)],
             self.db.execute(
                 """
                 SELECT record_version, tombstone FROM samples
                 ORDER BY canonical_id
                 """
             ).fetchall(),
+        )
+        self.assertEqual(
+            -1,
+            self.db.execute(
+                "SELECT deletions FROM batches WHERE key = 'legacy-dated'"
+            ).fetchone()[0],
         )
 
     def test_duplicate_legacy_receipt_migrates_stable_id_before_acknowledging(self):
@@ -2257,8 +2564,7 @@ class TransactionAndArchiveTests(unittest.TestCase):
             })],
         )
 
-        self.assertEqual(
-            (1, 1, False),
+        with self.assertRaises(PartialBatch):
             ingest_compatible(self.db, {
                 "data": {
                     "metrics": [{
@@ -2274,12 +2580,10 @@ class TransactionAndArchiveTests(unittest.TestCase):
                         }],
                     }],
                 },
-            }),
-        )
+            })
         self.assertEqual(
             [
-                ("apple.healthkit:sleep_analysis:None", 1),
-                ("healthAutoExport:sleep-stable", 0),
+                ("apple.healthkit:sleep_analysis:None", 0),
             ],
             self.db.execute(
                 """

@@ -293,10 +293,9 @@ final class ReceiverIntegrationTests: XCTestCase {
             token: token,
             idempotencyKey: "stable-alias-delete"
         )
-        XCTAssertEqual(retry.status, 200)
-        XCTAssertEqual(retry.json["duplicate"] as? Bool, false)
+        XCTAssertEqual(retry.status, 409)
         let remaining = try await store.totalRecordCount()
-        XCTAssertEqual(remaining, 0)
+        XCTAssertEqual(remaining, 1)
     }
 
     /// A connection test has to succeed visibly, or the user checking their

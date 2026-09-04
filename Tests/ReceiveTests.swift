@@ -234,7 +234,7 @@ final class ReceiveTests: XCTestCase {
     func testStableDeletionDoesNotRemoveAnotherSampleAtTheSameTime() async throws {
         let store = try makeStore()
         _ = try await store.ingest(
-            try BatchParser.parse(
+                try BatchParser.parse(
                 Data(
                     """
                     {"data":{"metrics":[{"name":"step_count","units":"count","data":[
@@ -265,7 +265,7 @@ final class ReceiveTests: XCTestCase {
         XCTAssertEqual(remaining.map(\.id), ["keep"])
     }
 
-    func testStableDeletionAlsoRemovesPreUpgradeTimeAlias() async throws {
+    func testStableDeletionCannotGuessPreUpgradeTimeAlias() async throws {
         let store = try makeStore()
         let date = "2026-01-01 10:00:00 +0000"
         _ = try await store.ingest(
@@ -290,13 +290,15 @@ final class ReceiveTests: XCTestCase {
             )
         )
 
-        let first = try await store.ingest(deletion, idempotencyKey: "delete-1")
-        let retry = try await store.ingest(deletion, idempotencyKey: "delete-2")
-
-        XCTAssertEqual(first.deleted, 1)
-        XCTAssertEqual(retry.deleted, 0)
+        for key in ["delete-1", "delete-2"] {
+            do {
+                _ = try await store.ingest(deletion, idempotencyKey: key)
+                XCTFail("A timestamp alone cannot identify the stable record.")
+            } catch is UnresolvedLegacyAliasError {
+            }
+        }
         let total = try await store.totalRecordCount()
-        XCTAssertEqual(total, 0)
+        XCTAssertEqual(total, 1)
     }
 
     func testDateLessStableDeletionRefusesToReceiptUnresolvedLegacyAlias() async throws {
@@ -341,13 +343,16 @@ final class ReceiveTests: XCTestCase {
                 """.utf8
             )
         )
-        let retried = try await store.ingest(
-            dated,
-            idempotencyKey: "stable-delete"
-        )
-        XCTAssertFalse(retried.duplicate)
+        do {
+            _ = try await store.ingest(
+                dated,
+                idempotencyKey: "stable-delete"
+            )
+            XCTFail("Adding a date still cannot prove a stable identity.")
+        } catch is UnresolvedLegacyAliasError {
+        }
         let remaining = try await store.totalRecordCount()
-        XCTAssertEqual(remaining, 0)
+        XCTAssertEqual(remaining, 1)
     }
 
     func testSameBatchStableReplacementCanResolveAliasBeforeDateLessDelete() async throws {
@@ -483,10 +488,14 @@ final class ReceiveTests: XCTestCase {
         let finalCount = try await store.totalRecordCount()
         XCTAssertEqual(finalCount, 0)
 
-        _ = try await store.ingest(
-            delayedLegacy,
-            idempotencyKey: "late-legacy"
-        )
+        do {
+            _ = try await store.ingest(
+                delayedLegacy,
+                idempotencyKey: "late-legacy"
+            )
+            XCTFail("A stable tombstone cannot prove a legacy timestamp identity.")
+        } catch is UnresolvedLegacyAliasError {
+        }
         let afterLegacy = try await store.totalRecordCount()
         XCTAssertEqual(afterLegacy, 0)
     }
@@ -546,7 +555,8 @@ final class ReceiveTests: XCTestCase {
             idempotencyKey: "stable-delete"
         )
 
-        _ = try await store.ingest(
+        do {
+            _ = try await store.ingest(
             try BatchParser.parse(
                 Data(
                     """
@@ -555,9 +565,12 @@ final class ReceiveTests: XCTestCase {
                     ]}]}}
                     """.utf8
                 )
-            ),
-            idempotencyKey: "delayed-legacy"
-        )
+                ),
+                idempotencyKey: "delayed-legacy"
+            )
+            XCTFail("An offset-only legacy identity must remain retryable.")
+        } catch is UnresolvedLegacyAliasError {
+        }
 
         let finalCount = try await store.totalRecordCount()
         XCTAssertEqual(finalCount, 0)
@@ -565,8 +578,9 @@ final class ReceiveTests: XCTestCase {
 
     func testEquivalentTimestampLegacyAliasCannotBypassRetirement() async throws {
         let store = try makeStore()
-        _ = try await store.ingest(
-            try BatchParser.parse(
+        do {
+            _ = try await store.ingest(
+                try BatchParser.parse(
                 Data(
                     """
                     {"data":{"metrics":[{"name":"step_count","units":"count","data":[
@@ -587,8 +601,155 @@ final class ReceiveTests: XCTestCase {
                     ]}]}}
                     """.utf8
                 )
+                ),
+                idempotencyKey: "legacy-offset"
+            )
+            XCTFail("A delayed offset alias has no proven stable identity.")
+        } catch is UnresolvedLegacyAliasError {
+        }
+
+        let records = try await store.samples(type: "step_count")
+        XCTAssertEqual(records.map(\.id), ["stable"])
+    }
+
+    func testSameTimestampDistinctSourceAndValueAreNotAliases() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":111,"source":"Watch"}
+                    ]}]}}
+                    """.utf8
+                )
             ),
-            idempotencyKey: "legacy-offset"
+            idempotencyKey: "watch-legacy"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"phone-stable","date":"\(date)","qty":222,"source":"Phone"}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "phone-stable"
+        )
+
+        let records = try await store.samples(type: "step_count")
+        XCTAssertEqual(records.count, 2)
+    }
+
+    func testOneLegacyAliasCannotBeConsumedByTwoStableBatchRecords() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "one-legacy"
+        )
+        let ambiguous = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                  {"id":"stable-a","date":"\(date)","qty":20},
+                  {"id":"stable-b","date":"\(date)","qty":20}
+                ]}]}}
+                """.utf8
+            )
+        )
+
+        do {
+            _ = try await store.ingest(ambiguous, idempotencyKey: "two-stable")
+            XCTFail("An ambiguous batch must remain retryable.")
+        } catch is UnresolvedLegacyAliasError {
+        }
+
+        let records = try await store.samples(type: "step_count")
+        XCTAssertEqual(records.count, 1)
+        XCTAssertTrue(records[0].id.hasPrefix("step_count:"))
+    }
+
+    func testMappedLegacyReplayCannotChangeFieldsAndResurrect() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":20,"source":"Watch"}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "mapped-legacy"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"stable","date":"\(date)","qty":20,"source":"Watch"}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "mapped-stable"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":999,"source":"Other"}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "mutated-legacy-replay"
+        )
+
+        let records = try await store.samples(type: "step_count")
+        XCTAssertEqual(records.map(\.id), ["stable"])
+        XCTAssertEqual(records.first?.value, 20)
+    }
+
+    func testTimestampDeletionPreservesUnmappedStableRecord() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"id":"stable","type":"step_count","kind":"quantity","startDate":"2026-01-01T10:00:00.000Z","quantity":{"value":99,"unit":"count"}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "unmapped-stable"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[],"deletions":[
+                      {"name":"step_count","type":"step_count","date":"\(date)"}
+                    ]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "legacy-only-delete"
         )
 
         let records = try await store.samples(type: "step_count")
@@ -623,8 +784,9 @@ final class ReceiveTests: XCTestCase {
         database.close()
         let reopened = try makeStore()
 
-        _ = try await reopened.ingest(
-            try BatchParser.parse(
+        do {
+            _ = try await reopened.ingest(
+                try BatchParser.parse(
                 Data(
                     """
                     {"data":{"metrics":[{"name":"step_count","units":"count","data":[
@@ -632,9 +794,12 @@ final class ReceiveTests: XCTestCase {
                     ]}]}}
                     """.utf8
                 )
-            ),
-            idempotencyKey: "legacy-after-migration"
-        )
+                ),
+                idempotencyKey: "legacy-after-migration"
+            )
+            XCTFail("An upgrade cannot infer a delayed legacy identity.")
+        } catch is UnresolvedLegacyAliasError {
+        }
 
         let records = try await reopened.samples(type: "step_count")
         XCTAssertEqual(records.map(\.id), ["stable"])
@@ -651,6 +816,18 @@ final class ReceiveTests: XCTestCase {
                 ]}]}}
                 """.utf8
             )
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "legacy-before-stable-time-delete"
         )
         _ = try await store.ingest(stable, idempotencyKey: "stable-before-time-delete")
         _ = try await store.ingest(
@@ -711,6 +888,50 @@ final class ReceiveTests: XCTestCase {
 
         let finalCount = try await store.totalRecordCount()
         XCTAssertEqual(finalCount, 0)
+    }
+
+    func testTombstonedStableArrivalPreservesUnmatchedLegacySample() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":111,"source":"Watch"}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "unmatched-legacy"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"id":"stable","type":"step_count","kind":"deletion","deleted":true}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "unmatched-stable-tombstone"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"stable","date":"\(date)","qty":222,"source":"Phone"}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "unmatched-stable-arrival"
+        )
+
+        let records = try await store.samples(type: "step_count")
+        XCTAssertEqual(records.count, 1)
+        XCTAssertEqual(records.first?.value, 111)
+        XCTAssertEqual(records.first?.sourceName, "Watch")
     }
 
     func testDeletionReplayDoesNotRecreateResolvedLegacyBarrier() async throws {
