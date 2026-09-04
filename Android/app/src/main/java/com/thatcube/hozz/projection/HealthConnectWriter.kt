@@ -96,17 +96,18 @@ class HealthConnectWriter(
             for (chunk in records.chunked(MAX_INSERT_RECORDS)) {
                 client.deleteRecords(
                     recordType = recordClass(target),
-                    recordIdsList = chunk.map(
-                        ProjectionDraft.Delete::healthConnectRecordId,
+                    recordIdsList = emptyList(),
+                    clientRecordIdsList = chunk.map(
+                        ProjectionDraft.Delete::canonicalId,
                     ),
-                    clientRecordIdsList = emptyList(),
                 )
                 removed += chunk.map { draft ->
                     HealthConnectProjection(
                         canonicalId = draft.canonicalId,
                         targetRecord = draft.targetRecord,
                         canonicalVersion = draft.recordVersion,
-                        healthConnectRecordId = draft.healthConnectRecordId,
+                        healthConnectRecordId =
+                            draft.healthConnectRecordId.orEmpty(),
                     )
                 }
             }

@@ -31,6 +31,18 @@ data class HealthConnectProjection(
     val healthConnectRecordId: String,
 )
 
+enum class HealthConnectPendingAction {
+    UPSERT,
+    DELETE,
+}
+
+data class PendingHealthConnectOperation(
+    val canonicalId: String,
+    val targetRecord: String,
+    val canonicalVersion: Long,
+    val action: HealthConnectPendingAction,
+)
+
 data class TimelineCursor(
     val sortTime: Instant?,
     val canonicalId: String,
@@ -62,6 +74,18 @@ interface CanonicalRecordStore {
     suspend fun healthConnectProjections(
         canonicalIds: Set<String>,
     ): Map<String, HealthConnectProjection>
+    suspend fun pendingHealthConnectOperations(
+        canonicalIds: Set<String>,
+    ): Map<String, PendingHealthConnectOperation>
+    suspend fun stageHealthConnectOperations(
+        operations: List<PendingHealthConnectOperation>,
+    )
+    suspend fun completeHealthConnectUpserts(
+        projections: List<HealthConnectProjection>,
+    )
+    suspend fun completeHealthConnectDeletes(
+        operations: List<PendingHealthConnectOperation>,
+    )
     suspend fun saveHealthConnectProjections(
         projections: List<HealthConnectProjection>,
     )
@@ -85,6 +109,10 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
     private val runRecords = linkedMapOf<String, ArchiveRunRecord>()
     private val healthConnectProjections =
         linkedMapOf<String, HealthConnectProjection>()
+    private val pendingHealthConnectOperations =
+        linkedMapOf<String, PendingHealthConnectOperation>()
+    private val completedHealthConnectOperations =
+        linkedMapOf<String, PendingHealthConnectOperation>()
 
     override suspend fun upsert(records: List<CanonicalRecord>): MergeResult {
         return merge(records)
@@ -394,6 +422,172 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
         canonicalIds: Set<String>,
     ): Map<String, HealthConnectProjection> =
         healthConnectProjections.filterKeys(canonicalIds::contains)
+
+    override suspend fun pendingHealthConnectOperations(
+        canonicalIds: Set<String>,
+    ): Map<String, PendingHealthConnectOperation> =
+        pendingHealthConnectOperations.filterKeys(canonicalIds::contains)
+
+    override suspend fun stageHealthConnectOperations(
+        operations: List<PendingHealthConnectOperation>,
+    ) {
+        for (operation in operations) {
+            val completed = completedHealthConnectOperations[operation.canonicalId]
+            if (completed == operation) {
+                continue
+            }
+            val committed = healthConnectProjections[operation.canonicalId]
+            check(
+                committed == null ||
+                    (
+                        committed.targetRecord == operation.targetRecord &&
+                            (
+                                operation.canonicalVersion >
+                                    committed.canonicalVersion ||
+                                    (
+                                        operation.action ==
+                                            HealthConnectPendingAction.DELETE &&
+                                            operation.canonicalVersion ==
+                                            committed.canonicalVersion
+                                        )
+                                )
+                        )
+            ) {
+                "A canonical record cannot change its Health Connect target."
+            }
+            check(
+                completed == null ||
+                    (
+                        completed.targetRecord == operation.targetRecord &&
+                            (
+                                operation.canonicalVersion >
+                                    completed.canonicalVersion ||
+                                    (
+                                        completed.action ==
+                                            HealthConnectPendingAction.UPSERT &&
+                                            operation.action ==
+                                            HealthConnectPendingAction.DELETE &&
+                                            operation.canonicalVersion ==
+                                            completed.canonicalVersion
+                                        )
+                                )
+                    )
+            ) {
+                "Stale Health Connect work cannot replace completed state."
+            }
+            val current = pendingHealthConnectOperations[operation.canonicalId]
+            check(
+                current == null ||
+                    current.targetRecord == operation.targetRecord
+            ) {
+                "A pending Health Connect target cannot be replaced."
+            }
+            check(
+                current == null ||
+                    operation.canonicalVersion > current.canonicalVersion ||
+                    (
+                        operation.canonicalVersion == current.canonicalVersion &&
+                            (
+                                operation.action == current.action ||
+                                    (
+                                        current.action == HealthConnectPendingAction.UPSERT &&
+                                            operation.action == HealthConnectPendingAction.DELETE
+                                        )
+                                )
+                        )
+            ) {
+                "Stale Health Connect work cannot replace a pending operation."
+            }
+            if (
+                current == null ||
+                operation.canonicalVersion > current.canonicalVersion ||
+                operation.action != current.action
+            ) {
+                pendingHealthConnectOperations[operation.canonicalId] = operation
+            }
+        }
+    }
+
+    override suspend fun completeHealthConnectUpserts(
+        projections: List<HealthConnectProjection>,
+    ) {
+        for (projection in projections) {
+            val pending = pendingHealthConnectOperations[projection.canonicalId]
+            val currentCompleted =
+                completedHealthConnectOperations[projection.canonicalId]
+            if (
+                pending?.action != HealthConnectPendingAction.UPSERT ||
+                pending.canonicalVersion != projection.canonicalVersion ||
+                pending.targetRecord != projection.targetRecord ||
+                (
+                    currentCompleted != null &&
+                        currentCompleted.canonicalVersion >=
+                        projection.canonicalVersion
+                    )
+            ) {
+                continue
+            }
+            saveHealthConnectProjections(listOf(projection))
+            val completed = PendingHealthConnectOperation(
+                canonicalId = projection.canonicalId,
+                targetRecord = projection.targetRecord,
+                canonicalVersion = projection.canonicalVersion,
+                action = HealthConnectPendingAction.UPSERT,
+            )
+            check(
+                currentCompleted == null ||
+                    currentCompleted.targetRecord == completed.targetRecord
+            )
+            completedHealthConnectOperations[projection.canonicalId] = completed
+            if (
+                pending.action == HealthConnectPendingAction.UPSERT &&
+                pending.canonicalVersion == projection.canonicalVersion
+            ) {
+                pendingHealthConnectOperations.remove(projection.canonicalId)
+            }
+        }
+    }
+
+    override suspend fun completeHealthConnectDeletes(
+        operations: List<PendingHealthConnectOperation>,
+    ) {
+        for (operation in operations) {
+            val pending = pendingHealthConnectOperations[operation.canonicalId]
+            val completed = completedHealthConnectOperations[operation.canonicalId]
+            if (
+                pending != operation ||
+                (
+                    completed != null &&
+                        (
+                            completed.canonicalVersion >
+                                operation.canonicalVersion ||
+                                (
+                                    completed.canonicalVersion ==
+                                        operation.canonicalVersion &&
+                                        completed.action !=
+                                        HealthConnectPendingAction.UPSERT
+                                    )
+                            )
+                    )
+            ) {
+                continue
+            }
+            val projection = healthConnectProjections[operation.canonicalId]
+            if (
+                projection == null ||
+                projection.canonicalVersion <= operation.canonicalVersion
+            ) {
+                healthConnectProjections.remove(operation.canonicalId)
+            }
+            completedHealthConnectOperations[operation.canonicalId] = operation
+            if (
+                pending.action == HealthConnectPendingAction.DELETE &&
+                pending.canonicalVersion == operation.canonicalVersion
+            ) {
+                pendingHealthConnectOperations.remove(operation.canonicalId)
+            }
+        }
+    }
 
     override suspend fun saveHealthConnectProjections(
         projections: List<HealthConnectProjection>,

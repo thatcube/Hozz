@@ -3,11 +3,15 @@ package com.thatcube.hozz.projection
 import com.thatcube.hozz.core.CanonicalRecord
 import com.thatcube.hozz.core.CanonicalValue
 import com.thatcube.hozz.core.HealthConnectProjection
+import com.thatcube.hozz.core.HealthConnectPendingAction
 import com.thatcube.hozz.core.InMemoryCanonicalRecordStore
+import com.thatcube.hozz.core.PendingHealthConnectOperation
 import com.thatcube.hozz.core.SourceLineage
 import java.io.IOException
 import java.time.Instant
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -65,6 +69,249 @@ class ProjectionExecutorTest {
             store.healthConnectProjections(
                 setOf(cancelled.canonicalId, later.canonicalId),
             ).isEmpty(),
+        )
+        assertEquals(
+            2,
+            store.pendingHealthConnectOperations(
+                setOf(cancelled.canonicalId, later.canonicalId),
+            ).size,
+        )
+    }
+
+    @Test
+    fun callerCancellationWaitsForSubmittedMutationAndCompletion() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val record = live("cancel-after-submit")
+        val started = CompletableDeferred<Unit>()
+        val release = CompletableDeferred<Unit>()
+        val writer = object : HealthConnectProjectionWriter {
+            override suspend fun writeUpserts(
+                drafts: List<ProjectionDraft>,
+            ): HealthConnectWriteResult {
+                started.complete(Unit)
+                release.await()
+                return HealthConnectWriteResult(
+                    attempted = 1,
+                    projections = listOf(
+                        projection(
+                            drafts.single().canonicalId,
+                            drafts.single().recordVersion,
+                            "health-after-cancel",
+                        )
+                    ),
+                )
+            }
+
+            override suspend fun delete(
+                drafts: List<ProjectionDraft.Delete>,
+            ): List<HealthConnectProjection> = error("not used")
+        }
+        val job = launch {
+            executor(store, writer).apply(listOf(ProjectionPlanner.plan(record)))
+        }
+        started.await()
+
+        job.cancel()
+        release.complete(Unit)
+        job.join()
+
+        assertEquals(
+            "health-after-cancel",
+            store.healthConnectProjections(setOf(record.canonicalId))
+                .getValue(record.canonicalId)
+                .healthConnectRecordId,
+        )
+        assertTrue(
+            store.pendingHealthConnectOperations(setOf(record.canonicalId))
+                .isEmpty(),
+        )
+    }
+
+    @Test
+    fun writeSuccessBeforeLedgerCompletionRemainsRecoverable() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val live = live("crash-window")
+        val writer = FakeWriter()
+        val executor = ProjectionExecutor(
+            writer = writer,
+            stageOperations = store::stageHealthConnectOperations,
+            completeUpserts = { throw IOException("process stopped before commit") },
+            completeDeletes = store::completeHealthConnectDeletes,
+        )
+
+        var failed = false
+        try {
+            executor.apply(listOf(ProjectionPlanner.plan(live)))
+        } catch (_: IOException) {
+            failed = true
+        }
+
+        assertTrue(failed)
+        val pending = store.pendingHealthConnectOperations(setOf(live.canonicalId))
+            .getValue(live.canonicalId)
+        assertTrue(
+            store.healthConnectProjections(setOf(live.canonicalId)).isEmpty(),
+        )
+        val deletion = ProjectionPlanner.plan(
+            live.copy(recordVersion = 2, tombstone = true),
+            pending = pending,
+        )
+        assertEquals(ProjectionAction.DELETE, deletion.action)
+        assertEquals(
+            live.canonicalId,
+            (deletion.draft as ProjectionDraft.Delete).canonicalId,
+        )
+    }
+
+    @Test
+    fun committedTargetCannotBeReplacedByAnotherRecordType() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val canonicalId = "apple.healthkit:target-mutation"
+        store.saveHealthConnectProjections(
+            listOf(projection(canonicalId, 1, "health-weight")),
+        )
+        var rejected = false
+
+        try {
+            store.stageHealthConnectOperations(
+                listOf(
+                    PendingHealthConnectOperation(
+                        canonicalId = canonicalId,
+                        targetRecord = "HeightRecord",
+                        canonicalVersion = 2,
+                        action = HealthConnectPendingAction.UPSERT,
+                    )
+                )
+            )
+        } catch (_: IllegalStateException) {
+            rejected = true
+        }
+
+        assertTrue(rejected)
+        assertTrue(
+            store.pendingHealthConnectOperations(setOf(canonicalId)).isEmpty(),
+        )
+    }
+
+    @Test
+    fun sameVersionPendingDeleteCannotBeReplacedByUpsert() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val deletion = PendingHealthConnectOperation(
+            canonicalId = "apple.healthkit:pending-delete",
+            targetRecord = "WeightRecord",
+            canonicalVersion = 2,
+            action = HealthConnectPendingAction.DELETE,
+        )
+        store.stageHealthConnectOperations(listOf(deletion))
+
+        var rejected = false
+        try {
+            store.stageHealthConnectOperations(
+                listOf(deletion.copy(action = HealthConnectPendingAction.UPSERT)),
+            )
+        } catch (_: IllegalStateException) {
+            rejected = true
+        }
+
+        assertTrue(rejected)
+        assertEquals(
+            deletion,
+            store.pendingHealthConnectOperations(setOf(deletion.canonicalId))
+                .getValue(deletion.canonicalId),
+        )
+    }
+
+    @Test
+    fun completedOperationCanBeStagedAgainAsIdempotentNoOp() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val upsert = PendingHealthConnectOperation(
+            canonicalId = "apple.healthkit:completed-retry",
+            targetRecord = "WeightRecord",
+            canonicalVersion = 1,
+            action = HealthConnectPendingAction.UPSERT,
+        )
+        store.stageHealthConnectOperations(listOf(upsert))
+        store.completeHealthConnectUpserts(
+            listOf(projection(upsert.canonicalId, 1, "health-completed")),
+        )
+
+        store.stageHealthConnectOperations(listOf(upsert))
+
+        assertTrue(
+            store.pendingHealthConnectOperations(setOf(upsert.canonicalId)).isEmpty(),
+        )
+    }
+
+    @Test
+    fun completedDeleteRejectsStaleUpsertAndCannotEraseNewerLedger() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val canonicalId = "apple.healthkit:high-water"
+        val upsertOne = PendingHealthConnectOperation(
+            canonicalId = canonicalId,
+            targetRecord = "WeightRecord",
+            canonicalVersion = 1,
+            action = HealthConnectPendingAction.UPSERT,
+        )
+        store.stageHealthConnectOperations(listOf(upsertOne))
+        store.completeHealthConnectUpserts(
+            listOf(projection(canonicalId, 1, "health-1")),
+        )
+        val deleteTwo = upsertOne.copy(
+            canonicalVersion = 2,
+            action = HealthConnectPendingAction.DELETE,
+        )
+        store.stageHealthConnectOperations(listOf(deleteTwo))
+        store.completeHealthConnectDeletes(listOf(deleteTwo))
+        store.completeHealthConnectUpserts(
+            listOf(projection(canonicalId, 1, "late-health-1")),
+        )
+        assertTrue(
+            store.healthConnectProjections(setOf(canonicalId)).isEmpty(),
+        )
+
+        var rejected = false
+        try {
+            store.stageHealthConnectOperations(listOf(upsertOne))
+        } catch (_: IllegalStateException) {
+            rejected = true
+        }
+        assertTrue(rejected)
+
+        val upsertThree = upsertOne.copy(canonicalVersion = 3)
+        store.stageHealthConnectOperations(listOf(upsertThree))
+        val newest = projection(canonicalId, 3, "health-3")
+        store.completeHealthConnectUpserts(listOf(newest))
+        store.completeHealthConnectDeletes(listOf(deleteTwo))
+
+        assertEquals(
+            newest,
+            store.healthConnectProjections(setOf(canonicalId))
+                .getValue(canonicalId),
+        )
+    }
+
+    @Test
+    fun sameVersionArchiveOnlyCleanupCanDeleteCommittedProjection() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val record = live("same-version-cleanup").copy(
+            canonicalType = "activity.steps",
+            type = "HKQuantityTypeIdentifierStepCount",
+        )
+        val prior = HealthConnectProjection(
+            canonicalId = record.canonicalId,
+            targetRecord = "StepsRecord",
+            canonicalVersion = record.recordVersion,
+            healthConnectRecordId = "legacy-step",
+        )
+        store.saveHealthConnectProjections(listOf(prior))
+
+        val result = executor(store, FakeWriter()).apply(
+            listOf(ProjectionPlanner.plan(record, prior)),
+        )
+
+        assertEquals(1, result.deleted)
+        assertTrue(
+            store.healthConnectProjections(setOf(record.canonicalId)).isEmpty(),
         )
     }
 
@@ -165,8 +412,9 @@ class ProjectionExecutorTest {
         writer: HealthConnectProjectionWriter,
     ) = ProjectionExecutor(
         writer = writer,
-        saveProjections = store::saveHealthConnectProjections,
-        removeProjections = store::removeHealthConnectProjections,
+        stageOperations = store::stageHealthConnectOperations,
+        completeUpserts = store::completeHealthConnectUpserts,
+        completeDeletes = store::completeHealthConnectDeletes,
     )
 
     private fun live(id: String) = record(id, version = 1, tombstone = false)
@@ -256,10 +504,12 @@ class ProjectionExecutorTest {
                 throw IOException("delete failed")
             }
             return drafts.map { draft ->
-                projection(
-                    draft.canonicalId,
-                    draft.recordVersion,
-                    draft.healthConnectRecordId,
+                HealthConnectProjection(
+                    canonicalId = draft.canonicalId,
+                    targetRecord = draft.targetRecord,
+                    canonicalVersion = draft.recordVersion,
+                    healthConnectRecordId =
+                        draft.healthConnectRecordId.orEmpty(),
                 )
             }
         }

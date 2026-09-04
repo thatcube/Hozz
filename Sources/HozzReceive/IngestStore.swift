@@ -2,6 +2,14 @@ import Foundation
 import HozzCore
 import HozzStore
 
+public struct UnresolvedLegacyAliasError: Error, LocalizedError, Sendable {
+    public let type: String
+
+    public var errorDescription: String? {
+        "A stable deletion for \(type) cannot be matched to a pre-upgrade time-based record without its original date."
+    }
+}
+
 /// One reading from inside a quantity series, back out of the store.
 public struct QuantitySeriesReading: Hashable, Sendable {
     /// Its absolute position in the sample, which is what makes it the same
@@ -326,6 +334,78 @@ public actor IngestStore {
             .first ?? 0
         try migrateToEight(database, from: version)
         try migrateToNine(database, from: version)
+        try migrateToTen(database, from: version)
+    }
+
+    private static func migrateToTen(
+        _ database: SQLiteDatabase,
+        from version: Int64
+    ) throws {
+        guard version < 10 else {
+            return
+        }
+        try database.transaction {
+            try database.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sample_tombstone (
+                    id TEXT PRIMARY KEY,
+                    received_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sample_identity_alias (
+                    stable_id TEXT PRIMARY KEY,
+                    legacy_id TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS sample_identity_alias_legacy
+                    ON sample_identity_alias (legacy_id);
+                CREATE TABLE IF NOT EXISTS sample_unresolved_legacy_deletion (
+                    stable_id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sample_alias_retirement (
+                    type TEXT NOT NULL,
+                    start_time TEXT NOT NULL,
+                    PRIMARY KEY (type, start_time)
+                );
+                INSERT OR REPLACE INTO sample_identity_alias
+                    (stable_id, legacy_id)
+                SELECT stable.id, legacy.id
+                FROM sample AS stable
+                JOIN sample AS legacy
+                  ON legacy.type = stable.type
+                 AND legacy.start_date = stable.start_date
+                 AND legacy.id != stable.id
+                WHERE substr(legacy.id, 1, length(legacy.type) + 1)
+                          = legacy.type || ':'
+                  AND substr(stable.id, 1, length(stable.type) + 1)
+                          != stable.type || ':';
+                INSERT OR REPLACE INTO sample_alias_retirement
+                    (type, start_time)
+                SELECT stable.type, stable.start_date
+                FROM sample AS stable
+                JOIN sample AS legacy
+                  ON legacy.type = stable.type
+                 AND legacy.start_date = stable.start_date
+                 AND legacy.id != stable.id
+                WHERE substr(legacy.id, 1, length(legacy.type) + 1)
+                          = legacy.type || ':'
+                  AND substr(stable.id, 1, length(stable.type) + 1)
+                          != stable.type || ':';
+                DELETE FROM sample
+                WHERE substr(id, 1, length(type) + 1) = type || ':'
+                  AND EXISTS (
+                    SELECT 1 FROM sample AS stable
+                    WHERE stable.type = sample.type
+                      AND stable.start_date = sample.start_date
+                      AND substr(
+                            stable.id,
+                            1,
+                            length(stable.type) + 1
+                          ) != stable.type || ':'
+                  );
+                """
+            )
+            try database.execute("PRAGMA user_version = 10")
+        }
     }
 
     /// The table that holds what the phone says about its own reading.
@@ -461,6 +541,26 @@ public actor IngestStore {
                     ON sample (type, start_date);
                 CREATE INDEX IF NOT EXISTS sample_start
                     ON sample (start_date);
+
+                CREATE TABLE IF NOT EXISTS sample_tombstone (
+                    id TEXT PRIMARY KEY,
+                    received_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sample_identity_alias (
+                    stable_id TEXT PRIMARY KEY,
+                    legacy_id TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS sample_identity_alias_legacy
+                    ON sample_identity_alias (legacy_id);
+                CREATE TABLE IF NOT EXISTS sample_unresolved_legacy_deletion (
+                    stable_id TEXT PRIMARY KEY,
+                    type TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sample_alias_retirement (
+                    type TEXT NOT NULL,
+                    start_time TEXT NOT NULL,
+                    PRIMARY KEY (type, start_time)
+                );
 
                 -- A batch that arrives twice must not be stored twice. The key
                 -- is the content hash the phone sends, so a retried delivery
@@ -965,8 +1065,200 @@ public actor IngestStore {
         var storedVoltagePages = 0
         var storedQuantitySeriesPages = 0
         var storedAudiograms = 0
-
+        var deletedIdentities = Set<String>()
+        func isTombstoned(_ id: String) throws -> Bool {
+            try database.query(
+                "SELECT 1 FROM sample_tombstone WHERE id = ? LIMIT 1",
+                [.text(id)],
+                row: { _ in true }
+            ).first ?? false
+        }
+        func removeSpecializedRecords(for id: String) throws {
+            try database.run(
+                "DELETE FROM electrocardiogram_voltage_page WHERE sample_id = ?",
+                [.text(id)]
+            )
+            try database.run(
+                "DELETE FROM electrocardiogram WHERE id = ?",
+                [.text(id)]
+            )
+            try database.run(
+                "DELETE FROM quantity_series_page WHERE sample_id = ?",
+                [.text(id)]
+            )
+            try database.run(
+                "DELETE FROM quantity_series WHERE sample_id = ?",
+                [.text(id)]
+            )
+            try database.run(
+                "DELETE FROM audiogram_point WHERE audiogram_id = ?",
+                [.text(id)]
+            )
+            try database.run(
+                "DELETE FROM audiogram WHERE id = ?",
+                [.text(id)]
+            )
+            try database.run(
+                "DELETE FROM state_of_mind WHERE id = ?",
+                [.text(id)]
+            )
+            try database.run(
+                "DELETE FROM medication_dose WHERE id = ?",
+                [.text(id)]
+            )
+            try database.run(
+                "DELETE FROM workout_statistic WHERE workout_id = ?",
+                [.text(id)]
+            )
+            try database.run(
+                "DELETE FROM workout_activity WHERE workout_id = ?",
+                [.text(id)]
+            )
+            try database.run(
+                "DELETE FROM workout_detail WHERE id = ?",
+                [.text(id)]
+            )
+        }
         for record in batch.records {
+            let retiredInstant = try database.query(
+                """
+                SELECT 1 FROM sample_alias_retirement
+                WHERE type = ? AND start_time = ? LIMIT 1
+                """,
+                [
+                    .text(record.type),
+                    .text(Timestamps.text(from: record.startDate))
+                ],
+                row: { _ in true }
+            ).first ?? false
+            if retiredInstant && record.isLegacyCompatibilityIdentity {
+                continue
+            }
+            let retiredAlias = try database.query(
+                """
+                SELECT 1 FROM sample_identity_alias
+                WHERE legacy_id = ? LIMIT 1
+                """,
+                [.text(record.id)],
+                row: { _ in true }
+            ).first ?? false
+            if retiredAlias {
+                continue
+            }
+            if record.isLegacyCompatibilityIdentity {
+                let matchingStable = try database.query(
+                    """
+                    SELECT id FROM sample
+                    WHERE type = ? AND start_date = ? AND id != ?
+                    """,
+                    [
+                        .text(record.type),
+                        .text(Timestamps.text(from: record.startDate)),
+                        .text(record.id)
+                    ],
+                    row: { $0.text(0) }
+                ).first { !$0.hasPrefix("\(record.type):") }
+                if let matchingStable {
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_identity_alias
+                            (stable_id, legacy_id)
+                        VALUES (?, ?)
+                        """,
+                        [.text(matchingStable), .text(record.id)]
+                    )
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_alias_retirement
+                            (type, start_time)
+                        VALUES (?, ?)
+                        """,
+                        [
+                            .text(record.type),
+                            .text(Timestamps.text(from: record.startDate))
+                        ]
+                    )
+                    try database.run(
+                        "DELETE FROM sample WHERE id = ?",
+                        [.text(record.id)]
+                    )
+                    deleted += database.changeCount
+                    continue
+                }
+            }
+            if try isTombstoned(record.id) {
+                if let legacyAliasID = record.legacyAliasID {
+                    let matchingLegacyIDs = Set(
+                        try database.query(
+                            """
+                            SELECT id FROM sample
+                            WHERE type = ? AND start_date = ?
+                              AND substr(id, 1, length(type) + 1) = type || ':'
+                            """,
+                            [
+                                .text(record.type),
+                                .text(Timestamps.text(from: record.startDate))
+                            ],
+                            row: { $0.text(0) }
+                        )
+                    ).union([legacyAliasID])
+                    for matchingLegacyID in matchingLegacyIDs {
+                        try database.run(
+                            """
+                            INSERT OR REPLACE INTO sample_tombstone (id, received_at)
+                            VALUES (?, ?)
+                            """,
+                            [.text(matchingLegacyID), .text(timestamp)]
+                        )
+                        try database.run(
+                            "DELETE FROM sample WHERE id = ?",
+                            [.text(matchingLegacyID)]
+                        )
+                        deleted += database.changeCount
+                        try removeSpecializedRecords(for: matchingLegacyID)
+                    }
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_identity_alias
+                            (stable_id, legacy_id)
+                        VALUES (?, ?)
+                        """,
+                        [.text(record.id), .text(legacyAliasID)]
+                    )
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_alias_retirement
+                            (type, start_time)
+                        VALUES (?, ?)
+                        """,
+                        [
+                            .text(record.type),
+                            .text(Timestamps.text(from: record.startDate))
+                        ]
+                    )
+                    try database.run(
+                        """
+                        DELETE FROM sample_unresolved_legacy_deletion
+                        WHERE stable_id = ?
+                        """,
+                        [.text(record.id)]
+                    )
+                }
+                continue
+            }
+            if record.isLegacyCompatibilityIdentity {
+                let unresolved = try database.query(
+                    """
+                    SELECT 1 FROM sample_unresolved_legacy_deletion
+                    WHERE type = ? LIMIT 1
+                    """,
+                    [.text(record.type)],
+                    row: { _ in true }
+                ).first ?? false
+                if unresolved {
+                    throw UnresolvedLegacyAliasError(type: record.type)
+                }
+            }
             if let legacyTypeAlias = record.legacyTypeAlias,
                legacyTypeAlias != record.type {
                 try database.run(
@@ -1030,10 +1322,227 @@ public actor IngestStore {
                     .text(timestamp)
                 ]
             )
+            if let legacyAliasID = record.legacyAliasID {
+                try database.run(
+                    """
+                    INSERT OR REPLACE INTO sample_identity_alias
+                        (stable_id, legacy_id)
+                    VALUES (?, ?)
+                    """,
+                    [.text(record.id), .text(legacyAliasID)]
+                )
+                try database.run(
+                    """
+                    INSERT OR REPLACE INTO sample_alias_retirement
+                        (type, start_time)
+                    VALUES (?, ?)
+                    """,
+                    [
+                        .text(record.type),
+                        .text(Timestamps.text(from: record.startDate))
+                    ]
+                )
+            }
             stored += 1
         }
 
+        // Stable records in this same transaction get the first chance to
+        // retire their time-based aliases. Only aliases still present after
+        // those replacements make a date-less deletion unsafe to receipt.
+        let unresolvedTypes = Set(
+            batch.deletions.compactMap { deletion in
+                deletion.requiresLegacyAliasResolution
+                    ? deletion.type
+                    : nil
+            }
+        )
+        for type in unresolvedTypes.sorted() {
+            let stableIDs = Set(
+                batch.deletions.compactMap { deletion in
+                    deletion.requiresLegacyAliasResolution &&
+                        deletion.type == type
+                        ? deletion.id
+                        : nil
+                }
+            )
+            let stablePlaceholders = stableIDs.map { _ in "?" }.joined(separator: ",")
+            var resolvedStableIDs: Set<String>
+            if stableIDs.isEmpty {
+                resolvedStableIDs = []
+            } else {
+                resolvedStableIDs = Set(
+                    try database.query(
+                        """
+                        SELECT id FROM sample
+                        WHERE type = ? AND id IN (\(stablePlaceholders))
+                        """,
+                        [.text(type)] + stableIDs.sorted().map(SQLiteValue.text),
+                        row: { $0.text(0) }
+                    )
+                )
+                resolvedStableIDs.formUnion(
+                    try database.query(
+                        """
+                        SELECT stable_id FROM sample_identity_alias
+                        WHERE stable_id IN (\(stablePlaceholders))
+                        """,
+                        stableIDs.sorted().map(SQLiteValue.text),
+                        row: { $0.text(0) }
+                    )
+                )
+            }
+            let unresolvedIDs = stableIDs.subtracting(resolvedStableIDs)
+            if !unresolvedIDs.isEmpty {
+                let prefix = "\(type):"
+                let liveLegacyAlias = try database.query(
+                    """
+                    SELECT 1 FROM sample
+                    WHERE type = ? AND substr(id, 1, ?) = ?
+                    LIMIT 1
+                    """,
+                    [
+                        .text(type),
+                        .integer(Int64(prefix.count)),
+                        .text(prefix)
+                    ],
+                    row: { _ in true }
+                ).first ?? false
+                if liveLegacyAlias {
+                    throw UnresolvedLegacyAliasError(type: type)
+                }
+                for stableID in unresolvedIDs {
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_unresolved_legacy_deletion
+                            (stable_id, type)
+                        VALUES (?, ?)
+                        """,
+                        [.text(stableID), .text(type)]
+                    )
+                }
+            }
+        }
+
         for deletion in batch.deletions {
+            deletedIdentities.insert(deletion.id)
+            var stableAliases = Set(try database.query(
+                """
+                SELECT stable_id FROM sample_identity_alias
+                WHERE legacy_id = ?
+                """,
+                [.text(deletion.id)],
+                row: { $0.text(0) }
+            ))
+            if let type = deletion.type, let startDate = deletion.startDate {
+                let normalizedStart = Timestamps.text(from: startDate)
+                stableAliases.formUnion(
+                    try database.query(
+                        """
+                        SELECT id FROM sample
+                        WHERE type = ? AND start_date = ?
+                          AND substr(id, 1, length(type) + 1) != type || ':'
+                        """,
+                        [.text(type), .text(normalizedStart)],
+                        row: { $0.text(0) }
+                    )
+                )
+                try database.run(
+                    """
+                    INSERT OR REPLACE INTO sample_alias_retirement
+                        (type, start_time)
+                    VALUES (?, ?)
+                    """,
+                    [.text(type), .text(normalizedStart)]
+                )
+            }
+            var legacyAliases = Set(try database.query(
+                """
+                SELECT legacy_id FROM sample_identity_alias
+                WHERE stable_id = ?
+                """,
+                [.text(deletion.id)],
+                row: { $0.text(0) }
+            ))
+            if let explicitAlias = deletion.legacyAliasID {
+                legacyAliases.insert(explicitAlias)
+            }
+            if let stored = try database.query(
+                """
+                SELECT type, raw, start_date FROM sample
+                WHERE id = ? LIMIT 1
+                """,
+                [.text(deletion.id)],
+                row: { ($0.text(0), $0.blob(1), $0.text(2)) }
+            ).first,
+               let raw = stored.1,
+               let object = try? JSONSerialization.jsonObject(with: raw)
+                    as? [String: Any],
+               object["id"] is String,
+               let date = (object["date"] as? String)
+                    ?? (object["startDate"] as? String) {
+                legacyAliases.insert("\(stored.0):\(date)")
+                try database.run(
+                    """
+                    INSERT OR REPLACE INTO sample_alias_retirement
+                        (type, start_time)
+                    VALUES (?, ?)
+                    """,
+                    [.text(stored.0), .text(stored.2)]
+                )
+            }
+            if
+                let type = deletion.type,
+                let legacyStartDate = deletion.legacyStartDate
+            {
+                try database.run(
+                    """
+                    INSERT OR REPLACE INTO sample_alias_retirement
+                        (type, start_time)
+                    VALUES (?, ?)
+                    """,
+                    [
+                        .text(type),
+                        .text(Timestamps.text(from: legacyStartDate))
+                    ]
+                )
+            }
+            deletedIdentities.formUnion(stableAliases)
+            deletedIdentities.formUnion(legacyAliases)
+            try database.run(
+                """
+                INSERT OR REPLACE INTO sample_tombstone (id, received_at)
+                VALUES (?, ?)
+                """,
+                [.text(deletion.id), .text(timestamp)]
+            )
+            for stableAlias in stableAliases {
+                try database.run(
+                    """
+                    INSERT OR REPLACE INTO sample_tombstone (id, received_at)
+                    VALUES (?, ?)
+                    """,
+                    [.text(stableAlias), .text(timestamp)]
+                )
+                try database.run(
+                    "DELETE FROM sample WHERE id = ?",
+                    [.text(stableAlias)]
+                )
+                deleted += database.changeCount
+            }
+            for legacyAlias in legacyAliases {
+                try database.run(
+                    """
+                    INSERT OR REPLACE INTO sample_tombstone (id, received_at)
+                    VALUES (?, ?)
+                    """,
+                    [.text(legacyAlias), .text(timestamp)]
+                )
+                try database.run(
+                    "DELETE FROM sample WHERE id = ?",
+                    [.text(legacyAlias)]
+                )
+                deleted += database.changeCount
+            }
             if let startDate = deletion.startDate, let type = deletion.type {
                 // The metrics shape carries no sample identifier, so a
                 // deletion can only be matched the same way its upserts
@@ -1047,8 +1556,38 @@ public actor IngestStore {
                     "DELETE FROM sample WHERE id = ?",
                     [.text(deletion.id)]
                 )
+                deleted += database.changeCount
+                if
+                    let type = deletion.type,
+                    let legacyStartDate = deletion.legacyStartDate
+                {
+                    let prefix = "\(type):"
+                    try database.run(
+                        """
+                        DELETE FROM sample
+                        WHERE type = ?
+                          AND (
+                            id = ?
+                            OR (
+                              start_date = ?
+                              AND substr(id, 1, ?) = ?
+                            )
+                          )
+                        """,
+                        [
+                            .text(type),
+                            deletion.legacyAliasID.map(SQLiteValue.text) ?? .null,
+                            .text(Timestamps.text(from: legacyStartDate)),
+                            .integer(Int64(prefix.count)),
+                            .text(prefix)
+                        ]
+                    )
+                    deleted += database.changeCount
+                }
             }
-            deleted += database.changeCount
+            if deletion.startDate != nil {
+                deleted += database.changeCount
+            }
         }
 
         // A characteristic is a current fact, so re-delivery replaces the
@@ -1112,6 +1651,7 @@ public actor IngestStore {
         }
 
         for ecg in batch.electrocardiograms {
+            if try isTombstoned(ecg.id) { continue }
             try database.run(
                 """
                 INSERT INTO electrocardiogram
@@ -1152,6 +1692,7 @@ public actor IngestStore {
         // Keyed by sequence, so a page replayed byte-for-byte overwrites
         // itself rather than appearing twice in the waveform.
         for page in batch.voltagePages {
+            if try isTombstoned(page.sampleID) { continue }
             try database.run(
                 """
                 INSERT INTO electrocardiogram_voltage_page
@@ -1176,15 +1717,18 @@ public actor IngestStore {
         // Kept out of `sample` entirely, so a page of five hundred readings
         // never counts as a reading of the type it belongs to.
         for page in batch.quantitySeriesPages {
+            if try isTombstoned(page.sampleID) { continue }
             try Self.insert(page, into: database)
             storedQuantitySeriesPages += 1
         }
 
         for end in batch.quantitySeriesEnds {
+            if try isTombstoned(end.sampleID) { continue }
             try Self.insert(end, into: database)
         }
 
         for audiogram in batch.audiograms {
+            if try isTombstoned(audiogram.id) { continue }
             try database.run(
                 """
                 INSERT INTO audiogram
@@ -1233,6 +1777,7 @@ public actor IngestStore {
 
 
         for workout in batch.workoutDetails {
+            if try isTombstoned(workout.id) { continue }
             try database.run(
                 """
                 INSERT INTO workout_detail
@@ -1295,6 +1840,7 @@ public actor IngestStore {
         }
 
         for mood in batch.moodEntries {
+            if try isTombstoned(mood.id) { continue }
             try database.run(
                 """
                 INSERT INTO state_of_mind
@@ -1329,6 +1875,7 @@ public actor IngestStore {
         }
 
         for dose in batch.medicationDoses {
+            if try isTombstoned(dose.id) { continue }
             try database.run(
                 """
                 INSERT INTO medication_dose
@@ -1373,6 +1920,12 @@ public actor IngestStore {
 
         for report in batch.coverageReports {
             try write(report, at: timestamp, into: database)
+        }
+
+        // A batch may contain a workout upsert followed by its tombstone. This
+        // cleanup stays last so detail rows cannot be recreated after deletion.
+        for deletionID in deletedIdentities {
+            try removeSpecializedRecords(for: deletionID)
         }
 
         return (

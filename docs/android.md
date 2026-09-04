@@ -79,6 +79,9 @@ export pages also stop at a 512 KiB cumulative raw-record budget; callers keep
 paging until an empty result rather than treating a short page as end-of-data.
 The Compose timeline retains that cursor and appends the next bounded page near
 the end of a scroll, with an explicit load-more control as an accessible fallback.
+SQLite stores a fixed-width, full-precision timeline key and indexes it with the
+canonical ID tie-breaker, so fractional timestamps page in true `Instant` order
+without sorting the complete archive.
 
 | Hozz canonical type | Apple source | Health Connect target | Fidelity |
 | --- | --- | --- | --- |
@@ -107,11 +110,13 @@ Every inserted record uses its deterministic canonical ID as
 higher version replaces it. Records whose lineage already includes Health
 Connect package `com.thatcube.hozz` are excluded from projection.
 
-Hozz keeps a local projection ledger containing only records Health Connect
-actually accepted. The preview distinguishes inserts, updates, and deletes.
-Deletion requires a separate confirmation, uses Health Connect's returned
-record ID, and removes the ledger entry immediately after success so replaying
-the same tombstone does not issue another delete.
+Hozz records a durable pending operation before calling Health Connect. A
+successful upsert commits the returned record ID and clears that journal entry
+in one transaction; a crash after the platform write therefore retries safely
+through deterministic `clientRecordId`. Tombstones delete by that client
+identity even when the returned platform ID was never committed locally. The
+preview distinguishes inserts, updates, and deletes, and deletion still
+requires separate confirmation.
 
 ## Platform requirements
 

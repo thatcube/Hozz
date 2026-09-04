@@ -256,6 +256,49 @@ final class ReceiverIntegrationTests: XCTestCase {
         XCTAssertEqual(retryCount, 1)
     }
 
+    func testDateLessStableDeletionWithLegacyAliasReturnsRetryableConflict() async throws {
+        let date = "2026-01-01 10:00:00 +0000"
+        let legacy = """
+            {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+              {"date":"\(date)","qty":1}
+            ]}]}}
+            """
+        let accepted = try await post(
+            body: legacy,
+            token: token,
+            idempotencyKey: "legacy-alias"
+        )
+        XCTAssertEqual(accepted.status, 200)
+        let dateLess = """
+            {"data":{"metrics":[],"deletions":[
+              {"id":"stable","name":"step_count","type":"step_count","date":""}
+            ]}}
+            """
+        let rejected = try await post(
+            body: dateLess,
+            token: token,
+            idempotencyKey: "stable-alias-delete"
+        )
+        XCTAssertEqual(rejected.status, 409)
+        let stillLive = try await store.totalRecordCount()
+        XCTAssertEqual(stillLive, 1)
+
+        let dated = """
+            {"data":{"metrics":[],"deletions":[
+              {"id":"stable","name":"step_count","type":"step_count","date":"\(date)"}
+            ]}}
+            """
+        let retry = try await post(
+            body: dated,
+            token: token,
+            idempotencyKey: "stable-alias-delete"
+        )
+        XCTAssertEqual(retry.status, 200)
+        XCTAssertEqual(retry.json["duplicate"] as? Bool, false)
+        let remaining = try await store.totalRecordCount()
+        XCTAssertEqual(remaining, 0)
+    }
+
     /// A connection test has to succeed visibly, or the user checking their
     /// setup is told it is broken when it is not.
     func testAConnectionTestSucceeds() async throws {

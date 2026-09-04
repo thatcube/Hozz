@@ -446,6 +446,15 @@ public actor HealthReceiver {
                     "unreadable": result.unreadable
                 ]
             )
+        } catch let error as UnresolvedLegacyAliasError {
+            record(ReceiverEvent(outcome: .rejected("Legacy record needs reconciliation")))
+            return HTTPResponse(
+                status: 409,
+                json: [
+                    "error": "legacy record needs reconciliation",
+                    "detail": error.errorDescription ?? "Retry with the original record date."
+                ]
+            )
         } catch let error as IngestStorageError {
             // A full disk is not a server fault and not the phone's fault, and
             // it is the one failure a person can actually do something about.

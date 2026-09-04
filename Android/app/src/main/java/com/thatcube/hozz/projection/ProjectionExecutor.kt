@@ -2,8 +2,16 @@ package com.thatcube.hozz.projection
 
 import android.os.RemoteException
 import com.thatcube.hozz.core.HealthConnectProjection
+import com.thatcube.hozz.core.HealthConnectPendingAction
+import com.thatcube.hozz.core.PendingHealthConnectOperation
 import java.io.IOException
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 
 data class ProjectionFailure(
     val canonicalId: String,
@@ -28,12 +36,20 @@ data class ProjectionExecutionResult(
 
 class ProjectionExecutor(
     private val writer: HealthConnectProjectionWriter,
-    private val saveProjections:
+    private val stageOperations:
+        suspend (List<PendingHealthConnectOperation>) -> Unit,
+    private val completeUpserts:
         suspend (List<HealthConnectProjection>) -> Unit,
-    private val removeProjections:
-        suspend (List<HealthConnectProjection>) -> Unit,
+    private val completeDeletes:
+        suspend (List<PendingHealthConnectOperation>) -> Unit,
 ) {
     suspend fun apply(
+        operations: List<PlannedRecord>,
+    ): ProjectionExecutionResult = executionMutex.withLock {
+        applyLocked(operations)
+    }
+
+    private suspend fun applyLocked(
         operations: List<PlannedRecord>,
     ): ProjectionExecutionResult {
         var result = ProjectionExecutionResult()
@@ -46,33 +62,50 @@ class ProjectionExecutor(
                 .values
                 .flatMap { it.chunked(MAX_PROJECTION_BATCH) }
         ) {
-            val batch = attempt(
-                chunk.first().canonicalId,
-                ProjectionAction.DELETE,
-            ) {
-                writer.delete(chunk)
+            stageOperations(
+                chunk.map {
+                    it.pending(HealthConnectPendingAction.DELETE)
+                },
+            )
+            currentCoroutineContext().ensureActive()
+            val batch = withContext(NonCancellable) {
+                val attempted = attempt(
+                    chunk.first().canonicalId,
+                    ProjectionAction.DELETE,
+                ) {
+                    writer.delete(chunk)
+                }
+                if (attempted.value != null) {
+                    result += acceptDeletions(chunk, attempted.value)
+                    null
+                } else {
+                    attempted
+                }
             }
-            if (batch.value != null) {
-                result += acceptDeletions(chunk, batch.value)
-            } else if (chunk.size == 1) {
-                result += ProjectionExecutionResult(
-                    failures = listOfNotNull(batch.failure),
-                )
-            } else {
-                for (draft in chunk) {
-                    val single = attempt(
-                        draft.canonicalId,
-                        ProjectionAction.DELETE,
-                    ) {
-                        writer.delete(listOf(draft))
-                    }
-                    val removed = single.value
-                    result += if (removed == null) {
-                        ProjectionExecutionResult(
-                            failures = listOfNotNull(single.failure),
-                        )
-                    } else {
-                        acceptDeletions(listOf(draft), removed)
+            if (batch != null) {
+                if (chunk.size == 1) {
+                    result += ProjectionExecutionResult(
+                        failures = listOfNotNull(batch.failure),
+                    )
+                } else {
+                    for (draft in chunk) {
+                        currentCoroutineContext().ensureActive()
+                        result += withContext(NonCancellable) {
+                            val single = attempt(
+                                draft.canonicalId,
+                                ProjectionAction.DELETE,
+                            ) {
+                                writer.delete(listOf(draft))
+                            }
+                            val removed = single.value
+                            if (removed == null) {
+                                ProjectionExecutionResult(
+                                    failures = listOfNotNull(single.failure),
+                                )
+                            } else {
+                                acceptDeletions(listOf(draft), removed)
+                            }
+                        }
                     }
                 }
             }
@@ -84,28 +117,51 @@ class ProjectionExecutor(
         }
         for (chunk in upserts.chunked(MAX_PROJECTION_BATCH)) {
             val drafts = chunk.map { requireNotNull(it.draft) }
-            val batch = attempt(drafts.first().canonicalId, chunk.first().action) {
-                writer.writeUpserts(drafts)
+            stageOperations(
+                drafts.map {
+                    it.pending(HealthConnectPendingAction.UPSERT)
+                },
+            )
+            currentCoroutineContext().ensureActive()
+            val batch = withContext(NonCancellable) {
+                val attempted = attempt(
+                    drafts.first().canonicalId,
+                    chunk.first().action,
+                ) {
+                    writer.writeUpserts(drafts)
+                }
+                if (attempted.value != null) {
+                    result += acceptUpserts(chunk, attempted.value)
+                    null
+                } else {
+                    attempted
+                }
             }
-            if (batch.value != null) {
-                result += acceptUpserts(chunk, batch.value)
-            } else if (chunk.size == 1) {
-                result += ProjectionExecutionResult(
-                    failures = listOfNotNull(batch.failure),
-                )
-            } else {
-                for (operation in chunk) {
-                    val draft = operation.draft ?: continue
-                    val single = attempt(draft.canonicalId, operation.action) {
-                        writer.writeUpserts(listOf(draft))
-                    }
-                    val written = single.value
-                    result += if (written == null) {
-                        ProjectionExecutionResult(
-                            failures = listOfNotNull(single.failure),
-                        )
-                    } else {
-                        acceptUpserts(listOf(operation), written)
+            if (batch != null) {
+                if (chunk.size == 1) {
+                    result += ProjectionExecutionResult(
+                        failures = listOfNotNull(batch.failure),
+                    )
+                } else {
+                    for (operation in chunk) {
+                        val draft = operation.draft ?: continue
+                        currentCoroutineContext().ensureActive()
+                        result += withContext(NonCancellable) {
+                            val single = attempt(
+                                draft.canonicalId,
+                                operation.action,
+                            ) {
+                                writer.writeUpserts(listOf(draft))
+                            }
+                            val written = single.value
+                            if (written == null) {
+                                ProjectionExecutionResult(
+                                    failures = listOfNotNull(single.failure),
+                                )
+                            } else {
+                                acceptUpserts(listOf(operation), written)
+                            }
+                        }
                     }
                 }
             }
@@ -118,17 +174,21 @@ class ProjectionExecutor(
         removed: List<HealthConnectProjection>,
     ): ProjectionExecutionResult {
         val expected = drafts.associate {
-            it.canonicalId to it.healthConnectRecordId
+            it.canonicalId to it.targetRecord
         }
         check(
             removed.size == drafts.size &&
                 removed.associate {
-                    it.canonicalId to it.healthConnectRecordId
+                    it.canonicalId to it.targetRecord
                 } == expected,
         ) {
             "Health Connect acknowledged different deletions."
         }
-        removeProjections(removed)
+        completeDeletes(
+            drafts.map {
+                it.pending(HealthConnectPendingAction.DELETE)
+            },
+        )
         return ProjectionExecutionResult(deleted = removed.size)
     }
 
@@ -146,7 +206,7 @@ class ProjectionExecutor(
         ) {
             "Health Connect acknowledged different upserts."
         }
-        saveProjections(written.projections)
+        completeUpserts(written.projections)
         return ProjectionExecutionResult(
             inserted = operations.count { it.action == ProjectionAction.INSERT },
             updated = operations.count { it.action == ProjectionAction.UPDATE },
@@ -181,6 +241,15 @@ class ProjectionExecutor(
 
     }
 
+    private fun ProjectionDraft.pending(
+        action: HealthConnectPendingAction,
+    ): PendingHealthConnectOperation = PendingHealthConnectOperation(
+        canonicalId = canonicalId,
+        targetRecord = targetRecord(),
+        canonicalVersion = recordVersion,
+        action = action,
+    )
+
     private fun <T : Any> failure(
         canonicalId: String,
         action: ProjectionAction,
@@ -193,6 +262,10 @@ class ProjectionExecutor(
                 message = error.message ?: error::class.java.simpleName,
             ),
         )
+
+    private companion object {
+        val executionMutex = Mutex()
+    }
 }
 
 private const val MAX_PROJECTION_BATCH = 500

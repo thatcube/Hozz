@@ -38,6 +38,11 @@ certificate and private key whose trust chain is already installed on the
 phone, or expose the loopback listener through an authenticated TLS tunnel.
 Hozz never generates or silently trusts a self-signed certificate.
 
+Each connection has absolute TLS-handshake, header, and body deadlines, and the
+listener serves a bounded number of connections concurrently. Complete bodies
+are spooled before one serialized SQLite transaction begins, so a slow peer
+cannot monopolize the receiver or overlap database commits.
+
 ## Why retries are safe
 
 - Every record resolves to a stable Hozz canonical ID and monotonic version, so
@@ -62,6 +67,13 @@ before any part of the archive commits. ZIP entries must use Stored or Deflate;
 encrypted, BZIP2, LZMA, and unknown methods are rejected before decompression.
 Network requests are capped and spooled, while NDJSON and JSON arrays are
 decoded one record at a time.
+
+Folder imports open each candidate once and use its content digest as the
+idempotent batch identity. Device, inode, size, and nanosecond modification time
+form a freshness snapshot recorded in the same transaction as its records. If
+either the descriptor or pathname changes before commit, the import rolls back
+and the next scan retries the completed file. Changing only filesystem metadata
+does not duplicate archive run or coverage records.
 
 Health Auto Export metric points must include their source record ID. Without
 it, a later date-less deletion cannot identify the record it supersedes, so the

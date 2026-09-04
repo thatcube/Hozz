@@ -3,7 +3,9 @@ package com.thatcube.hozz.projection
 import com.thatcube.hozz.core.CanonicalRecord
 import com.thatcube.hozz.core.CanonicalValue
 import com.thatcube.hozz.core.HealthConnectProjection
+import com.thatcube.hozz.core.HealthConnectPendingAction
 import com.thatcube.hozz.core.InMemoryCanonicalRecordStore
+import com.thatcube.hozz.core.PendingHealthConnectOperation
 import com.thatcube.hozz.core.SourceLineage
 import java.time.Instant
 import kotlin.math.roundToLong
@@ -149,6 +151,60 @@ class ProjectionPlannerTest {
         assertEquals(record.recordVersion, deletion.recordVersion)
         assertEquals("StepsRecord", deletion.targetRecord)
         assertEquals("health-connect-id", deletion.healthConnectRecordId)
+    }
+
+    @Test
+    fun pendingOnlyTombstoneDeletesByDeterministicClientIdentity() {
+        val record = quantity(
+            "pending-delete",
+            "HKQuantityTypeIdentifierBodyMass",
+            1.0,
+            "kg",
+            version = 2,
+        ).copy(tombstone = true)
+        val pending = PendingHealthConnectOperation(
+            canonicalId = record.canonicalId,
+            targetRecord = "WeightRecord",
+            canonicalVersion = 1,
+            action = HealthConnectPendingAction.UPSERT,
+        )
+
+        val planned = ProjectionPlanner.plan(
+            record,
+            projection = null,
+            pending = pending,
+        )
+
+        assertEquals(ProjectionAction.DELETE, planned.action)
+        val deletion = planned.draft as ProjectionDraft.Delete
+        assertEquals(record.canonicalId, deletion.canonicalId)
+        assertNull(deletion.healthConnectRecordId)
+    }
+
+    @Test
+    fun pendingOnlyLiveRecordRetriesIdempotently() {
+        val record = quantity(
+            "pending-live",
+            "HKQuantityTypeIdentifierBodyMass",
+            1.0,
+            "kg",
+            version = 2,
+        )
+        val pending = PendingHealthConnectOperation(
+            canonicalId = record.canonicalId,
+            targetRecord = "WeightRecord",
+            canonicalVersion = 2,
+            action = HealthConnectPendingAction.UPSERT,
+        )
+
+        val planned = ProjectionPlanner.plan(
+            record,
+            projection = null,
+            pending = pending,
+        )
+
+        assertEquals(ProjectionAction.UPDATE, planned.action)
+        assertTrue(planned.draft is ProjectionDraft.Weight)
     }
 
     @Test

@@ -18,8 +18,12 @@ import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.thatcube.hozz.core.InMemoryCanonicalRecordStore
+import com.thatcube.hozz.core.HealthConnectPendingAction
+import com.thatcube.hozz.core.PendingHealthConnectOperation
+import com.thatcube.hozz.core.SqliteCanonicalRecordStore
 import java.io.FileInputStream
 import java.time.Instant
+import java.util.UUID
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -206,6 +210,109 @@ class HealthConnectWriterIntegrationTest {
             it.metadata.clientRecordId == canonicalId
         }
         assertTrue(matches.isEmpty())
+    }
+
+    @Test
+    fun pendingWriteCrashWindowDeletesByClientRecordIdAfterRestart() = runBlocking {
+            val context = context()
+            provisionWrite(context, WeightRecord::class.java.simpleName)
+            val client = HealthConnectClient.getOrCreate(context)
+            val writer = HealthConnectWriter(context)
+            val canonicalId = "apple.healthkit:pending-crash-delete"
+            val instant = Instant.now().minusSeconds(30)
+            val databaseName = "pending-${UUID.randomUUID()}.sqlite"
+            var store = SqliteCanonicalRecordStore(context, databaseName)
+            try {
+                val pendingUpsert = PendingHealthConnectOperation(
+                    canonicalId = canonicalId,
+                    targetRecord = "WeightRecord",
+                    canonicalVersion = 1,
+                    action = HealthConnectPendingAction.UPSERT,
+                )
+                store.stageHealthConnectOperations(listOf(pendingUpsert))
+                writer.writeUpserts(
+                    listOf(
+                        ProjectionDraft.Weight(
+                            canonicalId = canonicalId,
+                            recordVersion = 1,
+                            time = instant,
+                            kilograms = 1.0,
+                        )
+                    )
+                )
+                store.close()
+                store = SqliteCanonicalRecordStore(context, databaseName)
+                assertEquals(
+                    pendingUpsert,
+                    store.pendingHealthConnectOperations(setOf(canonicalId))
+                        .getValue(canonicalId),
+                )
+
+                val pendingDelete = pendingUpsert.copy(
+                    canonicalVersion = 2,
+                    action = HealthConnectPendingAction.DELETE,
+                )
+                store.stageHealthConnectOperations(listOf(pendingDelete))
+                val removed = writer.delete(
+                    listOf(
+                        ProjectionDraft.Delete(
+                            canonicalId = canonicalId,
+                            recordVersion = 2,
+                            targetRecord = "WeightRecord",
+                            healthConnectRecordId = null,
+                        )
+                    )
+                )
+                assertEquals(1, removed.size)
+                store.completeHealthConnectDeletes(listOf(pendingDelete))
+
+                assertTrue(
+                    store.pendingHealthConnectOperations(setOf(canonicalId)).isEmpty(),
+                )
+                val matches = client.readRecords(
+                    ReadRecordsRequest(
+                        recordType = WeightRecord::class,
+                        timeRangeFilter = TimeRangeFilter.between(
+                            instant.minusSeconds(60),
+                            instant.plusSeconds(60),
+                        ),
+                        dataOriginFilter = setOf(DataOrigin(context.packageName)),
+                    )
+                ).records.filter {
+                    it.metadata.clientRecordId == canonicalId
+                }
+
+                assertTrue(matches.isEmpty())
+            } finally {
+                val ids = weightRecordIds(
+                    client,
+                    context.packageName,
+                    canonicalId,
+                    instant.minusSeconds(60),
+                    instant.plusSeconds(60),
+                )
+                if (ids.isNotEmpty()) {
+                    client.deleteRecords(WeightRecord::class, ids, emptyList())
+                }
+                store.close()
+                context.deleteDatabase(databaseName)
+            }
+    }
+
+    @Test
+    fun clientRecordIdDeletionIsSafeWhenAbsentOrRepeated() = runBlocking {
+        val context = context()
+        provisionWrite(context, WeightRecord::class.java.simpleName)
+        val writer = HealthConnectWriter(context)
+        val draft = ProjectionDraft.Delete(
+            canonicalId = "apple.healthkit:absent-client-record",
+            recordVersion = 2,
+            targetRecord = "WeightRecord",
+            healthConnectRecordId = null,
+        )
+
+        assertEquals(1, writer.delete(listOf(draft)).size)
+        assertEquals(1, writer.delete(listOf(draft)).size)
     }
 
     private suspend fun weightRecordIds(

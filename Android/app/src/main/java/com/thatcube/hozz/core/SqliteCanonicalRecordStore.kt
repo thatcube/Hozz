@@ -6,6 +6,7 @@ import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
 import java.time.Instant
+import java.util.Locale
 import java.util.UUID
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -14,7 +15,7 @@ class SqliteCanonicalRecordStore(
     context: Context,
     databaseName: String = "hozz-archive.sqlite",
 ) :
-    SQLiteOpenHelper(context, databaseName, null, 10),
+    SQLiteOpenHelper(context, databaseName, null, 12),
     CanonicalRecordStore {
 
     override fun onCreate(database: SQLiteDatabase) {
@@ -44,6 +45,7 @@ class SqliteCanonicalRecordStore(
                 source_store TEXT NOT NULL,
                 source_bundle_identifier TEXT,
                 source_name TEXT,
+                timeline_sort_key TEXT,
                 device_json TEXT,
                 metadata_json TEXT,
                 lineage_json TEXT NOT NULL,
@@ -54,10 +56,16 @@ class SqliteCanonicalRecordStore(
         )
         createRunRecordTables(database)
         createHealthConnectProjectionTable(database)
+        createHealthConnectPendingTable(database)
+        createHealthConnectOperationStateTable(database)
         database.execSQL(
             """
             CREATE INDEX canonical_record_timeline
-            ON canonical_record (tombstone, end_time DESC, start_time DESC)
+            ON canonical_record (
+                tombstone,
+                timeline_sort_key DESC,
+                canonical_id ASC
+            )
             """.trimIndent(),
         )
         database.execSQL(
@@ -163,6 +171,29 @@ class SqliteCanonicalRecordStore(
         if (oldVersion < 10) {
             database.execSQL("DROP TABLE IF EXISTS main.canonical_record_stage")
             database.execSQL("DROP TABLE IF EXISTS main.archive_run_record_stage")
+        }
+        if (oldVersion < 11) {
+            if (!hasColumn(database, "canonical_record", "timeline_sort_key")) {
+                database.execSQL(
+                    "ALTER TABLE canonical_record ADD COLUMN timeline_sort_key TEXT",
+                )
+            }
+            backfillTimelineSortKeys(database)
+            database.execSQL("DROP INDEX IF EXISTS canonical_record_timeline")
+            database.execSQL(
+                """
+                CREATE INDEX canonical_record_timeline
+                ON canonical_record (
+                    tombstone,
+                    timeline_sort_key DESC,
+                    canonical_id ASC
+                )
+                """.trimIndent(),
+            )
+            createHealthConnectPendingTable(database)
+        }
+        if (oldVersion < 12) {
+            createHealthConnectOperationStateTable(database)
         }
         reconcileEncodingFailures(database)
     }
@@ -345,17 +376,17 @@ class SqliteCanonicalRecordStore(
         after: TimelineCursor?,
         limit: Int,
     ): TimelinePage {
-        val time = after?.sortTime?.toString()
+        val time = after?.sortTime?.let(::timelineSortKey)
         val selection = when {
             after == null -> "tombstone = 0"
             time == null ->
-                "tombstone = 0 AND COALESCE(end_time, start_time) IS NULL " +
+                "tombstone = 0 AND timeline_sort_key IS NULL " +
                     "AND canonical_id > ?"
             else ->
                 "tombstone = 0 AND (" +
-                    "COALESCE(end_time, start_time) < ? OR " +
-                    "(COALESCE(end_time, start_time) = ? AND canonical_id > ?) OR " +
-                    "COALESCE(end_time, start_time) IS NULL)"
+                    "timeline_sort_key < ? OR " +
+                    "(timeline_sort_key = ? AND canonical_id > ?) OR " +
+                    "timeline_sort_key IS NULL)"
         }
         val arguments = when {
             after == null -> null
@@ -369,7 +400,7 @@ class SqliteCanonicalRecordStore(
             arguments,
             null,
             null,
-            "COALESCE(end_time, start_time) DESC, canonical_id",
+            "timeline_sort_key DESC, canonical_id",
             limit.coerceIn(1, 1_000).toString(),
         ).use { cursor ->
             buildList {
@@ -391,6 +422,50 @@ class SqliteCanonicalRecordStore(
                 TimelineCursor(it.endTime ?: it.startTime, it.canonicalId)
             },
         )
+    }
+
+    internal fun timelineQueryPlan(after: TimelineCursor?): List<String> {
+        val time = after?.sortTime?.let(::timelineSortKey)
+        val sql: String
+        val arguments: Array<String>
+        if (after == null) {
+            sql = """
+                EXPLAIN QUERY PLAN
+                SELECT canonical_id FROM canonical_record
+                WHERE tombstone = 0
+                ORDER BY timeline_sort_key DESC, canonical_id
+                LIMIT 200
+            """.trimIndent()
+            arguments = emptyArray()
+        } else if (time == null) {
+            sql = """
+                EXPLAIN QUERY PLAN
+                SELECT canonical_id FROM canonical_record
+                WHERE tombstone = 0 AND timeline_sort_key IS NULL
+                  AND canonical_id > ?
+                ORDER BY timeline_sort_key DESC, canonical_id
+                LIMIT 200
+            """.trimIndent()
+            arguments = arrayOf(after.canonicalId)
+        } else {
+            sql = """
+                EXPLAIN QUERY PLAN
+                SELECT canonical_id FROM canonical_record
+                WHERE tombstone = 0 AND (
+                  timeline_sort_key < ? OR
+                  (timeline_sort_key = ? AND canonical_id > ?) OR
+                  timeline_sort_key IS NULL
+                )
+                ORDER BY timeline_sort_key DESC, canonical_id
+                LIMIT 200
+            """.trimIndent()
+            arguments = arrayOf(time, time, after.canonicalId)
+        }
+        return readableDatabase.rawQuery(sql, arguments).use { cursor ->
+            buildList {
+                while (cursor.moveToNext()) add(cursor.getString(3))
+            }
+        }
     }
 
     override suspend fun recordsPage(
@@ -567,6 +642,354 @@ class SqliteCanonicalRecordStore(
         }
     }
 
+    override suspend fun pendingHealthConnectOperations(
+                canonicalIds: Set<String>,
+            ): Map<String, PendingHealthConnectOperation> {
+                if (canonicalIds.isEmpty()) return emptyMap()
+                val placeholders = canonicalIds.joinToString(",") { "?" }
+                return readableDatabase.rawQuery(
+                    """
+                    SELECT canonical_id, target_record, canonical_version, action
+                    FROM health_connect_pending_operation
+                    WHERE canonical_id IN ($placeholders)
+                    """.trimIndent(),
+                    canonicalIds.toTypedArray(),
+                ).use { cursor ->
+                    buildMap {
+                        while (cursor.moveToNext()) {
+                            val operation = PendingHealthConnectOperation(
+                                canonicalId = cursor.getString(0),
+                                targetRecord = cursor.getString(1),
+                                canonicalVersion = cursor.getLong(2),
+                                action = HealthConnectPendingAction.valueOf(
+                                    cursor.getString(3),
+                                ),
+                            )
+                            put(operation.canonicalId, operation)
+                        }
+                    }
+                }
+            }
+
+    override suspend fun stageHealthConnectOperations(
+                operations: List<PendingHealthConnectOperation>,
+            ) {
+                if (operations.isEmpty()) return
+                val database = writableDatabase
+                database.beginTransaction()
+                try {
+                    for (operation in operations) {
+                        val completed = database.rawQuery(
+                            """
+                            SELECT target_record, canonical_version, action
+                            FROM health_connect_operation_state
+                            WHERE canonical_id = ?
+                            """.trimIndent(),
+                            arrayOf(operation.canonicalId),
+                        ).use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                Triple(
+                                    cursor.getString(0),
+                                    cursor.getLong(1),
+                                    cursor.getString(2),
+                                )
+                            } else {
+                                null
+                            }
+                        }
+                        if (
+                            completed?.first == operation.targetRecord &&
+                            completed.second == operation.canonicalVersion &&
+                            completed.third == operation.action.name
+                        ) {
+                            continue
+                        }
+                        val committed = database.rawQuery(
+                            """
+                            SELECT target_record, canonical_version
+                            FROM health_connect_projection
+                            WHERE canonical_id = ?
+                            """.trimIndent(),
+                            arrayOf(operation.canonicalId),
+                        ).use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                cursor.getString(0) to cursor.getLong(1)
+                            } else {
+                                null
+                            }
+                        }
+                        check(
+                            committed == null ||
+                                (
+                                    committed.first == operation.targetRecord &&
+                                        (
+                                            operation.canonicalVersion >
+                                                committed.second ||
+                                                (
+                                                    operation.action ==
+                                                        HealthConnectPendingAction.DELETE &&
+                                                        operation.canonicalVersion ==
+                                                        committed.second
+                                                    )
+                                            )
+                                )
+                        ) {
+                            "Stale work cannot replace a committed Health Connect projection."
+                        }
+                        check(
+                            completed == null ||
+                                (
+                                    completed.first == operation.targetRecord &&
+                                        (
+                                            operation.canonicalVersion >
+                                                completed.second ||
+                                                (
+                                                    completed.third ==
+                                                        HealthConnectPendingAction.UPSERT.name &&
+                                                        operation.action ==
+                                                        HealthConnectPendingAction.DELETE &&
+                                                        operation.canonicalVersion ==
+                                                        completed.second
+                                                    )
+                                            )
+                                )
+                        ) {
+                            "Stale work cannot replace completed Health Connect state."
+                        }
+                        val current = database.rawQuery(
+                            """
+                            SELECT canonical_version, target_record, action
+                            FROM health_connect_pending_operation
+                            WHERE canonical_id = ?
+                            """.trimIndent(),
+                            arrayOf(operation.canonicalId),
+                        ).use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                Triple(
+                                    cursor.getLong(0),
+                                    cursor.getString(1),
+                                    HealthConnectPendingAction.valueOf(cursor.getString(2)),
+                                )
+                            } else {
+                                null
+                            }
+                        }
+                        check(
+                            current == null ||
+                                (
+                                    current.second == operation.targetRecord &&
+                                        (
+                                            operation.canonicalVersion > current.first ||
+                                                (
+                                                    operation.canonicalVersion == current.first &&
+                                                        (
+                                                            operation.action == current.third ||
+                                                                (
+                                                                    current.third ==
+                                                                        HealthConnectPendingAction.UPSERT &&
+                                                                        operation.action ==
+                                                                            HealthConnectPendingAction.DELETE
+                                                                    )
+                                                            )
+                                                    )
+                                            )
+                                )
+                        ) {
+                            "Stale work cannot replace a pending Health Connect operation."
+                        }
+                        val values = pendingValues(operation)
+                        if (current == null) {
+                            database.insertOrThrow(
+                                "health_connect_pending_operation",
+                                null,
+                                values,
+                            )
+                        } else if (
+                            operation.canonicalVersion > current.first ||
+                            operation.action != current.third
+                        ) {
+                            database.update(
+                                "health_connect_pending_operation",
+                                values,
+                                "canonical_id = ?",
+                                arrayOf(operation.canonicalId),
+                            )
+                        }
+                    }
+                    database.setTransactionSuccessful()
+                } finally {
+                    database.endTransaction()
+                }
+            }
+
+    override suspend fun completeHealthConnectUpserts(
+                projections: List<HealthConnectProjection>,
+            ) {
+                if (projections.isEmpty()) return
+                val database = writableDatabase
+                database.beginTransaction()
+                try {
+                    for (projection in projections) {
+                        val pending = database.rawQuery(
+                            """
+                            SELECT target_record, canonical_version, action
+                            FROM health_connect_pending_operation
+                            WHERE canonical_id = ?
+                            """.trimIndent(),
+                            arrayOf(projection.canonicalId),
+                        ).use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                Triple(
+                                    cursor.getString(0),
+                                    cursor.getLong(1),
+                                    cursor.getString(2),
+                                )
+                            } else {
+                                null
+                            }
+                        }
+                        val completed = database.rawQuery(
+                            """
+                            SELECT canonical_version, action
+                            FROM health_connect_operation_state
+                            WHERE canonical_id = ?
+                            """.trimIndent(),
+                            arrayOf(projection.canonicalId),
+                        ).use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                cursor.getLong(0) to cursor.getString(1)
+                            } else {
+                                null
+                            }
+                        }
+                        if (
+                            pending?.first != projection.targetRecord ||
+                            pending.second != projection.canonicalVersion ||
+                            pending.third != HealthConnectPendingAction.UPSERT.name ||
+                            (
+                                completed != null &&
+                                    completed.first >= projection.canonicalVersion
+                                )
+                        ) {
+                            continue
+                        }
+                        saveProjection(database, projection)
+                        saveOperationState(
+                            database,
+                            PendingHealthConnectOperation(
+                                canonicalId = projection.canonicalId,
+                                targetRecord = projection.targetRecord,
+                                canonicalVersion = projection.canonicalVersion,
+                                action = HealthConnectPendingAction.UPSERT,
+                            ),
+                        )
+                        database.delete(
+                            "health_connect_pending_operation",
+                            """
+                            canonical_id = ? AND canonical_version = ?
+                            AND action = ?
+                            """.trimIndent(),
+                            arrayOf(
+                                projection.canonicalId,
+                                projection.canonicalVersion.toString(),
+                                HealthConnectPendingAction.UPSERT.name,
+                            ),
+                        )
+                    }
+                    database.setTransactionSuccessful()
+                } finally {
+                    database.endTransaction()
+                }
+            }
+
+    override suspend fun completeHealthConnectDeletes(
+                operations: List<PendingHealthConnectOperation>,
+            ) {
+                if (operations.isEmpty()) return
+                val database = writableDatabase
+                database.beginTransaction()
+                try {
+                    for (operation in operations) {
+                        val pending = database.rawQuery(
+                            """
+                            SELECT target_record, canonical_version, action
+                            FROM health_connect_pending_operation
+                            WHERE canonical_id = ?
+                            """.trimIndent(),
+                            arrayOf(operation.canonicalId),
+                        ).use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                Triple(
+                                    cursor.getString(0),
+                                    cursor.getLong(1),
+                                    cursor.getString(2),
+                                )
+                            } else {
+                                null
+                            }
+                        }
+                        val completed = database.rawQuery(
+                            """
+                            SELECT canonical_version, action
+                            FROM health_connect_operation_state
+                            WHERE canonical_id = ?
+                            """.trimIndent(),
+                            arrayOf(operation.canonicalId),
+                        ).use { cursor ->
+                            if (cursor.moveToFirst()) {
+                                cursor.getLong(0) to cursor.getString(1)
+                            } else {
+                                null
+                            }
+                        }
+                        if (
+                            pending?.first != operation.targetRecord ||
+                            pending.second != operation.canonicalVersion ||
+                            pending.third != HealthConnectPendingAction.DELETE.name ||
+                            (
+                                completed != null &&
+                                    (
+                                        completed.first >
+                                            operation.canonicalVersion ||
+                                            (
+                                                completed.first ==
+                                                    operation.canonicalVersion &&
+                                                    completed.second !=
+                                                    HealthConnectPendingAction.UPSERT.name
+                                                )
+                                        )
+                                )
+                        ) {
+                            continue
+                        }
+                        database.delete(
+                            "health_connect_projection",
+                            "canonical_id = ? AND canonical_version <= ?",
+                            arrayOf(
+                                operation.canonicalId,
+                                operation.canonicalVersion.toString(),
+                            ),
+                        )
+                        saveOperationState(database, operation)
+                        database.delete(
+                            "health_connect_pending_operation",
+                            """
+                            canonical_id = ? AND canonical_version = ?
+                            AND action = ?
+                            """.trimIndent(),
+                            arrayOf(
+                                operation.canonicalId,
+                                operation.canonicalVersion.toString(),
+                                HealthConnectPendingAction.DELETE.name,
+                            ),
+                        )
+                    }
+                    database.setTransactionSuccessful()
+                } finally {
+                    database.endTransaction()
+                }
+            }
+
     override suspend fun saveHealthConnectProjections(
         projections: List<HealthConnectProjection>,
     ) {
@@ -577,39 +1000,7 @@ class SqliteCanonicalRecordStore(
         database.beginTransaction()
         try {
             for (projection in projections) {
-                val currentVersion = database.rawQuery(
-                    """
-                    SELECT canonical_version
-                    FROM health_connect_projection
-                    WHERE canonical_id = ?
-                    """.trimIndent(),
-                    arrayOf(projection.canonicalId),
-                ).use { cursor ->
-                    if (cursor.moveToFirst()) cursor.getLong(0) else null
-                }
-                val values = ContentValues().apply {
-                    put("canonical_id", projection.canonicalId)
-                    put("target_record", projection.targetRecord)
-                    put("canonical_version", projection.canonicalVersion)
-                    put(
-                        "health_connect_record_id",
-                        projection.healthConnectRecordId,
-                    )
-                }
-                if (currentVersion == null) {
-                    database.insertOrThrow(
-                        "health_connect_projection",
-                        null,
-                        values,
-                    )
-                } else if (projection.canonicalVersion >= currentVersion) {
-                    database.update(
-                        "health_connect_projection",
-                        values,
-                        "canonical_id = ?",
-                        arrayOf(projection.canonicalId),
-                    )
-                }
+                saveProjection(database, projection)
             }
             database.setTransactionSuccessful()
         } finally {
@@ -963,6 +1354,90 @@ class SqliteCanonicalRecordStore(
         }
     }
 
+    private fun pendingValues(
+        operation: PendingHealthConnectOperation,
+    ): ContentValues = ContentValues().apply {
+        put("canonical_id", operation.canonicalId)
+        put("target_record", operation.targetRecord)
+        put("canonical_version", operation.canonicalVersion)
+        put("action", operation.action.name)
+    }
+
+    private fun saveProjection(
+        database: SQLiteDatabase,
+        projection: HealthConnectProjection,
+    ) {
+        val currentVersion = database.rawQuery(
+            """
+            SELECT canonical_version
+            FROM health_connect_projection
+            WHERE canonical_id = ?
+            """.trimIndent(),
+            arrayOf(projection.canonicalId),
+        ).use { cursor ->
+            if (cursor.moveToFirst()) cursor.getLong(0) else null
+        }
+        val values = ContentValues().apply {
+            put("canonical_id", projection.canonicalId)
+            put("target_record", projection.targetRecord)
+            put("canonical_version", projection.canonicalVersion)
+            put("health_connect_record_id", projection.healthConnectRecordId)
+        }
+        if (currentVersion == null) {
+            database.insertOrThrow(
+                "health_connect_projection",
+                null,
+                values,
+            )
+        } else if (projection.canonicalVersion >= currentVersion) {
+            database.update(
+                "health_connect_projection",
+                values,
+                "canonical_id = ?",
+                arrayOf(projection.canonicalId),
+            )
+        }
+    }
+
+    private fun saveOperationState(
+        database: SQLiteDatabase,
+        operation: PendingHealthConnectOperation,
+    ) {
+        val current = database.rawQuery(
+            """
+            SELECT target_record, canonical_version
+            FROM health_connect_operation_state
+            WHERE canonical_id = ?
+            """.trimIndent(),
+            arrayOf(operation.canonicalId),
+        ).use { cursor ->
+            if (cursor.moveToFirst()) {
+                cursor.getString(0) to cursor.getLong(1)
+            } else {
+                null
+            }
+        }
+        if (current != null && current.second > operation.canonicalVersion) return
+        check(current == null || current.first == operation.targetRecord) {
+            "A canonical record cannot change its completed Health Connect target."
+        }
+        val values = pendingValues(operation)
+        if (current == null) {
+            database.insertOrThrow(
+                "health_connect_operation_state",
+                null,
+                values,
+            )
+        } else {
+            database.update(
+                "health_connect_operation_state",
+                values,
+                "canonical_id = ?",
+                arrayOf(operation.canonicalId),
+            )
+        }
+    }
+
     private fun values(record: CanonicalRecord): ContentValues = ContentValues().apply {
         put("canonical_id", record.canonicalId)
         put("parent_canonical_id", record.parentCanonicalId)
@@ -987,6 +1462,7 @@ class SqliteCanonicalRecordStore(
         put("source_store", record.sourceStore)
         put("source_bundle_identifier", record.sourceBundleIdentifier)
         put("source_name", record.sourceName)
+        put("timeline_sort_key", (record.endTime ?: record.startTime)?.let(::timelineSortKey))
         put("device_json", record.deviceJson)
         put("metadata_json", record.metadataJson)
         put("lineage_json", CanonicalRecordParser.lineageJson(record.lineage))
@@ -998,6 +1474,7 @@ class SqliteCanonicalRecordStore(
         sessionId: String,
         record: CanonicalRecord,
     ): ContentValues = ContentValues(values(record)).apply {
+        remove("timeline_sort_key")
         put("session_id", sessionId)
     }
 
@@ -1195,6 +1672,44 @@ class SqliteCanonicalRecordStore(
                 arrayOf(table),
             ).use(Cursor::moveToFirst)
 
+        private fun timelineSortKey(instant: Instant): String = String.format(
+            Locale.US,
+            "%017d%09d",
+            instant.epochSecond - Instant.MIN.epochSecond,
+            instant.nano,
+        )
+
+        private fun backfillTimelineSortKeys(database: SQLiteDatabase) {
+            database.rawQuery(
+                """
+                SELECT canonical_id, end_time, start_time
+                FROM canonical_record
+                """.trimIndent(),
+                null,
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val text = when {
+                        !cursor.isNull(1) -> cursor.getString(1)
+                        !cursor.isNull(2) -> cursor.getString(2)
+                        else -> null
+                    }
+                    val key = text?.let {
+                        try {
+                            timelineSortKey(Instant.parse(it))
+                        } catch (_: Exception) {
+                            null
+                        }
+                    }
+                    database.update(
+                        "canonical_record",
+                        ContentValues().apply { put("timeline_sort_key", key) },
+                        "canonical_id = ?",
+                        arrayOf(cursor.getString(0)),
+                    )
+                }
+            }
+        }
+
         private data class StoredRecordState(
             val recordVersion: Long,
             val tombstone: Boolean,
@@ -1212,6 +1727,32 @@ class SqliteCanonicalRecordStore(
                 target_record TEXT NOT NULL,
                 canonical_version INTEGER NOT NULL,
                 health_connect_record_id TEXT NOT NULL
+            )
+            """.trimIndent(),
+        )
+    }
+
+    fun createHealthConnectPendingTable(database: SQLiteDatabase) {
+        database.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS health_connect_pending_operation (
+                canonical_id TEXT PRIMARY KEY,
+                target_record TEXT NOT NULL,
+                canonical_version INTEGER NOT NULL,
+                action TEXT NOT NULL
+            )
+            """.trimIndent(),
+        )
+    }
+
+    fun createHealthConnectOperationStateTable(database: SQLiteDatabase) {
+        database.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS health_connect_operation_state (
+                canonical_id TEXT PRIMARY KEY,
+                target_record TEXT NOT NULL,
+                canonical_version INTEGER NOT NULL,
+                action TEXT NOT NULL
             )
             """.trimIndent(),
         )

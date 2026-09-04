@@ -28,6 +28,10 @@ public actor FolderIngestWatcher {
     private var folder: URL?
     private var source: DispatchSourceFileSystemObject?
     private var descriptor: CInt = -1
+    private var retryTask: Task<Void, Never>?
+    private var retryDelayMilliseconds: Int64 = 1_100
+    private var failedSnapshots: [String: FileSnapshot] = [:]
+    private var attemptedSnapshots: [String: FileSnapshot] = [:]
     /// Files already read, so a folder that is rescanned does not re-ingest.
     private var seen: Set<String> = []
     private var observers: [@Sendable (ReceiverEvent) -> Void] = []
@@ -77,6 +81,11 @@ public actor FolderIngestWatcher {
         source?.cancel()
         source = nil
         descriptor = -1
+        retryTask?.cancel()
+        retryTask = nil
+        retryDelayMilliseconds = 1_100
+        failedSnapshots.removeAll()
+        attemptedSnapshots.removeAll()
         folder = nil
         seen.removeAll()
     }
@@ -95,14 +104,29 @@ public actor FolderIngestWatcher {
                 continue
             }
             let url = folder.appending(path: name)
+            let snapshot = Self.snapshot(of: url)
+            if failedSnapshots[name] == snapshot {
+                continue
+            }
+            failedSnapshots.removeValue(forKey: name)
+            if attemptedSnapshots[name] != snapshot {
+                retryDelayMilliseconds = 1_100
+            }
+            attemptedSnapshots[name] = snapshot
 
             // A file still being written, or still downloading from iCloud, is
             // skipped rather than half-read. It will be picked up on the next
             // pass once it has settled.
             guard Self.isSettled(url) else {
+                scheduleRetry()
                 continue
             }
             guard let data = try? Data(contentsOf: url) else {
+                scheduleRetry(backingOff: true)
+                continue
+            }
+            guard Self.snapshot(of: url) == snapshot else {
+                scheduleRetry()
                 continue
             }
 
@@ -113,6 +137,9 @@ public actor FolderIngestWatcher {
                 // data.
                 let result = try await store.ingest(batch, idempotencyKey: name)
                 seen.insert(name)
+                failedSnapshots.removeValue(forKey: name)
+                attemptedSnapshots.removeValue(forKey: name)
+                retryDelayMilliseconds = 1_100
                 emit(
                     ReceiverEvent(
                         outcome: result.duplicate
@@ -120,14 +147,39 @@ public actor FolderIngestWatcher {
                             : .stored(records: result.stored, deleted: result.deleted)
                     )
                 )
+            } catch BatchParseError.connectionTest {
+                seen.insert(name)
             } catch is BatchParseError {
-                seen.insert(name)
-            } catch {
                 Self.log.error("A file in the watched folder could not be read.")
-                seen.insert(name)
                 emit(ReceiverEvent(outcome: .rejected("A file could not be read")))
+                if Self.snapshot(of: url) == snapshot {
+                    failedSnapshots[name] = snapshot
+                }
+                scheduleRetry()
+            } catch {
+                Self.log.error("A file in the watched folder could not be stored yet.")
+                emit(ReceiverEvent(outcome: .rejected("A file could not be stored yet")))
+                scheduleRetry(backingOff: true)
             }
         }
+    }
+
+    private func scheduleRetry(backingOff: Bool = false) {
+        guard retryTask == nil else { return }
+        let delay = backingOff ? retryDelayMilliseconds : 1_100
+        if backingOff {
+            retryDelayMilliseconds = min(retryDelayMilliseconds * 2, 60_000)
+        }
+        retryTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(delay))
+            guard !Task.isCancelled else { return }
+            await self?.runScheduledRetry()
+        }
+    }
+
+    private func runScheduledRetry() async {
+        retryTask = nil
+        await ingestNewFiles()
     }
 
     /// Whether a file has finished being written or downloaded.
@@ -151,9 +203,25 @@ public actor FolderIngestWatcher {
         return true
     }
 
+    private static func snapshot(of url: URL) -> FileSnapshot {
+        let values = try? url.resourceValues(forKeys: [
+            .fileSizeKey,
+            .contentModificationDateKey
+        ])
+        return FileSnapshot(
+            size: values?.fileSize,
+            modified: values?.contentModificationDate
+        )
+    }
+
     private func emit(_ event: ReceiverEvent) {
         for observer in observers {
             observer(event)
         }
     }
+}
+
+private struct FileSnapshot: Equatable {
+    let size: Int?
+    let modified: Date?
 }

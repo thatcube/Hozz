@@ -1,14 +1,19 @@
 import contextlib
+import http.client
 import io
 import json
+import os
 import sqlite3
 import socket
 import struct
 import tempfile
+import threading
+import time
 import tracemalloc
 import unittest
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 import receiver.hozz_receiver as receiver
@@ -1086,7 +1091,6 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM archive_run_records"
             ).fetchone()[0],
         )
-
     def test_payload_memory_budget_rejects_before_decode(self):
         with (
             mock.patch.object(receiver, "MAX_PENDING_BATCH_BYTES", 8),
@@ -1209,7 +1213,7 @@ class TransactionAndArchiveTests(unittest.TestCase):
             "padding": "x" * 600,
             "data": {
                 "metrics": [{
-                    "name": "steps",
+                    "name": "step_count",
                     "units": "count",
                     "data": [{
                         "id": "point-1",
@@ -1433,8 +1437,8 @@ class TransactionAndArchiveTests(unittest.TestCase):
             "data": {
                 "deletions": [{
                     "id": "deleted-id",
-                    "name": "steps",
-                    "type": "steps",
+                    "name": "step_count",
+                    "type": "HKQuantityTypeIdentifierStepCount",
                     "date": "",
                 }],
             },
@@ -1453,6 +1457,403 @@ class TransactionAndArchiveTests(unittest.TestCase):
             "SELECT record_version, tombstone FROM samples ORDER BY tombstone"
         ).fetchall()
         self.assertEqual([(2, 1)], rows)
+
+    def test_date_less_deletion_blocks_legacy_until_stable_identity_arrives(self):
+        date = "2026-01-01T00:00:00Z"
+        deletion = {
+            "data": {
+                "deletions": [{
+                    "id": "stable-id",
+                    "name": "steps",
+                    "type": "steps",
+                    "date": "",
+                }],
+            },
+        }
+        ingest_compatible(self.db, deletion, batch_key="fresh-delete")
+        legacy = json.dumps({
+            "id": f"steps:{date}",
+            "type": "steps",
+            "kind": "quantity",
+            "startDate": date,
+            "endDate": date,
+            "quantity": {"value": 100, "unit": "count"},
+        })
+
+        with self.assertRaises(PartialBatch):
+            ingest_lines(self.db, [legacy], batch_key="legacy-before-stable")
+
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "steps",
+                    "units": "count",
+                    "data": [{
+                        "id": "stable-id",
+                        "date": date,
+                        "qty": 100,
+                    }],
+                }],
+            },
+        })
+        self.assertEqual(
+            (0, 0, False),
+            ingest_lines(self.db, [legacy], batch_key="legacy-before-stable"),
+        )
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+            ).fetchone()[0],
+        )
+
+    def test_pre_upgrade_tombstone_backfills_unresolved_legacy_barrier(self):
+        date = "2026-01-01T00:00:00Z"
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [{
+                    "id": "stable-id",
+                    "name": "steps",
+                    "type": "steps",
+                    "date": "",
+                }],
+            },
+        })
+        self.db.execute("DELETE FROM compatible_unresolved_deletion")
+        self.db.commit()
+
+        receiver.backfill_compatible_deletion_state(self.db)
+        self.db.commit()
+
+        with self.assertRaises(PartialBatch):
+            ingest_lines(
+                self.db,
+                [json.dumps({
+                    "id": f"steps:{date}",
+                    "type": "steps",
+                    "kind": "quantity",
+                    "startDate": date,
+                    "endDate": date,
+                    "quantity": {"value": 100, "unit": "count"},
+                })],
+                batch_key="legacy-after-upgrade",
+            )
+
+    def test_same_timestamp_resolutions_survive_backfill(self):
+        date = "2026-01-01T00:00:00Z"
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "steps",
+                    "units": "count",
+                    "data": [
+                        {"id": "first", "date": date, "qty": 1},
+                        {"id": "second", "date": date, "qty": 2},
+                    ],
+                }],
+            },
+        })
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [
+                    {"id": "first", "name": "steps", "type": "steps", "date": ""},
+                    {"id": "second", "name": "steps", "type": "steps", "date": ""},
+                ],
+            },
+        })
+        self.db.execute("DELETE FROM compatible_unresolved_deletion")
+        self.db.execute(
+            """
+            CREATE TABLE compatible_alias_retirement_old_shape (
+                type TEXT NOT NULL,
+                start_epoch INTEGER NOT NULL,
+                stable_id TEXT NOT NULL,
+                PRIMARY KEY (type, start_epoch)
+            )
+            """
+        )
+        self.db.execute(
+            """
+            INSERT INTO compatible_alias_retirement_old_shape
+            SELECT type, start_epoch, MIN(stable_id)
+            FROM compatible_alias_retirement
+            GROUP BY type, start_epoch
+            """
+        )
+        self.db.execute("DROP TABLE compatible_alias_retirement")
+        self.db.execute(
+            """
+            ALTER TABLE compatible_alias_retirement_old_shape
+            RENAME TO compatible_alias_retirement
+            """
+        )
+        self.db.execute("DELETE FROM compatible_resolved_deletion")
+
+        receiver.ensure_compatible_alias_retirement_schema(self.db)
+        receiver.backfill_compatible_deletion_state(self.db)
+
+        self.assertEqual(
+            1,
+            self.db.execute(
+                """
+                SELECT COUNT(*) FROM compatible_alias_retirement
+                WHERE type = 'steps'
+                """
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM compatible_unresolved_deletion"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            2,
+            self.db.execute(
+                "SELECT COUNT(*) FROM compatible_resolved_deletion"
+            ).fetchone()[0],
+        )
+
+    def test_dated_deletion_retires_delayed_legacy_alias(self):
+        date = "2026-01-01T00:00:00Z"
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [{
+                    "id": "stable-id",
+                    "name": "steps",
+                    "type": "steps",
+                    "date": date,
+                }],
+            },
+        })
+        result = ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": f"steps:{date}",
+                "type": "steps",
+                "kind": "quantity",
+                "startDate": date,
+                "endDate": date,
+                "quantity": {"value": 100, "unit": "count"},
+            })],
+            batch_key="legacy-after-dated-delete",
+        )
+
+        self.assertEqual((0, 0, False), result)
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+            ).fetchone()[0],
+        )
+
+    def test_rejected_compatible_payload_does_not_leak_unresolved_barrier(self):
+        malformed = {
+            "data": {
+                "deletions": [
+                    {
+                        "id": "pending",
+                        "name": "steps",
+                        "type": "steps",
+                        "date": "",
+                    },
+                    {
+                        "id": "",
+                        "name": "steps",
+                        "type": "steps",
+                        "date": "",
+                    },
+                ],
+            },
+        }
+
+        with self.assertRaises(PartialBatch):
+            ingest_compatible(self.db, malformed, batch_key="malformed-barrier")
+
+        self.assertFalse(self.db.in_transaction)
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": "steps:2026-01-01T00:00:00Z",
+                "type": "steps",
+                "kind": "quantity",
+                "startDate": "2026-01-01T00:00:00Z",
+                "endDate": "2026-01-01T00:00:00Z",
+                "quantity": {"value": 100, "unit": "count"},
+            })],
+            batch_key="valid-after-rejection",
+        )
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM compatible_unresolved_deletion"
+            ).fetchone()[0],
+        )
+
+    def test_date_less_stable_deletion_rejects_live_legacy_alias_without_receipt(self):
+        date = "2026-01-01T00:00:00Z"
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": f"step_count:{date}",
+                "type": "step_count",
+                "kind": "quantity",
+                "startDate": date,
+                "endDate": date,
+                "quantity": {"value": 100, "unit": "count"},
+            })],
+        )
+        deletion = {
+            "data": {
+                "deletions": [{
+                    "id": "stable-id",
+                    "name": "step_count",
+                    "type": "HKQuantityTypeIdentifierStepCount",
+                    "date": "",
+                }],
+            },
+        }
+
+        with self.assertRaises(PartialBatch):
+            ingest_compatible(self.db, deletion, batch_key="ambiguous-delete")
+
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+            ).fetchone()[0],
+        )
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT 1 FROM batches WHERE key = 'ambiguous-delete'"
+            ).fetchone()
+        )
+
+    def test_stable_compatibility_point_retires_delayed_legacy_alias(self):
+        date = "2026-01-01T00:00:00Z"
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "step_count",
+                    "units": "count",
+                    "data": [{
+                        "id": "stable-step",
+                        "date": date,
+                        "qty": 100,
+                    }],
+                }],
+            },
+        })
+        self.db.execute("DELETE FROM compatible_alias_retirement")
+        self.db.commit()
+
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": f"step_count:{date}",
+                "type": "step_count",
+                "kind": "quantity",
+                "startDate": date,
+                "endDate": date,
+                "quantity": {"value": 100, "unit": "count"},
+            })],
+            batch_key="delayed-legacy-step",
+        )
+
+        self.assertEqual(
+            [("healthAutoExport:stable-step", 0)],
+            self.db.execute(
+                """
+                SELECT canonical_id, tombstone FROM samples
+                WHERE type = 'step_count' AND tombstone = 0
+                """
+            ).fetchall(),
+        )
+
+    def test_stable_sleep_retires_date_less_legacy_sleep_alias(self):
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "sleep_analysis",
+                    "units": "hr",
+                    "data": [{
+                        "id": "stable-sleep",
+                        "startDate": "2026-01-01T00:00:00Z",
+                        "endDate": "2026-01-01T01:00:00Z",
+                        "qty": 1,
+                        "value": "Core",
+                    }],
+                }],
+            },
+        })
+        self.db.execute("DELETE FROM compatible_alias_retirement")
+        self.db.commit()
+
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": "sleep_analysis:None",
+                "type": "sleep_analysis",
+                "kind": "category",
+                "value": 3,
+            })],
+            batch_key="delayed-legacy-sleep",
+        )
+
+        self.assertEqual(
+            [("healthAutoExport:stable-sleep", 0)],
+            self.db.execute(
+                """
+                SELECT canonical_id, tombstone FROM samples
+                WHERE type = 'sleep_analysis' AND tombstone = 0
+                """
+            ).fetchall(),
+        )
+
+    def test_same_batch_stable_replacement_resolves_legacy_before_deletion(self):
+        date = "2026-01-01T00:00:00Z"
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": f"step_count:{date}",
+                "type": "step_count",
+                "kind": "quantity",
+                "startDate": date,
+                "endDate": date,
+                "quantity": {"value": 100, "unit": "count"},
+            })],
+        )
+        result = ingest_compatible(
+            self.db,
+            {
+                "data": {
+                    "metrics": [{
+                        "name": "step_count",
+                        "units": "count",
+                        "data": [{
+                            "id": "stable-step",
+                            "date": date,
+                            "qty": 100,
+                        }],
+                    }],
+                    "deletions": [{
+                        "id": "stable-step",
+                        "name": "step_count",
+                        "type": "HKQuantityTypeIdentifierStepCount",
+                        "date": "",
+                    }],
+                },
+            },
+            batch_key="replacement-and-delete",
+        )
+
+        self.assertEqual((1, 2, False), result)
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+            ).fetchone()[0],
+        )
 
     def test_duplicate_legacy_date_less_deletion_refuses_false_repair(self):
         date = "2026-01-01T00:00:00Z"
@@ -1513,6 +1914,24 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 "quantity": {"value": 100, "unit": "count"},
             })],
         )
+        ingest_lines(
+            self.db,
+            [json.dumps({
+                "id": "unavailable-in-old-row",
+                "type": "steps",
+                "kind": "quantity",
+                "schemaVersion": 1,
+                "recordVersion": 1,
+                "sourceRecord": {
+                    "id": "unavailable-in-old-row",
+                    "store": "healthAutoExport",
+                    "type": "steps",
+                },
+                "startDate": date,
+                "endDate": date,
+                "quantity": {"value": 100, "unit": "count"},
+            })],
+        )
         self.db.execute(
             "INSERT INTO batches (key, received_at, records) VALUES (?, ?, ?)",
             ("legacy-dated", 1, 0),
@@ -1520,7 +1939,7 @@ class TransactionAndArchiveTests(unittest.TestCase):
         self.db.commit()
 
         self.assertEqual(
-            (0, 1, True),
+            (0, 2, True),
             ingest_compatible(
                 self.db,
                 {
@@ -1537,9 +1956,12 @@ class TransactionAndArchiveTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            [(2, 1)],
+            [(2, 1), (2, 1)],
             self.db.execute(
-                "SELECT record_version, tombstone FROM samples"
+                """
+                SELECT record_version, tombstone FROM samples
+                ORDER BY canonical_id
+                """
             ).fetchall(),
         )
 
@@ -2562,6 +2984,526 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM archive_run_records"
             ).fetchone()[0],
         )
+
+    def test_canonical_retry_repairs_unknown_deletion_receipt(self):
+        record = self.strict_record("legacy-receipt")
+        ingest_lines(self.db, [json.dumps(record)])
+        self.db.execute(
+            """
+            INSERT INTO batches (key, received_at, records, deletions)
+            VALUES ('legacy-canonical', 0, 1, -1)
+            """
+        )
+        self.db.commit()
+        deletion = {
+            **record,
+            "deleted": True,
+            "kind": "deletion",
+            "recordVersion": 2,
+        }
+
+        result = ingest_lines(
+            self.db,
+            [json.dumps(deletion), json.dumps(record)],
+            batch_key="legacy-canonical",
+        )
+
+        self.assertEqual((0, 1, True), result)
+        stored = self.db.execute(
+            """
+            SELECT record_version, tombstone, kind
+            FROM samples WHERE canonical_id = ?
+            """,
+            (record["canonicalId"],),
+        ).fetchone()
+        self.assertEqual((2, 1, "deletion"), stored)
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT deletions FROM batches WHERE key = 'legacy-canonical'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            (0, 0, True),
+            ingest_lines(
+                self.db,
+                [json.dumps(record)],
+                batch_key="legacy-canonical",
+            ),
+        )
+
+    def test_failed_canonical_legacy_retry_keeps_receipt_unknown(self):
+        record = self.strict_record("legacy-rollback")
+        ingest_lines(self.db, [json.dumps(record)])
+        self.db.execute(
+            """
+            INSERT INTO batches (key, received_at, records, deletions)
+            VALUES ('legacy-rollback', 0, 1, -1)
+            """
+        )
+        self.db.commit()
+        deletion = {
+            **record,
+            "kind": "deletion",
+            "recordVersion": 2,
+        }
+
+        with self.assertRaises(PartialBatch):
+            ingest_lines(
+                self.db,
+                [json.dumps(deletion), "not-json"],
+                batch_key="legacy-rollback",
+            )
+
+        self.assertEqual(
+            (1, 0),
+            self.db.execute(
+                """
+                SELECT record_version, tombstone FROM samples
+                WHERE canonical_id = ?
+                """,
+                (record["canonicalId"],),
+            ).fetchone(),
+        )
+        self.assertEqual(
+            -1,
+            self.db.execute(
+                "SELECT deletions FROM batches WHERE key = 'legacy-rollback'"
+            ).fetchone()[0],
+        )
+
+    def test_plain_append_during_ingest_rolls_back_without_receipts(self):
+        path = Path(self.directory.name) / "hozz-growing.ndjson"
+        first = json.dumps(self.strict_record("first"))
+        second = json.dumps(self.strict_record("second"))
+        path.write_text(first + "\n")
+        original = receiver.iter_ndjson_lines
+
+        def append_after_first(stream):
+            for index, line in enumerate(original(stream)):
+                yield line
+                if index == 0:
+                    with path.open("a") as output:
+                        output.write(second + "\n")
+
+        with (
+            mock.patch.object(receiver, "iter_ndjson_lines", append_after_first),
+            self.assertRaises(PartialBatch),
+        ):
+            ingest_file(self.db, path, watch_receipt_name=path.name)
+
+        self.assertEqual(0, self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0])
+        self.assertEqual(0, self.db.execute("SELECT COUNT(*) FROM batches").fetchone()[0])
+        self.assertEqual(
+            0,
+            self.db.execute("SELECT COUNT(*) FROM ingested_files").fetchone()[0],
+        )
+
+        self.assertEqual(
+            (2, 0),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+        self.assertEqual(
+            1,
+            self.db.execute("SELECT COUNT(*) FROM ingested_files").fetchone()[0],
+        )
+
+    def test_json_array_file_keeps_descriptor_open_for_snapshot_verification(self):
+        path = Path(self.directory.name) / "hozz-array.json"
+        path.write_text(json.dumps([
+            self.strict_record("array-one"),
+            self.strict_record("array-two"),
+        ]))
+
+        self.assertEqual(
+            (2, 0),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+        self.assertEqual(
+            2,
+            self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.db.execute("SELECT COUNT(*) FROM ingested_files").fetchone()[0],
+        )
+
+    def test_metadata_only_rewrite_does_not_duplicate_run_records(self):
+        path = Path(self.directory.name) / "hozz-run.ndjson"
+        path.write_text(json.dumps({
+            "kind": "typeSummary",
+            "schemaVersion": 1,
+            "type": "heart.rate",
+            "state": "complete",
+        }) + "\n")
+        self.assertEqual(
+            (0, 0),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+        before = self.db.execute(
+            "SELECT COUNT(*) FROM archive_run_records"
+        ).fetchone()[0]
+
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+        self.assertEqual(
+            (0, 0),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+
+        self.assertEqual(
+            before,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
+
+    def test_legacy_filename_receipt_does_not_bless_reused_name(self):
+        path = Path(self.directory.name) / "hozz-old.ndjson"
+        path.write_text(
+            json.dumps(self.strict_record("already-received"))
+            + "\n"
+            + json.dumps({
+                "kind": "typeSummary",
+                "schemaVersion": 1,
+                "type": "heart.rate",
+                "state": "complete",
+            })
+            + "\n"
+        )
+        self.db.execute(
+            """
+            INSERT INTO batches (key, received_at, records, deletions)
+            VALUES (?, 0, 1, 0)
+            """,
+            (f"file:{path.name}",),
+        )
+        self.db.commit()
+
+        self.assertEqual(
+            (1, 0),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+
+        self.assertEqual(
+            1,
+            self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM batches WHERE key LIKE 'file:v3:%'"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
+
+    def test_legacy_filename_receipt_reuses_run_scope_without_duplication(self):
+        path = Path(self.directory.name) / "hozz-old-run.ndjson"
+        run = json.dumps({
+            "kind": "typeSummary",
+            "schemaVersion": 1,
+            "type": "heart.rate",
+            "state": "complete",
+        })
+        path.write_text(run + "\n")
+        legacy_key = f"file:{path.name}"
+        ingest_lines(self.db, [run], batch_key=legacy_key)
+        receiver.record_file_receipt(
+            self.db,
+            path.name,
+            receiver.file_snapshot(path.stat()),
+        )
+        self.db.commit()
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            (0, 0),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
+
+    def test_null_snapshot_legacy_receipt_is_probed_without_run_duplication(self):
+        path = Path(self.directory.name) / "hozz-upgraded-run.ndjson"
+        run = json.dumps({
+            "kind": "typeSummary",
+            "schemaVersion": 1,
+            "type": "heart.rate",
+            "state": "complete",
+        })
+        path.write_text(run + "\n")
+        legacy_key = f"file:{path.name}"
+        ingest_lines(self.db, [run], batch_key=legacy_key)
+        self.db.execute(
+            """
+            INSERT INTO ingested_files (name, ingested_at)
+            VALUES (?, 0)
+            """,
+            (path.name,),
+        )
+        self.db.commit()
+
+        self.assertEqual(
+            (0, 0),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM batches WHERE key LIKE 'file:v3:%'"
+            ).fetchone()[0],
+        )
+        self.assertIsNotNone(
+            self.db.execute(
+                """
+                SELECT 1 FROM ingested_files
+                WHERE name = ? AND device IS NOT NULL
+                """,
+                (path.name,),
+            ).fetchone()
+        )
+        self.assertEqual(
+            (0, 0),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
+
+    def test_file_verification_io_failure_is_transient(self):
+        path = Path(self.directory.name) / "hozz-transient.ndjson"
+        path.write_text(json.dumps(self.strict_record("transient")) + "\n")
+
+        with (
+            mock.patch.object(Path, "stat", side_effect=OSError("temporarily unavailable")),
+            self.assertRaises(receiver.TransientFileError),
+        ):
+            ingest_file(self.db, path, watch_receipt_name=path.name)
+
+        self.assertEqual(
+            0,
+            self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.db.execute("SELECT COUNT(*) FROM ingested_files").fetchone()[0],
+        )
+
+        self.assertEqual(
+            (1, 0),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+
+        self.assertEqual(
+            1,
+            self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+        )
+
+    def test_slow_header_does_not_block_healthy_request(self):
+        server, thread = self.start_server(header_timeout=0.15)
+        slow = socket.create_connection(server.server_address, timeout=1)
+        try:
+            slow.sendall(b"POST / HTTP/1.1\r\nHost: localhost\r\n")
+            status, _ = self.healthy_post(server, "healthy-header")
+            self.assertEqual(200, status)
+            time.sleep(0.25)
+            slow.settimeout(1)
+            self.assertEqual(b"", slow.recv(1))
+        finally:
+            slow.close()
+            self.stop_server(server, thread)
+
+    def test_partial_body_times_out_without_receipt(self):
+        server, thread = self.start_server(body_timeout=0.15)
+        slow = socket.create_connection(server.server_address, timeout=1)
+        try:
+            slow.sendall(
+                b"POST / HTTP/1.1\r\n"
+                b"Host: localhost\r\n"
+                b"Authorization: test-token\r\n"
+                b"Idempotency-Key: partial-body\r\n"
+                b"Content-Length: 100\r\n\r\n{"
+            )
+            time.sleep(0.25)
+            slow.settimeout(1)
+            self.assertEqual(b"", slow.recv(1))
+            self.assertEqual(
+                0,
+                self.db.execute("SELECT COUNT(*) FROM batches").fetchone()[0],
+            )
+        finally:
+            slow.close()
+            self.stop_server(server, thread)
+
+    def test_completed_body_is_not_timed_out_during_ingestion(self):
+        server, thread = self.start_server(body_timeout=0.05)
+        original = receiver.ingest_seekable_stream
+
+        def slow_ingest(*args, **kwargs):
+            time.sleep(0.15)
+            return original(*args, **kwargs)
+
+        try:
+            with mock.patch.object(
+                receiver,
+                "ingest_seekable_stream",
+                slow_ingest,
+            ):
+                status, _ = self.healthy_post(server, "slow-processing")
+            self.assertEqual(200, status)
+            self.assertEqual(
+                1,
+                self.db.execute(
+                    "SELECT COUNT(*) FROM batches WHERE key = 'slow-processing'"
+                ).fetchone()[0],
+            )
+        finally:
+            self.stop_server(server, thread)
+
+    def test_concurrent_requests_serialize_database_access(self):
+        server, thread = self.start_server()
+        original = receiver.ingest_seekable_stream
+        active = maximum = 0
+        lock = threading.Lock()
+
+        def observed(*args, **kwargs):
+            nonlocal active, maximum
+            with lock:
+                active += 1
+                maximum = max(maximum, active)
+            try:
+                time.sleep(0.05)
+                return original(*args, **kwargs)
+            finally:
+                with lock:
+                    active -= 1
+
+        results = []
+        with mock.patch.object(receiver, "ingest_seekable_stream", observed):
+            workers = [
+                threading.Thread(
+                    target=lambda key=key: results.append(
+                        self.healthy_post(server, key)[0]
+                    )
+                )
+                for key in ("concurrent-a", "concurrent-b")
+            ]
+            for worker in workers:
+                worker.start()
+            for worker in workers:
+                worker.join(timeout=2)
+        self.stop_server(server, thread)
+
+        self.assertEqual([200, 200], sorted(results))
+        self.assertEqual(1, maximum)
+
+    def test_slow_tls_handshake_runs_outside_accept_loop(self):
+        server, thread = self.start_server()
+        started = threading.Event()
+
+        class FakeTLSContext:
+            calls = 0
+            lock = threading.Lock()
+
+            def wrap_socket(self, request, server_side):
+                self.assert_server(server_side)
+                with self.lock:
+                    self.calls += 1
+                    call = self.calls
+                if call == 1:
+                    started.set()
+                    time.sleep(0.25)
+                    raise socket.timeout("handshake deadline")
+                return request
+
+            def assert_server(self, server_side):
+                if not server_side:
+                    raise AssertionError("receiver TLS must use server mode")
+
+        server.tls_context = FakeTLSContext()
+        slow = socket.create_connection(server.server_address, timeout=1)
+        try:
+            self.assertTrue(started.wait(timeout=1))
+            began = time.monotonic()
+            status, _ = self.healthy_post(server, "healthy-during-tls")
+            self.assertEqual(200, status)
+            self.assertLess(time.monotonic() - began, 0.2)
+        finally:
+            slow.close()
+            self.stop_server(server, thread)
+
+    def start_server(
+        self,
+        header_timeout=1,
+        body_timeout=1,
+    ):
+        args = SimpleNamespace(
+            host="127.0.0.1",
+            port=0,
+            cert=None,
+            key=None,
+            database=str(self.database),
+            token="test-token",
+            allow_unauthenticated=False,
+            tls_timeout=1,
+            header_timeout=header_timeout,
+            body_timeout=body_timeout,
+            max_connections=4,
+        )
+        server = receiver.create_receiver_server(args, db=self.db)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        return server, thread
+
+    def stop_server(self, server, thread):
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+    def healthy_post(self, server, key):
+        body = json.dumps(self.strict_record(key))
+        connection = http.client.HTTPConnection(
+            server.server_address[0],
+            server.server_address[1],
+            timeout=2,
+        )
+        connection.request(
+            "POST",
+            "/",
+            body=body,
+            headers={
+                "Authorization": "test-token",
+                "Idempotency-Key": key,
+                "Content-Type": "application/json",
+            },
+        )
+        response = connection.getresponse()
+        payload = response.read()
+        connection.close()
+        return response.status, payload
 
     def manifest(self, record_count):
         return {

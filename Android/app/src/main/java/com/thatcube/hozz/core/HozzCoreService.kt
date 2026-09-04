@@ -58,7 +58,10 @@ class HozzCoreService(context: Context) {
             val ledger = store.healthConnectProjections(
                 page.mapTo(linkedSetOf(), CanonicalRecord::canonicalId),
             )
-            projection += ProjectionPlanner.plan(page, ledger).summary()
+            val pending = store.pendingHealthConnectOperations(
+                page.mapTo(linkedSetOf(), CanonicalRecord::canonicalId),
+            )
+            projection += ProjectionPlanner.plan(page, ledger, pending).summary()
             after = page.last().canonicalId
         }
         val timeline = store.timelinePage()
@@ -80,8 +83,11 @@ class HozzCoreService(context: Context) {
         val ledger = store.healthConnectProjections(
             records.mapTo(linkedSetOf(), CanonicalRecord::canonicalId),
         )
+        val pending = store.pendingHealthConnectOperations(
+            records.mapTo(linkedSetOf(), CanonicalRecord::canonicalId),
+        )
         return ProjectionDraftPage(
-            operations = ProjectionPlanner.plan(records, ledger).records
+            operations = ProjectionPlanner.plan(records, ledger, pending).records
                 .filter { it.draft != null },
             nextCanonicalId = records.lastOrNull()?.canonicalId,
         )
@@ -91,6 +97,24 @@ class HozzCoreService(context: Context) {
         projections: List<HealthConnectProjection>,
     ) {
         store.saveHealthConnectProjections(projections)
+    }
+
+    suspend fun stageHealthConnectOperations(
+        operations: List<PendingHealthConnectOperation>,
+    ) {
+        store.stageHealthConnectOperations(operations)
+    }
+
+    suspend fun completeHealthConnectUpserts(
+        projections: List<HealthConnectProjection>,
+    ) {
+        store.completeHealthConnectUpserts(projections)
+    }
+
+    suspend fun completeHealthConnectDeletes(
+        operations: List<PendingHealthConnectOperation>,
+    ) {
+        store.completeHealthConnectDeletes(operations)
     }
 
     suspend fun removeHealthConnectProjections(

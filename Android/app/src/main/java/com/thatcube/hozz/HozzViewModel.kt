@@ -286,8 +286,9 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
             var permissionDeferred = 0
             val executor = ProjectionExecutor(
                 writer = healthConnect,
-                saveProjections = core::saveHealthConnectProjections,
-                removeProjections = core::removeHealthConnectProjections,
+                stageOperations = core::stageHealthConnectOperations,
+                completeUpserts = core::completeHealthConnectUpserts,
+                completeDeletes = core::completeHealthConnectDeletes,
             )
             do {
                 val page = withContext(Dispatchers.IO) {

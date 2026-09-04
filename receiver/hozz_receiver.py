@@ -34,11 +34,13 @@ import ssl
 import struct
 import sys
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
 from pathlib import Path
 
 SOURCE_STORE = "apple.healthkit"
@@ -72,6 +74,10 @@ MAX_NETWORK_BODY_BYTES = 8 * 1_024 * 1_024
 MAX_ENVELOPE_BYTES = 1 * 1_024 * 1_024
 MAX_RUN_OCCURRENCE_KEYS = 100_000
 MAX_MANIFEST_BYTES = 256 * 1_024
+DEFAULT_TLS_TIMEOUT = 10.0
+DEFAULT_HEADER_TIMEOUT = 10.0
+DEFAULT_BODY_TIMEOUT = 30.0
+DEFAULT_MAX_CONNECTIONS = 16
 MAX_ENTRY_COMPRESSION_RATIO = 200
 MAX_GLOBAL_COMPRESSION_RATIO = 100
 ENTRY_RATIO_SLACK_BYTES = 8 * 1_024 * 1_024
@@ -117,7 +123,11 @@ CREATE TABLE IF NOT EXISTS batches (
 
 CREATE TABLE IF NOT EXISTS ingested_files (
     name        TEXT PRIMARY KEY,
-    ingested_at REAL NOT NULL
+    ingested_at REAL NOT NULL,
+    device      INTEGER,
+    inode       INTEGER,
+    size        INTEGER,
+    mtime_ns    INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS archive_run_records (
@@ -126,6 +136,19 @@ CREATE TABLE IF NOT EXISTS archive_run_records (
     kind        TEXT NOT NULL,
     raw         TEXT NOT NULL,
     PRIMARY KEY (fingerprint, occurrence)
+);
+CREATE TABLE IF NOT EXISTS compatible_alias_retirement (
+    type        TEXT NOT NULL,
+    start_epoch INTEGER NOT NULL,
+    stable_id   TEXT NOT NULL,
+    PRIMARY KEY (type, start_epoch, stable_id)
+);
+CREATE TABLE IF NOT EXISTS compatible_unresolved_deletion (
+    stable_id   TEXT PRIMARY KEY,
+    type        TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS compatible_resolved_deletion (
+    stable_id   TEXT PRIMARY KEY
 );
 """
 
@@ -155,6 +178,8 @@ def connect(path):
         else:
             create_schema(db)
         ensure_current_columns(db)
+        ensure_compatible_alias_retirement_schema(db)
+        backfill_compatible_deletion_state(db)
         db.commit()
         return db
     except Exception:
@@ -167,6 +192,110 @@ def create_schema(db):
     for statement in SCHEMA.split(";"):
         if statement.strip():
             db.execute(statement)
+
+
+def ensure_compatible_alias_retirement_schema(db):
+    columns = db.execute(
+        "PRAGMA table_info(compatible_alias_retirement)"
+    ).fetchall()
+    primary_key = [
+        row[1] for row in sorted(columns, key=lambda row: row[5]) if row[5]
+    ]
+    if primary_key == ["type", "start_epoch", "stable_id"]:
+        return
+    db.execute(
+        """
+        INSERT OR IGNORE INTO compatible_resolved_deletion (stable_id)
+        SELECT canonical_id FROM samples
+        WHERE tombstone = 1
+          AND canonical_id LIKE 'healthAutoExport:%'
+          AND canonical_id NOT IN (
+            SELECT stable_id FROM compatible_unresolved_deletion
+          )
+        """
+    )
+    db.execute(
+        "ALTER TABLE compatible_alias_retirement "
+        "RENAME TO compatible_alias_retirement_old"
+    )
+    db.execute(
+        """
+        CREATE TABLE compatible_alias_retirement (
+            type        TEXT NOT NULL,
+            start_epoch INTEGER NOT NULL,
+            stable_id   TEXT NOT NULL,
+            PRIMARY KEY (type, start_epoch, stable_id)
+        )
+        """
+    )
+    db.execute(
+        """
+        INSERT OR IGNORE INTO compatible_alias_retirement
+            (type, start_epoch, stable_id)
+        SELECT type, start_epoch, stable_id
+        FROM compatible_alias_retirement_old
+        """
+    )
+    db.execute("DROP TABLE compatible_alias_retirement_old")
+
+
+def backfill_compatible_deletion_state(db):
+    rows = db.execute(
+        """
+        SELECT canonical_id, raw FROM samples
+        WHERE tombstone = 1
+          AND canonical_id LIKE 'healthAutoExport:%'
+        """
+    ).fetchall()
+    for canonical_id, raw in rows:
+        try:
+            record = parse_json(raw)
+        except (TypeError, ValueError):
+            continue
+        compatibility = record.get("compatibilityRaw")
+        if not isinstance(compatibility, dict):
+            continue
+        name = compatibility.get("name")
+        date = compatibility.get("date")
+        if not isinstance(name, str) or not name:
+            continue
+        if isinstance(date, str) and date:
+            try:
+                epoch = compatible_epoch_milliseconds(date)
+            except PartialBatch:
+                continue
+            db.execute(
+                """
+                INSERT OR REPLACE INTO compatible_alias_retirement
+                    (type, start_epoch, stable_id)
+                VALUES (?, ?, ?)
+                """,
+                (name, epoch, canonical_id),
+            )
+            db.execute(
+                """
+                INSERT OR IGNORE INTO compatible_resolved_deletion (stable_id)
+                VALUES (?)
+                """,
+                (canonical_id,),
+            )
+            continue
+        resolved = db.execute(
+            """
+            SELECT 1 FROM compatible_resolved_deletion
+            WHERE stable_id = ?
+            """,
+            (canonical_id,),
+        ).fetchone()
+        if not resolved:
+            db.execute(
+                """
+                INSERT OR REPLACE INTO compatible_unresolved_deletion
+                    (stable_id, type)
+                VALUES (?, ?)
+                """,
+                (canonical_id, name),
+            )
 
 
 def ensure_current_columns(db):
@@ -192,6 +321,12 @@ def ensure_current_columns(db):
         db.execute(
             "ALTER TABLE batches ADD COLUMN deletions INTEGER NOT NULL DEFAULT -1"
         )
+    file_columns = {
+        row[1] for row in db.execute("PRAGMA table_info(ingested_files)")
+    }
+    for name in ("device", "inode", "size", "mtime_ns"):
+        if name not in file_columns:
+            db.execute(f"ALTER TABLE ingested_files ADD COLUMN {name} INTEGER")
     restore_continuation_errors(db)
     reconcile_parent_tombstones(db)
     reconcile_encoding_errors(db)
@@ -296,6 +431,10 @@ class PartialBatch(Exception):
     Hozz would advance its cursor past records that were dropped, and they
     would never be sent again.
     """
+
+
+class TransientFileError(OSError):
+    """A filesystem condition that may clear without changing the file."""
 
 
 def encoding_failure_id(source_id, type_identifier):
@@ -830,19 +969,30 @@ def ingest_lines(db, lines, batch_key=None):
         raise
 
 
-def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
+def _ingest_lines(
+    db,
+    lines,
+    batch_key=None,
+    strict_v1=False,
+    run_scope_key=None,
+    replay_run_occurrences=False,
+):
+    legacy_receipt = False
     if batch_key:
         seen = db.execute(
-            "SELECT 1 FROM batches WHERE key = ?", (batch_key,)
+            "SELECT records, deletions FROM batches WHERE key = ?", (batch_key,)
         ).fetchone()
         if seen:
-            # Hozz resends a batch when a response was lost. The data is
-            # already here, so acknowledging without storing it again is
-            # exactly right.
-            return 0, 0, True, 0
+            if seen[1] >= 0:
+                # Hozz resends a batch when a response was lost. The data is
+                # already here, so acknowledging without storing it again is
+                # exactly right.
+                return 0, 0, True, 0
+            legacy_receipt = True
 
     stored = deleted = canonical_count = 0
-    current_run = f"batch:{batch_key}" if batch_key else None
+    scope_key = run_scope_key or batch_key
+    current_run = f"batch:{scope_key}" if scope_key else None
     occurrences = {}
     for index, line in enumerate(lines):
         if isinstance(line, bytes):
@@ -895,7 +1045,11 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
                 )
             if fingerprint not in occurrences:
                 first_occurrence = 0
-                if batch_key:
+                if (
+                    batch_key
+                    and not legacy_receipt
+                    and not replay_run_occurrences
+                ):
                     first_occurrence = db.execute(
                         """
                         SELECT COALESCE(MAX(occurrence) + 1, 0)
@@ -926,6 +1080,102 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
         canonical_id, source_id, parent_id, version = identity
         resolution_id = nonempty_text(record.get("resolutionCanonicalId"))
         tombstone = kind == "deletion" or record.get("deleted") is True
+        record_type = record.get("type", "")
+        start_date = record.get("startDate")
+        if (
+            not tombstone
+            and canonical_id.startswith("apple.healthkit:")
+            and source_id.startswith(f"{record_type}:")
+        ):
+            if db.execute(
+                """
+                SELECT 1 FROM compatible_unresolved_deletion
+                WHERE type = ? LIMIT 1
+                """,
+                (record_type,),
+            ).fetchone():
+                raise PartialBatch(
+                    "legacy identity cannot be reconciled with a pending deletion"
+                )
+            start_epoch = None
+            if isinstance(start_date, str):
+                try:
+                    start_epoch = compatible_epoch_milliseconds(start_date)
+                except PartialBatch:
+                    pass
+            retired = (
+                start_epoch is not None
+                and db.execute(
+                    """
+                    SELECT 1 FROM compatible_alias_retirement
+                    WHERE type = ? AND start_epoch = ?
+                    """,
+                    (record_type, start_epoch),
+                ).fetchone()
+            )
+            if not retired and start_epoch is not None:
+                for stable_id, stable_start in db.execute(
+                    """
+                    SELECT canonical_id, start_date FROM samples
+                    WHERE type = ? AND tombstone = 0
+                      AND canonical_id LIKE 'healthAutoExport:%'
+                    """,
+                    (record_type,),
+                ):
+                    try:
+                        same_instant = (
+                            isinstance(stable_start, str)
+                            and compatible_epoch_milliseconds(stable_start)
+                                == start_epoch
+                        )
+                    except PartialBatch:
+                        same_instant = False
+                    if same_instant:
+                        db.execute(
+                            """
+                            INSERT OR REPLACE INTO compatible_alias_retirement
+                                (type, start_epoch, stable_id)
+                            VALUES (?, ?, ?)
+                            """,
+                            (record_type, start_epoch, stable_id),
+                        )
+                        retired = True
+                        break
+            if (
+                not retired
+                and record_type == "sleep_analysis"
+                and source_id == "sleep_analysis:None"
+            ):
+                stable_sleep = db.execute(
+                    """
+                    SELECT canonical_id FROM samples
+                    WHERE type = 'sleep_analysis' AND tombstone = 0
+                      AND canonical_id LIKE 'healthAutoExport:%'
+                    LIMIT 1
+                    """
+                ).fetchone()
+                if stable_sleep:
+                    db.execute(
+                        """
+                        INSERT OR REPLACE INTO compatible_alias_retirement
+                            (type, start_epoch, stable_id)
+                        VALUES ('sleep_analysis', -1, ?)
+                        """,
+                        (stable_sleep[0],),
+                    )
+                    retired = True
+            if retired:
+                retired_cursor = db.execute(
+                    """
+                    UPDATE samples
+                    SET tombstone = 1,
+                        record_version = MAX(record_version + 1, 2)
+                    WHERE canonical_id = ? AND tombstone = 0
+                    """,
+                    (canonical_id,),
+                )
+                deleted += retired_cursor.rowcount
+                continue
         if parent_id:
             parent = db.execute(
                 "SELECT record_version, tombstone FROM samples "
@@ -1022,17 +1272,23 @@ def _ingest_lines(db, lines, batch_key=None, strict_v1=False):
                 )
 
     if batch_key:
-        db.execute(
-            """
-            INSERT OR IGNORE INTO batches
-                (key, received_at, records, deletions)
-            VALUES (?, ?, ?, ?)
-            """,
-            (batch_key, time.time(), stored, deleted),
-        )
+        if legacy_receipt:
+            db.execute(
+                "UPDATE batches SET deletions = ? WHERE key = ?",
+                (deleted, batch_key),
+            )
+        else:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO batches
+                    (key, received_at, records, deletions)
+                VALUES (?, ?, ?, ?)
+                """,
+                (batch_key, time.time(), stored, deleted),
+            )
     restore_unresolved_continuation_errors(db)
     reconcile_encoding_errors(db)
-    return stored, deleted, False, canonical_count
+    return stored, deleted, legacy_receipt, canonical_count
 
 
 def reconcile_encoding_errors(db):
@@ -1248,7 +1504,15 @@ def ingest_payload(db, payload, batch_key=None):
     )
 
 
-def ingest_seekable_stream(db, stream, length, batch_key=None):
+def ingest_seekable_stream(
+    db,
+    stream,
+    length,
+    batch_key=None,
+    commit=True,
+    run_scope_key=None,
+    replay_run_occurrences=False,
+):
     stream.seek(0)
     first_offset = None
     scanned = 0
@@ -1277,8 +1541,9 @@ def ingest_seekable_stream(db, stream, length, batch_key=None):
         except (ValueError, TypeError):
             envelope = None
         if is_compatible_envelope(envelope):
-            return ingest_compatible(db, envelope, batch_key)
+            return ingest_compatible(db, envelope, batch_key, commit=commit)
 
+    text = None
     if first == ord("["):
         text = io.TextIOWrapper(stream, encoding="utf-8", errors="strict")
         lines = iter_json_array_lines(text)
@@ -1290,10 +1555,21 @@ def ingest_seekable_stream(db, stream, length, batch_key=None):
             db,
             lines,
             batch_key,
+            run_scope_key=run_scope_key,
+            replay_run_occurrences=replay_run_occurrences,
         )
-        db.commit()
+        if text is not None:
+            text.detach()
+            text = None
+        if commit:
+            db.commit()
         return stored, deleted, duplicate
     except Exception:
+        if text is not None:
+            try:
+                text.detach()
+            except (ValueError, OSError):
+                pass
         db.rollback()
         raise
 
@@ -1439,12 +1715,35 @@ def nonempty_token(value):
     return value
 
 
-def ingest_compatible(db, envelope, batch_key=None):
+def positive_number(value):
+    try:
+        number = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive number") from error
+    if not math.isfinite(number) or number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive number")
+    return number
+
+
+def positive_integer(value):
+    try:
+        number = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if number <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return number
+
+
+def ingest_compatible(db, envelope, batch_key=None, commit=True):
     """Flatten the Health Auto Export shaped payload into the same table."""
     lines = []
     deletion_lines = []
     legacy_aliases = []
     identities = set()
+    deletion_identities = set()
+    incoming_stable_ids = set()
+    unresolved_deletions = []
     data = envelope.get("data", {})
     if not isinstance(data, dict):
         raise PartialBatch("compatible envelope data is not an object")
@@ -1491,10 +1790,17 @@ def ingest_compatible(db, envelope, batch_key=None):
             if source is not None and not isinstance(source, str):
                 raise PartialBatch(f"compatible metric {name} has invalid source")
             identity = require_text(point, "id", f"{name} point")
+            stable_canonical_id = canonical_id_for("healthAutoExport", identity)
+            incoming_stable_ids.add(stable_canonical_id)
             date_alias = point.get("date")
             if isinstance(date_alias, str) and date_alias:
                 legacy_aliases.append(
-                    (name, date_alias, compatible_epoch_milliseconds(date_alias))
+                    (
+                        name,
+                        date_alias,
+                        compatible_epoch_milliseconds(date_alias),
+                        stable_canonical_id,
+                    )
                 )
             if name == "heart_rate":
                 start = require_text(point, "date", "heart-rate point")
@@ -1522,7 +1828,12 @@ def ingest_compatible(db, envelope, batch_key=None):
                 start = require_text(point, "startDate", "sleep point")
                 end = require_text(point, "endDate", "sleep point")
                 legacy_aliases.append(
-                    (name, start, compatible_epoch_milliseconds(start))
+                    (
+                        name,
+                        start,
+                        compatible_epoch_milliseconds(start),
+                        stable_canonical_id,
+                    )
                 )
                 hours = finite_number(point, "qty", "sleep point")
                 stage = require_text(point, "value", "sleep point")
@@ -1614,31 +1925,79 @@ def ingest_compatible(db, envelope, batch_key=None):
     for deletion in deletions:
         if not isinstance(deletion, dict):
             raise PartialBatch("compatible deletion is not an object")
-        identity = require_text(deletion, "id", "compatible deletion")
+        stable_identity = require_text(deletion, "id", "compatible deletion")
         name = require_text(deletion, "name", "compatible deletion")
         record_type = require_text(deletion, "type", "compatible deletion")
-        if repair_legacy_deletions:
-            date = require_text(
-                deletion,
-                "date",
-                "legacy compatible deletion",
+        canonical_id = canonical_id_for("healthAutoExport", stable_identity)
+        stable_row = db.execute(
+            """
+            SELECT start_date FROM samples
+            WHERE canonical_id = ? AND tombstone = 0
+            """,
+            (canonical_id,),
+        ).fetchone()
+        if stable_row and isinstance(stable_row[0], str):
+            legacy_aliases.append(
+                (
+                    name,
+                    stable_row[0],
+                    compatible_epoch_milliseconds(stable_row[0]),
+                    canonical_id,
+                )
             )
-            identity = f"{name}:{date}"
-            source_store = "apple.healthkit"
-        else:
-            source_store = "healthAutoExport"
+        if not repair_legacy_deletions:
+            deletion_date = deletion.get("date")
+            if not isinstance(deletion_date, str):
+                raise PartialBatch("compatible deletion has invalid date")
+            if not deletion_date:
+                stable_exists = db.execute(
+                    "SELECT 1 FROM samples WHERE canonical_id = ?",
+                    (canonical_id,),
+                ).fetchone()
+                legacy_prefix = f"apple.healthkit:{name}:%"
+                legacy_exists = db.execute(
+                    """
+                    SELECT 1 FROM samples
+                    WHERE tombstone = 0 AND type = ?
+                      AND canonical_id LIKE ?
+                    LIMIT 1
+                    """,
+                    (name, legacy_prefix),
+                ).fetchone()
+                if (
+                    stable_exists is None
+                    and canonical_id not in incoming_stable_ids
+                    and legacy_exists is not None
+                ):
+                    raise PartialBatch(
+                        "date-less deletion cannot identify a pre-stable record"
+                    )
+                if (
+                    stable_exists is None
+                    and canonical_id not in incoming_stable_ids
+                ):
+                    unresolved_deletions.append((canonical_id, name))
+            else:
+                legacy_aliases.append(
+                    (
+                        name,
+                        deletion_date,
+                        compatible_epoch_milliseconds(deletion_date),
+                        canonical_id,
+                    )
+                )
         add_compatible_line(
             deletion_lines,
-            identities,
+            deletion_identities,
             {
                 "deleted": True,
-                "id": identity,
+                "id": stable_identity,
                 "kind": "deletion",
                 "recordVersion": 2,
                 "schemaVersion": 1,
                 "sourceRecord": {
-                    "id": identity,
-                    "store": source_store,
+                    "id": stable_identity,
+                    "store": "healthAutoExport",
                     "type": record_type,
                 },
                 "textValue": name,
@@ -1646,8 +2005,43 @@ def ingest_compatible(db, envelope, batch_key=None):
                 "compatibilityRaw": deletion,
             },
         )
+        if repair_legacy_deletions:
+            date = require_text(
+                deletion,
+                "date",
+                "legacy compatible deletion",
+            )
+            legacy_identity = f"{name}:{date}"
+            add_compatible_line(
+                deletion_lines,
+                deletion_identities,
+                {
+                    "deleted": True,
+                    "id": legacy_identity,
+                    "kind": "deletion",
+                    "recordVersion": 2,
+                    "schemaVersion": 1,
+                    "sourceRecord": {
+                        "id": legacy_identity,
+                        "store": "apple.healthkit",
+                        "type": name,
+                    },
+                    "textValue": name,
+                    "type": name,
+                    "compatibilityRaw": deletion,
+                },
+            )
 
     try:
+        for stable_id, record_type in unresolved_deletions:
+            db.execute(
+                """
+                INSERT OR REPLACE INTO compatible_unresolved_deletion
+                    (stable_id, type)
+                VALUES (?, ?)
+                """,
+                (stable_id, record_type),
+            )
         alias_deletions = reconcile_compatible_aliases(db, legacy_aliases)
         encoded_lines = [
             json.dumps(line, separators=(",", ":"))
@@ -1667,7 +2061,8 @@ def ingest_compatible(db, envelope, batch_key=None):
                 batch_key,
             )
         deleted += alias_deletions
-        db.commit()
+        if commit:
+            db.commit()
         return stored, deleted, duplicate
     except Exception:
         db.rollback()
@@ -1676,8 +2071,30 @@ def ingest_compatible(db, envelope, batch_key=None):
 
 def reconcile_compatible_aliases(db, aliases):
     targets = {}
-    for record_type, date_text, epoch in dict.fromkeys(aliases):
+    for record_type, date_text, epoch, stable_id in dict.fromkeys(aliases):
         targets.setdefault(record_type, set()).add((date_text, epoch))
+        db.execute(
+            """
+            INSERT OR REPLACE INTO compatible_alias_retirement
+                (type, start_epoch, stable_id)
+            VALUES (?, ?, ?)
+            """,
+            (record_type, epoch, stable_id),
+        )
+        db.execute(
+            """
+            INSERT OR IGNORE INTO compatible_resolved_deletion (stable_id)
+            VALUES (?)
+            """,
+            (stable_id,),
+        )
+        db.execute(
+            """
+            DELETE FROM compatible_unresolved_deletion
+            WHERE stable_id = ?
+            """,
+            (stable_id,),
+        )
 
     tombstones = []
     for record_type, dates in targets.items():
@@ -1793,16 +2210,86 @@ def finite_number(value, field, context):
     return float(number)
 
 
-def serve(args):
+class ReceiverHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+    block_on_close = True
+    allow_reuse_address = True
+
+    def __init__(
+        self,
+        address,
+        handler,
+        *,
+        address_family,
+        tls_context,
+        tls_timeout,
+        max_connections,
+    ):
+        self.address_family = address_family
+        self.tls_context = tls_context
+        self.tls_timeout = tls_timeout
+        self.connection_slots = threading.BoundedSemaphore(max_connections)
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self.connection_slots.acquire(blocking=False):
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self.connection_slots.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        wrapped = request
+        try:
+            if self.tls_context is not None:
+                request.settimeout(self.tls_timeout)
+                wrapped = self.tls_context.wrap_socket(
+                    request,
+                    server_side=True,
+                )
+                wrapped.settimeout(None)
+            super().process_request_thread(wrapped, client_address)
+        except (OSError, ssl.SSLError):
+            self.shutdown_request(wrapped)
+        finally:
+            self.connection_slots.release()
+
+
+def create_receiver_server(args, db=None):
     tls_context, address_family = serve_security(
         args.host,
         args.cert,
         args.key,
     )
-    db = connect(args.database)
+    database = db or connect(args.database)
+    db_lock = threading.RLock()
+    header_timeout = getattr(args, "header_timeout", DEFAULT_HEADER_TIMEOUT)
+    body_timeout = getattr(args, "body_timeout", DEFAULT_BODY_TIMEOUT)
+    tls_timeout = getattr(args, "tls_timeout", DEFAULT_TLS_TIMEOUT)
+    max_connections = getattr(
+        args,
+        "max_connections",
+        DEFAULT_MAX_CONNECTIONS,
+    )
 
     class Handler(BaseHTTPRequestHandler):
+        def handle(self):
+            self._header_timer = threading.Timer(
+                header_timeout,
+                self.close_for_timeout,
+            )
+            self._header_timer.daemon = True
+            self._header_timer.start()
+            try:
+                super().handle()
+            finally:
+                self._header_timer.cancel()
+
         def do_POST(self):
+            self._header_timer.cancel()
             if not args.allow_unauthenticated:
                 supplied = self.headers.get("Authorization", "")
                 if not hmac.compare_digest(
@@ -1823,9 +2310,7 @@ def serve(args):
                     {"error": "exactly one Content-Length is required"},
                 )
             try:
-                length = parse_content_length(
-                    lengths[0]
-                )
+                length = parse_content_length(lengths[0])
             except PartialBatch as error:
                 return self.finish_with(400, {"error": str(error)})
             if length > MAX_NETWORK_BODY_BYTES:
@@ -1834,26 +2319,34 @@ def serve(args):
                     {"error": "payload exceeds the pending import memory budget"},
                 )
             key = self.headers.get("Idempotency-Key")
-            with tempfile.TemporaryFile() as body:
-                remaining = length
-                while remaining:
-                    chunk = self.rfile.read(min(remaining, 64 * 1_024))
-                    if not chunk:
-                        return self.finish_with(400, {"error": "incomplete body"})
-                    body.write(chunk)
-                    remaining -= len(chunk)
-                body.seek(0)
-                try:
-                    stored, deleted, duplicate = ingest_seekable_stream(
-                        db,
-                        body,
-                        length,
-                        key,
-                    )
-                except PartialBatch as error:
-                    return self.finish_with(400, {"error": str(error)})
-                except Exception as error:  # noqa: BLE001 - report, never crash
-                    return self.finish_with(500, {"error": str(error)})
+            timer = threading.Timer(body_timeout, self.close_for_timeout)
+            timer.daemon = True
+            timer.start()
+            try:
+                with tempfile.TemporaryFile() as body:
+                    remaining = length
+                    while remaining:
+                        chunk = self.rfile.read(min(remaining, 64 * 1_024))
+                        if not chunk:
+                            return
+                        body.write(chunk)
+                        remaining -= len(chunk)
+                    timer.cancel()
+                    body.seek(0)
+                    try:
+                        with db_lock:
+                            stored, deleted, duplicate = ingest_seekable_stream(
+                                database,
+                                body,
+                                length,
+                                key,
+                            )
+                    except PartialBatch as error:
+                        return self.finish_with(400, {"error": str(error)})
+                    except Exception as error:  # noqa: BLE001 - report, never crash
+                        return self.finish_with(500, {"error": str(error)})
+            finally:
+                timer.cancel()
 
             if duplicate:
                 print(f"batch {key[:8] if key else '?'} already stored")
@@ -1863,34 +2356,52 @@ def serve(args):
                 "stored": stored, "deleted": deleted, "duplicate": duplicate,
             })
 
+        def close_for_timeout(self):
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
         def finish_with(self, code, body):
             encoded = json.dumps(body).encode()
-            self.send_response(code)
-            self.send_header("Content-Type", "application/json")
-            self.send_header("Content-Length", str(len(encoded)))
-            self.end_headers()
-            self.wfile.write(encoded)
+            try:
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+            except OSError:
+                self.close_connection = True
 
         def log_message(self, *_):
-            pass  # Access logs would record nothing useful and add noise.
+            pass
 
-    class ReceiverHTTPServer(HTTPServer):
-        pass
+    server = ReceiverHTTPServer(
+        (args.host, args.port),
+        Handler,
+        address_family=address_family,
+        tls_context=tls_context,
+        tls_timeout=tls_timeout,
+        max_connections=max_connections,
+    )
+    server.database = database
+    return server
 
-    ReceiverHTTPServer.address_family = address_family
-    server = ReceiverHTTPServer((args.host, args.port), Handler)
-    if tls_context is not None:
-        server.socket = tls_context.wrap_socket(
-            server.socket,
-            server_side=True,
-        )
-    scheme = "https" if tls_context is not None else "http"
+
+def serve(args):
+    server = create_receiver_server(args)
+    scheme = "https" if server.tls_context is not None else "http"
     display_host = f"[{args.host}]" if ":" in args.host else args.host
     print(f"Hozz receiver listening on {scheme}://{display_host}:{args.port}")
     print(f"Database: {os.path.abspath(args.database)}")
     if args.allow_unauthenticated:
         print("Unauthenticated access was explicitly enabled.")
-    server.serve_forever()
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()
+        server.database.close()
 
 
 def serve_security(host, certificate, key):
@@ -1918,26 +2429,66 @@ def watch(args):
     """Import files Hozz drops into a synced folder."""
     db = connect(args.database)
     folder = Path(args.folder).expanduser()
+    deterministic_failures = {}
+    transient_failures = {}
     print(f"Watching {folder}")
     print(f"Database: {os.path.abspath(args.database)}")
 
     while True:
         for path in sorted(folder.glob("hozz-*")):
+            try:
+                snapshot = file_snapshot(path.stat())
+            except OSError:
+                continue
+            if deterministic_failures.get(path.name) == snapshot:
+                continue
+            transient = transient_failures.get(path.name)
+            if (
+                transient is not None
+                and transient[0] == snapshot
+                and time.monotonic() < transient[1]
+            ):
+                continue
+            if deterministic_failures.get(path.name) != snapshot:
+                deterministic_failures.pop(path.name, None)
+            if transient is not None and transient[0] != snapshot:
+                transient_failures.pop(path.name, None)
             done = db.execute(
-                "SELECT 1 FROM ingested_files WHERE name = ?", (path.name,)
+                """
+                SELECT 1 FROM ingested_files
+                WHERE name = ? AND device = ? AND inode = ?
+                  AND size = ? AND mtime_ns = ?
+                """,
+                (path.name, *snapshot),
             ).fetchone()
             if done:
                 continue
             try:
-                stored, deleted = ingest_file(db, path)
-            except Exception as error:  # noqa: BLE001
+                stored, deleted = ingest_file(
+                    db,
+                    path,
+                    watch_receipt_name=path.name,
+                )
+            except PartialBatch as error:
+                deterministic_failures[path.name] = snapshot
                 print(f"skipped {path.name}: {error}")
                 continue
-            db.execute(
-                "INSERT OR REPLACE INTO ingested_files VALUES (?, ?)",
-                (path.name, time.time()),
-            )
-            db.commit()
+            except Exception as error:  # noqa: BLE001
+                previous = transient_failures.get(path.name)
+                delay = (
+                    min(previous[2] * 2, 60.0)
+                    if previous is not None and previous[0] == snapshot
+                    else max(float(args.interval), 1.0)
+                )
+                transient_failures[path.name] = (
+                    snapshot,
+                    time.monotonic() + delay,
+                    delay,
+                )
+                print(f"skipped {path.name}: {error}")
+                continue
+            deterministic_failures.pop(path.name, None)
+            transient_failures.pop(path.name, None)
             print(f"{path.name}: stored {stored}, deleted {deleted}")
 
         if args.once:
@@ -1945,125 +2496,289 @@ def watch(args):
         time.sleep(args.interval)
 
 
-def ingest_file(db, path):
+def ingest_file(db, path, watch_receipt_name=None):
     """A ZIP from a full export, or a plain batch file."""
-    file_batch_key = f"file:{path.name}"
-    if path.suffix == ".zip":
-        try:
-            stored = deleted = canonical_count = line_count = 0
-            preflight_zip_entry_count(path)
-            with zipfile.ZipFile(path) as archive:
-                infos = archive.infolist()
-                validate_zip_entries(infos)
-                manifests = [
-                    info for info in infos
-                    if info.filename == "hozz-manifest.json"
-                ]
-                if len(manifests) > 1:
-                    raise PartialBatch("archive contains more than one manifest")
-                manifest = None
-                manifest_info = None
-                if manifests:
-                    manifest_info = manifests[0]
-                    if manifest_info.file_size > MAX_MANIFEST_BYTES:
-                        raise PartialBatch("archive manifest is too large")
-                    manifest = parse_json(
-                        decode_utf8(
-                            archive.read(manifest_info),
-                            "archive manifest",
-                        )
-                    )
-                    validate_archive_manifest(manifest)
-                    ndjson_infos = [
-                        info for info in infos
-                        if info.filename.endswith(".ndjson")
-                    ]
-                    if (
-                        len(ndjson_infos) != 1
-                        or ndjson_infos[0].filename != manifest["recordsEntry"]
-                    ):
-                        raise PartialBatch(
-                            "archive must contain only its declared NDJSON stream"
-                        )
-                    record_infos = ndjson_infos
-                else:
-                    record_infos = [
-                        info for info in infos
-                        if info.filename.endswith(".ndjson")
-                    ]
-                    if len(record_infos) != 1:
-                        raise PartialBatch(
-                            "legacy archive must contain one NDJSON stream"
-                        )
+    try:
+        with path.open("rb") as source:
+            initial = file_snapshot(os.fstat(source.fileno()))
+            file_batch_key = file_content_key(source)
+            legacy_scope = legacy_file_receipt_scope(db, path.name, initial)
+            legacy_receipt = legacy_file_receipt(db, path.name)
+            if (
+                legacy_scope is None
+                and legacy_receipt is not None
+                and legacy_receipt[3] >= 0
+                and file_matches_legacy_receipt(
+                    db,
+                    path,
+                    source,
+                    initial,
+                    legacy_receipt[0],
+                )
+            ):
+                db.execute(
+                    """
+                    INSERT OR IGNORE INTO batches
+                        (key, received_at, records, deletions)
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (file_batch_key, *legacy_receipt[1:]),
+                )
+                verify_file_snapshot(path, source, initial)
+                record_file_receipt(db, watch_receipt_name, initial)
+                db.commit()
+                return 0, 0
+            if path.suffix == ".zip":
+                return ingest_zip_stream(
+                    db,
+                    path,
+                    source,
+                    initial,
+                    file_batch_key,
+                    watch_receipt_name,
+                    legacy_scope,
+                )
 
-                record_info = record_infos[0]
-                for info in infos:
-                    if info.is_dir() or info == manifest_info:
-                        continue
-                    if info != record_info:
-                        drain_zip_entry(archive, info)
-
-                for info in record_infos:
-                    def lines():
-                        nonlocal line_count
-                        with archive.open(info) as stream:
-                            while True:
-                                raw = stream.readline(MAX_RECORD_BYTES + 2)
-                                if not raw:
-                                    return
-                                content = (
-                                    raw[:-1] if raw.endswith(b"\n") else raw
-                                )
-                                if content.endswith(b"\r"):
-                                    content = content[:-1]
-                                if len(content) > MAX_RECORD_BYTES:
-                                    raise PartialBatch(
-                                        "archive record exceeds the byte limit"
-                                    )
-                                line = decode_utf8(raw, "archive record")
-                                if line.strip():
-                                    line_count += 1
-                                    if line_count > MAX_RECORD_LINES:
-                                        raise PartialBatch(
-                                            "archive contains too many records"
-                                        )
-                                yield line
-
-                    added, removed, duplicate, read = _ingest_lines(
-                        db,
-                        lines(),
-                        batch_key=file_batch_key,
-                        strict_v1=manifest is not None,
-                    )
-                    stored += added
-                    deleted += removed
-                    canonical_count += read
-                if (
-                    manifest is not None
-                    and manifest.get("recordCount") is not None
-                    and not duplicate
-                    and canonical_count != manifest["recordCount"]
-                ):
-                    raise PartialBatch(
-                        "archive record count does not match its manifest"
-                    )
+            file_size = initial[2]
+            if file_size > MAX_INFLATED_BYTES:
+                raise PartialBatch("file exceeds the import byte limit")
+            stored, deleted, _ = ingest_seekable_stream(
+                db,
+                source,
+                file_size,
+                file_batch_key,
+                commit=False,
+                run_scope_key=legacy_scope,
+                replay_run_occurrences=legacy_scope is not None,
+            )
+            verify_file_snapshot(path, source, initial)
+            record_file_receipt(db, watch_receipt_name, initial)
             db.commit()
             return stored, deleted
-        except Exception:
-            db.rollback()
-            raise
+    except Exception:
+        db.rollback()
+        raise
 
-    file_size = path.stat().st_size
-    if file_size > MAX_INFLATED_BYTES:
-        raise PartialBatch("file exceeds the import byte limit")
-    with path.open("rb") as stream:
-        stored, deleted, _ = ingest_seekable_stream(
-            db,
-            stream,
-            file_size,
-            file_batch_key,
-        )
+
+def ingest_zip_stream(
+    db,
+    path,
+    source,
+    initial,
+    file_batch_key,
+    watch_receipt_name,
+    legacy_scope,
+    commit=True,
+):
+    stored = deleted = canonical_count = line_count = 0
+    preflight_zip_entry_count_stream(source)
+    source.seek(0)
+    with zipfile.ZipFile(source) as archive:
+        infos = archive.infolist()
+        validate_zip_entries(infos)
+        manifests = [
+            info for info in infos
+            if info.filename == "hozz-manifest.json"
+        ]
+        if len(manifests) > 1:
+            raise PartialBatch("archive contains more than one manifest")
+        manifest = None
+        manifest_info = None
+        if manifests:
+            manifest_info = manifests[0]
+            if manifest_info.file_size > MAX_MANIFEST_BYTES:
+                raise PartialBatch("archive manifest is too large")
+            manifest = parse_json(
+                decode_utf8(
+                    archive.read(manifest_info),
+                    "archive manifest",
+                )
+            )
+            validate_archive_manifest(manifest)
+            ndjson_infos = [
+                info for info in infos
+                if info.filename.endswith(".ndjson")
+            ]
+            if (
+                len(ndjson_infos) != 1
+                or ndjson_infos[0].filename != manifest["recordsEntry"]
+            ):
+                raise PartialBatch(
+                    "archive must contain only its declared NDJSON stream"
+                )
+            record_infos = ndjson_infos
+        else:
+            record_infos = [
+                info for info in infos
+                if info.filename.endswith(".ndjson")
+            ]
+            if len(record_infos) != 1:
+                raise PartialBatch(
+                    "legacy archive must contain one NDJSON stream"
+                )
+
+        record_info = record_infos[0]
+        for info in infos:
+            if info.is_dir() or info == manifest_info:
+                continue
+            if info != record_info:
+                drain_zip_entry(archive, info)
+
+        for info in record_infos:
+            def lines():
+                nonlocal line_count
+                with archive.open(info) as stream:
+                    while True:
+                        raw = stream.readline(MAX_RECORD_BYTES + 2)
+                        if not raw:
+                            return
+                        content = raw[:-1] if raw.endswith(b"\n") else raw
+                        if content.endswith(b"\r"):
+                            content = content[:-1]
+                        if len(content) > MAX_RECORD_BYTES:
+                            raise PartialBatch(
+                                "archive record exceeds the byte limit"
+                            )
+                        line = decode_utf8(raw, "archive record")
+                        if line.strip():
+                            line_count += 1
+                            if line_count > MAX_RECORD_LINES:
+                                raise PartialBatch(
+                                    "archive contains too many records"
+                                )
+                        yield line
+
+            added, removed, duplicate, read = _ingest_lines(
+                db,
+                lines(),
+                batch_key=file_batch_key,
+                strict_v1=manifest is not None,
+                run_scope_key=legacy_scope,
+                replay_run_occurrences=legacy_scope is not None,
+            )
+            stored += added
+            deleted += removed
+            canonical_count += read
+        if (
+            manifest is not None
+            and manifest.get("recordCount") is not None
+            and not duplicate
+            and canonical_count != manifest["recordCount"]
+        ):
+            raise PartialBatch(
+                "archive record count does not match its manifest"
+            )
+        verify_file_snapshot(path, source, initial)
+        if commit:
+            record_file_receipt(db, watch_receipt_name, initial)
+            db.commit()
         return stored, deleted
+
+
+def file_snapshot(stat):
+    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+
+
+def file_content_key(stream):
+    digest = hashlib.sha256()
+    stream.seek(0)
+    while True:
+        chunk = stream.read(64 * 1_024)
+        if not chunk:
+            break
+        digest.update(chunk)
+    stream.seek(0)
+    return f"file:v3:{digest.hexdigest()}"
+
+
+def legacy_file_receipt_scope(db, name, snapshot):
+    receipt = legacy_file_receipt(db, name)
+    if receipt:
+        exact_file = db.execute(
+            """
+            SELECT 1 FROM ingested_files
+            WHERE name = ? AND device = ? AND inode = ?
+              AND size = ? AND mtime_ns = ?
+            """,
+            (name, *snapshot),
+        ).fetchone()
+        if exact_file:
+            return receipt[0]
+    return None
+
+
+def legacy_file_receipt(db, name):
+    for legacy_key in (f"file:{name}", name):
+        receipt = db.execute(
+            """
+            SELECT received_at, records, deletions FROM batches
+            WHERE key = ?
+            """,
+            (legacy_key,),
+        ).fetchone()
+        if receipt:
+            return (legacy_key, *receipt)
+    return None
+
+
+def file_matches_legacy_receipt(db, path, source, initial, legacy_key):
+    savepoint = "legacy_file_probe"
+    db.execute(f"SAVEPOINT {savepoint}")
+    before = db.total_changes
+    try:
+        if path.suffix == ".zip":
+            ingest_zip_stream(
+                db,
+                path,
+                source,
+                initial,
+                None,
+                None,
+                legacy_key,
+                commit=False,
+            )
+        else:
+            ingest_seekable_stream(
+                db,
+                source,
+                initial[2],
+                batch_key=None,
+                commit=False,
+                run_scope_key=legacy_key,
+                replay_run_occurrences=True,
+            )
+        unchanged = db.total_changes == before
+        db.execute(f"ROLLBACK TO {savepoint}")
+        db.execute(f"RELEASE {savepoint}")
+        source.seek(0)
+        return unchanged
+    except Exception:  # noqa: BLE001 - a failed probe falls back to normal ingest
+        db.rollback()
+        source.seek(0)
+        return False
+
+
+def verify_file_snapshot(path, stream, initial):
+    descriptor = file_snapshot(os.fstat(stream.fileno()))
+    try:
+        current_path = file_snapshot(path.stat())
+    except OSError as error:
+        raise TransientFileError("file could not be verified after ingestion") from error
+    if descriptor != initial or current_path != initial:
+        raise PartialBatch("file changed during ingestion")
+
+
+def record_file_receipt(db, name, snapshot):
+    if name is None:
+        return
+    db.execute(
+        """
+        INSERT OR REPLACE INTO ingested_files
+            (name, ingested_at, device, inode, size, mtime_ns)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (name, time.time(), *snapshot),
+    )
 
 
 def decode_utf8(payload, field):
@@ -2093,6 +2808,12 @@ def drain_zip_entry(archive, info):
 
 def preflight_zip_entry_count(path):
     with path.open("rb") as stream:
+        preflight_zip_entry_count_stream(stream)
+
+
+def preflight_zip_entry_count_stream(stream):
+    original = stream.tell()
+    try:
         stream.seek(0, os.SEEK_END)
         size = stream.tell()
         tail_size = min(size, 65_557)
@@ -2134,6 +2855,8 @@ def preflight_zip_entry_count(path):
             raise PartialBatch("archive ZIP directory count is inconsistent")
         if parsed_entries > MAX_ZIP_ENTRIES:
             raise PartialBatch("archive contains too many entries")
+    finally:
+        stream.seek(original)
 
 
 def count_central_directory_entries(stream, offset, length, file_size):
@@ -2266,6 +2989,26 @@ def build_argument_parser():
     serve_parser.add_argument("--host", "--bind", default="127.0.0.1")
     serve_parser.add_argument("--cert")
     serve_parser.add_argument("--key")
+    serve_parser.add_argument(
+        "--tls-timeout",
+        type=positive_number,
+        default=DEFAULT_TLS_TIMEOUT,
+    )
+    serve_parser.add_argument(
+        "--header-timeout",
+        type=positive_number,
+        default=DEFAULT_HEADER_TIMEOUT,
+    )
+    serve_parser.add_argument(
+        "--body-timeout",
+        type=positive_number,
+        default=DEFAULT_BODY_TIMEOUT,
+    )
+    serve_parser.add_argument(
+        "--max-connections",
+        type=positive_integer,
+        default=DEFAULT_MAX_CONNECTIONS,
+    )
     authentication = serve_parser.add_mutually_exclusive_group(required=True)
     authentication.add_argument(
         "--token",

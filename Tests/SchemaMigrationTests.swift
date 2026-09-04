@@ -32,7 +32,7 @@ final class SchemaMigrationTests: XCTestCase {
     }
 
     /// The current schema. Every historical fixture must reach this.
-    private static let currentVersion: Int64 = 9
+    private static let currentVersion: Int64 = 10
 
     // MARK: - The historical schemas, as they actually were
 
@@ -536,6 +536,46 @@ final class SchemaMigrationTests: XCTestCase {
 
         XCTAssertEqual(try tables(in: databaseURL), before)
         XCTAssertEqual(try version(of: databaseURL), Self.currentVersion)
+    }
+
+    func testVersionNineDatabaseGainsTombstoneTables() async throws {
+        let directory = root.appending(path: "version-nine")
+        let store = try IngestStore(directory: directory)
+        await store.close()
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let database = try SQLiteDatabase(url: databaseURL)
+        try database.execute(
+            """
+            DROP TABLE sample_tombstone;
+            DROP TABLE sample_identity_alias;
+            DROP TABLE sample_unresolved_legacy_deletion;
+            DROP TABLE sample_alias_retirement;
+            PRAGMA user_version = 9;
+            """
+        )
+        database.close()
+
+        let upgraded = try IngestStore(directory: directory)
+        _ = try await upgraded.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"id":"post-upgrade","type":"steps","kind":"quantity","startDate":"2026-01-01T10:00:00.000Z","quantity":{"value":1,"unit":"count"}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "post-upgrade"
+        )
+        await upgraded.close()
+
+        XCTAssertEqual(try version(of: databaseURL), Self.currentVersion)
+        XCTAssertTrue(try tables(in: databaseURL).contains("sample_tombstone"))
+        XCTAssertTrue(try tables(in: databaseURL).contains("sample_identity_alias"))
+        XCTAssertTrue(
+            try tables(in: databaseURL)
+                .contains("sample_unresolved_legacy_deletion")
+        )
+        XCTAssertTrue(try tables(in: databaseURL).contains("sample_alias_retirement"))
     }
 
     /// Five agents added tables in one evening. Someone adding one to the

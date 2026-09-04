@@ -1,6 +1,7 @@
 import Foundation
 import HozzCore
-import HozzReceive
+import HozzStore
+@testable import HozzReceive
 import XCTest
 
 /// Covers the desktop side: understanding whatever the phone sends, and storing
@@ -223,7 +224,8 @@ final class ReceiveTests: XCTestCase {
             HealthDeletion(
                 id: "gone",
                 type: "step_count",
-                startDate: nil
+                startDate: nil,
+                requiresLegacyAliasResolution: true
             )
         ])
         XCTAssertEqual(batch.unreadableCount, 0)
@@ -261,6 +263,556 @@ final class ReceiveTests: XCTestCase {
         XCTAssertEqual(result.deleted, 1)
         let remaining = try await store.samples(type: "step_count")
         XCTAssertEqual(remaining.map(\.id), ["keep"])
+    }
+
+    func testStableDeletionAlsoRemovesPreUpgradeTimeAlias() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":120}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "legacy"
+        )
+        let deletion = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[],"deletions":[
+                  {"id":"stable","name":"step_count","type":"step_count","date":"\(date)"}
+                ]}}
+                """.utf8
+            )
+        )
+
+        let first = try await store.ingest(deletion, idempotencyKey: "delete-1")
+        let retry = try await store.ingest(deletion, idempotencyKey: "delete-2")
+
+        XCTAssertEqual(first.deleted, 1)
+        XCTAssertEqual(retry.deleted, 0)
+        let total = try await store.totalRecordCount()
+        XCTAssertEqual(total, 0)
+    }
+
+    func testDateLessStableDeletionRefusesToReceiptUnresolvedLegacyAlias() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":120}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "legacy-live"
+        )
+        let dateLess = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[],"deletions":[
+                  {"id":"stable","name":"step_count","type":"step_count","date":""}
+                ]}}
+                """.utf8
+            )
+        )
+
+        do {
+            _ = try await store.ingest(dateLess, idempotencyKey: "stable-delete")
+            XCTFail("An unresolved legacy alias must keep the batch retryable.")
+        } catch is UnresolvedLegacyAliasError {
+        }
+        let stillLive = try await store.totalRecordCount()
+        XCTAssertEqual(stillLive, 1)
+
+        let dated = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[],"deletions":[
+                  {"id":"stable","name":"step_count","type":"step_count","date":"\(date)"}
+                ]}}
+                """.utf8
+            )
+        )
+        let retried = try await store.ingest(
+            dated,
+            idempotencyKey: "stable-delete"
+        )
+        XCTAssertFalse(retried.duplicate)
+        let remaining = try await store.totalRecordCount()
+        XCTAssertEqual(remaining, 0)
+    }
+
+    func testSameBatchStableReplacementCanResolveAliasBeforeDateLessDelete() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":120}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "legacy-before-mixed"
+        )
+        let mixed = try BatchParser.parse(
+            Data(
+                """
+                {"data":{
+                  "metrics":[{"name":"step_count","units":"count","data":[
+                    {"id":"stable","date":"\(date)","qty":120}
+                  ]}],
+                  "deletions":[
+                    {"id":"stable","name":"step_count","type":"step_count","date":""}
+                  ]
+                }}
+                """.utf8
+            )
+        )
+
+        let result = try await store.ingest(
+            mixed,
+            idempotencyKey: "mixed-resolution"
+        )
+
+        XCTAssertFalse(result.duplicate)
+        XCTAssertEqual(result.deleted, 1)
+        let remaining = try await store.totalRecordCount()
+        XCTAssertEqual(remaining, 0)
+    }
+
+    func testExistingStableRecordAllowsDateLessDeleteDespiteUnrelatedLegacyAlias() async throws {
+        let store = try makeStore()
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"2026-01-01 09:00:00 +0000","qty":10},
+                      {"id":"stable","date":"2026-01-01 10:00:00 +0000","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "mixed-identities"
+        )
+        let deletion = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[],"deletions":[
+                  {"id":"stable","name":"step_count","type":"step_count","date":""}
+                ]}}
+                """.utf8
+            )
+        )
+
+        let result = try await store.ingest(
+            deletion,
+            idempotencyKey: "delete-stable-only"
+        )
+
+        XCTAssertEqual(result.deleted, 1)
+        let remaining = try await store.samples(type: "step_count")
+        XCTAssertEqual(remaining.count, 1)
+        XCTAssertTrue(remaining[0].id.hasPrefix("step_count:"))
+    }
+
+    func testFreshDateLessStableDeletionSuppressesLaterStableAndLegacyRecords() async throws {
+        let store = try makeStore()
+        let deletion = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[],"deletions":[
+                  {"id":"late","name":"step_count","type":"step_count","date":""}
+                ]}}
+                """.utf8
+            )
+        )
+        let first = try await store.ingest(
+            deletion,
+            idempotencyKey: "late-delete"
+        )
+        XCTAssertFalse(first.duplicate)
+
+        let delayedLegacy = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                  {"date":"2026-01-01 10:00:00 +0000","qty":20}
+                ]}]}}
+                """.utf8
+            )
+        )
+        do {
+            _ = try await store.ingest(
+                delayedLegacy,
+                idempotencyKey: "late-legacy"
+            )
+            XCTFail("An unresolved old identity must not bypass a fresh tombstone.")
+        } catch is UnresolvedLegacyAliasError {
+        }
+
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"late","date":"2026-01-01 10:00:00 +0000","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "late-upsert"
+        )
+        let retry = try await store.ingest(
+            deletion,
+            idempotencyKey: "late-delete"
+        )
+
+        XCTAssertTrue(retry.duplicate)
+        let finalCount = try await store.totalRecordCount()
+        XCTAssertEqual(finalCount, 0)
+
+        _ = try await store.ingest(
+            delayedLegacy,
+            idempotencyKey: "late-legacy"
+        )
+        let afterLegacy = try await store.totalRecordCount()
+        XCTAssertEqual(afterLegacy, 0)
+    }
+
+    func testGenericTombstonePreventsDelayedStableUpsert() async throws {
+        let store = try makeStore()
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"id":"late","type":"steps","kind":"deletion","deleted":true}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "generic-delete"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"id":"late","type":"steps","kind":"quantity","startDate":"2026-01-01T10:00:00.000Z","quantity":{"value":20,"unit":"count"}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "delayed-upsert"
+        )
+
+        let finalCount = try await store.totalRecordCount()
+        XCTAssertEqual(finalCount, 0)
+    }
+
+    func testStableDeletionPreventsDelayedLegacyAliasFromResurrecting() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"stable","date":"2026-01-01 05:00:00 -0500","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "stable-before-delete"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[],"deletions":[
+                      {"id":"stable","name":"step_count","type":"step_count","date":""}
+                    ]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "stable-delete"
+        )
+
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "delayed-legacy"
+        )
+
+        let finalCount = try await store.totalRecordCount()
+        XCTAssertEqual(finalCount, 0)
+    }
+
+    func testEquivalentTimestampLegacyAliasCannotBypassRetirement() async throws {
+        let store = try makeStore()
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"stable","date":"2026-01-01 05:00:00 -0500","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "stable-offset"
+        )
+
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"2026-01-01 10:00:00 +0000","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "legacy-offset"
+        )
+
+        let records = try await store.samples(type: "step_count")
+        XCTAssertEqual(records.map(\.id), ["stable"])
+    }
+
+    func testPreMigrationStableRecordLazilyRetiresDelayedLegacyAlias() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"stable","date":"\(date)","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "stable-pre-migration"
+        )
+        await store.close()
+        let database = try SQLiteDatabase(
+            url: root.appending(path: "store/hozz-received.sqlite")
+        )
+        try database.execute(
+            """
+            DELETE FROM sample_identity_alias;
+            DELETE FROM sample_alias_retirement;
+            """
+        )
+        database.close()
+        let reopened = try makeStore()
+
+        _ = try await reopened.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"2026-01-01 05:00:00 -0500","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "legacy-after-migration"
+        )
+
+        let records = try await reopened.samples(type: "step_count")
+        XCTAssertEqual(records.map(\.id), ["stable"])
+    }
+
+    func testTimestampDeletionTombstonesMappedStableIdentity() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        let stable = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                  {"id":"stable","date":"\(date)","qty":20}
+                ]}]}}
+                """.utf8
+            )
+        )
+        _ = try await store.ingest(stable, idempotencyKey: "stable-before-time-delete")
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[],"deletions":[
+                      {"name":"step_count","type":"step_count","date":"\(date)"}
+                    ]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "time-delete"
+        )
+        _ = try await store.ingest(stable, idempotencyKey: "stable-replay")
+
+        let finalCount = try await store.totalRecordCount()
+        XCTAssertEqual(finalCount, 0)
+    }
+
+    func testTombstonedStableArrivalDeletesAlreadyLiveLegacyAlias() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "legacy-first"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"id":"stable","type":"step_count","kind":"deletion","deleted":true}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "stable-tombstone"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"stable","date":"2026-01-01 05:00:00 -0500","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "stable-after-tombstone"
+        )
+
+        let finalCount = try await store.totalRecordCount()
+        XCTAssertEqual(finalCount, 0)
+    }
+
+    func testDeletionReplayDoesNotRecreateResolvedLegacyBarrier() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"stable","date":"\(date)","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "stable-for-replay"
+        )
+        let deletion = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[],"deletions":[
+                  {"id":"stable","name":"step_count","type":"step_count","date":""}
+                ]}}
+                """.utf8
+            )
+        )
+        _ = try await store.ingest(deletion, idempotencyKey: "delete-once")
+        _ = try await store.ingest(deletion, idempotencyKey: "delete-again")
+
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"2026-01-02 10:00:00 +0000","qty":30}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "unrelated-legacy"
+        )
+
+        let records = try await store.samples(type: "step_count")
+        XCTAssertEqual(records.count, 1)
+        XCTAssertTrue(records[0].id.hasPrefix("step_count:"))
+    }
+
+    func testAudiogramTombstoneRemovesHeaderAndPoints() async throws {
+        let store = try makeStore()
+        let audiogram = ReceivedAudiogram(
+            id: "hearing-test",
+            startDate: try date("2026-01-01T10:00:00.000Z"),
+            endDate: nil,
+            sourceName: "iPhone",
+            points: [
+                .init(
+                    frequency: 1_000,
+                    ear: "left",
+                    sensitivity: 20,
+                    unit: "dBHL",
+                    masked: false,
+                    clamped: false
+                )
+            ],
+            raw: Data(#"{"kind":"audiogram"}"#.utf8)
+        )
+        _ = try await store.ingest(
+            ParsedBatch(
+                records: [],
+                deletions: [],
+                audiograms: [audiogram],
+                unreadableCount: 0
+            ),
+            idempotencyKey: "audiogram"
+        )
+        let storedAudiograms = try await store.audiograms()
+        XCTAssertEqual(storedAudiograms.count, 1)
+
+        let result = try await store.ingest(
+            ParsedBatch(
+                records: [],
+                deletions: [.init(id: "hearing-test")],
+                unreadableCount: 0
+            ),
+            idempotencyKey: "audiogram-delete"
+        )
+
+        XCTAssertEqual(result.deleted, 0)
+        let remainingAudiograms = try await store.audiograms()
+        XCTAssertTrue(remainingAudiograms.isEmpty)
+
+        _ = try await store.ingest(
+            ParsedBatch(
+                records: [],
+                deletions: [],
+                audiograms: [audiogram],
+                unreadableCount: 0
+            ),
+            idempotencyKey: "delayed-audiogram"
+        )
+        let afterDelayedAudiogram = try await store.audiograms()
+        XCTAssertTrue(afterDelayedAudiogram.isEmpty)
     }
 
     func testStableMetricIdAtomicallyReplacesLegacyAlias() async throws {
@@ -427,6 +979,88 @@ final class ReceiveTests: XCTestCase {
         XCTAssertTrue(legacy.isEmpty)
         XCTAssertEqual(current.count, 1)
         XCTAssertEqual(total, 1)
+    }
+
+    func testWorkoutDeletionRemovesAllWorkoutOwnedRows() async throws {
+        let store = try makeStore()
+        let start = try date("2026-01-01T10:00:00.000Z")
+        let end = try date("2026-01-01T11:00:00.000Z")
+        let statistic = ReceivedWorkoutDetail.Statistic(
+            type: "heart-rate",
+            unit: "count/min",
+            sum: nil,
+            average: 150,
+            minimum: 120,
+            maximum: 180
+        )
+        let detail = ReceivedWorkoutDetail(
+            id: "workout-delete",
+            startDate: start,
+            endDate: end,
+            activityType: 37,
+            duration: 3_600,
+            sourceName: "Watch",
+            statistics: [statistic],
+            activities: [
+                .init(
+                    id: "workout-leg",
+                    activityType: 37,
+                    startDate: start,
+                    endDate: end,
+                    statistics: [statistic]
+                )
+            ]
+        )
+        _ = try await store.ingest(
+            ParsedBatch(
+                records: [
+                    HealthRecord(
+                        id: "workout-delete",
+                        type: "workout",
+                        kind: "workout",
+                        startDate: start,
+                        endDate: end,
+                        value: 3_600,
+                        unit: "sec",
+                        raw: Data()
+                    )
+                ],
+                deletions: [],
+                workoutDetails: [detail],
+                unreadableCount: 0
+            ),
+            idempotencyKey: "workout-live"
+        )
+        let beforeDeletion = try await store.workouts()
+        XCTAssertEqual(beforeDeletion.count, 1)
+
+        _ = try await store.ingest(
+            ParsedBatch(
+                records: [
+                    HealthRecord(
+                        id: "workout-delete",
+                        type: "workout",
+                        kind: "workout",
+                        startDate: start,
+                        endDate: end,
+                        value: 3_600,
+                        unit: "sec",
+                        raw: Data()
+                    )
+                ],
+                deletions: [
+                    HealthDeletion(id: "workout-delete", type: "workout")
+                ],
+                workoutDetails: [detail],
+                unreadableCount: 0
+            ),
+            idempotencyKey: "workout-delete"
+        )
+
+        let remainingWorkouts = try await store.workouts()
+        let remainingSamples = try await store.samples(type: "workout")
+        XCTAssertTrue(remainingWorkouts.isEmpty)
+        XCTAssertTrue(remainingSamples.isEmpty)
     }
 
     func testDeletionsAreParsed() throws {

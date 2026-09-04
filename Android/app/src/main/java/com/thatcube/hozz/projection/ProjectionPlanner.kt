@@ -2,6 +2,8 @@ package com.thatcube.hozz.projection
 
 import com.thatcube.hozz.core.CanonicalRecord
 import com.thatcube.hozz.core.HealthConnectProjection
+import com.thatcube.hozz.core.HealthConnectPendingAction
+import com.thatcube.hozz.core.PendingHealthConnectOperation
 import com.thatcube.hozz.generated.GeneratedContract
 import com.thatcube.hozz.generated.MappingDisposition
 import com.thatcube.hozz.generated.MappingQuality
@@ -41,7 +43,7 @@ sealed interface ProjectionDraft {
         override val canonicalId: String,
         override val recordVersion: Long,
         val targetRecord: String,
-        val healthConnectRecordId: String,
+        val healthConnectRecordId: String?,
     ) : ProjectionDraft
 
     data class Steps(
@@ -204,38 +206,41 @@ object ProjectionPlanner {
     fun plan(
         records: List<CanonicalRecord>,
         projections: Map<String, HealthConnectProjection> = emptyMap(),
+        pending: Map<String, PendingHealthConnectOperation> = emptyMap(),
     ): ProjectionPlan =
         ProjectionPlan(records.map { record ->
-            plan(record, projections[record.canonicalId])
+            plan(
+                record,
+                projections[record.canonicalId],
+                pending[record.canonicalId],
+            )
         })
 
     fun plan(
         record: CanonicalRecord,
         projection: HealthConnectProjection? = null,
+        pending: PendingHealthConnectOperation? = null,
     ): PlannedRecord {
         if (record.hasVisitedHealthConnectTarget()) {
             return applyProjectionState(
                 archiveOnly(record, "source-store-loop", "lineage"),
                 projection,
+                pending,
             )
         }
         if (record.kind == "clinicalRecord") {
             return applyProjectionState(
                 archiveOnly(record, "clinical-snapshot-incomplete"),
                 projection,
+                pending,
             )
         }
         if (record.tombstone) {
-            val existing = projection
+            val deletion = deletionDraft(record, projection, pending)
                 ?: return archiveOnly(record, "tombstone")
             return exact(
                 record,
-                ProjectionDraft.Delete(
-                    canonicalId = record.canonicalId,
-                    recordVersion = record.recordVersion,
-                    targetRecord = existing.targetRecord,
-                    healthConnectRecordId = existing.healthConnectRecordId,
-                ),
+                deletion,
                 action = ProjectionAction.DELETE,
             )
         }
@@ -243,31 +248,29 @@ object ProjectionPlanner {
             return applyProjectionState(
                 archiveOnly(record, "unsupported-type"),
                 projection,
+                pending,
             )
         }
         val mapping = GeneratedContract.recordMappings[record.type]
             ?: return applyProjectionState(
                 archiveOnly(record, "unsupported-type"),
                 projection,
+                pending,
             )
         if (mapping.sourceKind != record.kind) {
             return applyProjectionState(
                 archiveOnly(record, "unsupported-type", "kind"),
                 projection,
+                pending,
             )
         }
         if (mapping.quality == MappingQuality.ARCHIVE_ONLY) {
-            if (projection != null) {
+            val deletion = deletionDraft(record, projection, pending)
+            if (deletion != null) {
                 return PlannedRecord(
                     source = record,
                     quality = ProjectionQuality.ARCHIVE_ONLY,
-                    draft = ProjectionDraft.Delete(
-                        canonicalId = record.canonicalId,
-                        recordVersion = record.recordVersion,
-                        targetRecord = projection.targetRecord,
-                        healthConnectRecordId =
-                            projection.healthConnectRecordId,
-                    ),
+                    draft = deletion,
                     warnings = listOf(
                         warning(
                             record,
@@ -295,37 +298,56 @@ object ProjectionPlanner {
             "ExerciseSessionRecord" -> exercise(record)
             else -> archiveOnly(record, "unsupported-type")
         }
-        return applyProjectionState(planned, projection)
+        return applyProjectionState(planned, projection, pending)
     }
 
     private fun applyProjectionState(
         planned: PlannedRecord,
         projection: HealthConnectProjection?,
+        pending: PendingHealthConnectOperation?,
     ): PlannedRecord {
         val draft = planned.draft
         if (draft == null) {
-            return if (projection == null) {
+            val deletion = deletionDraft(planned.source, projection, pending)
+            return if (deletion == null) {
                 planned
             } else {
                 planned.copy(
-                    draft = ProjectionDraft.Delete(
-                        canonicalId = planned.source.canonicalId,
-                        recordVersion = planned.source.recordVersion,
-                        targetRecord = projection.targetRecord,
-                        healthConnectRecordId =
-                            projection.healthConnectRecordId,
-                    ),
+                    draft = deletion,
                     action = ProjectionAction.DELETE,
                 )
             }
         }
         if (projection == null) {
-            return planned.copy(action = ProjectionAction.INSERT)
+            return planned.copy(
+                action = if (pending?.action == HealthConnectPendingAction.UPSERT) {
+                    ProjectionAction.UPDATE
+                } else {
+                    ProjectionAction.INSERT
+                },
+            )
         }
-        if (projection.canonicalVersion >= draft.recordVersion) {
+        if (
+            projection.canonicalVersion >= draft.recordVersion &&
+            pending == null
+        ) {
             return planned.copy(draft = null, action = ProjectionAction.NONE)
         }
         return planned.copy(action = ProjectionAction.UPDATE)
+    }
+
+    private fun deletionDraft(
+        record: CanonicalRecord,
+        projection: HealthConnectProjection?,
+        pending: PendingHealthConnectOperation?,
+    ): ProjectionDraft.Delete? {
+        val target = projection?.targetRecord ?: pending?.targetRecord ?: return null
+        return ProjectionDraft.Delete(
+            canonicalId = record.canonicalId,
+            recordVersion = record.recordVersion,
+            targetRecord = target,
+            healthConnectRecordId = projection?.healthConnectRecordId,
+        )
     }
 
     private fun steps(record: CanonicalRecord): PlannedRecord {

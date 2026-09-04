@@ -388,6 +388,186 @@ class SqliteCanonicalRecordStoreTest {
         }
 
     @Test
+    fun pendingHealthConnectOperationSurvivesRestartAndCompletesAtomically() =
+        runBlocking {
+            val pending = PendingHealthConnectOperation(
+                canonicalId = "apple.healthkit:pending-weight",
+                targetRecord = "WeightRecord",
+                canonicalVersion = 1,
+                action = HealthConnectPendingAction.UPSERT,
+            )
+            store.stageHealthConnectOperations(listOf(pending))
+            store.close()
+            store = SqliteCanonicalRecordStore(context, databaseName)
+
+            assertEquals(
+                pending,
+                store.pendingHealthConnectOperations(setOf(pending.canonicalId))
+                    .getValue(pending.canonicalId),
+            )
+            val projection = HealthConnectProjection(
+                canonicalId = pending.canonicalId,
+                targetRecord = pending.targetRecord,
+                canonicalVersion = pending.canonicalVersion,
+                healthConnectRecordId = "health-pending",
+            )
+            store.completeHealthConnectUpserts(listOf(projection))
+            assertEquals(
+                projection,
+                store.healthConnectProjections(setOf(pending.canonicalId))
+                    .getValue(pending.canonicalId),
+            )
+            assertTrue(
+                store.pendingHealthConnectOperations(setOf(pending.canonicalId))
+                    .isEmpty(),
+            )
+
+            val deletion = pending.copy(
+                canonicalVersion = 2,
+                action = HealthConnectPendingAction.DELETE,
+            )
+            store.stageHealthConnectOperations(listOf(deletion))
+            store.completeHealthConnectDeletes(listOf(deletion))
+            assertTrue(
+                store.healthConnectProjections(setOf(pending.canonicalId)).isEmpty(),
+            )
+            assertTrue(
+                store.pendingHealthConnectOperations(setOf(pending.canonicalId))
+                    .isEmpty(),
+            )
+            store.close()
+            store = SqliteCanonicalRecordStore(context, databaseName)
+            var staleRejected = false
+            try {
+                store.stageHealthConnectOperations(listOf(pending))
+            } catch (_: IllegalStateException) {
+                staleRejected = true
+            }
+            assertTrue(staleRejected)
+        }
+
+    @Test
+    fun sameVersionPendingDeleteCannotBeReplacedByUpsert() = runBlocking {
+        val deletion = PendingHealthConnectOperation(
+            canonicalId = "apple.healthkit:pending-delete",
+            targetRecord = "WeightRecord",
+            canonicalVersion = 2,
+            action = HealthConnectPendingAction.DELETE,
+        )
+        store.stageHealthConnectOperations(listOf(deletion))
+
+        var rejected = false
+        try {
+            store.stageHealthConnectOperations(
+                listOf(deletion.copy(action = HealthConnectPendingAction.UPSERT)),
+            )
+        } catch (_: IllegalStateException) {
+            rejected = true
+        }
+
+        assertTrue(rejected)
+        assertEquals(
+            deletion,
+            store.pendingHealthConnectOperations(setOf(deletion.canonicalId))
+                .getValue(deletion.canonicalId),
+        )
+    }
+
+    @Test
+    fun completedOperationCanBeStagedAgainAsIdempotentNoOp() = runBlocking {
+        val upsert = PendingHealthConnectOperation(
+            canonicalId = "apple.healthkit:completed-retry",
+            targetRecord = "WeightRecord",
+            canonicalVersion = 1,
+            action = HealthConnectPendingAction.UPSERT,
+        )
+        store.stageHealthConnectOperations(listOf(upsert))
+        store.completeHealthConnectUpserts(
+            listOf(
+                HealthConnectProjection(
+                    canonicalId = upsert.canonicalId,
+                    targetRecord = upsert.targetRecord,
+                    canonicalVersion = upsert.canonicalVersion,
+                    healthConnectRecordId = "health-completed",
+                )
+            )
+        )
+
+        store.stageHealthConnectOperations(listOf(upsert))
+
+        assertTrue(
+            store.pendingHealthConnectOperations(setOf(upsert.canonicalId)).isEmpty(),
+        )
+    }
+
+    @Test
+    fun timelineUsesIndexedFullPrecisionOrderAcrossPages() = runBlocking {
+        val times = listOf(
+            "fraction-999" to Instant.parse("2026-01-01T00:00:00.999999999Z"),
+            "fraction-100" to Instant.parse("2026-01-01T00:00:00.100Z"),
+            "fraction-001" to Instant.parse("2026-01-01T00:00:00.000000001Z"),
+            "whole" to Instant.parse("2026-01-01T00:00:00Z"),
+        )
+        val records = times.map { (id, time) ->
+            record(version = 1, tombstone = false).copy(
+                canonicalId = "apple.healthkit:$id",
+                sourceRecordId = id,
+                startTime = time,
+                endTime = time,
+            )
+        } + record(version = 1, tombstone = false).copy(
+            canonicalId = "apple.healthkit:no-time",
+            sourceRecordId = "no-time",
+            startTime = null,
+            endTime = null,
+        )
+        store.upsert(records)
+
+        val seen = mutableListOf<String>()
+        var cursor: TimelineCursor? = null
+        do {
+            val page = store.timelinePage(cursor, limit = 1)
+            seen += page.records.map(CanonicalRecord::canonicalId)
+            cursor = page.nextCursor
+        } while (page.records.isNotEmpty())
+
+        assertEquals(
+            listOf(
+                "apple.healthkit:fraction-999",
+                "apple.healthkit:fraction-100",
+                "apple.healthkit:fraction-001",
+                "apple.healthkit:whole",
+                "apple.healthkit:no-time",
+            ),
+            seen,
+        )
+        store.close()
+        context.openOrCreateDatabase(databaseName, 0, null).use { database ->
+            database.execSQL(
+                "UPDATE canonical_record SET timeline_sort_key = NULL",
+            )
+            database.version = 10
+        }
+        store = SqliteCanonicalRecordStore(context, databaseName)
+        val migratedOrder = store.timelinePage(null, limit = 10)
+            .records
+            .map(CanonicalRecord::canonicalId)
+        assertEquals(
+            seen,
+            migratedOrder,
+        )
+        for (plan in listOf(
+            store.timelineQueryPlan(null),
+            store.timelineQueryPlan(
+                TimelineCursor(times.first().second, "apple.healthkit:fraction-999"),
+            ),
+        )) {
+            assertTrue(plan.any { it.contains("canonical_record_timeline") })
+            assertTrue(plan.none { it.contains("TEMP B-TREE") })
+        }
+    }
+
+    @Test
     fun runRecordsPersistWithoutDuplicatingOnReplay() = runBlocking {
         val line =
             """

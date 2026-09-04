@@ -107,6 +107,7 @@ public enum CompatiblePayloadBuilder {
             let name = MetricNameMap.metricName(for: record.typeIdentifier)
             let units = record.unit ?? "count"
             var point: [String: Any] = [
+                "id": record.identifier,
                 "date": record.startDate,
                 "units": units
             ]

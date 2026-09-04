@@ -319,6 +319,7 @@ final class HealthAutoExportTests: XCTestCase {
         )
 
         XCTAssertNotEqual(hozz, compatible)
+        XCTAssertTrue(String(decoding: hozz, as: UTF8.self).contains("\"id\":\"abc-123\""))
         XCTAssertTrue(String(decoding: hozz, as: UTF8.self).contains("\"qty\""))
         XCTAssertTrue(String(decoding: compatible, as: UTF8.self).contains("\"Avg\""))
     }

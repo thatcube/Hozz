@@ -19,6 +19,7 @@ public struct HealthRecord: Hashable, Sendable {
     public let sourceName: String?
     public let legacyAliasID: String?
     public let legacyTypeAlias: String?
+    public let isLegacyCompatibilityIdentity: Bool
     public let raw: Data
 
     public init(
@@ -32,6 +33,7 @@ public struct HealthRecord: Hashable, Sendable {
         sourceName: String? = nil,
         legacyAliasID: String? = nil,
         legacyTypeAlias: String? = nil,
+        isLegacyCompatibilityIdentity: Bool = false,
         raw: Data
     ) {
         self.id = id
@@ -44,6 +46,7 @@ public struct HealthRecord: Hashable, Sendable {
         self.sourceName = sourceName
         self.legacyAliasID = legacyAliasID
         self.legacyTypeAlias = legacyTypeAlias
+        self.isLegacyCompatibilityIdentity = isLegacyCompatibilityIdentity
         self.raw = raw
     }
 }
@@ -122,11 +125,25 @@ public struct HealthDeletion: Hashable, Sendable {
     /// Set only for payload shapes that carry no per-sample identifier, where
     /// a deletion can only be matched by type and timestamp.
     public let startDate: Date?
+    /// The pre-stable-ID compatibility identity, constrained by type and time.
+    public let legacyAliasID: String?
+    public let legacyStartDate: Date?
+    public let requiresLegacyAliasResolution: Bool
 
-    public init(id: String, type: String? = nil, startDate: Date? = nil) {
+    public init(
+        id: String,
+        type: String? = nil,
+        startDate: Date? = nil,
+        legacyAliasID: String? = nil,
+        legacyStartDate: Date? = nil,
+        requiresLegacyAliasResolution: Bool = false
+    ) {
         self.id = id
         self.type = type
         self.startDate = startDate
+        self.legacyAliasID = legacyAliasID
+        self.legacyStartDate = legacyStartDate
+        self.requiresLegacyAliasResolution = requiresLegacyAliasResolution
     }
 }
 
@@ -1016,6 +1033,7 @@ public enum BatchParser {
                         unit: units,
                         sourceName: point["source"] as? String,
                         legacyAliasID: legacyAliasID,
+                        isLegacyCompatibilityIdentity: legacyAliasID == nil,
                         raw: (try? JSONSerialization.data(
                             withJSONObject: object,
                             options: [.sortedKeys]
@@ -1123,7 +1141,17 @@ public enum BatchParser {
             if let identifier = (deletion["id"] as? String),
                !identifier.isEmpty {
                 deletions.append(
-                    HealthDeletion(id: identifier, type: name, startDate: nil)
+                    HealthDeletion(
+                        id: identifier,
+                        type: name,
+                        startDate: nil,
+                        legacyAliasID: dateText.flatMap {
+                            $0.isEmpty ? nil : "\(name):\($0)"
+                        },
+                        legacyStartDate: date,
+                        requiresLegacyAliasResolution:
+                            dateText?.isEmpty != false
+                    )
                 )
             } else if let dateText, let date {
                 deletions.append(
