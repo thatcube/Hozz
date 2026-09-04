@@ -1,6 +1,7 @@
 package com.thatcube.hozz.projection
 
 import android.content.pm.PackageManager
+import android.util.Log
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
@@ -107,6 +108,17 @@ class HealthConnectWriterIntegrationTest {
             }
             assertEquals(1, matches.size)
             assertEquals(2, matches.single().metadata.clientRecordVersion)
+            println(
+                "HEALTH_CONNECT_READBACK count=${matches.size} " +
+                    "version=${matches.single().metadata.clientRecordVersion} " +
+                    "origin=${context.packageName}",
+            )
+            Log.i(
+                "HozzHealthConnectTest",
+                "readback count=${matches.size} " +
+                    "version=${matches.single().metadata.clientRecordVersion} " +
+                    "origin=${context.packageName}",
+            )
         } finally {
             client.deleteRecords(
                 recordType = WeightRecord::class,
@@ -120,6 +132,7 @@ class HealthConnectWriterIntegrationTest {
                 clientRecordIdsList = emptyList(),
             )
         }
+        Unit
     }
 
     @Test
@@ -362,6 +375,15 @@ class HealthConnectWriterIntegrationTest {
             else -> error("Unknown integration record $recordName")
         }
         assertFalse(granted.contains(readPermission))
+        println(
+            "HEALTH_CONNECT_PERMISSION write=$permission granted=true " +
+                "read=$readPermission granted=false",
+        )
+        Log.i(
+            "HozzHealthConnectTest",
+            "permission write=$permission granted=true " +
+                "read=$readPermission granted=false",
+        )
     }
 
     private fun context(): android.content.Context =
