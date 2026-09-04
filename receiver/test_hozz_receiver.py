@@ -1,4 +1,5 @@
 import contextlib
+import hashlib
 import http.client
 import io
 import json
@@ -6,12 +7,14 @@ import os
 import sqlite3
 import socket
 import struct
+import sys
 import tempfile
 import threading
 import time
 import tracemalloc
 import unittest
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -616,6 +619,253 @@ class CanonicalIdentityTests(unittest.TestCase):
 
 
 class MigrationTests(unittest.TestCase):
+    def test_a07df_millisecond_evidence_never_aliases_submillisecond_heart_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receiver.sqlite"
+            db = connect(path)
+            stable_unique_date = "2026-01-03T00:00:00.0009Z"
+            legacy_unique_date = "2026-01-03T00:00:00.0001Z"
+            ambiguous_date = "2026-01-03T00:00:01.0001Z"
+            self.assertEqual(
+                int(datetime.fromisoformat(
+                    stable_unique_date.replace("Z", "+00:00")
+                ).timestamp() * 1_000),
+                int(datetime.fromisoformat(
+                    legacy_unique_date.replace("Z", "+00:00")
+                ).timestamp() * 1_000),
+            )
+            points = [
+                {
+                    "id": "unique-stable",
+                    "date": stable_unique_date,
+                    "Min": 62,
+                    "Avg": 62,
+                    "Max": 62,
+                    "source": "Watch",
+                },
+                *[
+                    {
+                        "id": identity,
+                        "date": ambiguous_date,
+                        "Min": 63,
+                        "Avg": 63,
+                        "Max": 63,
+                        "source": "Watch",
+                    }
+                    for identity in ("ambiguous-a", "ambiguous-b")
+                ],
+            ]
+            ingest_compatible(db, {
+                "data": {
+                    "metrics": [{
+                        "name": "heart_rate",
+                        "units": "bpm",
+                        "data": points,
+                    }],
+                },
+            })
+            ingest_compatible(db, {
+                "data": {
+                    "deletions": [
+                        {
+                            "id": point["id"],
+                            "name": "heart_rate",
+                            "type": "heart_rate",
+                            "date": "",
+                        }
+                        for point in points
+                    ],
+                },
+            })
+            signatures = db.execute(
+                """
+                SELECT type, start_instant, end_instant, value, unit,
+                       source, kind, stable_id
+                FROM compatible_alias_retirement
+                ORDER BY stable_id
+                """
+            ).fetchall()
+
+            for date in (legacy_unique_date, ambiguous_date):
+                source_id = f"heart_rate:{date}"
+                raw = json.dumps({
+                    "id": source_id,
+                    "type": "heart_rate",
+                    "kind": "quantity",
+                    "startDate": date,
+                    "endDate": date,
+                    "quantity": {"value": None, "unit": "bpm"},
+                    "source": {"name": "Watch"},
+                })
+                db.execute(
+                    """
+                    INSERT INTO samples
+                        (canonical_id, source_id, record_version, tombstone,
+                         type, kind, start_date, end_date, value, unit,
+                         source, raw)
+                    VALUES (?, ?, 1, 0, 'heart_rate', 'quantity',
+                            ?, ?, NULL, 'bpm', 'Watch', ?)
+                    """,
+                    (
+                        f"apple.healthkit:{source_id}",
+                        source_id,
+                        date,
+                        date,
+                        raw,
+                    ),
+                )
+
+            db.execute("DROP TABLE compatible_alias_retirement")
+            db.execute(
+                """
+                CREATE TABLE compatible_alias_retirement (
+                    type TEXT NOT NULL,
+                    start_epoch INTEGER NOT NULL,
+                    end_epoch INTEGER,
+                    value REAL,
+                    unit TEXT,
+                    source TEXT,
+                    kind TEXT,
+                    stable_id TEXT NOT NULL,
+                    PRIMARY KEY (type, start_epoch, stable_id)
+                )
+                """
+            )
+            for (
+                record_type,
+                start,
+                end,
+                value,
+                unit,
+                source,
+                kind,
+                stable_id,
+            ) in signatures:
+                db.execute(
+                    """
+                    INSERT INTO compatible_alias_retirement
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record_type,
+                        int(datetime.fromisoformat(
+                            start.replace("Z", "+00:00")
+                        ).timestamp() * 1_000),
+                        int(datetime.fromisoformat(
+                            end.replace("Z", "+00:00")
+                        ).timestamp() * 1_000),
+                        value,
+                        unit,
+                        source,
+                        kind,
+                        stable_id,
+                    ),
+                )
+            db.commit()
+            db.close()
+
+            migrated = connect(path)
+            self.assertEqual(
+                [
+                    (f"heart_rate:{legacy_unique_date}", 0),
+                    (f"heart_rate:{ambiguous_date}", 0),
+                ],
+                migrated.execute(
+                    """
+                    SELECT source_id, tombstone FROM samples
+                    WHERE canonical_id LIKE 'apple.healthkit:heart_rate:%'
+                    ORDER BY source_id
+                    """
+                ).fetchall(),
+            )
+            self.assertEqual(
+                [],
+                migrated.execute(
+                    """
+                    SELECT stable_id, legacy_id FROM compatible_alias_identity
+                    """
+                ).fetchall(),
+            )
+            self.assertEqual(
+                {
+                    "healthAutoExport:unique-stable",
+                    "healthAutoExport:ambiguous-a",
+                    "healthAutoExport:ambiguous-b",
+                },
+                {
+                    row[0]
+                    for row in migrated.execute(
+                        "SELECT stable_id FROM compatible_unresolved_deletion"
+                    )
+                },
+            )
+            self.assertEqual(
+                [],
+                migrated.execute(
+                    """
+                    SELECT start_instant, value
+                    FROM compatible_alias_retirement
+                    WHERE stable_id = 'healthAutoExport:unique-stable'
+                    """
+                ).fetchall(),
+            )
+            migrated.close()
+
+    def test_legacy_file_receipts_gain_generation_and_digest_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receiver.sqlite"
+            db = sqlite3.connect(path)
+            db.execute(
+                """
+                CREATE TABLE ingested_files (
+                    name TEXT PRIMARY KEY,
+                    ingested_at REAL NOT NULL,
+                    device INTEGER,
+                    inode INTEGER,
+                    size INTEGER,
+                    mtime_ns INTEGER
+                )
+                """
+            )
+            db.execute(
+                """
+                INSERT INTO ingested_files
+                    (name, ingested_at, device, inode, size, mtime_ns)
+                VALUES ('hozz-old.ndjson', 0, 1, 2, 3, 4)
+                """
+            )
+            db.commit()
+            db.close()
+
+            migrated = connect(path)
+            self.assertIn(
+                "digest",
+                {
+                    row[1]
+                    for row in migrated.execute(
+                        "PRAGMA table_info(ingested_files)"
+                    )
+                },
+            )
+            self.assertIn(
+                "ctime_ns",
+                {
+                    row[1]
+                    for row in migrated.execute(
+                        "PRAGMA table_info(ingested_files)"
+                    )
+                },
+            )
+            self.assertIsNone(
+                migrated.execute(
+                    """
+                    SELECT digest FROM ingested_files
+                    WHERE name = 'hozz-old.ndjson'
+                    """
+                ).fetchone()[0]
+            )
+            migrated.close()
+
     def test_legacy_batch_receipts_are_marked_with_unknown_deletion_count(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "receiver.sqlite"
@@ -1024,6 +1274,161 @@ class MigrationTests(unittest.TestCase):
                 ],
                 rows,
             )
+
+    def test_migrated_legacy_heart_rate_null_is_reconciled_by_known_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receiver.sqlite"
+            date = "2026-01-01T12:00:00.0001Z"
+            legacy_id = f"heart_rate:{date}"
+            raw = json.dumps({
+                "id": legacy_id,
+                "type": "heart_rate",
+                "kind": "quantity",
+                "startDate": date,
+                "endDate": date,
+                "quantity": {"value": None, "unit": "bpm"},
+                "source": {"name": "Watch"},
+            })
+            db = sqlite3.connect(path)
+            db.execute(
+                """
+                CREATE TABLE samples (
+                    id TEXT PRIMARY KEY, type TEXT NOT NULL, kind TEXT,
+                    start_date TEXT, end_date TEXT, value REAL, unit TEXT,
+                    source TEXT, raw TEXT NOT NULL
+                )
+                """
+            )
+            db.execute(
+                """
+                INSERT INTO samples VALUES
+                    (?, 'heart_rate', 'quantity', ?, ?, NULL, 'bpm', 'Watch', ?)
+                """,
+                (legacy_id, date, date, raw),
+            )
+            db.commit()
+            db.close()
+
+            migrated = connect(path)
+            self.assertEqual(
+                (1, 1, False),
+                ingest_compatible(migrated, {
+                    "data": {
+                        "metrics": [{
+                            "name": "heart_rate",
+                            "units": "bpm",
+                            "data": [{
+                                "id": "stable-heart",
+                                "date": date,
+                                "Min": 62,
+                                "Avg": 62,
+                                "Max": 62,
+                                "source": "Watch",
+                            }],
+                        }],
+                    },
+                }),
+            )
+            self.assertEqual(
+                (0, 1, False),
+                ingest_compatible(migrated, {
+                    "data": {
+                        "deletions": [{
+                            "id": "stable-heart",
+                            "name": "heart_rate",
+                            "type": "heart_rate",
+                            "date": "",
+                        }],
+                    },
+                }),
+            )
+            self.assertEqual(
+                0,
+                migrated.execute(
+                    "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                [(
+                    "healthAutoExport:stable-heart",
+                    f"apple.healthkit:{legacy_id}",
+                )],
+                migrated.execute(
+                    """
+                    SELECT stable_id, legacy_id FROM compatible_alias_identity
+                    """
+                ).fetchall(),
+            )
+            migrated.close()
+
+    def test_null_heart_rate_outside_known_legacy_shape_is_not_reconciled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receiver.sqlite"
+            date = "2026-01-01T12:00:00Z"
+            legacy_id = f"heart_rate:{date}"
+            raw = json.dumps({
+                "id": legacy_id,
+                "type": "heart_rate",
+                "kind": "quantity",
+                "schemaVersion": 1,
+                "startDate": date,
+                "endDate": date,
+                "quantity": {"value": None, "unit": "bpm"},
+                "source": {"name": "Watch"},
+            })
+            db = sqlite3.connect(path)
+            db.execute(
+                """
+                CREATE TABLE samples (
+                    id TEXT PRIMARY KEY, type TEXT NOT NULL, kind TEXT,
+                    start_date TEXT, end_date TEXT, value REAL, unit TEXT,
+                    source TEXT, raw TEXT NOT NULL
+                )
+                """
+            )
+            db.execute(
+                """
+                INSERT INTO samples VALUES
+                    (?, 'heart_rate', 'quantity', ?, ?, NULL, 'bpm', 'Watch', ?)
+                """,
+                (legacy_id, date, date, raw),
+            )
+            db.commit()
+            db.close()
+
+            migrated = connect(path)
+            self.assertEqual(
+                (1, 0, False),
+                ingest_compatible(migrated, {
+                    "data": {
+                        "metrics": [{
+                            "name": "heart_rate",
+                            "units": "bpm",
+                            "data": [{
+                                "id": "stable-heart",
+                                "date": date,
+                                "Min": 62,
+                                "Avg": 62,
+                                "Max": 62,
+                                "source": "Watch",
+                            }],
+                        }],
+                    },
+                }),
+            )
+            self.assertEqual(
+                2,
+                migrated.execute(
+                    "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+                ).fetchone()[0],
+            )
+            self.assertEqual(
+                0,
+                migrated.execute(
+                    "SELECT COUNT(*) FROM compatible_alias_identity"
+                ).fetchone()[0],
+            )
+            migrated.close()
 
 
 class TransactionAndArchiveTests(unittest.TestCase):
@@ -1566,6 +1971,15 @@ class TransactionAndArchiveTests(unittest.TestCase):
         self.db.execute("DELETE FROM compatible_unresolved_deletion")
         self.db.execute(
             """
+            INSERT INTO compatible_alias_identity (stable_id, legacy_id)
+            VALUES (
+                'healthAutoExport:first',
+                'apple.healthkit:steps:rounded-millisecond'
+            )
+            """
+        )
+        self.db.execute(
+            """
             CREATE TABLE compatible_alias_retirement_old_shape (
                 type TEXT NOT NULL,
                 start_epoch INTEGER NOT NULL,
@@ -1577,9 +1991,9 @@ class TransactionAndArchiveTests(unittest.TestCase):
         self.db.execute(
             """
             INSERT INTO compatible_alias_retirement_old_shape
-            SELECT type, start_epoch, MIN(stable_id)
+            SELECT type, 0, MIN(stable_id)
             FROM compatible_alias_retirement
-            GROUP BY type, start_epoch
+            GROUP BY type, start_instant
             """
         )
         self.db.execute("DROP TABLE compatible_alias_retirement")
@@ -1613,6 +2027,12 @@ class TransactionAndArchiveTests(unittest.TestCase):
             0,
             self.db.execute(
                 "SELECT COUNT(*) FROM compatible_resolved_deletion"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM compatible_alias_identity"
             ).fetchone()[0],
         )
 
@@ -1682,9 +2102,24 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 """
             )
         )
+        signature_plan = " ".join(
+            row[3] for row in self.db.execute(
+                """
+                EXPLAIN QUERY PLAN
+                SELECT stable_id FROM compatible_alias_retirement
+                WHERE type = 'steps'
+                  AND start_instant = '2026-01-01T00:00:00Z'
+                  AND end_instant IS '2026-01-01T00:00:00Z'
+                  AND value IS 1 AND unit IS 'count'
+                  AND source IS NULL AND kind IS 'quantity'
+                """
+            )
+        )
 
         self.assertIn("compatible_alias_identity_legacy", identity_plan)
         self.assertIn("compatible_alias_retirement_stable", retirement_plan)
+        self.assertIn("compatible_alias_retirement_signature", signature_plan)
+
     def test_dated_deletion_blocks_ambiguous_delayed_legacy_alias(self):
         date = "2026-01-01T00:00:00Z"
         ingest_compatible(self.db, {
@@ -1922,6 +2357,924 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 "SELECT 1 FROM batches WHERE key = 'ambiguous-stable'"
             ).fetchone()
         )
+
+    def test_alias_signatures_preserve_submillisecond_precision(self):
+        self.assertNotEqual(
+            receiver.compatible_normalized_timestamp(
+                "2026-01-01T00:00:00.0000001Z"
+            ),
+            receiver.compatible_normalized_timestamp(
+                "2026-01-01T00:00:00.0000009Z"
+            ),
+        )
+        self.assertEqual(
+            receiver.compatible_normalized_timestamp(
+                "2026-01-01T00:00:00.0001000Z"
+            ),
+            receiver.compatible_normalized_timestamp(
+                "2025-12-31 19:00:00.0001 -0500"
+            ),
+        )
+        dates = [
+            "2026-01-01T00:00:00.0001Z",
+            "2026-01-01T00:00:00.0009Z",
+        ]
+        ingest_lines(
+            self.db,
+            [
+                json.dumps({
+                    "id": f"steps:{date}",
+                    "type": "steps",
+                    "kind": "quantity",
+                    "startDate": date,
+                    "endDate": date,
+                    "quantity": {"value": 100, "unit": "count"},
+                })
+                for date in dates
+            ],
+        )
+
+        self.assertEqual(
+            (2, 2, False),
+            ingest_compatible(self.db, {
+                "data": {
+                    "metrics": [{
+                        "name": "steps",
+                        "units": "count",
+                        "data": [
+                            {"id": f"stable-{index}", "date": date, "qty": 100}
+                            for index, date in enumerate(dates)
+                        ],
+                    }],
+                },
+            }),
+        )
+        self.assertEqual(
+            [
+                (f"apple.healthkit:steps:{date}", 1)
+                for date in dates
+            ],
+            self.db.execute(
+                """
+                SELECT canonical_id, tombstone FROM samples
+                WHERE canonical_id LIKE 'apple.healthkit:%'
+                ORDER BY canonical_id
+                """
+            ).fetchall(),
+        )
+
+    def test_compatible_offsets_enforce_rfc3339_ranges_atomically(self):
+        self.assertEqual(
+            "2025-12-31T00:01:00Z",
+            receiver.compatible_normalized_timestamp(
+                "2026-01-01T00:00:00+23:59"
+            ),
+        )
+        self.assertEqual(
+            "2026-01-01T23:59:00Z",
+            receiver.compatible_normalized_timestamp(
+                "2026-01-01T00:00:00-23:59"
+            ),
+        )
+
+        for index, invalid in enumerate(
+            (
+                "2026-01-01T00:00:00+00:60",
+                "2026-01-01T00:00:00-0060",
+                "2026-01-01T00:00:00+24:00",
+                "2026-01-01T00:00:00-2400",
+                "2026-01-01T24:00:00.1Z",
+                "2026-01-01T00:60:00Z",
+                "2026-01-01T00:00:60Z",
+            )
+        ):
+            with (
+                self.subTest(timestamp=invalid),
+                self.assertRaisesRegex(PartialBatch, "invalid timestamp"),
+            ):
+                ingest_compatible(
+                    self.db,
+                    {
+                        "data": {
+                            "metrics": [{
+                                "name": "steps",
+                                "units": "count",
+                                "data": [
+                                    {
+                                        "id": f"valid-before-{index}",
+                                        "date": "2026-01-01T00:00:00Z",
+                                        "qty": 1,
+                                    },
+                                    {
+                                        "id": f"invalid-{index}",
+                                        "date": invalid,
+                                        "qty": 2,
+                                    },
+                                ],
+                            }],
+                        },
+                    },
+                    batch_key=f"invalid-offset-{index}",
+                )
+
+        self.assertEqual(
+            (0, 0, 0),
+            (
+                self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+                self.db.execute("SELECT COUNT(*) FROM batches").fetchone()[0],
+                self.db.execute(
+                    "SELECT COUNT(*) FROM compatible_alias_retirement"
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_every_compatible_timestamp_field_rejects_and_can_retry(self):
+        valid = "2026-01-01T00:00:00Z"
+        invalid = "2026-01-01T00:00:00+00:60"
+        cases = [
+            (
+                "metric-start",
+                {
+                    "metrics": [{
+                        "name": "steps_0",
+                        "units": "count",
+                        "data": [{"id": "bad-0", "date": invalid, "qty": 1}],
+                    }],
+                },
+                {
+                    "metrics": [{
+                        "name": "steps_0",
+                        "units": "count",
+                        "data": [{"id": "bad-0", "date": valid, "qty": 1}],
+                    }],
+                },
+            ),
+            (
+                "metric-end",
+                {
+                    "metrics": [{
+                        "name": "steps_1",
+                        "units": "count",
+                        "data": [{
+                            "id": "bad-1",
+                            "date": valid,
+                            "endDate": invalid,
+                            "qty": 1,
+                        }],
+                    }],
+                },
+                {
+                    "metrics": [{
+                        "name": "steps_1",
+                        "units": "count",
+                        "data": [{
+                            "id": "bad-1",
+                            "date": valid,
+                            "endDate": valid,
+                            "qty": 1,
+                        }],
+                    }],
+                },
+            ),
+            (
+                "heart-end",
+                {
+                    "metrics": [{
+                        "name": "heart_rate",
+                        "units": "bpm",
+                        "data": [{
+                            "id": "bad-heart",
+                            "date": valid,
+                            "endDate": invalid,
+                            "Min": 60,
+                            "Avg": 60,
+                            "Max": 60,
+                        }],
+                    }],
+                },
+                {
+                    "metrics": [{
+                        "name": "heart_rate",
+                        "units": "bpm",
+                        "data": [{
+                            "id": "bad-heart",
+                            "date": valid,
+                            "endDate": valid,
+                            "Min": 60,
+                            "Avg": 60,
+                            "Max": 60,
+                        }],
+                    }],
+                },
+            ),
+            (
+                "sleep-start",
+                {
+                    "metrics": [{
+                        "name": "sleep_analysis",
+                        "units": "hr",
+                        "data": [{
+                            "id": "bad-sleep-start",
+                            "startDate": invalid,
+                            "endDate": valid,
+                            "qty": 1,
+                            "value": "Core",
+                        }],
+                    }],
+                },
+                {
+                    "metrics": [{
+                        "name": "sleep_analysis",
+                        "units": "hr",
+                        "data": [{
+                            "id": "bad-sleep-start",
+                            "startDate": valid,
+                            "endDate": valid,
+                            "qty": 1,
+                            "value": "Core",
+                        }],
+                    }],
+                },
+            ),
+            (
+                "sleep-end",
+                {
+                    "metrics": [{
+                        "name": "sleep_analysis",
+                        "units": "hr",
+                        "data": [{
+                            "id": "bad-sleep-end",
+                            "startDate": valid,
+                            "endDate": invalid,
+                            "qty": 1,
+                            "value": "Core",
+                        }],
+                    }],
+                },
+                {
+                    "metrics": [{
+                        "name": "sleep_analysis",
+                        "units": "hr",
+                        "data": [{
+                            "id": "bad-sleep-end",
+                            "startDate": valid,
+                            "endDate": valid,
+                            "qty": 1,
+                            "value": "Core",
+                        }],
+                    }],
+                },
+            ),
+            (
+                "workout-start",
+                {
+                    "workouts": [{
+                        "id": "bad-workout-start",
+                        "name": "Running",
+                        "start": invalid,
+                        "end": valid,
+                        "duration": 60,
+                    }],
+                },
+                {
+                    "workouts": [{
+                        "id": "bad-workout-start",
+                        "name": "Running",
+                        "start": valid,
+                        "end": valid,
+                        "duration": 60,
+                    }],
+                },
+            ),
+            (
+                "workout-end",
+                {
+                    "workouts": [{
+                        "id": "bad-workout-end",
+                        "name": "Running",
+                        "start": valid,
+                        "end": invalid,
+                        "duration": 60,
+                    }],
+                },
+                {
+                    "workouts": [{
+                        "id": "bad-workout-end",
+                        "name": "Running",
+                        "start": valid,
+                        "end": valid,
+                        "duration": 60,
+                    }],
+                },
+            ),
+            (
+                "deletion-date",
+                {
+                    "deletions": [{
+                        "id": "bad-deletion",
+                        "name": "steps_7",
+                        "type": "steps_7",
+                        "date": invalid,
+                    }],
+                },
+                {
+                    "deletions": [{
+                        "id": "bad-deletion",
+                        "name": "steps_7",
+                        "type": "steps_7",
+                        "date": valid,
+                    }],
+                },
+            ),
+        ]
+
+        for index, (name, bad_data, corrected_data) in enumerate(cases):
+            batch_key = f"timestamp-field-{index}"
+            marker_id = f"timestamp-marker-{index}"
+            marker = {
+                "name": f"marker_{index}",
+                "units": "count",
+                "data": [{"id": marker_id, "date": valid, "qty": 1}],
+            }
+            bad_data = {
+                **bad_data,
+                "metrics": [marker, *bad_data.get("metrics", [])],
+            }
+            corrected_data = {
+                **corrected_data,
+                "metrics": [marker, *corrected_data.get("metrics", [])],
+            }
+            with (
+                self.subTest(field=name),
+                self.assertRaisesRegex(PartialBatch, "invalid timestamp"),
+            ):
+                ingest_compatible(
+                    self.db,
+                    {"data": bad_data},
+                    batch_key=batch_key,
+                )
+            self.assertIsNone(
+                self.db.execute(
+                    "SELECT 1 FROM batches WHERE key = ?",
+                    (batch_key,),
+                ).fetchone()
+            )
+            self.assertIsNone(
+                self.db.execute(
+                    "SELECT 1 FROM samples WHERE canonical_id = ?",
+                    (f"healthAutoExport:{marker_id}",),
+                ).fetchone()
+            )
+            ingest_compatible(
+                self.db,
+                {"data": corrected_data},
+                batch_key=batch_key,
+            )
+            self.assertIsNotNone(
+                self.db.execute(
+                    "SELECT 1 FROM batches WHERE key = ?",
+                    (batch_key,),
+                ).fetchone()
+            )
+
+    def test_late_known_null_heart_rate_uses_deleted_stable_evidence(self):
+        date = "2026-01-01T12:00:00Z"
+        point = {
+            "id": "stable-heart",
+            "date": date,
+            "Min": 62,
+            "Avg": 62,
+            "Max": 62,
+            "source": "Watch",
+        }
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "heart_rate",
+                    "units": "bpm",
+                    "data": [point],
+                }],
+            },
+        })
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [{
+                    "id": "stable-heart",
+                    "name": "heart_rate",
+                    "type": "heart_rate",
+                    "date": "",
+                }],
+            },
+        })
+        legacy_id = f"heart_rate:{date}"
+        legacy = json.dumps({
+            "id": legacy_id,
+            "type": "heart_rate",
+            "kind": "quantity",
+            "startDate": date,
+            "endDate": date,
+            "quantity": {"value": None, "unit": "bpm"},
+            "source": {"name": "Watch"},
+        })
+
+        self.assertEqual(
+            (0, 0, False),
+            ingest_lines(self.db, [legacy], batch_key="late-null-heart"),
+        )
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            [(
+                "healthAutoExport:stable-heart",
+                f"apple.healthkit:{legacy_id}",
+            )],
+            self.db.execute(
+                """
+                SELECT stable_id, legacy_id FROM compatible_alias_identity
+                """
+            ).fetchall(),
+        )
+
+    def test_unprovable_late_known_null_heart_rate_rejects_atomically(self):
+        date = "2026-01-01T13:00:00Z"
+        legacy_id = f"heart_rate:{date}"
+        legacy = json.dumps({
+            "id": legacy_id,
+            "type": "heart_rate",
+            "kind": "quantity",
+            "startDate": date,
+            "endDate": date,
+            "quantity": {"value": None, "unit": "bpm"},
+            "source": {"name": "Watch"},
+        })
+
+        with self.assertRaises(PartialBatch):
+            ingest_lines(self.db, [legacy], batch_key="unproved-null-heart")
+
+        self.assertEqual(
+            (0, 0),
+            (
+                self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+                self.db.execute("SELECT COUNT(*) FROM batches").fetchone()[0],
+            ),
+        )
+
+    def test_ambiguous_late_known_null_heart_rate_rejects_atomically(self):
+        date = "2026-01-01T14:00:00Z"
+        points = [
+            {
+                "id": identity,
+                "date": date,
+                "Min": 62,
+                "Avg": 62,
+                "Max": 62,
+                "source": "Watch",
+            }
+            for identity in ("stable-heart-a", "stable-heart-b")
+        ]
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "heart_rate",
+                    "units": "bpm",
+                    "data": points,
+                }],
+            },
+        })
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [
+                    {
+                        "id": point["id"],
+                        "name": "heart_rate",
+                        "type": "heart_rate",
+                        "date": "",
+                    }
+                    for point in points
+                ],
+            },
+        })
+        legacy = json.dumps({
+            "id": f"heart_rate:{date}",
+            "type": "heart_rate",
+            "kind": "quantity",
+            "startDate": date,
+            "endDate": date,
+            "quantity": {"value": None, "unit": "bpm"},
+            "source": {"name": "Watch"},
+        })
+
+        with self.assertRaisesRegex(PartialBatch, "not unambiguous"):
+            ingest_lines(self.db, [legacy], batch_key="ambiguous-null-heart")
+
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+            ).fetchone()[0],
+        )
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT 1 FROM batches WHERE key = 'ambiguous-null-heart'"
+            ).fetchone()
+        )
+
+    def test_late_null_heart_rate_rejects_competing_live_stable(self):
+        date = "2026-01-01T15:00:00Z"
+        points = [
+            {
+                "id": "deleted-62",
+                "date": date,
+                "Min": 62,
+                "Avg": 62,
+                "Max": 62,
+                "source": "Watch",
+            },
+            {
+                "id": "live-63",
+                "date": date,
+                "Min": 63,
+                "Avg": 63,
+                "Max": 63,
+                "source": "Watch",
+            },
+        ]
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "heart_rate",
+                    "units": "bpm",
+                    "data": points,
+                }],
+            },
+        })
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [{
+                    "id": "deleted-62",
+                    "name": "heart_rate",
+                    "type": "heart_rate",
+                    "date": "",
+                }],
+            },
+        })
+        legacy_id = f"heart_rate:{date}"
+        legacy = json.dumps({
+            "id": legacy_id,
+            "type": "heart_rate",
+            "kind": "quantity",
+            "startDate": date,
+            "endDate": date,
+            "quantity": {"value": None, "unit": "bpm"},
+            "source": {"name": "Watch"},
+        })
+
+        with self.assertRaisesRegex(PartialBatch, "not unambiguous"):
+            ingest_lines(self.db, [legacy], batch_key="live-stable-competitor")
+
+        self.assertEqual(
+            [("healthAutoExport:live-63", 63)],
+            self.db.execute(
+                """
+                SELECT canonical_id, value FROM samples
+                WHERE tombstone = 0
+                """
+            ).fetchall(),
+        )
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT 1 FROM batches WHERE key = 'live-stable-competitor'"
+            ).fetchone()
+        )
+
+    def test_late_null_heart_rate_sees_direct_live_stable_since_startup(self):
+        date = "2026-01-01T15:30:00Z"
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "heart_rate",
+                    "units": "bpm",
+                    "data": [{
+                        "id": "deleted-62",
+                        "date": date,
+                        "Min": 62,
+                        "Avg": 62,
+                        "Max": 62,
+                        "source": "Watch",
+                    }],
+                }],
+            },
+        })
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [{
+                    "id": "deleted-62",
+                    "name": "heart_rate",
+                    "type": "heart_rate",
+                    "date": "",
+                }],
+            },
+        })
+        ingest_lines(self.db, [json.dumps({
+            "canonicalId": "healthAutoExport:direct-63",
+            "id": "direct-63",
+            "kind": "quantity",
+            "recordVersion": 1,
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": "direct-63",
+                "store": "healthAutoExport",
+                "type": "heart_rate",
+            },
+            "startDate": date,
+            "endDate": date,
+            "quantity": {"value": 63, "unit": "bpm"},
+            "source": {"name": "Watch"},
+            "type": "heart_rate",
+        })])
+        legacy = json.dumps({
+            "id": f"heart_rate:{date}",
+            "type": "heart_rate",
+            "kind": "quantity",
+            "startDate": date,
+            "endDate": date,
+            "quantity": {"value": None, "unit": "bpm"},
+            "source": {"name": "Watch"},
+        })
+
+        with self.assertRaisesRegex(PartialBatch, "not unambiguous"):
+            ingest_lines(self.db, [legacy], batch_key="direct-live-stable")
+
+        self.assertEqual(
+            [("healthAutoExport:direct-63", 63)],
+            self.db.execute(
+                """
+                SELECT canonical_id, value FROM samples
+                WHERE tombstone = 0
+                """
+            ).fetchall(),
+        )
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT 1 FROM batches WHERE key = 'direct-live-stable'"
+            ).fetchone()
+        )
+
+    def test_late_null_heart_rate_rejects_live_finite_legacy_competitor(self):
+        date = "2026-01-01T16:00:00Z"
+        finite_date = "2026-01-01T11:00:00-05:00"
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "heart_rate",
+                    "units": "bpm",
+                    "data": [{
+                        "id": "deleted-62",
+                        "date": date,
+                        "Min": 62,
+                        "Avg": 62,
+                        "Max": 62,
+                        "source": "Watch",
+                    }],
+                }],
+            },
+        })
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [{
+                    "id": "deleted-62",
+                    "name": "heart_rate",
+                    "type": "heart_rate",
+                    "date": "",
+                }],
+            },
+        })
+        finite_id = f"heart_rate:{finite_date}"
+        ingest_lines(self.db, [json.dumps({
+            "id": finite_id,
+            "type": "heart_rate",
+            "kind": "quantity",
+            "startDate": finite_date,
+            "endDate": finite_date,
+            "quantity": {"value": 63, "unit": "bpm"},
+            "source": {"name": "Watch"},
+        })])
+        null_id = f"heart_rate:{date}"
+        legacy = json.dumps({
+            "id": null_id,
+            "type": "heart_rate",
+            "kind": "quantity",
+            "startDate": date,
+            "endDate": date,
+            "quantity": {"value": None, "unit": "bpm"},
+            "source": {"name": "Watch"},
+        })
+
+        with self.assertRaisesRegex(PartialBatch, "not unambiguous"):
+            ingest_lines(self.db, [legacy], batch_key="finite-legacy-competitor")
+
+        self.assertEqual(
+            [(f"apple.healthkit:{finite_id}", 63)],
+            self.db.execute(
+                """
+                SELECT canonical_id, value FROM samples
+                WHERE tombstone = 0
+                """
+            ).fetchall(),
+        )
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT 1 FROM batches WHERE key = 'finite-legacy-competitor'"
+            ).fetchone()
+        )
+
+    def test_bulk_late_null_heart_rate_resolution_scans_candidates_once(self):
+        count = 600
+
+        def timestamp(index):
+            minute, second = divmod(index, 60)
+            return f"2026-01-02T00:{minute:02d}:{second:02d}.123456Z"
+
+        points = [
+            {
+                "id": f"stable-{index}",
+                "date": timestamp(index),
+                "Min": 60 + index,
+                "Avg": 60 + index,
+                "Max": 60 + index,
+                "source": "Watch",
+            }
+            for index in range(count)
+        ]
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "heart_rate",
+                    "units": "bpm",
+                    "data": points,
+                }],
+            },
+        })
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [
+                    {
+                        "id": point["id"],
+                        "name": "heart_rate",
+                        "type": "heart_rate",
+                        "date": "",
+                    }
+                    for point in points
+                ],
+            },
+        })
+        legacy = [
+            json.dumps({
+                "id": f"heart_rate:{point['date']}",
+                "type": "heart_rate",
+                "kind": "quantity",
+                "startDate": point["date"],
+                "endDate": point["date"],
+                "quantity": {"value": None, "unit": "bpm"},
+                "source": {"name": "Watch"},
+            })
+            for point in points
+        ]
+        retirement_queries = []
+        candidate_queries = []
+
+        def trace(statement):
+            normalized = " ".join(statement.split())
+            if "FROM compatible_alias_retirement" in normalized:
+                retirement_queries.append(normalized)
+            if (
+                "SELECT canonical_id, source_id, type, start_date" in normalized
+                and "FROM samples" in normalized
+            ):
+                candidate_queries.append(normalized)
+
+        self.db.set_trace_callback(trace)
+        try:
+            result = ingest_lines(
+                self.db,
+                legacy,
+                batch_key="bulk-null-heart",
+            )
+        finally:
+            self.db.set_trace_callback(None)
+
+        self.assertEqual((0, 0, False), result)
+        self.assertEqual(count, self.db.execute(
+            "SELECT COUNT(*) FROM compatible_alias_identity"
+        ).fetchone()[0])
+        self.assertEqual(1, len(retirement_queries))
+        self.assertEqual(1, len(candidate_queries))
+
+    def test_bulk_alias_reconciliation_uses_bounded_signature_queries(self):
+        count = 256
+        prior_date = "2025-12-31T23:59:59.123456Z"
+
+        def timestamp(index):
+            hour, remainder = divmod(index, 3_600)
+            minute, second = divmod(remainder, 60)
+            return (
+                f"2026-01-01T{hour:02d}:{minute:02d}:{second:02d}.123456Z"
+            )
+
+        ingest_lines(
+            self.db,
+            [
+                json.dumps({
+                    "id": f"steps:{prior_date}",
+                    "type": "steps",
+                    "kind": "quantity",
+                    "startDate": prior_date,
+                    "endDate": prior_date,
+                    "quantity": {"value": 9_999, "unit": "count"},
+                }),
+                *[
+                    json.dumps({
+                        "id": f"steps:{timestamp(index)}",
+                        "type": "steps",
+                        "kind": "quantity",
+                        "startDate": timestamp(index),
+                        "endDate": timestamp(index),
+                        "quantity": {"value": index, "unit": "count"},
+                    })
+                    for index in range(count)
+                ],
+            ],
+        )
+        prior_signature = receiver.compatibility_stored_signature(
+            (
+                "steps",
+                prior_date,
+                prior_date,
+                9_999,
+                "count",
+                None,
+                "quantity",
+            )
+        )
+        self.db.execute(
+            """
+            INSERT INTO compatible_alias_retirement
+                (type, start_instant, end_instant, value, unit,
+                 source, kind, stable_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'healthAutoExport:prior-stable')
+            """,
+            prior_signature,
+        )
+        self.db.commit()
+        signature_queries = []
+
+        def trace(statement):
+            normalized = " ".join(statement.split())
+            if (
+                "FROM compatible_alias_retirement" in normalized
+                and (
+                    (
+                        "SELECT stable_id" in normalized
+                        and (
+                            "start_epoch =" in normalized
+                            or "start_instant =" in normalized
+                        )
+                    )
+                    or (
+                        "SELECT start_instant, end_instant" in normalized
+                        and "start_instant IN" in normalized
+                    )
+                )
+            ):
+                signature_queries.append(normalized)
+
+        self.db.set_trace_callback(trace)
+        try:
+            result = ingest_compatible(self.db, {
+                "data": {
+                    "metrics": [{
+                        "name": "steps",
+                        "units": "count",
+                        "data": [
+                            {
+                                "id": f"stable-{index}",
+                                "date": timestamp(index),
+                                "qty": index,
+                            }
+                            for index in range(count)
+                        ],
+                    }],
+                },
+            })
+        finally:
+            self.db.set_trace_callback(None)
+
+        self.assertEqual((count, count + 1, False), result)
+        self.assertEqual(1, len(signature_queries))
 
     def test_mapped_legacy_replay_cannot_change_fields_and_resurrect(self):
         date = "2026-01-01T00:00:00Z"
@@ -3382,9 +4735,11 @@ class TransactionAndArchiveTests(unittest.TestCase):
         second = json.dumps(self.strict_record("second"))
         path.write_text(first + "\n")
         original = receiver.iter_ndjson_lines
+        observed = []
 
         def append_after_first(stream):
             for index, line in enumerate(original(stream)):
+                observed.append(line)
                 yield line
                 if index == 0:
                     with path.open("a") as output:
@@ -3396,6 +4751,7 @@ class TransactionAndArchiveTests(unittest.TestCase):
         ):
             ingest_file(self.db, path, watch_receipt_name=path.name)
 
+        self.assertEqual(1, len(observed))
         self.assertEqual(0, self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0])
         self.assertEqual(0, self.db.execute("SELECT COUNT(*) FROM batches").fetchone()[0])
         self.assertEqual(
@@ -3411,6 +4767,465 @@ class TransactionAndArchiveTests(unittest.TestCase):
             1,
             self.db.execute("SELECT COUNT(*) FROM ingested_files").fetchone()[0],
         )
+
+    def test_same_size_rewrite_after_hash_rolls_back_digest_and_records(self):
+        path = Path(self.directory.name) / "hozz-rewritten.ndjson"
+        first = json.dumps(self.strict_record("alpha")) + "\n"
+        replacement = json.dumps(self.strict_record("bravo")) + "\n"
+        self.assertEqual(len(first.encode()), len(replacement.encode()))
+        path.write_text(first)
+        metadata = path.stat()
+        original_ingest = receiver.ingest_hashed_file
+
+        def rewrite_before_ingest(
+            db,
+            candidate,
+            captured,
+            source,
+            initial,
+            file_batch_key,
+            digest,
+            receipt_name,
+        ):
+            with candidate.open("r+b") as output:
+                output.write(replacement.encode())
+                output.truncate()
+            os.utime(
+                candidate,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+            )
+            current = receiver.file_snapshot(os.fstat(source.fileno()))
+            self.assertEqual(initial[:4], current[:4])
+            source.seek(0)
+            return original_ingest(
+                db,
+                candidate,
+                captured,
+                source,
+                current,
+                file_batch_key,
+                digest,
+                receipt_name,
+            )
+
+        with (
+            mock.patch.object(
+                receiver,
+                "verify_file_snapshot",
+                return_value=None,
+            ),
+            mock.patch.object(
+                receiver,
+                "ingest_hashed_file",
+                side_effect=rewrite_before_ingest,
+            ),
+            self.assertRaisesRegex(PartialBatch, "content changed"),
+        ):
+            ingest_file(self.db, path, watch_receipt_name=path.name)
+
+        self.assertEqual(
+            (0, 0, 0),
+            (
+                self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+                self.db.execute("SELECT COUNT(*) FROM batches").fetchone()[0],
+                self.db.execute(
+                    "SELECT COUNT(*) FROM ingested_files"
+                ).fetchone()[0],
+            ),
+        )
+
+    def test_aba_rewrite_imports_the_immutable_hashed_snapshot(self):
+        path = Path(self.directory.name) / "hozz-aba.ndjson"
+        first = json.dumps(self.strict_record("alpha")) + "\n"
+        replacement = json.dumps(self.strict_record("bravo")) + "\n"
+        self.assertEqual(len(first.encode()), len(replacement.encode()))
+        path.write_text(first)
+        metadata = path.stat()
+        creation_time = metadata.st_ctime_ns
+        actual_snapshot = receiver.file_snapshot
+        original_ingest = receiver.ingest_hashed_file
+        original_lines = receiver.iter_ndjson_lines
+
+        def colliding_snapshot(stat_result):
+            snapshot = actual_snapshot(stat_result)
+            return (*snapshot[:4], creation_time)
+
+        def rewrite_before_ingest(
+            db,
+            candidate,
+            captured,
+            source,
+            initial,
+            file_batch_key,
+            digest,
+            receipt_name,
+        ):
+            with candidate.open("r+b") as output:
+                output.write(replacement.encode())
+                output.truncate()
+            os.utime(
+                candidate,
+                ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+            )
+            source.seek(0)
+
+            def restore_after_import(stream):
+                for line in original_lines(stream):
+                    yield line
+                    with candidate.open("r+b") as output:
+                        output.write(first.encode())
+                        output.truncate()
+                    os.utime(
+                        candidate,
+                        ns=(metadata.st_atime_ns, metadata.st_mtime_ns),
+                    )
+
+            with mock.patch.object(
+                receiver,
+                "iter_ndjson_lines",
+                restore_after_import,
+            ):
+                return original_ingest(
+                    db,
+                    candidate,
+                    captured,
+                    source,
+                    initial,
+                    file_batch_key,
+                    digest,
+                    receipt_name,
+                )
+
+        with (
+            mock.patch.object(receiver, "file_snapshot", colliding_snapshot),
+            mock.patch.object(
+                receiver,
+                "ingest_hashed_file",
+                side_effect=rewrite_before_ingest,
+            ),
+        ):
+            self.assertEqual(
+                (1, 0),
+                ingest_file(self.db, path, watch_receipt_name=path.name),
+            )
+
+        self.assertEqual(
+            [("apple.healthkit:alpha", first.strip())],
+            self.db.execute(
+                "SELECT canonical_id, raw FROM samples"
+            ).fetchall(),
+        )
+        self.assertEqual(
+            hashlib.sha256(first.encode()).hexdigest(),
+            self.db.execute(
+                "SELECT digest FROM ingested_files WHERE name = ?",
+                (path.name,),
+            ).fetchone()[0],
+        )
+
+    def test_watch_generation_detects_same_size_mtime_replacement(self):
+        path = Path(self.directory.name) / "hozz-replaced.ndjson"
+        first = json.dumps(self.strict_record("first")) + "\n"
+        replacement = json.dumps(self.strict_record("other")) + "\n"
+        self.assertEqual(len(first.encode()), len(replacement.encode()))
+        path.write_text(first)
+        args = SimpleNamespace(
+            database=str(self.database),
+            folder=self.directory.name,
+            interval=0,
+            once=True,
+        )
+
+        receiver.watch(args)
+        original = path.stat()
+        original_digest = self.db.execute(
+            "SELECT digest FROM ingested_files WHERE name = ?",
+            (path.name,),
+        ).fetchone()[0]
+
+        hasher = mock.Mock(wraps=receiver.file_content_key)
+        with (
+            mock.patch.object(
+                receiver,
+                "filesystem_type",
+                return_value="apfs",
+            ),
+            mock.patch.object(receiver, "file_content_key", hasher),
+        ):
+            receiver.watch(args)
+        hasher.assert_not_called()
+
+        time.sleep(0.002)
+        with path.open("r+b") as output:
+            output.write(replacement.encode())
+            output.truncate()
+        os.utime(
+            path,
+            ns=(original.st_atime_ns, original.st_mtime_ns),
+        )
+        current = path.stat()
+        self.assertEqual(original.st_ino, current.st_ino)
+        self.assertEqual(original.st_size, current.st_size)
+        self.assertEqual(original.st_mtime_ns, current.st_mtime_ns)
+        self.assertNotEqual(original.st_ctime_ns, current.st_ctime_ns)
+
+        receiver.watch(args)
+
+        self.assertEqual(
+            2,
+            self.db.execute(
+                "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+            ).fetchone()[0],
+        )
+        current_digest = self.db.execute(
+            "SELECT digest FROM ingested_files WHERE name = ?",
+            (path.name,),
+        ).fetchone()[0]
+        self.assertNotEqual(original_digest, current_digest)
+        self.assertEqual(
+            hashlib.sha256(replacement.encode()).hexdigest(),
+            current_digest,
+        )
+
+    def test_unreliable_change_time_rehashes_same_generation_rewrite(self):
+        path = Path(self.directory.name) / "hozz-windows-rewrite.ndjson"
+        first = json.dumps(self.strict_record("first")) + "\n"
+        replacement = json.dumps(self.strict_record("other")) + "\n"
+        self.assertEqual(len(first.encode()), len(replacement.encode()))
+        path.write_text(first)
+        creation_time = path.stat().st_ctime_ns
+        actual_snapshot = receiver.file_snapshot
+
+        def windows_snapshot(metadata):
+            snapshot = actual_snapshot(metadata)
+            return (*snapshot[:4], creation_time)
+
+        args = SimpleNamespace(
+            database=str(self.database),
+            folder=self.directory.name,
+            interval=0,
+            once=True,
+        )
+        hasher = mock.Mock(wraps=receiver.file_content_key)
+        with (
+            mock.patch.object(
+                receiver,
+                "filesystem_type",
+                return_value="ntfs",
+            ),
+            mock.patch.object(receiver, "file_snapshot", windows_snapshot),
+            mock.patch.object(receiver, "file_content_key", hasher),
+        ):
+            receiver.watch(args)
+            original = path.stat()
+            with path.open("r+b") as output:
+                output.write(replacement.encode())
+                output.truncate()
+            os.utime(
+                path,
+                ns=(original.st_atime_ns, original.st_mtime_ns),
+            )
+            receiver.watch(args)
+
+        self.assertGreaterEqual(hasher.call_count, 4)
+        self.assertEqual(
+            {
+                "apple.healthkit:first",
+                "apple.healthkit:other",
+            },
+            {
+                row[0]
+                for row in self.db.execute(
+                    "SELECT canonical_id FROM samples WHERE tombstone = 0"
+                )
+            },
+        )
+        self.assertEqual(
+            hashlib.sha256(replacement.encode()).hexdigest(),
+            self.db.execute(
+                "SELECT digest FROM ingested_files WHERE name = ?",
+                (path.name,),
+            ).fetchone()[0],
+        )
+
+    def test_change_time_fast_path_requires_whitelisted_filesystem(self):
+        for filesystem, expected in (
+            ("apfs", True),
+            ("hfs", False),
+            ("ntfs", False),
+            (None, False),
+        ):
+            with (
+                self.subTest(filesystem=filesystem),
+                mock.patch.object(
+                    receiver,
+                    "filesystem_type",
+                    return_value=filesystem,
+                ),
+            ):
+                self.assertEqual(
+                    expected,
+                    receiver.file_change_time_is_reliable(
+                        Path(self.directory.name)
+                    ),
+                )
+
+    def test_darwin_mount_detection_distinguishes_apfs_hfs_and_unknown(self):
+        mounts = (
+            (Path("/"), "apfs"),
+            (Path("/Volumes/Legacy"), "hfs"),
+        )
+
+        def fake_stat(path):
+            normalized = str(path).lower()
+            if normalized.startswith("/volumes/legacy"):
+                return SimpleNamespace(st_dev=2)
+            if normalized.startswith("/users"):
+                return SimpleNamespace(st_dev=1)
+            if normalized == "/":
+                return SimpleNamespace(st_dev=1)
+            return SimpleNamespace(st_dev=3)
+
+        self.assertEqual(
+            "apfs",
+            receiver.filesystem_type_from_mounts(
+                Path("/Users/example/Health"),
+                mounts,
+                stat_function=fake_stat,
+            ),
+        )
+        self.assertEqual(
+            "hfs",
+            receiver.filesystem_type_from_mounts(
+                Path("/volumes/legacy/Health"),
+                mounts,
+                stat_function=fake_stat,
+            ),
+        )
+        self.assertIsNone(
+            receiver.filesystem_type_from_mounts(
+                Path("/Volumes/Unknown/Health"),
+                (),
+                stat_function=fake_stat,
+            )
+        )
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin-specific detection")
+    def test_actual_darwin_filesystem_detection_enables_apfs(self):
+        self.assertEqual(
+            "apfs",
+            receiver.filesystem_type(Path(self.directory.name)),
+        )
+        self.assertTrue(
+            receiver.file_change_time_is_reliable(
+                Path(self.directory.name)
+            )
+        )
+
+    def test_unchanged_deterministic_failure_is_not_rehashed_each_poll(self):
+        path = Path(self.directory.name) / "hozz-invalid.ndjson"
+        path.write_text("not-json\n")
+        args = SimpleNamespace(
+            database=str(self.database),
+            folder=self.directory.name,
+            interval=0,
+            once=False,
+        )
+
+        def finish_after_first_poll(_interval):
+            args.once = True
+
+        hasher = mock.Mock(wraps=receiver.file_content_key)
+        with (
+            mock.patch.object(
+                receiver,
+                "filesystem_type",
+                return_value="apfs",
+            ),
+            mock.patch.object(receiver, "file_content_key", hasher),
+            mock.patch.object(
+                receiver.time,
+                "sleep",
+                side_effect=finish_after_first_poll,
+            ),
+        ):
+            receiver.watch(args)
+
+        self.assertEqual(1, hasher.call_count)
+
+    def test_oversized_plain_and_zip_files_reject_before_hashing(self):
+        plain = Path(self.directory.name) / "hozz-too-large.ndjson"
+        plain.write_text(json.dumps(self.strict_record("large")) + "\n")
+        archive = Path(self.directory.name) / "hozz-too-large.zip"
+        self.write_zip(
+            archive,
+            {"records.ndjson": json.dumps(self.strict_record("zip-large")) + "\n"},
+        )
+
+        for path in (plain, archive):
+            with (
+                self.subTest(path=path.name),
+                mock.patch.object(
+                    receiver,
+                    "MAX_INFLATED_BYTES",
+                    path.stat().st_size - 1,
+                ),
+                mock.patch.object(
+                    receiver,
+                    "file_content_key",
+                    side_effect=AssertionError("hashed oversized file"),
+                ),
+                self.assertRaisesRegex(PartialBatch, "byte limit"),
+            ):
+                ingest_file(self.db, path, watch_receipt_name=path.name)
+
+    def test_nonregular_folder_candidate_rejects_before_hashing(self):
+        path = Path(self.directory.name) / "hozz-directory"
+        path.mkdir()
+
+        with (
+            mock.patch.object(
+                receiver,
+                "file_content_key",
+                side_effect=AssertionError("hashed nonregular file"),
+            ),
+            self.assertRaisesRegex(PartialBatch, "regular file"),
+        ):
+            ingest_file(self.db, path, watch_receipt_name=path.name)
+
+    def test_growing_file_hash_is_bounded_to_initial_snapshot(self):
+        path = Path(self.directory.name) / "hozz-growing-hash.ndjson"
+        path.write_bytes(b"a" * (128 * 1_024))
+
+        with path.open("rb") as source:
+            initial = receiver.file_snapshot(os.fstat(source.fileno()))
+
+            class GrowingStream:
+                def __init__(self, wrapped):
+                    self.wrapped = wrapped
+                    self.bytes_returned = 0
+                    self.grew = False
+
+                def fileno(self):
+                    return self.wrapped.fileno()
+
+                def read(self, amount):
+                    value = self.wrapped.read(amount)
+                    self.bytes_returned += len(value)
+                    if value and not self.grew:
+                        self.grew = True
+                        with path.open("ab") as output:
+                            output.write(b"b" * (128 * 1_024))
+                    return value
+
+                def seek(self, *args):
+                    return self.wrapped.seek(*args)
+
+            growing = GrowingStream(source)
+            with self.assertRaisesRegex(PartialBatch, "changed during hashing"):
+                receiver.file_content_key(growing, initial)
+
+        self.assertLessEqual(growing.bytes_returned, initial[2] + 1)
 
     def test_json_array_file_keeps_descriptor_open_for_snapshot_verification(self):
         path = Path(self.directory.name) / "hozz-array.json"

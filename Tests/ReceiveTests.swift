@@ -62,6 +62,32 @@ final class ReceiveTests: XCTestCase {
         XCTAssertEqual(batch.records.first?.value, 62)
     }
 
+    func testAnInvalidTopLevelJSONArrayIsRejected() {
+        for payload in [
+            #"[{"id":"truncated"}"#,
+            #"[1]"#
+        ] {
+            XCTAssertThrowsError(try BatchParser.parse(Data(payload.utf8))) { error in
+                guard case BatchParseError.invalidTopLevelJSONArray = error else {
+                    return XCTFail("Unexpected error: \(error)")
+                }
+            }
+        }
+    }
+
+    func testLeadingBOMIsRemovedBeforeJSONArrayClassification() throws {
+        let batch = try BatchParser.parse(
+            Data(
+                (
+                    "\u{FEFF}[{\"id\":\"a\",\"type\":\"steps\","
+                        + "\"startDate\":\"2026-01-01T10:00:00.000Z\"}]"
+                ).utf8
+            )
+        )
+
+        XCTAssertEqual(batch.records.map(\.id), ["a"])
+    }
+
     func testCSVIsParsed() throws {
         let payload = Data(
             """
@@ -149,7 +175,7 @@ final class ReceiveTests: XCTestCase {
         XCTAssertEqual(sleep.endDate.timeIntervalSince(sleep.startDate), 3_600)
     }
 
-    func testDefaultHozzMetricsKeepHeartSleepAndWorkoutMeaning() throws {
+    func testCompatibilityWorkoutWithoutDurationDoesNotInventOne() throws {
         let payload = Data(
             """
             {"data":{
@@ -168,9 +194,10 @@ final class ReceiveTests: XCTestCase {
 
         let batch = try BatchParser.parse(payload)
 
-        XCTAssertEqual(batch.records.map(\.value), [62, 3, 1_800])
+        XCTAssertEqual(batch.records.map(\.value), [62, 3, nil])
         XCTAssertEqual(batch.records.map(\.kind), ["quantity", "category", "workout"])
-        XCTAssertEqual(batch.workoutDetails.first?.duration, 1_800)
+        XCTAssertNil(batch.workoutDetails.first?.duration)
+        XCTAssertEqual(batch.workoutDetails.first?.provenance, .compatibility)
     }
 
     func testMalformedStableIdentifierRejectsCompatibilityEnvelope() {
@@ -1074,8 +1101,21 @@ final class ReceiveTests: XCTestCase {
         let payload = Data(#"{"kind":"hozzConnectionTest","schemaVersion":1}"#.utf8)
 
         XCTAssertThrowsError(try BatchParser.parse(payload)) { error in
-            XCTAssertTrue(error is BatchParseError)
+            guard case BatchParseError.connectionTest = error else {
+                return XCTFail("Unexpected error: \(error)")
+            }
         }
+    }
+
+    func testConnectionTestRequiresTheExactParsedObject() throws {
+        let batch = try BatchParser.parse(
+            Data(
+                #"{"kind":"hozzConnectionTest","schemaVersion":1,"record":"not a probe"}"#
+                    .utf8
+            )
+        )
+
+        XCTAssertEqual(batch.unhandled.count, 1)
     }
 
     func testUnreadableLinesAreCountedNotDiscardedSilently() throws {
@@ -1168,7 +1208,7 @@ final class ReceiveTests: XCTestCase {
                 records: [
                     HealthRecord(
                         id: "w1",
-                        type: "Workout",
+                        type: "Running",
                         kind: "workout",
                         startDate: start,
                         endDate: end,
@@ -1194,11 +1234,171 @@ final class ReceiveTests: XCTestCase {
 
         _ = try await store.ingest(upgraded, idempotencyKey: "stable-workout")
 
-        let legacy = try await store.samples(type: "Workout")
+        let legacy = try await store.samples(type: "Running")
         let current = try await store.samples(type: "workout")
         let total = try await store.totalRecordCount()
         XCTAssertTrue(legacy.isEmpty)
         XCTAssertEqual(current.count, 1)
+        XCTAssertEqual(total, 1)
+    }
+
+    func testCompatibilityWorkoutPreservesCanonicalSampleAndRicherDetail() async throws {
+        let store = try makeStore()
+        let canonical = Data(
+            #"{"kind":"workout","id":"shared-workout","type":"HKWorkoutTypeIdentifier","startDate":"2026-01-01T10:00:00.123Z","endDate":"2026-01-01T11:00:00.987Z","activityType":37,"duration":3599.75,"statistics":[{"type":"HKQuantityTypeIdentifierHeartRate","unit":"count/min","average":152,"minimum":98,"maximum":178}],"source":{"name":"Apple Watch"}}"#.utf8
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(canonical),
+            idempotencyKey: "canonical-workout"
+        )
+
+        let compatibility = Data(
+            """
+            {"data":{"metrics":[],"workouts":[
+              {"id":"shared-workout","name":"Running",
+               "start":"2026-01-01T10:00:00.000Z",
+               "end":"2026-01-01T11:01:00.000Z","source":"Legacy Exporter"}
+            ]}}
+            """.utf8
+        )
+        let compatibilityBatch = try BatchParser.parse(compatibility)
+        XCTAssertNil(compatibilityBatch.workoutDetails.first?.duration)
+        _ = try await store.ingest(
+            compatibilityBatch,
+            idempotencyKey: "compatibility-workout"
+        )
+
+        let canonicalSamples = try await store.samples(
+            type: "HKWorkoutTypeIdentifier"
+        )
+        XCTAssertEqual(canonicalSamples.map(\.id), ["shared-workout"])
+        XCTAssertEqual(canonicalSamples.first?.value, 3_599.75)
+        XCTAssertEqual(canonicalSamples.first?.sourceName, "Apple Watch")
+        let compatibilitySamples = try await store.samples(type: "workout")
+        XCTAssertTrue(compatibilitySamples.isEmpty)
+        let total = try await store.totalRecordCount()
+        XCTAssertEqual(total, 1)
+
+        let workouts = try await store.workouts()
+        let workout = try XCTUnwrap(workouts.first)
+        XCTAssertEqual(
+            workout.startDate.timeIntervalSince1970,
+            try date("2026-01-01T10:00:00.123Z").timeIntervalSince1970,
+            accuracy: 0.002
+        )
+        let workoutEnd = try XCTUnwrap(workout.endDate)
+        XCTAssertEqual(
+            workoutEnd.timeIntervalSince1970,
+            try date("2026-01-01T11:00:00.987Z").timeIntervalSince1970,
+            accuracy: 0.002
+        )
+        XCTAssertEqual(workout.activityType, 37)
+        XCTAssertEqual(workout.duration, 3_599.75)
+        XCTAssertEqual(workout.sourceName, "Apple Watch")
+        XCTAssertEqual(workout.statistics.count, 1)
+        XCTAssertEqual(workout.statistics.first?.average, 152)
+    }
+
+    func testHistoricalWorkoutAliasRetiresWhenSameIDRunningArrives() async throws {
+        let store = try makeStore()
+        let start = try date("2026-01-01T10:00:00.000Z")
+        let end = try date("2026-01-01T11:00:00.000Z")
+        _ = try await store.ingest(
+            ParsedBatch(
+                records: [
+                    HealthRecord(
+                        id: "historical-workout",
+                        type: "Workout",
+                        kind: "workout",
+                        startDate: start,
+                        endDate: end,
+                        value: 3_600,
+                        unit: "sec",
+                        sourceName: "Historical exporter",
+                        raw: Data()
+                    )
+                ],
+                deletions: [],
+                unreadableCount: 0
+            ),
+            idempotencyKey: "historical-workout"
+        )
+        let running = Data(
+            """
+            {"data":{"metrics":[],"workouts":[
+              {"id":"historical-workout","name":"Running",
+               "start":"2026-01-01T10:00:00.000Z",
+               "end":"2026-01-01T11:00:00.000Z",
+               "duration":3600,"source":"Current exporter"}
+            ]}}
+            """.utf8
+        )
+
+        _ = try await store.ingest(
+            try BatchParser.parse(running),
+            idempotencyKey: "running-workout"
+        )
+
+        let historical = try await store.samples(type: "Workout")
+        let current = try await store.samples(type: "workout")
+        XCTAssertTrue(historical.isEmpty)
+        XCTAssertEqual(current.map(\.id), ["historical-workout"])
+        let total = try await store.totalRecordCount()
+        XCTAssertEqual(total, 1)
+        let workouts = try await store.workouts()
+        XCTAssertEqual(workouts.map(\.id), ["historical-workout"])
+        XCTAssertEqual(workouts.first?.duration, 3_600)
+        XCTAssertEqual(workouts.first?.sourceName, "Current exporter")
+    }
+
+    func testCanonicalWorkoutSupersedesEarlierCompatibilityFields() async throws {
+        let store = try makeStore()
+        let compatibility = Data(
+            """
+            {"data":{"metrics":[],"workouts":[
+              {"id":"compatibility-first","name":"Running",
+               "start":"2026-01-01T10:00:00.000Z",
+               "end":"2026-01-01T11:01:00.000Z",
+               "duration":3660,"source":"Legacy Exporter"}
+            ]}}
+            """.utf8
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(compatibility),
+            idempotencyKey: "compatibility-first"
+        )
+        let canonical = Data(
+            #"{"kind":"workout","id":"compatibility-first","type":"HKWorkoutTypeIdentifier","startDate":"2026-01-01T10:00:00.123Z","endDate":"2026-01-01T11:00:00.987Z","activityType":37,"duration":3599.75,"statistics":[],"source":{"name":"Apple Watch"}}"#.utf8
+        )
+
+        _ = try await store.ingest(
+            try BatchParser.parse(canonical),
+            idempotencyKey: "canonical-second"
+        )
+
+        let workouts = try await store.workouts()
+        let workout = try XCTUnwrap(workouts.first)
+        XCTAssertEqual(
+            workout.startDate.timeIntervalSince1970,
+            try date("2026-01-01T10:00:00.123Z").timeIntervalSince1970,
+            accuracy: 0.002
+        )
+        let workoutEnd = try XCTUnwrap(workout.endDate)
+        XCTAssertEqual(
+            workoutEnd.timeIntervalSince1970,
+            try date("2026-01-01T11:00:00.987Z").timeIntervalSince1970,
+            accuracy: 0.002
+        )
+        XCTAssertEqual(workout.activityType, 37)
+        XCTAssertEqual(workout.duration, 3_599.75)
+        XCTAssertEqual(workout.sourceName, "Apple Watch")
+        let compatibilitySamples = try await store.samples(type: "workout")
+        let canonicalSamples = try await store.samples(
+            type: "HKWorkoutTypeIdentifier"
+        )
+        XCTAssertTrue(compatibilitySamples.isEmpty)
+        XCTAssertEqual(canonicalSamples.map(\.id), ["compatibility-first"])
+        let total = try await store.totalRecordCount()
         XCTAssertEqual(total, 1)
     }
 

@@ -1,5 +1,7 @@
 package com.thatcube.hozz.projection
 
+import android.os.RemoteException
+import androidx.health.connect.client.HealthConnectClient
 import com.thatcube.hozz.core.CanonicalRecord
 import com.thatcube.hozz.core.CanonicalValue
 import com.thatcube.hozz.core.HealthConnectProjection
@@ -19,6 +21,98 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class ProjectionExecutorTest {
+    @Test
+    fun standaloneProviderDeleteRetryIsRejectedSoApi28To33ProjectionIsGated() =
+        runBlocking {
+            val clientRecordId = "apple.healthkit:delete-recovery"
+            val provider = StandaloneDeleteProviderFake(setOf(clientRecordId))
+
+            provider.deleteByClientRecordId(clientRecordId)
+            val retryAfterCrashBeforeLedgerCompletion = runCatching {
+                provider.deleteByClientRecordId(clientRecordId)
+            }.exceptionOrNull()
+
+            assertTrue(retryAfterCrashBeforeLedgerCompletion is RemoteException)
+            assertEquals(2, provider.deleteCalls)
+            for (sdk in 28..33) {
+                assertEquals(
+                    HealthConnectClient.SDK_UNAVAILABLE,
+                    healthConnectProjectionStatus(sdk) {
+                        HealthConnectClient.SDK_AVAILABLE
+                    },
+                )
+            }
+            assertEquals(
+                HealthConnectClient.SDK_AVAILABLE,
+                healthConnectProjectionStatus(34) {
+                    HealthConnectClient.SDK_AVAILABLE
+                },
+            )
+        }
+
+    @Test
+    fun providerFailureAbortsLargeProjectionWithoutSingletonFanOut() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val failure = IOException("provider database unavailable")
+        val writer = FakeWriter(providerUpsertFailure = failure)
+        val operations = (1..10_000).map { index ->
+            ProjectionPlanner.plan(live("provider-failure-$index"))
+        }
+
+        val thrown = runCatching {
+            executor(store, writer).apply(operations)
+        }.exceptionOrNull()
+
+        assertTrue(thrown is IOException)
+        assertEquals(failure.message, thrown?.message)
+        assertEquals(listOf(500), writer.batchSizes)
+        assertEquals(
+            500,
+            store.pendingHealthConnectOperations(
+                operations.mapTo(linkedSetOf()) { it.source.canonicalId },
+            ).size,
+        )
+    }
+
+    @Test
+    fun providerReceiptCountMismatchDoesNotRetryRecordsIndividually() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val writer = FakeWriter(providerReceiptCountMismatch = true)
+        val operations = (1..10_000).map { index ->
+            ProjectionPlanner.plan(live("receipt-mismatch-$index"))
+        }
+
+        val thrown = runCatching {
+            executor(store, writer).apply(operations)
+        }.exceptionOrNull()
+
+        assertTrue(thrown is HealthConnectProviderProtocolException)
+        assertEquals(listOf(500), writer.batchSizes)
+        assertEquals(
+            500,
+            store.pendingHealthConnectOperations(
+                operations.mapTo(linkedSetOf()) { it.source.canonicalId },
+            ).size,
+        )
+    }
+
+    @Test
+    fun recordLocalFailuresRetainOnlyBoundedDetails() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val operations = (1..1_000).map { index ->
+            ProjectionPlanner.plan(live("record-failure-$index"))
+        }
+        val failedIds = operations.mapTo(hashSetOf()) { it.source.canonicalId }
+        val writer = FakeWriter(failUpserts = failedIds)
+
+        val result = executor(store, writer).apply(operations)
+
+        assertEquals(0, result.inserted)
+        assertEquals(1_000, result.failureCount)
+        assertEquals(MAX_RETAINED_PROJECTION_FAILURES, result.failures.size)
+        assertEquals(1_002, writer.batchSizes.size)
+    }
+
     @Test
     fun largeDeletionSetsUseBoundedPerTypeBatches() = runBlocking {
         val store = InMemoryCanonicalRecordStore()
@@ -467,6 +561,8 @@ class ProjectionExecutorTest {
         private val failDeletes: Set<String> = emptySet(),
         private val failUpserts: Set<String> = emptySet(),
         private val cancelUpserts: Set<String> = emptySet(),
+        private val providerUpsertFailure: IOException? = null,
+        private val providerReceiptCountMismatch: Boolean = false,
     ) : HealthConnectProjectionWriter {
         val calls = mutableListOf<String>()
         val batchSizes = mutableListOf<Int>()
@@ -477,11 +573,18 @@ class ProjectionExecutorTest {
         ): HealthConnectWriteResult {
             batchSizes += drafts.size
             calls += "insert:${drafts.joinToString(",") { it.canonicalId }}"
+            providerUpsertFailure?.let { throw it }
+            if (providerReceiptCountMismatch) {
+                validateHealthConnectReceiptCount(
+                    expected = drafts.size,
+                    actual = drafts.size - 1,
+                )
+            }
             if (drafts.any { it.canonicalId in cancelUpserts }) {
                 throw CancellationException("cancelled")
             }
             if (drafts.any { it.canonicalId in failUpserts }) {
-                throw IOException("insert failed")
+                throw IllegalArgumentException("insert failed")
             }
             return HealthConnectWriteResult(
                 attempted = drafts.size,
@@ -501,7 +604,7 @@ class ProjectionExecutorTest {
             deleteBatchSizes += drafts.size
             calls += "delete:${drafts.joinToString(",") { it.canonicalId }}"
             if (drafts.any { it.canonicalId in failDeletes }) {
-                throw IOException("delete failed")
+                throw IllegalArgumentException("delete failed")
             }
             return drafts.map { draft ->
                 HealthConnectProjection(
@@ -510,6 +613,23 @@ class ProjectionExecutorTest {
                     canonicalVersion = draft.recordVersion,
                     healthConnectRecordId =
                         draft.healthConnectRecordId.orEmpty(),
+                )
+            }
+        }
+    }
+
+    private class StandaloneDeleteProviderFake(
+        clientRecordIds: Set<String>,
+    ) {
+        private val clientRecordIds = clientRecordIds.toMutableSet()
+        var deleteCalls = 0
+            private set
+
+        fun deleteByClientRecordId(clientRecordId: String) {
+            deleteCalls += 1
+            if (!clientRecordIds.remove(clientRecordId)) {
+                throw RemoteException(
+                    "Deleting the same record multiple times results in IPC failure.",
                 )
             }
         }

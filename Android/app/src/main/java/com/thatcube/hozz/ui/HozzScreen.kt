@@ -1,5 +1,6 @@
 package com.thatcube.hozz.ui
 
+import android.os.Build
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -417,7 +418,17 @@ private fun ProjectionPreview(
             }
             if (state.healthConnectStatus != HealthConnectClient.SDK_AVAILABLE) {
                 Text(
-                    text = "Health Connect is not available on this device. The imported archive remains usable in Hozz.",
+                    text = if (
+                        Build.VERSION.SDK_INT <
+                        Build.VERSION_CODES.UPSIDE_DOWN_CAKE
+                    ) {
+                        "Health Connect projection requires Android 14 or newer " +
+                            "and is unavailable on this device. The imported " +
+                            "archive remains usable in Hozz."
+                    } else {
+                        "Health Connect is not available on this device. " +
+                            "The imported archive remains usable in Hozz."
+                    },
                     color = MaterialTheme.colorScheme.error,
                     style = MaterialTheme.typography.bodySmall,
                     modifier = Modifier.padding(top = 8.dp),

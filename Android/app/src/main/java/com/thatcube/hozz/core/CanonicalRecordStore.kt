@@ -1,6 +1,9 @@
 package com.thatcube.hozz.core
 
 import java.time.Instant
+import java.util.ArrayDeque
+
+internal const val MAX_CANONICAL_PARENT_DEPTH = 64
 
 data class MergeResult(
     val inserted: Int = 0,
@@ -104,6 +107,145 @@ interface CanonicalImportSession {
     suspend fun discard()
 }
 
+internal data class CanonicalParentWinner(
+    val recordVersion: Long,
+    val parentCanonicalId: String?,
+)
+
+internal fun validateCanonicalParentGraph(
+    startCanonicalIds: Iterable<String>,
+    winner: (String) -> CanonicalParentWinner?,
+) {
+    val depthById = mutableMapOf<String, Int>()
+    for (start in startCanonicalIds) {
+        if (start in depthById) continue
+        val path = mutableListOf<String>()
+        val visiting = hashSetOf<String>()
+        var canonicalId = start
+        var baseDepth: Int
+        while (true) {
+            val knownDepth = depthById[canonicalId]
+            if (knownDepth != null) {
+                baseDepth = knownDepth
+                break
+            }
+            val current = winner(canonicalId)
+            if (current == null) {
+                baseDepth = 0
+                break
+            }
+            if (!visiting.add(canonicalId)) {
+                throw ArchiveFormatException(
+                    "Canonical records contain a parent cycle.",
+                )
+            }
+            path += canonicalId
+            val parentCanonicalId = current.parentCanonicalId
+            if (parentCanonicalId == null) {
+                baseDepth = -1
+                break
+            }
+            canonicalId = parentCanonicalId
+        }
+        var depth = baseDepth
+        for (pathId in path.asReversed()) {
+            depth += 1
+            if (depth > MAX_CANONICAL_PARENT_DEPTH) {
+                throw ArchiveFormatException(
+                    "Canonical parent depth exceeds the " +
+                        "$MAX_CANONICAL_PARENT_DEPTH level limit.",
+                )
+            }
+            depthById[pathId] = depth
+        }
+    }
+}
+
+internal fun recordsInParentWinnerOrder(
+    records: List<CanonicalRecord>,
+    persistedWinner: (String) -> CanonicalParentWinner?,
+): List<CanonicalRecord> {
+    if (records.any { it.parentCanonicalId == it.canonicalId }) {
+        throw ArchiveFormatException("Canonical records contain a parent cycle.")
+    }
+    if (records.isEmpty()) return records
+    val recordsById = linkedMapOf<String, MutableList<CanonicalRecord>>()
+    val winnerById = linkedMapOf<String, CanonicalRecord>()
+    for (record in records) {
+        recordsById.getOrPut(record.canonicalId, ::mutableListOf) += record
+        val winner = winnerById[record.canonicalId]
+        if (winner == null || record.recordVersion > winner.recordVersion) {
+            winnerById[record.canonicalId] = record
+        }
+    }
+
+    val persistedById = mutableMapOf<String, CanonicalParentWinner?>()
+    fun persisted(canonicalId: String): CanonicalParentWinner? {
+        if (!persistedById.containsKey(canonicalId)) {
+            persistedById[canonicalId] = persistedWinner(canonicalId)
+        }
+        return persistedById[canonicalId]
+    }
+
+    fun finalWinner(canonicalId: String): CanonicalParentWinner? {
+        val persisted = persisted(canonicalId)
+        val incoming = winnerById[canonicalId]
+        return if (
+            incoming != null &&
+            (persisted == null || incoming.recordVersion > persisted.recordVersion)
+        ) {
+            CanonicalParentWinner(
+                recordVersion = incoming.recordVersion,
+                parentCanonicalId = incoming.parentCanonicalId,
+            )
+        } else {
+            persisted
+        }
+    }
+
+    validateCanonicalParentGraph(recordsById.keys, ::finalWinner)
+
+    val dependencyCount = recordsById.keys.associateWithTo(linkedMapOf()) { 0 }
+    val childrenByParent = linkedMapOf<String, LinkedHashSet<String>>()
+    for (canonicalId in recordsById.keys) {
+        val parentId = finalWinner(canonicalId)?.parentCanonicalId ?: continue
+        if (recordsById.containsKey(parentId)) {
+            dependencyCount[canonicalId] = 1
+            childrenByParent.getOrPut(parentId, ::linkedSetOf) += canonicalId
+        }
+    }
+
+    val ready = ArrayDeque<String>()
+    dependencyCount.filterValues { it == 0 }.keys.forEach(ready::addLast)
+    val ordered = ArrayList<CanonicalRecord>(records.size)
+    while (ready.isNotEmpty()) {
+        val canonicalId = ready.removeFirst()
+        ordered += recordsById.getValue(canonicalId)
+        for (childId in childrenByParent[canonicalId].orEmpty()) {
+            val remaining = dependencyCount.getValue(childId) - 1
+            dependencyCount[childId] = remaining
+            if (remaining == 0) {
+                ready.addLast(childId)
+            }
+        }
+    }
+    if (ordered.size != records.size) {
+        throw ArchiveFormatException("Canonical records contain a parent cycle.")
+    }
+    return ordered
+}
+
+internal fun CanonicalRecord.deferredByParentTombstone(
+    parentVersion: Long,
+): CanonicalRecord = copy(
+    recordVersion = if (tombstone) {
+        maxOf(recordVersion, parentVersion)
+    } else {
+        parentVersion
+    },
+    tombstone = true,
+)
+
 class InMemoryCanonicalRecordStore : CanonicalRecordStore {
     private val records = linkedMapOf<String, CanonicalRecord>()
     private val runRecords = linkedMapOf<String, ArchiveRunRecord>()
@@ -166,18 +308,39 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
         }
 
     private fun merge(records: List<CanonicalRecord>): MergeResult {
+        val previousRecords = LinkedHashMap(this.records)
+        return try {
+            mergeApplying(records)
+        } catch (error: Throwable) {
+            this.records.clear()
+            this.records.putAll(previousRecords)
+            throw error
+        }
+    }
+
+    private fun mergeApplying(records: List<CanonicalRecord>): MergeResult {
         var result = MergeResult()
-        for (incoming in records) {
+        val ordered = recordsInParentWinnerOrder(records) { canonicalId ->
+            this.records[canonicalId]?.let {
+                CanonicalParentWinner(
+                    recordVersion = it.recordVersion,
+                    parentCanonicalId = it.parentCanonicalId,
+                )
+            }
+        }
+        for (incoming in ordered) {
             val parent =
                 incoming.parentCanonicalId?.let(this.records::get)
+            if (
+                parent?.tombstone == true &&
+                !incoming.tombstone &&
+                incoming.recordVersion > parent.recordVersion
+            ) {
+                result += MergeResult(ignored = 1)
+                continue
+            }
             val effective = if (parent?.tombstone == true) {
-                incoming.copy(
-                    recordVersion = maxOf(
-                        incoming.recordVersion,
-                        parent.recordVersion,
-                    ),
-                    tombstone = true,
-                )
+                incoming.deferredByParentTombstone(parent.recordVersion)
             } else {
                 incoming
             }
@@ -201,19 +364,7 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
             }
             val winningParent = this.records[effective.canonicalId]
             if (winningParent?.tombstone == true) {
-                this.records.replaceAll { _, child ->
-                    if (child.parentCanonicalId == winningParent.canonicalId) {
-                        child.copy(
-                            recordVersion = maxOf(
-                                child.recordVersion,
-                                winningParent.recordVersion,
-                            ),
-                            tombstone = true,
-                        )
-                    } else {
-                        child
-                    }
-                }
+                cascadeTombstone(winningParent)
             } else if (
                 winningParent != null &&
                 winningParent.kind != "sampleEncodingError"
@@ -238,9 +389,78 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
                 }
             }
         }
+        validateCanonicalParentGraph(
+            affectedCanonicalIds(
+                ordered.map(CanonicalRecord::canonicalId),
+            ),
+        ) { canonicalId ->
+            this.records[canonicalId]?.let {
+                CanonicalParentWinner(
+                    recordVersion = it.recordVersion,
+                    parentCanonicalId = it.parentCanonicalId,
+                )
+            }
+        }
         restoreUnresolvedContinuationErrors()
         reconcileEncodingFailures()
         return result
+    }
+
+    private fun affectedCanonicalIds(
+        seedCanonicalIds: Iterable<String>,
+    ): Set<String> {
+        val childrenByParent = linkedMapOf<String, MutableList<String>>()
+        for (record in records.values) {
+            record.parentCanonicalId?.let { parentId ->
+                childrenByParent.getOrPut(parentId, ::mutableListOf) +=
+                    record.canonicalId
+            }
+        }
+        val affected = linkedSetOf<String>()
+        val pending = ArrayDeque<String>()
+        seedCanonicalIds.forEach(pending::addLast)
+        while (pending.isNotEmpty()) {
+            val canonicalId = pending.removeFirst()
+            if (!affected.add(canonicalId)) continue
+            childrenByParent[canonicalId].orEmpty().forEach(pending::addLast)
+        }
+        return affected
+    }
+
+    private fun cascadeTombstone(parent: CanonicalRecord) {
+        val pending = ArrayDeque<CanonicalRecord>()
+        val visited = hashSetOf<String>()
+        pending.addLast(parent)
+        while (pending.isNotEmpty()) {
+            val tombstone = pending.removeFirst()
+            if (!visited.add(tombstone.canonicalId)) continue
+            val childIds = records.values
+                .filter { it.parentCanonicalId == tombstone.canonicalId }
+                .map(CanonicalRecord::canonicalId)
+            for (childId in childIds) {
+                val child = records.getValue(childId)
+                if (
+                    !child.tombstone &&
+                    child.kind != "sampleEncodingError" &&
+                    child.recordVersion > tombstone.recordVersion
+                ) {
+                    continue
+                }
+                val inherited = if (child.kind == "sampleEncodingError") {
+                    child.copy(
+                        recordVersion = maxOf(
+                            child.recordVersion,
+                            tombstone.recordVersion,
+                        ),
+                        tombstone = true,
+                    )
+                } else {
+                    child.deferredByParentTombstone(tombstone.recordVersion)
+                }
+                records[childId] = inherited
+                pending.addLast(inherited)
+            }
+        }
     }
 
     private fun restoreUnresolvedContinuationErrors() {

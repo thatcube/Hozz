@@ -95,12 +95,19 @@ public enum CompatiblePayloadBuilder {
             }
 
             if record.kind == "workout" {
-                workouts.append([
+                var workout: [String: Any] = [
                     "id": record.identifier,
-                    "name": "Workout",
+                    "name": record.activityName ?? "Workout",
                     "start": record.startDate,
                     "end": record.endDate
-                ])
+                ]
+                if let duration = record.duration {
+                    workout["duration"] = duration
+                }
+                if let sourceName = record.sourceName {
+                    workout["source"] = sourceName
+                }
+                workouts.append(workout)
                 continue
             }
 

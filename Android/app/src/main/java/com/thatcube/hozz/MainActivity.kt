@@ -20,8 +20,8 @@ class MainActivity : ComponentActivity() {
         uri?.let(viewModel::importArchive)
     }
 
-    private val archiveCreator = registerForActivityResult(
-        ActivityResultContracts.CreateDocument("application/zip"),
+    private val archiveDirectoryPicker = registerForActivityResult(
+        ActivityResultContracts.OpenDocumentTree(),
     ) { uri ->
         uri?.let(viewModel::exportArchive)
     }
@@ -53,7 +53,7 @@ class MainActivity : ComponentActivity() {
                         viewModel.prepareHealthConnectWrite(healthPermissions::launch)
                     },
                     onExport = {
-                        archiveCreator.launch("hozz-canonical-archive.zip")
+                        archiveDirectoryPicker.launch(null)
                     },
                     onLoadMoreTimeline = viewModel::loadMoreTimeline,
                 )

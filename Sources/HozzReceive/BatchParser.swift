@@ -483,12 +483,15 @@ public struct ReceivedQuantitySeriesEnd: Hashable, Sendable {
 
 public enum BatchParseError: Error, LocalizedError, Sendable {
     case connectionTest
+    case invalidTopLevelJSONArray
     case incompleteCompatibilityEnvelope(unreadableChildren: Int)
 
     public var errorDescription: String? {
         switch self {
         case .connectionTest:
             "This was a connection test, not a batch of samples."
+        case .invalidTopLevelJSONArray:
+            "The top-level JSON array is incomplete or invalid."
         case .incompleteCompatibilityEnvelope(let unreadableChildren):
             "The compatibility payload contains \(unreadableChildren) record(s) that cannot be represented safely."
         }
@@ -522,8 +525,7 @@ public enum BatchParser {
     public static let parserVersion = 8
 
     public static func parse(_ payload: Data) throws -> ParsedBatch {
-        let text = String(decoding: payload, as: UTF8.self)
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmed = normalizedText(payload)
         guard !trimmed.isEmpty else {
             return ParsedBatch(records: [], deletions: [], unreadableCount: 0)
         }
@@ -531,12 +533,12 @@ public enum BatchParser {
         // A connection test is a real, valid request that carries no samples.
         // Treating it as an unparseable batch would report a working setup as
         // broken at exactly the moment the user is checking it.
-        if trimmed.contains("hozzConnectionTest") {
+        if isConnectionTest(trimmed) {
             throw BatchParseError.connectionTest
         }
 
         if trimmed.hasPrefix("[") {
-            return parseJSONArray(trimmed)
+            return try parseJSONArray(trimmed)
         }
         if trimmed.hasPrefix("{"), isCompatibilityEnvelope(trimmed) {
             return try parseMetricsEnvelope(trimmed)
@@ -550,6 +552,32 @@ public enum BatchParser {
         return parseLines(trimmed)
     }
 
+    private static func normalizedText(_ payload: Data) -> String {
+        var text = String(decoding: payload, as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while text.unicodeScalars.first?.value == 0xFEFF {
+            text.removeFirst()
+            text = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        return text
+    }
+
+    private static func isConnectionTest(_ text: String) -> Bool {
+        guard
+            let data = text.data(using: .utf8),
+            let object = try? JSONSerialization.jsonObject(with: data)
+                as? [String: Any],
+            Set(object.keys) == ["kind", "schemaVersion"],
+            object["kind"] as? String == "hozzConnectionTest",
+            let version = object["schemaVersion"] as? NSNumber,
+            CFGetTypeID(version) != CFBooleanGetTypeID(),
+            version.doubleValue == 1
+        else {
+            return false
+        }
+        return true
+    }
+
     private static func looksLikeCSV(_ text: String) -> Bool {
         guard let first = text.split(separator: "\n", maxSplits: 1).first else {
             return false
@@ -557,12 +585,12 @@ public enum BatchParser {
         return first.contains("startDate") && first.contains(",")
     }
 
-    private static func parseJSONArray(_ text: String) -> ParsedBatch {
+    private static func parseJSONArray(_ text: String) throws -> ParsedBatch {
         guard
             let data = text.data(using: .utf8),
             let items = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]]
         else {
-            return ParsedBatch(records: [], deletions: [], unreadableCount: 1)
+            throw BatchParseError.invalidTopLevelJSONArray
         }
         return collect(items)
     }
@@ -1066,9 +1094,8 @@ public enum BatchParser {
                 continue
             }
             let duration = numeric(workout["duration"])
-                ?? end.timeIntervalSince(start)
             guard
-                duration >= 0,
+                duration.map({ $0 >= 0 }) ?? true,
                 workout["duration"] == nil || numeric(workout["duration"]) != nil
             else {
                 unreadable += 1
@@ -1080,8 +1107,10 @@ public enum BatchParser {
             object["kind"] = "workout"
             object["startDate"] = startText
             object["endDate"] = endText
-            object["value"] = duration
-            object["unit"] = "sec"
+            if let duration {
+                object["value"] = duration
+                object["unit"] = "sec"
+            }
             records.append(
                 HealthRecord(
                     id: identifier,
@@ -1090,7 +1119,7 @@ public enum BatchParser {
                     startDate: start,
                     endDate: end,
                     value: duration,
-                    unit: "sec",
+                    unit: duration == nil ? nil : "sec",
                     sourceName: workout["source"] as? String,
                     legacyTypeAlias: name,
                     raw: (try? JSONSerialization.data(
@@ -1108,7 +1137,8 @@ public enum BatchParser {
                     duration: duration,
                     sourceName: workout["source"] as? String,
                     statistics: [],
-                    activities: []
+                    activities: [],
+                    provenance: .compatibility
                 )
             )
         }
@@ -1708,6 +1738,11 @@ enum MoodAndMedicationShape {
 /// cost no extra query. Without them a workout is an activity type and a
 /// duration: you can tell a run happened and nothing about how it went.
 public struct ReceivedWorkoutDetail: Hashable, Sendable {
+    public enum Provenance: Hashable, Sendable {
+        case canonical
+        case compatibility
+    }
+
     public struct Statistic: Hashable, Sendable {
         public let type: String
         public let unit: String
@@ -1766,6 +1801,7 @@ public struct ReceivedWorkoutDetail: Hashable, Sendable {
     /// Empty for an ordinary workout. A triathlon is one workout and three
     /// efforts, and an average across all three describes none of them.
     public let activities: [Activity]
+    public let provenance: Provenance
 
     public init(
         id: String,
@@ -1775,7 +1811,8 @@ public struct ReceivedWorkoutDetail: Hashable, Sendable {
         duration: Double?,
         sourceName: String?,
         statistics: [Statistic],
-        activities: [Activity]
+        activities: [Activity],
+        provenance: Provenance = .canonical
     ) {
         self.id = id
         self.startDate = startDate
@@ -1785,6 +1822,7 @@ public struct ReceivedWorkoutDetail: Hashable, Sendable {
         self.sourceName = sourceName
         self.statistics = statistics
         self.activities = activities
+        self.provenance = provenance
     }
 }
 
@@ -1819,20 +1857,26 @@ enum WorkoutDetailShape {
                     statistics: Self.statistics(in: activity["statistics"])
                 )
             }
+        let endDate = (object["endDate"] as? String)
+            .flatMap(Timestamps.date(from:))
+        let activityType = BatchParser.numeric(object["activityType"]).map { Int($0) }
+        let duration = BatchParser.numeric(object["duration"])
+        let sourceName = (object["source"] as? [String: Any])?["name"] as? String
 
-        // A workout with neither statistics nor legs has nothing this table
-        // would hold that the sample row does not already carry.
-        guard !statistics.isEmpty || !activities.isEmpty else {
+        guard
+            endDate != nil || activityType != nil || duration != nil ||
+                sourceName != nil || !statistics.isEmpty || !activities.isEmpty
+        else {
             return nil
         }
 
         return ReceivedWorkoutDetail(
             id: id,
             startDate: start,
-            endDate: (object["endDate"] as? String).flatMap(Timestamps.date(from:)),
-            activityType: BatchParser.numeric(object["activityType"]).map { Int($0) },
-            duration: BatchParser.numeric(object["duration"]),
-            sourceName: (object["source"] as? [String: Any])?["name"] as? String,
+            endDate: endDate,
+            activityType: activityType,
+            duration: duration,
+            sourceName: sourceName,
             statistics: statistics,
             activities: activities
         )

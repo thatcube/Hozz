@@ -32,7 +32,7 @@ final class SchemaMigrationTests: XCTestCase {
     }
 
     /// The current schema. Every historical fixture must reach this.
-    private static let currentVersion: Int64 = 11
+    private static let currentVersion: Int64 = 12
 
     // MARK: - The historical schemas, as they actually were
 
@@ -126,6 +126,83 @@ final class SchemaMigrationTests: XCTestCase {
         );
         """
 
+    private static let workoutAndQuantitySeriesTables = """
+        CREATE TABLE IF NOT EXISTS workout_detail (
+            id TEXT PRIMARY KEY, start_date TEXT NOT NULL, end_date TEXT,
+            activity_type INTEGER, duration_seconds REAL, source_name TEXT,
+            received_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS workout_detail_start
+            ON workout_detail (start_date);
+        CREATE TABLE IF NOT EXISTS workout_statistic (
+            workout_id TEXT NOT NULL, activity_id TEXT NOT NULL DEFAULT '',
+            type TEXT NOT NULL, unit TEXT, sum REAL, average REAL,
+            minimum REAL, maximum REAL,
+            PRIMARY KEY (workout_id, activity_id, type)
+        );
+        CREATE TABLE IF NOT EXISTS workout_activity (
+            id TEXT PRIMARY KEY, workout_id TEXT NOT NULL,
+            ordinal INTEGER NOT NULL, activity_type INTEGER,
+            start_date TEXT NOT NULL, end_date TEXT
+        );
+        CREATE INDEX IF NOT EXISTS workout_activity_workout
+            ON workout_activity (workout_id, ordinal);
+        CREATE TABLE IF NOT EXISTS quantity_series_page (
+            sample_id TEXT NOT NULL, type TEXT NOT NULL,
+            sequence INTEGER NOT NULL, offset INTEGER NOT NULL,
+            reading_count INTEGER NOT NULL, unit TEXT,
+            start_date TEXT NOT NULL, end_date TEXT, readings BLOB NOT NULL,
+            PRIMARY KEY (sample_id, sequence)
+        );
+        CREATE INDEX IF NOT EXISTS quantity_series_page_sample
+            ON quantity_series_page (sample_id, offset);
+        CREATE INDEX IF NOT EXISTS quantity_series_page_type
+            ON quantity_series_page (type, start_date);
+        CREATE TABLE IF NOT EXISTS quantity_series (
+            sample_id TEXT PRIMARY KEY, type TEXT NOT NULL,
+            exported_readings INTEGER NOT NULL,
+            start_date TEXT NOT NULL, end_date TEXT
+        );
+        """
+
+    private static let typeCoverageTable = """
+        CREATE TABLE IF NOT EXISTS type_coverage (
+            type TEXT PRIMARY KEY, state TEXT NOT NULL,
+            delivered_count INTEGER, primed_from TEXT, primed_through TEXT,
+            observed_at TEXT NOT NULL, received_at TEXT NOT NULL
+        );
+        """
+
+    private static let legacyAliasTables = """
+        CREATE TABLE IF NOT EXISTS sample_tombstone (
+            id TEXT PRIMARY KEY, received_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sample_identity_alias (
+            stable_id TEXT PRIMARY KEY, legacy_id TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS sample_identity_alias_legacy
+            ON sample_identity_alias (legacy_id);
+        CREATE TABLE IF NOT EXISTS sample_unresolved_legacy_deletion (
+            stable_id TEXT PRIMARY KEY, type TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS sample_alias_retirement (
+            type TEXT NOT NULL, start_time TEXT NOT NULL,
+            PRIMARY KEY (type, start_time)
+        );
+        """
+
+    private static let aliasSignatureTable = """
+        CREATE TABLE IF NOT EXISTS sample_alias_signature (
+            stable_id TEXT PRIMARY KEY, type TEXT NOT NULL, kind TEXT,
+            start_time TEXT NOT NULL, end_time TEXT NOT NULL, value REAL,
+            unit TEXT, source_name TEXT
+        );
+        CREATE INDEX IF NOT EXISTS sample_alias_signature_lookup
+            ON sample_alias_signature (
+                type, start_time, end_time, kind, value, unit, source_name
+            );
+        """
+
     /// Builds a database exactly as version `version` left it, with data in it.
     private func makeHistoricalDatabase(version: Int64) throws -> URL {
         let url = root.appending(path: "store-v\(version)")
@@ -160,6 +237,110 @@ final class SchemaMigrationTests: XCTestCase {
         }
 
         try seed(database, version: version)
+        try database.execute("PRAGMA user_version = \(version)")
+        database.close()
+        return url
+    }
+
+    /// An archive as the selected receiver version wrote it, before receipts
+    /// carried their durability semantics explicitly.
+    private func makeReceiptDatabase(
+        version: Int64,
+        name: String,
+        deletionHasTombstone: Bool? = nil
+    ) throws -> URL {
+        let url = root.appending(path: name)
+        try FileManager.default.createDirectory(
+            at: url,
+            withIntermediateDirectories: true
+        )
+        let database = try SQLiteDatabase(
+            url: url.appending(path: "hozz-received.sqlite")
+        )
+        try database.execute(Self.sampleTable)
+        try database.execute(Self.deviceTable)
+        try database.execute(Self.characteristicAndQuarantine)
+        try database.execute(Self.parserVersionColumn)
+        try database.execute(Self.seriesTables)
+        try database.execute(Self.moodAndMedicationTables)
+        try database.execute(Self.workoutAndQuantitySeriesTables)
+        try database.execute(Self.typeCoverageTable)
+        if version >= 10 {
+            try database.execute(Self.legacyAliasTables)
+        }
+        if version >= 11 {
+            try database.execute(Self.aliasSignatureTable)
+        }
+        try database.run(
+            """
+            INSERT INTO sample
+                (id, type, kind, start_date, end_date, value, unit,
+                 source_name, raw, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                .text("stale-value"), .text("steps"), .text("quantity"),
+                .text("2026-01-01T09:00:00.000Z"),
+                .text("2026-01-01T09:00:00.000Z"), .real(2),
+                .text("count"), .text("iPhone"),
+                .blob(Data(#"{"id":"stale-value","value":2}"#.utf8)),
+                .text("2026-01-01T12:00:00.000Z")
+            ]
+        )
+        try database.run(
+            """
+            INSERT INTO batch (key, received_at, record_count)
+            VALUES (?, ?, ?)
+            """,
+            [
+                .text("stale-upsert-receipt"),
+                .text("2026-01-01T11:00:00.000Z"),
+                .integer(1)
+            ]
+        )
+        try database.run(
+            """
+            INSERT INTO sample
+                (id, type, kind, start_date, end_date, value, unit,
+                 source_name, raw, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                .text("deleted-before-upgrade"), .text("steps"),
+                .text("quantity"), .text("2026-01-01T10:00:00.000Z"),
+                .text("2026-01-01T10:00:00.000Z"), .real(1),
+                .text("count"), .text("iPhone"),
+                .blob(Data(#"{"id":"deleted-before-upgrade"}"#.utf8)),
+                .text("2026-01-01T11:00:00.000Z")
+            ]
+        )
+        try database.run(
+            "DELETE FROM sample WHERE id = ?",
+            [.text("deleted-before-upgrade")]
+        )
+        if deletionHasTombstone ?? (version >= 10) {
+            try database.run(
+                """
+                INSERT INTO sample_tombstone (id, received_at)
+                VALUES (?, ?)
+                """,
+                [
+                    .text("deleted-before-upgrade"),
+                    .text("2026-01-01T11:00:00.000Z")
+                ]
+            )
+        }
+        try database.run(
+            """
+            INSERT INTO batch (key, received_at, record_count)
+            VALUES (?, ?, ?)
+            """,
+            [
+                .text("legacy-deletion-receipt"),
+                .text("2026-01-01T11:00:00.000Z"),
+                .integer(0)
+            ]
+        )
         try database.execute("PRAGMA user_version = \(version)")
         database.close()
         return url
@@ -538,35 +719,64 @@ final class SchemaMigrationTests: XCTestCase {
         XCTAssertEqual(try version(of: databaseURL), Self.currentVersion)
     }
 
-    func testVersionNineDatabaseGainsTombstoneTables() async throws {
-        let directory = root.appending(path: "version-nine")
-        let store = try IngestStore(directory: directory)
-        await store.close()
+    func testVersionNineStaleUpsertIsIgnoredAndDeletionReplays() async throws {
+        let directory = try makeReceiptDatabase(
+            version: 9,
+            name: "store-v9-receipts"
+        )
         let databaseURL = directory.appending(path: "hozz-received.sqlite")
-        let database = try SQLiteDatabase(url: databaseURL)
-        try database.execute(
-            """
-            DROP TABLE sample_tombstone;
-            DROP TABLE sample_identity_alias;
-            DROP TABLE sample_unresolved_legacy_deletion;
-            DROP TABLE sample_alias_retirement;
-            DROP TABLE sample_alias_signature;
-            PRAGMA user_version = 9;
-            """
-        )
-        database.close()
-
         let upgraded = try IngestStore(directory: directory)
-        _ = try await upgraded.ingest(
-            try BatchParser.parse(
-                Data(
-                    """
-                    {"id":"post-upgrade","type":"steps","kind":"quantity","startDate":"2026-01-01T10:00:00.000Z","quantity":{"value":1,"unit":"count"}}
-                    """.utf8
-                )
-            ),
-            idempotencyKey: "post-upgrade"
+        let staleValueReplay = try BatchParser.parse(
+            Data(
+                #"{"id":"stale-value","type":"steps","kind":"quantity","startDate":"2026-01-01T09:00:00.000Z","quantity":{"value":1,"unit":"count"}}"#.utf8
+            )
         )
+        let staleResult = try await upgraded.ingest(
+            staleValueReplay,
+            idempotencyKey: "stale-upsert-receipt"
+        )
+        XCTAssertTrue(staleResult.duplicate)
+        let samplesAfterStaleReplay = try await upgraded.samples(type: "steps")
+        let preserved = samplesAfterStaleReplay.first { $0.id == "stale-value" }
+        XCTAssertEqual(preserved?.value, 2)
+
+        let staleUpsert = try BatchParser.parse(
+            Data(
+                #"{"id":"deleted-before-upgrade","type":"steps","kind":"quantity","startDate":"2026-01-01T10:00:00.000Z","quantity":{"value":1,"unit":"count"}}"#.utf8
+            )
+        )
+        _ = try await upgraded.ingest(
+            staleUpsert,
+            idempotencyKey: "stale-before-deletion-replay"
+        )
+        let resurrectedCount = try await upgraded.totalRecordCount()
+        XCTAssertEqual(resurrectedCount, 2)
+
+        let deletion = try BatchParser.parse(
+            Data(
+                #"{"id":"deleted-before-upgrade","type":"steps","kind":"deletion","deleted":true}"#.utf8
+            )
+        )
+        let replay = try await upgraded.ingest(
+            deletion,
+            idempotencyKey: "legacy-deletion-receipt"
+        )
+        XCTAssertFalse(replay.duplicate)
+        XCTAssertEqual(replay.deleted, 1)
+        let countAfterReplay = try await upgraded.totalRecordCount()
+        XCTAssertEqual(countAfterReplay, 1)
+
+        _ = try await upgraded.ingest(
+            staleUpsert,
+            idempotencyKey: "stale-after-deletion-replay"
+        )
+        let finalCount = try await upgraded.totalRecordCount()
+        XCTAssertEqual(finalCount, 1)
+        let secondReplay = try await upgraded.ingest(
+            deletion,
+            idempotencyKey: "legacy-deletion-receipt"
+        )
+        XCTAssertTrue(secondReplay.duplicate)
         await upgraded.close()
 
         XCTAssertEqual(try version(of: databaseURL), Self.currentVersion)
@@ -578,6 +788,120 @@ final class SchemaMigrationTests: XCTestCase {
         )
         XCTAssertTrue(try tables(in: databaseURL).contains("sample_alias_retirement"))
         XCTAssertTrue(try tables(in: databaseURL).contains("sample_alias_signature"))
+    }
+
+    func testVersionTenAndElevenInheritedReceiptsRemainVersionZero() async throws {
+        for version in [Int64(10), 11] {
+            let directory = try makeReceiptDatabase(
+                version: version,
+                name: "store-v\(version)-receipt"
+            )
+            let migrated = try IngestStore(directory: directory)
+            await migrated.close()
+            let databaseURL = directory.appending(path: "hozz-received.sqlite")
+            let database = try SQLiteDatabase(url: databaseURL)
+            let inheritedVersions = try database.query(
+                "SELECT receipt_version FROM batch ORDER BY key",
+                row: { $0.integer(0) }
+            )
+            database.close()
+            XCTAssertEqual(inheritedVersions, [0, 0], "version \(version)")
+
+            let upgraded = try IngestStore(directory: directory)
+            let staleValueReplay = try BatchParser.parse(
+                Data(
+                    #"{"id":"stale-value","type":"steps","kind":"quantity","startDate":"2026-01-01T09:00:00.000Z","quantity":{"value":1,"unit":"count"}}"#.utf8
+                )
+            )
+
+            let result = try await upgraded.ingest(
+                staleValueReplay,
+                idempotencyKey: "stale-upsert-receipt"
+            )
+
+            XCTAssertTrue(result.duplicate, "version \(version)")
+            let deletion = try BatchParser.parse(
+                Data(
+                    #"{"id":"deleted-before-upgrade","type":"steps","kind":"deletion","deleted":true}"#.utf8
+                )
+            )
+            let deletionResult = try await upgraded.ingest(
+                deletion,
+                idempotencyKey: "legacy-deletion-receipt"
+            )
+            XCTAssertFalse(deletionResult.duplicate, "version \(version)")
+            let samples = try await upgraded.samples(type: "steps")
+            let preserved = samples.first { $0.id == "stale-value" }
+            XCTAssertEqual(preserved?.value, 2, "version \(version)")
+            await upgraded.close()
+
+            let promoted = try SQLiteDatabase(url: databaseURL)
+            let promotedVersions = try promoted.query(
+                "SELECT receipt_version FROM batch ORDER BY key",
+                row: { $0.integer(0) }
+            )
+            promoted.close()
+            XCTAssertEqual(promotedVersions, [1, 1], "version \(version)")
+        }
+    }
+
+    func testVersionElevenCarriedPreTenReceiptReplaysOnlyDeletion() async throws {
+        let directory = try makeReceiptDatabase(
+            version: 11,
+            name: "store-v11-carried-v9-receipt",
+            deletionHasTombstone: false
+        )
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let migrated = try IngestStore(directory: directory)
+        await migrated.close()
+        let raw = try SQLiteDatabase(url: databaseURL)
+        let inheritedVersion = try raw.query(
+            """
+            SELECT receipt_version FROM batch
+            WHERE key = 'legacy-deletion-receipt'
+            """,
+            row: { $0.integer(0) }
+        ).first
+        raw.close()
+        XCTAssertEqual(inheritedVersion, 0)
+
+        let store = try IngestStore(directory: directory)
+        let resurrected = try BatchParser.parse(
+            Data(
+                #"{"id":"deleted-before-upgrade","type":"steps","kind":"quantity","startDate":"2026-01-01T10:00:00.000Z","quantity":{"value":9,"unit":"count"}}"#.utf8
+            )
+        )
+        _ = try await store.ingest(
+            resurrected,
+            idempotencyKey: "newer-resurrection"
+        )
+        let carriedPayload = try BatchParser.parse(
+            Data(
+                """
+                {"id":"stale-value","type":"steps","kind":"quantity","startDate":"2026-01-01T09:00:00.000Z","quantity":{"value":1,"unit":"count"}}
+                {"id":"deleted-before-upgrade","type":"steps","kind":"deletion","deleted":true}
+                """.utf8
+            )
+        )
+
+        let replay = try await store.ingest(
+            carriedPayload,
+            idempotencyKey: "legacy-deletion-receipt"
+        )
+
+        XCTAssertFalse(replay.duplicate)
+        XCTAssertEqual(replay.deleted, 1)
+        let remaining = try await store.samples(type: "steps")
+        XCTAssertEqual(remaining.map(\.id), ["stale-value"])
+        XCTAssertEqual(remaining.first?.value, 2)
+        _ = try await store.ingest(
+            resurrected,
+            idempotencyKey: "delayed-after-reconciliation"
+        )
+        let final = try await store.samples(type: "steps")
+        XCTAssertEqual(final.map(\.id), ["stale-value"])
+        XCTAssertEqual(final.first?.value, 2)
+        await store.close()
     }
 
     func testVersionTenDatabaseGainsSignatureTable() async throws {

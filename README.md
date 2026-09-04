@@ -146,8 +146,9 @@ You'll want:
 This repository also contains an **unreleased Android foundation** under
 [`Android/`](Android/). It can import a lossless Hozz NDJSON/ZIP archive into a
 local canonical store, show archive-only records, preview Health Connect mapping
-loss, and explicitly write the mapped subset. Apple Health extraction still
-happens on an Apple device; Android support is not a shipped product yet.
+loss, and explicitly write the mapped subset on Android 14/API 34 or newer.
+Apple Health extraction still happens on an Apple device; Android support is
+not a shipped product yet.
 
 ## What Hozz keeps, and its limits
 

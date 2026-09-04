@@ -48,16 +48,19 @@ limits before the staged import can commit.
 
 ## Health Connect projection
 
-Projection is always initiated by the person using Hozz. Before requesting
-permission, the UI shows exact, lossy, and archive-only counts. It requests only
-the write permissions represented by the current plan and does not request
-read, history, or background-read access. The pre-release manifest still
-declares write permissions for steps, distance, active energy, and sleep solely
-to remove a ledger-backed record written before those mappings were disabled;
-new records of those types are not projected while their mappings remain
-unsafe. Android has not shipped, so there is no supported migration that guesses
-at untracked prototype writes: deleting an unknown Health Connect record would
-violate the same idempotency rule this foundation is establishing.
+Projection requires Android 14/API 34 or newer and is always initiated by the
+person using Hozz. On Android 9 through 13 the shell reports projection as
+unavailable, even when the standalone Health Connect provider is installed.
+Before requesting permission on a supported device, the UI shows exact, lossy,
+and archive-only counts. It requests only the write permissions represented by
+the current plan and does not request read, history, or background-read access.
+The pre-release manifest still declares write permissions for steps, distance,
+active energy, and sleep solely to remove a ledger-backed record written before
+those mappings were disabled; new records of those types are not projected
+while their mappings remain unsafe. Android has not shipped, so there is no
+supported migration that guesses at untracked prototype writes: deleting an
+unknown Health Connect record would violate the same idempotency rule this
+foundation is establishing.
 
 Sidecar-declared v1 archives are intentionally strict. Archives produced before
 the canonical identity/provenance contract must be imported through the
@@ -114,22 +117,30 @@ Hozz records a durable pending operation before calling Health Connect. A
 successful upsert commits the returned record ID and clears that journal entry
 in one transaction; a crash after the platform write therefore retries safely
 through deterministic `clientRecordId`. Tombstones delete by that client
-identity even when the returned platform ID was never committed locally. The
-preview distinguishes inserts, updates, and deletes, and deletion still
-requires separate confirmation.
+identity even when the returned platform ID was never committed locally. This
+recovery relies on the Android 14+ system module accepting an already-absent
+identifier as a completed delete. The preview distinguishes inserts, updates,
+and deletes, and deletion still requires separate confirmation.
 
 ## Platform requirements
 
-The app's minimum is Android 9/API 28. Health Connect is a system module on
-Android 14 and newer and uses the separate
-`com.google.android.apps.healthdata` provider on Android 9 through 13. The
-project uses the stable `androidx.health.connect:connect-client:1.1.0` library.
+The app's minimum is Android 9/API 28, where archive import, viewing, and export
+remain available. Health Connect projection requires the system module on
+Android 14/API 34 or newer. The separate
+`com.google.android.apps.healthdata` provider used on Android 9 through 13 is
+explicitly gated off: `androidx.health.connect:connect-client:1.1.0` documents
+deleting an absent identifier or repeating a deletion as an IPC failure. If the
+provider deletes a record and the process dies before the local ledger commit,
+Hozz cannot distinguish that completed deletion from a provider failure without
+broad historical read access. Hozz keeps the archive available instead of
+claiming a projection it cannot recover truthfully.
 
 Google's write documentation permits correctly attributed imported data, while
 current Google Play health guidance also restricts synchronizing data between
-otherwise incompatible devices or platforms. The Health Connect action remains
-an unreleased, opt-in capability until Google provides policy clarification for
-user-initiated Apple Health migration.
+otherwise incompatible devices or platforms. That policy review is separate
+from the API 34 correctness gate. On supported devices the Health Connect action
+remains an unreleased, opt-in capability until Google provides policy
+clarification for user-initiated Apple Health migration.
 
 First-party references:
 

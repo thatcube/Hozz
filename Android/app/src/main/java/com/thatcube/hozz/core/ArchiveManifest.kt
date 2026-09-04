@@ -2,11 +2,9 @@ package com.thatcube.hozz.core
 
 import com.thatcube.hozz.generated.GeneratedContract
 import java.time.Instant
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.SerializationException
@@ -38,7 +36,11 @@ data class ArchiveManifest(
         }
 
         private fun decode(json: String): ArchiveManifest {
-            val jsonObject = Json.parseToJsonElement(json).jsonObject
+            val jsonObject = ArchiveJson.objectValue(
+                json = json,
+                subject = "Archive manifest",
+                rootError = "The archive manifest must be a JSON object.",
+            )
             val unknownKeys = jsonObject.keys - allowedKeys
             if (unknownKeys.isNotEmpty()) {
                 throw ArchiveFormatException(

@@ -24,13 +24,22 @@ data class ProjectionExecutionResult(
     val updated: Int = 0,
     val deleted: Int = 0,
     val failures: List<ProjectionFailure> = emptyList(),
+    val failureCount: Int = failures.size,
 ) {
     operator fun plus(other: ProjectionExecutionResult) =
         ProjectionExecutionResult(
             inserted = inserted + other.inserted,
             updated = updated + other.updated,
             deleted = deleted + other.deleted,
-            failures = failures + other.failures,
+            failures = buildList {
+                addAll(failures.take(MAX_RETAINED_PROJECTION_FAILURES))
+                addAll(
+                    other.failures.take(
+                        MAX_RETAINED_PROJECTION_FAILURES - size,
+                    ),
+                )
+            },
+            failureCount = failureCount + other.failureCount,
         )
 }
 
@@ -176,13 +185,15 @@ class ProjectionExecutor(
         val expected = drafts.associate {
             it.canonicalId to it.targetRecord
         }
-        check(
-            removed.size == drafts.size &&
-                removed.associate {
-                    it.canonicalId to it.targetRecord
-                } == expected,
+        if (
+            removed.size != drafts.size ||
+            removed.associate {
+                it.canonicalId to it.targetRecord
+            } != expected
         ) {
-            "Health Connect acknowledged different deletions."
+            throw HealthConnectProviderProtocolException(
+                "Health Connect acknowledged different deletions.",
+            )
         }
         completeDeletes(
             drafts.map {
@@ -197,14 +208,16 @@ class ProjectionExecutor(
         written: HealthConnectWriteResult,
     ): ProjectionExecutionResult {
         val expectedIds = operations.map { it.source.canonicalId }.toSet()
-        check(
-            written.attempted == operations.size &&
-                written.projections.size == operations.size &&
-                written.projections.map {
-                    it.canonicalId
-                }.toSet() == expectedIds,
+        if (
+            written.attempted != operations.size ||
+            written.projections.size != operations.size ||
+            written.projections.map {
+                it.canonicalId
+            }.toSet() != expectedIds
         ) {
-            "Health Connect acknowledged different upserts."
+            throw HealthConnectProviderProtocolException(
+                "Health Connect acknowledged different upserts.",
+            )
         }
         completeUpserts(written.projections)
         return ProjectionExecutionResult(
@@ -227,18 +240,15 @@ class ProjectionExecutor(
             Attempt(value = operation())
         } catch (error: CancellationException) {
             throw error
-        } catch (error: RemoteException) {
-            failure(canonicalId, action, error)
-        } catch (error: IOException) {
-            failure(canonicalId, action, error)
-        } catch (error: IllegalArgumentException) {
-            failure(canonicalId, action, error)
-        } catch (error: IllegalStateException) {
-            failure(canonicalId, action, error)
-        } catch (error: SecurityException) {
-            failure(canonicalId, action, error)
+        } catch (error: Exception) {
+            when (failureScope(error)) {
+                ProjectionFailureScope.RECORD ->
+                    failure(canonicalId, action, error)
+                ProjectionFailureScope.PROVIDER,
+                null,
+                -> throw error
+            }
         }
-
     }
 
     private fun ProjectionDraft.pending(
@@ -263,9 +273,28 @@ class ProjectionExecutor(
             ),
         )
 
+    private fun failureScope(error: Exception): ProjectionFailureScope? =
+        when (error) {
+            is HealthConnectProviderProtocolException ->
+                ProjectionFailureScope.PROVIDER
+            is IllegalArgumentException -> ProjectionFailureScope.RECORD
+            is RemoteException,
+            is IOException,
+            is IllegalStateException,
+            is SecurityException,
+            -> ProjectionFailureScope.PROVIDER
+            else -> null
+        }
+
     private companion object {
         val executionMutex = Mutex()
     }
 }
 
+private enum class ProjectionFailureScope {
+    RECORD,
+    PROVIDER,
+}
+
+internal const val MAX_RETAINED_PROJECTION_FAILURES = 100
 private const val MAX_PROJECTION_BATCH = 500

@@ -10,6 +10,7 @@ import com.networknt.schema.SchemaLocation
 import com.networknt.schema.SchemaRegistry
 import com.networknt.schema.SpecificationVersion
 import com.thatcube.hozz.generated.GeneratedContract
+import com.thatcube.hozz.projection.ProjectionAction
 import com.thatcube.hozz.projection.ProjectionPlanner
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
@@ -22,6 +23,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -221,6 +223,517 @@ class ArchiveImporterTest {
     }
 
     @Test
+    fun stagedChildBeforeNewerLiveParentUsesFinalParentWinner() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val sourceId = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        val childId = CanonicalRecordParser.seriesRecordId(
+            sourceId,
+            "HKQuantityTypeIdentifierStepCount",
+            "readings-0",
+        )
+        val oldParent = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:$sourceId","canonicalType":"activity.steps","id":"$sourceId","kind":"deletion","recordVersion":2,"schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent(),
+        )!!
+        val oldChild = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:$childId","canonicalType":"series.readings","endDate":"2026-01-01T00:01:00Z","id":"$childId","kind":"quantitySeriesReadings","parentCanonicalId":"apple.healthkit:$sourceId","recordVersion":2,"sample":"$sourceId","schemaVersion":1,"sequence":0,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent(),
+        )!!
+        val liveParent = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:$sourceId","canonicalType":"activity.steps","endDate":"2026-01-01T00:01:00Z","id":"$sourceId","kind":"quantity","quantity":{"unit":"count","value":3},"recordVersion":3,"schemaVersion":1,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent(),
+        )!!
+        val liveChild = CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"apple.healthkit:$childId","canonicalType":"series.readings","endDate":"2026-01-01T00:01:00Z","id":"$childId","kind":"quantitySeriesReadings","parentCanonicalId":"apple.healthkit:$sourceId","recordVersion":3,"sample":"$sourceId","schemaVersion":1,"sequence":0,"sourceRecord":{"id":"$sourceId","store":"apple.healthkit","type":"HKQuantityTypeIdentifierStepCount"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}
+            """.trimIndent(),
+        )!!
+        assertTrue(liveChild.canonicalId < liveParent.canonicalId)
+        store.upsert(listOf(oldParent, oldChild))
+        assertTrue(
+            store.allRecords()
+                .single { it.canonicalId == liveChild.canonicalId }
+                .tombstone,
+        )
+
+        val import = store.beginImport()
+        import.append(listOf(liveChild, liveParent))
+        import.commit()
+
+        val merged = store.allRecords().associateBy(CanonicalRecord::canonicalId)
+        assertFalse(merged.getValue(liveParent.canonicalId).tombstone)
+        assertFalse(merged.getValue(liveChild.canonicalId).tombstone)
+
+        val replay = store.beginImport()
+        replay.append(listOf(liveChild, liveParent))
+        assertEquals(2, replay.commit().ignored)
+        assertFalse(
+            store.allRecords()
+                .single { it.canonicalId == liveChild.canonicalId }
+                .tombstone,
+        )
+    }
+
+    @Test
+    fun stagedNestedChainUsesFinalParentWinnersBeforeEqualReplay() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val oldRoot = nestedRecord("z-root", null, 2, deleted = true)
+        val oldParent = nestedRecord(
+            "m-parent",
+            oldRoot.canonicalId,
+            2,
+            deleted = false,
+        )
+        val oldChild = nestedRecord(
+            "a-child",
+            oldParent.canonicalId,
+            2,
+            deleted = false,
+        )
+        store.upsert(listOf(oldRoot, oldParent, oldChild))
+        assertTrue(store.allRecords().all(CanonicalRecord::tombstone))
+
+        val liveRoot = nestedRecord("z-root", null, 3, deleted = false)
+        val liveParent = nestedRecord(
+            "m-parent",
+            liveRoot.canonicalId,
+            3,
+            deleted = false,
+        )
+        val liveChild = nestedRecord(
+            "a-child",
+            liveParent.canonicalId,
+            3,
+            deleted = false,
+        )
+        val childFirst = listOf(liveChild, liveParent, liveRoot)
+        val import = store.beginImport()
+        import.append(childFirst)
+        import.commit()
+
+        assertTrue(store.allRecords().none(CanonicalRecord::tombstone))
+        val replay = store.beginImport()
+        replay.append(childFirst)
+        assertEquals(3, replay.commit().ignored)
+        assertTrue(store.allRecords().none(CanonicalRecord::tombstone))
+    }
+
+    @Test
+    fun newerChildWaitsForMissingParentWinnerAcrossImports() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val oldParent = nestedRecord(
+            "missing-parent",
+            parentCanonicalId = null,
+            version = 2,
+            deleted = true,
+        )
+        val liveChild = nestedRecord(
+            "deferred-child",
+            parentCanonicalId = oldParent.canonicalId,
+            version = 3,
+            deleted = false,
+        )
+        store.upsert(listOf(oldParent))
+
+        val childOnly = store.beginImport()
+        childOnly.append(listOf(liveChild))
+        childOnly.commit()
+
+        assertTrue(
+            store.allRecords().none { it.canonicalId == liveChild.canonicalId },
+        )
+
+        val liveParent = nestedRecord(
+            "missing-parent",
+            parentCanonicalId = null,
+            version = 3,
+            deleted = false,
+        )
+        val complete = store.beginImport()
+        complete.append(listOf(liveChild, liveParent))
+        complete.commit()
+
+        assertTrue(store.allRecords().none(CanonicalRecord::tombstone))
+        val replay = store.beginImport()
+        replay.append(listOf(liveChild, liveParent))
+        assertEquals(2, replay.commit().ignored)
+        assertTrue(store.allRecords().none(CanonicalRecord::tombstone))
+    }
+
+    @Test
+    fun singleSelfParentIsRejectedBeforeMutation() {
+        val selfParent = nestedRecord(
+            "self-parent",
+            parentCanonicalId = "test:self-parent",
+            version = 1,
+            deleted = false,
+        )
+        val store = InMemoryCanonicalRecordStore()
+
+        val error = assertThrows(ArchiveFormatException::class.java) {
+            runBlocking { store.upsert(listOf(selfParent)) }
+        }
+
+        assertEquals("Canonical records contain a parent cycle.", error.message)
+        assertTrue(runBlocking { store.allRecords().isEmpty() })
+    }
+
+    @Test
+    fun splitImportParentCycleIsRejectedAgainstPersistedGraph() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val first = nestedRecord(
+            "split-a",
+            parentCanonicalId = "test:split-b",
+            version = 1,
+            deleted = false,
+        )
+        store.upsert(listOf(first))
+        val closing = nestedRecord(
+            "split-b",
+            parentCanonicalId = first.canonicalId,
+            version = 1,
+            deleted = false,
+        )
+
+        val import = store.beginImport()
+        import.append(listOf(closing))
+        val error = assertThrows(ArchiveFormatException::class.java) {
+            runBlocking { import.commit() }
+        }
+
+        assertEquals("Canonical records contain a parent cycle.", error.message)
+        assertEquals(listOf(first), store.allRecords())
+    }
+
+    @Test
+    fun deferredIncomingWinnerCannotHideResultingPersistedCycle() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val persistedB = nestedRecord(
+            "effective-b",
+            parentCanonicalId = null,
+            version = 1,
+            deleted = false,
+        )
+        val persistedA = nestedRecord(
+            "effective-a",
+            parentCanonicalId = persistedB.canonicalId,
+            version = 1,
+            deleted = false,
+        )
+        val tombstonedC = nestedRecord(
+            "effective-c",
+            parentCanonicalId = null,
+            version = 2,
+            deleted = true,
+        )
+        store.upsert(listOf(persistedA, persistedB, tombstonedC))
+        val before = store.allRecords()
+        val deferredA = nestedRecord(
+            "effective-a",
+            parentCanonicalId = tombstonedC.canonicalId,
+            version = 3,
+            deleted = false,
+        )
+        val closingB = nestedRecord(
+            "effective-b",
+            parentCanonicalId = persistedA.canonicalId,
+            version = 2,
+            deleted = false,
+        )
+
+        val error = assertThrows(ArchiveFormatException::class.java) {
+            runBlocking { store.upsert(listOf(deferredA, closingB)) }
+        }
+
+        assertEquals("Canonical records contain a parent cycle.", error.message)
+        assertEquals(before, store.allRecords())
+    }
+
+    @Test
+    fun parentDepthLimitUsesOneLookupPerWinnerAndRejectsDeeperGraph() =
+        runBlocking {
+            fun winner(index: Int): CanonicalParentWinner =
+                CanonicalParentWinner(
+                    recordVersion = 1,
+                    parentCanonicalId = if (index == 0) {
+                        null
+                    } else {
+                        "test:lookup-${index - 1}"
+                    },
+                )
+
+            val persisted = (0 until MAX_CANONICAL_PARENT_DEPTH).associate {
+                "test:lookup-$it" to winner(it)
+            }
+            val maximum = nestedRecord(
+                "lookup-$MAX_CANONICAL_PARENT_DEPTH",
+                parentCanonicalId =
+                    "test:lookup-${MAX_CANONICAL_PARENT_DEPTH - 1}",
+                version = 2,
+                deleted = false,
+            )
+            var lookups = 0
+
+            assertEquals(
+                listOf(maximum),
+                recordsInParentWinnerOrder(listOf(maximum)) { canonicalId ->
+                    lookups += 1
+                    persisted[canonicalId]
+                },
+            )
+            assertTrue(lookups <= MAX_CANONICAL_PARENT_DEPTH + 1)
+
+            val persistedAtLimit = persisted + (
+                maximum.canonicalId to CanonicalParentWinner(
+                    recordVersion = maximum.recordVersion,
+                    parentCanonicalId = maximum.parentCanonicalId,
+                )
+            )
+            val tooDeep = nestedRecord(
+                "lookup-${MAX_CANONICAL_PARENT_DEPTH + 1}",
+                parentCanonicalId = maximum.canonicalId,
+                version = 2,
+                deleted = false,
+            )
+            lookups = 0
+            val error = assertThrows(ArchiveFormatException::class.java) {
+                recordsInParentWinnerOrder(listOf(tooDeep)) { canonicalId ->
+                    lookups += 1
+                    persistedAtLimit[canonicalId]
+                }
+            }
+
+            assertEquals(
+                "Canonical parent depth exceeds the 64 level limit.",
+                error.message,
+            )
+            assertTrue(lookups <= MAX_CANONICAL_PARENT_DEPTH + 2)
+
+            val store = InMemoryCanonicalRecordStore()
+            val chain = (0..MAX_CANONICAL_PARENT_DEPTH).map { index ->
+                nestedRecord(
+                    "memory-depth-$index",
+                    parentCanonicalId = if (index == 0) {
+                        null
+                    } else {
+                        "test:memory-depth-${index - 1}"
+                    },
+                    version = 1,
+                    deleted = false,
+                )
+            }
+            store.upsert(chain.asReversed())
+            val memoryTooDeep = nestedRecord(
+                "memory-depth-${MAX_CANONICAL_PARENT_DEPTH + 1}",
+                parentCanonicalId = chain.last().canonicalId,
+                version = 1,
+                deleted = false,
+            )
+            val memoryError = assertThrows(ArchiveFormatException::class.java) {
+                runBlocking { store.upsert(listOf(memoryTooDeep)) }
+            }
+            assertEquals(error.message, memoryError.message)
+            assertEquals(chain.size, store.recordCount())
+        }
+
+    @Test
+    fun reparentingRootCannotPushPersistedDescendantPastDepthLimit() =
+        runBlocking {
+            val store = InMemoryCanonicalRecordStore()
+            val newRoot = nestedRecord(
+                "reparent-new-root",
+                parentCanonicalId = null,
+                version = 1,
+                deleted = false,
+            )
+            val chain = (0..MAX_CANONICAL_PARENT_DEPTH).map { index ->
+                nestedRecord(
+                    "reparent-$index",
+                    parentCanonicalId = if (index == 0) {
+                        null
+                    } else {
+                        "test:reparent-${index - 1}"
+                    },
+                    version = 1,
+                    deleted = false,
+                )
+            }
+            store.upsert(listOf(newRoot) + chain.asReversed())
+            val before = store.allRecords()
+            val reparented = chain.first().copy(
+                parentCanonicalId = newRoot.canonicalId,
+                recordVersion = 2,
+            )
+
+            val error = assertThrows(ArchiveFormatException::class.java) {
+                runBlocking { store.upsert(listOf(reparented)) }
+            }
+
+            assertEquals(
+                "Canonical parent depth exceeds the 64 level limit.",
+                error.message,
+            )
+            assertEquals(before, store.allRecords())
+        }
+
+    @Test
+    fun missingRootTombstoneAndLiveTransitionsReconcileDeepDescendants() =
+        runBlocking {
+            val store = InMemoryCanonicalRecordStore()
+            val rootId = "test:deep-root"
+            val parent = nestedRecord("deep-parent", rootId, 1, deleted = false)
+            val child = nestedRecord(
+                "deep-child",
+                parent.canonicalId,
+                1,
+                deleted = false,
+            )
+            val grandchild = nestedRecord(
+                "deep-grandchild",
+                child.canonicalId,
+                1,
+                deleted = false,
+            )
+            store.upsert(listOf(grandchild, child, parent))
+            assertTrue(store.allRecords().none(CanonicalRecord::tombstone))
+
+            val tombstone = nestedRecord(
+                "deep-root",
+                parentCanonicalId = null,
+                version = 2,
+                deleted = true,
+            )
+            store.upsert(listOf(tombstone))
+            assertTrue(store.allRecords().all(CanonicalRecord::tombstone))
+
+            val liveRoot = nestedRecord("deep-root", null, 3, deleted = false)
+            val liveParent = nestedRecord(
+                "deep-parent",
+                liveRoot.canonicalId,
+                3,
+                deleted = false,
+            )
+            val liveChild = nestedRecord(
+                "deep-child",
+                liveParent.canonicalId,
+                3,
+                deleted = false,
+            )
+            val liveGrandchild = nestedRecord(
+                "deep-grandchild",
+                liveChild.canonicalId,
+                3,
+                deleted = false,
+            )
+            val live = listOf(
+                liveGrandchild,
+                liveChild,
+                liveParent,
+                liveRoot,
+            )
+            store.upsert(live)
+
+            assertTrue(store.allRecords().none(CanonicalRecord::tombstone))
+            assertEquals(4, store.upsert(live).ignored)
+        }
+
+    @Test
+    fun deferredChildKeepsLedgerTransitionMonotonicWhenParentReturns() =
+        runBlocking {
+            val store = InMemoryCanonicalRecordStore()
+            val parentOne = nestedRecord(
+                "ledger-parent",
+                parentCanonicalId = null,
+                version = 1,
+                deleted = false,
+            )
+            fun child(version: Long): CanonicalRecord = nestedRecord(
+                "ledger-child",
+                parentCanonicalId = parentOne.canonicalId,
+                version = version,
+                deleted = false,
+            ).copy(
+                kind = "quantity",
+                canonicalType = "body.weight",
+                type = "HKQuantityTypeIdentifierBodyMass",
+                canonicalValue = CanonicalValue(70.0, "kg"),
+                originalValue = CanonicalValue(70.0, "kg"),
+                sourceRecordId = "ledger-child",
+            )
+            val childOne = child(1)
+            store.upsert(listOf(parentOne, childOne))
+            val projection = HealthConnectProjection(
+                canonicalId = childOne.canonicalId,
+                targetRecord = "WeightRecord",
+                canonicalVersion = 1,
+                healthConnectRecordId = "health-ledger-child",
+            )
+            store.saveHealthConnectProjections(listOf(projection))
+
+            val parentTwo = nestedRecord(
+                "ledger-parent",
+                parentCanonicalId = null,
+                version = 2,
+                deleted = true,
+            )
+            store.upsert(listOf(parentTwo))
+            val deletedChild = store.allRecords()
+                .single { it.canonicalId == childOne.canonicalId }
+            val deletion = ProjectionPlanner.plan(deletedChild, projection)
+            assertEquals(ProjectionAction.DELETE, deletion.action)
+            assertEquals(2L, deletion.draft?.recordVersion)
+            val deleteOperation = PendingHealthConnectOperation(
+                canonicalId = childOne.canonicalId,
+                targetRecord = "WeightRecord",
+                canonicalVersion = 2,
+                action = HealthConnectPendingAction.DELETE,
+            )
+            store.stageHealthConnectOperations(listOf(deleteOperation))
+            store.completeHealthConnectDeletes(listOf(deleteOperation))
+
+            val childThree = child(3)
+            assertEquals(1, store.upsert(listOf(childThree)).ignored)
+            val deferred = store.allRecords()
+                .single { it.canonicalId == childThree.canonicalId }
+            assertEquals(2, deferred.recordVersion)
+            assertEquals(
+                ProjectionAction.NONE,
+                ProjectionPlanner.plan(deferred).action,
+            )
+
+            val parentThree = nestedRecord(
+                "ledger-parent",
+                parentCanonicalId = null,
+                version = 3,
+                deleted = false,
+            )
+            store.upsert(listOf(childThree, parentThree))
+            val restored = store.allRecords()
+                .single { it.canonicalId == childThree.canonicalId }
+            val insertion = ProjectionPlanner.plan(restored)
+            assertEquals(ProjectionAction.INSERT, insertion.action)
+            assertEquals(3L, insertion.draft?.recordVersion)
+            val upsertOperation = PendingHealthConnectOperation(
+                canonicalId = restored.canonicalId,
+                targetRecord = "WeightRecord",
+                canonicalVersion = 3,
+                action = HealthConnectPendingAction.UPSERT,
+            )
+
+            store.stageHealthConnectOperations(listOf(upsertOperation))
+
+            assertEquals(
+                upsertOperation,
+                store.pendingHealthConnectOperations(setOf(restored.canonicalId))[
+                    restored.canonicalId
+                ],
+            )
+        }
+
+    @Test
     fun malformedLateRecordLeavesNoPartialImport() = runBlocking {
         val store = InMemoryCanonicalRecordStore()
         val valid = fixture.toString(Charsets.UTF_8).lineSequence().first()
@@ -236,6 +749,103 @@ class ArchiveImporterTest {
 
         assertTrue(failed)
         assertTrue(store.allRecords().isEmpty())
+    }
+
+    @Test
+    fun deeplyNestedRecordFailsWithBoundedArchiveFormatError() {
+        val record = buildString {
+            append(
+                """{"endDate":"2026-01-01T00:01:00Z","extension":""",
+            )
+            repeat(20_000) { append("""{"nested":""") }
+            append("null")
+            repeat(20_000) { append('}') }
+            append(
+                ""","id":"deep","kind":"quantity","quantity":{"unit":"count","value":1},"schemaVersion":1,"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierStepCount"}""",
+            )
+        }
+        val store = InMemoryCanonicalRecordStore()
+
+        val error = assertThrows(ArchiveFormatException::class.java) {
+            runBlocking {
+                ArchiveImporter(store).import(
+                    ByteArrayInputStream("$record\n".toByteArray()),
+                )
+            }
+        }
+
+        assertEquals(
+            "Record line 1 is invalid: Record JSON exceeds the maximum nesting depth of 64.",
+            error.message,
+        )
+        assertTrue(runBlocking { store.allRecords().isEmpty() })
+    }
+
+    @Test
+    fun recordJsonNestingLimitIsExactAndIgnoresBracesInsideStrings() {
+        fun deletionAtDepth(depth: Int): String = buildString {
+            append("""{"id":"depth-boundary","kind":"deletion","metadata":""")
+            repeat(depth - 1) { append("""{"nested":""") }
+            append(""""literal {[{[ braces"""")
+            repeat(depth - 1) { append('}') }
+            append(
+                ""","schemaVersion":1,"type":"HKQuantityTypeIdentifierStepCount"}""",
+            )
+        }
+
+        assertNotNull(
+            CanonicalRecordParser.parse(
+                deletionAtDepth(ArchiveJson.MAX_NESTING_DEPTH),
+            ),
+        )
+        val error = assertThrows(ArchiveFormatException::class.java) {
+            CanonicalRecordParser.parse(
+                deletionAtDepth(ArchiveJson.MAX_NESTING_DEPTH + 1),
+            )
+        }
+        assertEquals(
+            "Record JSON exceeds the maximum nesting depth of 64.",
+            error.message,
+        )
+    }
+
+    @Test
+    fun everyRecordParserEntryPointNormalizesArrayRootFailure() {
+        val parsers: List<() -> Unit> = listOf(
+            { CanonicalRecordParser.parse("[]") },
+            { CanonicalRecordParser.kind("[]") },
+            { CanonicalRecordParser.runIdentifier("[]") },
+            { CanonicalRecordParser.normalizedRunLine("[]") },
+            { CanonicalRecordParser.validateStrict("[]") },
+        )
+
+        for (parser in parsers) {
+            val error = assertThrows(ArchiveFormatException::class.java, parser)
+            assertEquals("A record must be a JSON object.", error.message)
+        }
+    }
+
+    @Test
+    fun recordsFirstZipArrayRootFailsWithArchiveFormatError() {
+        val store = InMemoryCanonicalRecordStore()
+        val archive = zip(
+            listOf(
+                "records.ndjson" to "[]\n".toByteArray(),
+                ArchiveManifest.ENTRY_NAME to manifest(recordCount = 0),
+            ),
+        )
+
+        val error = assertThrows(ArchiveFormatException::class.java) {
+            runBlocking {
+                ArchiveImporter(store).import(ByteArrayInputStream(archive))
+            }
+        }
+
+        assertEquals(
+            "Record line 1 is invalid: A record must be a JSON object.",
+            error.message,
+        )
+        assertTrue(runBlocking { store.allRecords().isEmpty() })
     }
 
     @Test
@@ -1448,6 +2058,24 @@ class ArchiveImporterTest {
         """
         {"archiveId":"fixture","createdAt":"2026-01-01T00:00:00Z","format":"hozz-ndjson","recordCount":$recordCount,"recordSchema":"hozz/v1/canonical-record","recordsEntry":"records.ndjson","schemaVersion":1}
         """.trimIndent().toByteArray()
+
+    private fun nestedRecord(
+        id: String,
+        parentCanonicalId: String?,
+        version: Long,
+        deleted: Boolean,
+    ): CanonicalRecord {
+        val parent = parentCanonicalId?.let {
+            ""","parentCanonicalId":"$it""""
+        }.orEmpty()
+        val deletion = if (deleted) ""","deleted":true""" else ""
+        return CanonicalRecordParser.parse(
+            """
+            {"canonicalId":"test:$id","canonicalType":"archive.raw"$deletion,"endDate":"2026-01-01T00:01:00Z","id":"$id","kind":"futureNested","lineage":[{"recordId":"$id","store":"test"}]$parent,"recordVersion":$version,"schemaVersion":1,"sourceRecord":{"id":"$id","store":"test","type":"FutureNestedType"},"startDate":"2026-01-01T00:00:00Z","type":"FutureNestedType"}
+            """.trimIndent(),
+            strictV1 = true,
+        )!!
+    }
 
     private fun versionedZip(records: ByteArray, recordCount: Int): ByteArray =
         zip(

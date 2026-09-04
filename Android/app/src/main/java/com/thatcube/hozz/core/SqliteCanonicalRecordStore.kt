@@ -18,6 +18,9 @@ class SqliteCanonicalRecordStore(
     SQLiteOpenHelper(context, databaseName, null, 12),
     CanonicalRecordStore {
 
+    internal var parentStateLookupCountForTesting = 0L
+        private set
+
     override fun onCreate(database: SQLiteDatabase) {
         database.execSQL(
             """
@@ -304,6 +307,8 @@ class SqliteCanonicalRecordStore(
                         expectedRunCount,
                     )
                     var result = MergeResult()
+                    materializeStagedParentGraph(database, sessionId)
+                    var mergedCount = 0L
                     database.query(
                         "canonical_record_stage",
                         null,
@@ -311,12 +316,19 @@ class SqliteCanonicalRecordStore(
                         arrayOf(sessionId),
                         null,
                         null,
-                        "canonical_id",
+                        "merge_depth, canonical_id",
                     ).use { cursor ->
                         while (cursor.moveToNext()) {
                             result += mergeOne(database, cursor.record())
+                            mergedCount += 1
                         }
                     }
+                    if (mergedCount != expectedCanonicalCount) {
+                        throw ArchiveFormatException(
+                            "Canonical records contain a parent cycle.",
+                        )
+                    }
+                    validateStagedAppliedParentGraph(database, sessionId)
                     restoreUnresolvedContinuationErrors(database)
                     reconcileEncodingFailures(database)
                     database.execSQL(
@@ -339,6 +351,16 @@ class SqliteCanonicalRecordStore(
                         "archive_run_record_stage",
                         "session_id = ?",
                         arrayOf(sessionId),
+                    )
+                    database.delete(
+                        "canonical_parent_winner_graph",
+                        null,
+                        null,
+                    )
+                    database.delete(
+                        "canonical_parent_graph_seed",
+                        null,
+                        null,
                     )
                     database.setTransactionSuccessful()
                     result
@@ -1033,14 +1055,251 @@ class SqliteCanonicalRecordStore(
         }
     }
 
+    private fun materializeStagedParentGraph(
+        database: SQLiteDatabase,
+        sessionId: String,
+    ) {
+        database.delete("canonical_parent_winner_graph", null, null)
+        database.execSQL(
+            """
+            WITH RECURSIVE reachable(canonical_id) AS (
+                SELECT canonical_id
+                FROM canonical_record_stage
+                WHERE session_id = ?
+                UNION
+                SELECT CASE
+                    WHEN staged.canonical_id IS NOT NULL
+                         AND (
+                             persisted.canonical_id IS NULL
+                             OR staged.record_version >
+                                 persisted.record_version
+                         )
+                        THEN staged.parent_canonical_id
+                    ELSE persisted.parent_canonical_id
+                END
+                FROM reachable
+                LEFT JOIN canonical_record_stage AS staged
+                  ON staged.session_id = ?
+                 AND staged.canonical_id = reachable.canonical_id
+                LEFT JOIN canonical_record AS persisted
+                  ON persisted.canonical_id = reachable.canonical_id
+                WHERE CASE
+                    WHEN staged.canonical_id IS NOT NULL
+                         AND (
+                             persisted.canonical_id IS NULL
+                             OR staged.record_version >
+                                 persisted.record_version
+                         )
+                        THEN staged.parent_canonical_id
+                    ELSE persisted.parent_canonical_id
+                END IS NOT NULL
+            )
+            INSERT INTO canonical_parent_winner_graph (
+                canonical_id,
+                parent_canonical_id
+            )
+            SELECT reachable.canonical_id,
+                   CASE
+                       WHEN staged.canonical_id IS NOT NULL
+                            AND (
+                                persisted.canonical_id IS NULL
+                                OR staged.record_version >
+                                    persisted.record_version
+                            )
+                           THEN staged.parent_canonical_id
+                       ELSE persisted.parent_canonical_id
+                   END
+            FROM reachable
+            LEFT JOIN canonical_record_stage AS staged
+              ON staged.session_id = ?
+             AND staged.canonical_id = reachable.canonical_id
+            LEFT JOIN canonical_record AS persisted
+              ON persisted.canonical_id = reachable.canonical_id
+            """.trimIndent(),
+            arrayOf(sessionId, sessionId, sessionId),
+        )
+        validateMaterializedParentGraph(database)
+        database.execSQL(
+            """
+            UPDATE canonical_record_stage
+            SET merge_depth = (
+                SELECT winner.merge_depth
+                FROM canonical_parent_winner_graph AS winner
+                WHERE winner.canonical_id =
+                    canonical_record_stage.canonical_id
+            )
+            WHERE session_id = ?
+            """.trimIndent(),
+            arrayOf(sessionId),
+        )
+    }
+
+    private fun validateMaterializedParentGraph(
+        database: SQLiteDatabase,
+    ) {
+        database.execSQL(
+            """
+            WITH RECURSIVE parent_depth(canonical_id, depth) AS (
+                SELECT canonical_id, 0
+                FROM canonical_parent_winner_graph
+                WHERE parent_canonical_id IS NULL
+                UNION ALL
+                SELECT child.canonical_id, parent_depth.depth + 1
+                FROM canonical_parent_winner_graph AS child
+                JOIN parent_depth
+                  ON child.parent_canonical_id = parent_depth.canonical_id
+                WHERE parent_depth.depth <= ?
+            )
+            UPDATE canonical_parent_winner_graph
+            SET merge_depth = (
+                SELECT parent_depth.depth
+                FROM parent_depth
+                WHERE parent_depth.canonical_id =
+                    canonical_parent_winner_graph.canonical_id
+            )
+            """.trimIndent(),
+            arrayOf<Any>(MAX_CANONICAL_PARENT_DEPTH),
+        )
+        val maximumDepth = database.rawQuery(
+            "SELECT MAX(merge_depth) FROM canonical_parent_winner_graph",
+            null,
+        ).use { cursor ->
+            if (cursor.moveToFirst() && !cursor.isNull(0)) cursor.getLong(0) else 0
+        }
+        if (maximumDepth > MAX_CANONICAL_PARENT_DEPTH) {
+            throw ArchiveFormatException(
+                "Canonical parent depth exceeds the " +
+                    "$MAX_CANONICAL_PARENT_DEPTH level limit.",
+            )
+        }
+        val hasCycle = database.rawQuery(
+            """
+            SELECT 1
+            FROM canonical_parent_winner_graph
+            WHERE merge_depth IS NULL
+            LIMIT 1
+            """.trimIndent(),
+            null,
+        ).use(Cursor::moveToFirst)
+        if (hasCycle) {
+            throw ArchiveFormatException(
+                "Canonical records contain a parent cycle.",
+            )
+        }
+    }
+
+    private fun validateStagedAppliedParentGraph(
+        database: SQLiteDatabase,
+        sessionId: String,
+    ) {
+        database.delete("canonical_parent_graph_seed", null, null)
+        database.execSQL(
+            """
+            INSERT OR IGNORE INTO canonical_parent_graph_seed (canonical_id)
+            SELECT canonical_id
+            FROM canonical_record_stage
+            WHERE session_id = ?
+            """.trimIndent(),
+            arrayOf(sessionId),
+        )
+        materializeAppliedParentGraph(database)
+        validateMaterializedParentGraph(database)
+    }
+
+    private fun materializeAppliedParentGraph(database: SQLiteDatabase) {
+        database.delete("canonical_parent_winner_graph", null, null)
+        database.execSQL(
+            """
+            WITH RECURSIVE affected(canonical_id) AS (
+                SELECT canonical_id
+                FROM canonical_parent_graph_seed
+                UNION
+                SELECT child.canonical_id
+                FROM canonical_record AS child
+                JOIN affected
+                  ON child.parent_canonical_id = affected.canonical_id
+            )
+            INSERT INTO canonical_parent_winner_graph (
+                canonical_id,
+                parent_canonical_id
+            )
+            SELECT affected.canonical_id,
+                   persisted.parent_canonical_id
+            FROM affected
+            LEFT JOIN canonical_record AS persisted
+              ON persisted.canonical_id = affected.canonical_id
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            WITH RECURSIVE closure(canonical_id) AS (
+                SELECT canonical_id
+                FROM canonical_parent_winner_graph
+                UNION
+                SELECT persisted.parent_canonical_id
+                FROM closure
+                JOIN canonical_record AS persisted
+                  ON persisted.canonical_id = closure.canonical_id
+                WHERE persisted.parent_canonical_id IS NOT NULL
+            )
+            INSERT OR IGNORE INTO canonical_parent_winner_graph (
+                canonical_id,
+                parent_canonical_id
+            )
+            SELECT closure.canonical_id,
+                   persisted.parent_canonical_id
+            FROM closure
+            LEFT JOIN canonical_record AS persisted
+              ON persisted.canonical_id = closure.canonical_id
+            """.trimIndent(),
+        )
+    }
+
+    private fun validateStoredParentGraph(
+        database: SQLiteDatabase,
+        canonicalIds: Iterable<String>,
+    ) {
+        database.delete("canonical_parent_graph_seed", null, null)
+        var hasSeeds = false
+        for (canonicalId in canonicalIds) {
+            hasSeeds = true
+            database.insertWithOnConflict(
+                "canonical_parent_graph_seed",
+                null,
+                ContentValues().apply { put("canonical_id", canonicalId) },
+                SQLiteDatabase.CONFLICT_IGNORE,
+            )
+        }
+        if (!hasSeeds) return
+        try {
+            materializeAppliedParentGraph(database)
+            validateMaterializedParentGraph(database)
+        } finally {
+            database.delete("canonical_parent_winner_graph", null, null)
+            database.delete("canonical_parent_graph_seed", null, null)
+        }
+    }
+
     private fun mergeIntoCanonical(
         database: SQLiteDatabase,
         records: List<CanonicalRecord>,
     ): MergeResult {
         var result = MergeResult()
-        for (record in records) {
+        val ordered = recordsInParentWinnerOrder(records) { canonicalId ->
+            parentState(database, canonicalId)?.let {
+                CanonicalParentWinner(
+                    recordVersion = it.recordVersion,
+                    parentCanonicalId = it.parentCanonicalId,
+                )
+            }
+        }
+        for (record in ordered) {
             result += mergeOne(database, record)
         }
+        validateStoredParentGraph(
+            database,
+            ordered.map(CanonicalRecord::canonicalId),
+        )
         restoreUnresolvedContinuationErrors(database)
         reconcileEncodingFailures(database)
         return result
@@ -1196,33 +1455,29 @@ class SqliteCanonicalRecordStore(
         database: SQLiteDatabase,
         record: CanonicalRecord,
     ): MergeResult {
-        val effective = record.parentCanonicalId
-            ?.let { parentState(database, it) }
-            ?.takeIf(StoredRecordState::tombstone)
-            ?.let { parent ->
-                record.copy(
-                    recordVersion = maxOf(
-                        record.recordVersion,
-                        parent.recordVersion,
-                    ),
-                    tombstone = true,
-                )
-            }
-            ?: record
-        val existingVersion = existingVersion(
-            database = database,
-            table = "canonical_record",
-            canonicalId = effective.canonicalId,
-        )
+        val parent = record.parentCanonicalId?.let { parentState(database, it) }
+        if (
+            parent?.tombstone == true &&
+            !record.tombstone &&
+            record.recordVersion > parent.recordVersion
+        ) {
+            return MergeResult(ignored = 1)
+        }
+        val effective = if (parent?.tombstone == true) {
+            record.deferredByParentTombstone(parent.recordVersion)
+        } else {
+            record
+        }
+        val existing = parentState(database, effective.canonicalId)
         val result = when {
-            existingVersion == null -> {
+            existing == null -> {
                 database.insertOrThrow("canonical_record", null, values(effective))
                 MergeResult(
                     inserted = 1,
                     tombstones = if (effective.tombstone) 1 else 0,
                 )
             }
-            effective.recordVersion > existingVersion -> {
+            effective.recordVersion > existing.recordVersion -> {
                 database.update(
                     "canonical_record",
                     values(effective),
@@ -1238,17 +1493,10 @@ class SqliteCanonicalRecordStore(
         }
         val winningParent = parentState(database, effective.canonicalId)
         if (winningParent?.tombstone == true) {
-            database.execSQL(
-                """
-                UPDATE canonical_record
-                SET tombstone = 1,
-                    record_version = MAX(record_version, ?)
-                WHERE parent_canonical_id = ?
-                """.trimIndent(),
-                arrayOf<Any>(
-                    winningParent.recordVersion,
-                    effective.canonicalId,
-                ),
+            cascadeTombstone(
+                database,
+                effective.canonicalId,
+                winningParent.recordVersion,
             )
         } else if (
             winningParent != null &&
@@ -1273,38 +1521,103 @@ class SqliteCanonicalRecordStore(
         return result
     }
 
+    private fun cascadeTombstone(
+        database: SQLiteDatabase,
+        parentCanonicalId: String,
+        parentVersion: Long,
+    ) {
+        database.execSQL(
+            """
+            WITH RECURSIVE descendants(canonical_id, inherited_version) AS (
+                SELECT child.canonical_id,
+                       CASE
+                           WHEN child.tombstone = 1
+                             OR child.kind = 'sampleEncodingError'
+                               THEN MAX(child.record_version, ?)
+                           ELSE ?
+                       END
+                FROM canonical_record AS child
+                WHERE child.parent_canonical_id = ?
+                  AND (
+                      child.tombstone = 1
+                      OR child.kind = 'sampleEncodingError'
+                      OR child.record_version <= ?
+                  )
+                UNION
+                SELECT child.canonical_id,
+                       CASE
+                           WHEN child.tombstone = 1
+                             OR child.kind = 'sampleEncodingError'
+                               THEN MAX(
+                                   child.record_version,
+                                   descendants.inherited_version
+                               )
+                           ELSE descendants.inherited_version
+                       END
+                FROM canonical_record AS child
+                JOIN descendants
+                  ON child.parent_canonical_id = descendants.canonical_id
+                WHERE child.tombstone = 1
+                   OR child.kind = 'sampleEncodingError'
+                   OR child.record_version <= descendants.inherited_version
+            )
+            UPDATE canonical_record
+            SET tombstone = 1,
+                record_version = (
+                    SELECT descendants.inherited_version
+                    FROM descendants
+                    WHERE descendants.canonical_id =
+                        canonical_record.canonical_id
+                )
+            WHERE canonical_id IN (
+                SELECT canonical_id
+                FROM descendants
+            )
+            """.trimIndent(),
+            arrayOf<Any>(
+                parentVersion,
+                parentVersion,
+                parentCanonicalId,
+                parentVersion,
+            ),
+        )
+    }
+
     private fun parentState(
         database: SQLiteDatabase,
         canonicalId: String,
-    ): StoredRecordState? = database.query(
-        "canonical_record",
-        arrayOf(
-            "record_version",
-            "tombstone",
-            "kind",
-            "parent_canonical_id",
-            "type",
-        ),
-        "canonical_id = ?",
-        arrayOf(canonicalId),
-        null,
-        null,
-        null,
-    ).use { cursor ->
-        if (cursor.moveToFirst()) {
-            StoredRecordState(
-                recordVersion = cursor.getLong(0),
-                tombstone = cursor.getInt(1) != 0,
-                kind = cursor.getString(2),
-                parentCanonicalId = if (cursor.isNull(3)) {
-                    null
-                } else {
-                    cursor.getString(3)
-                },
-                type = cursor.getString(4),
-            )
-        } else {
-            null
+    ): StoredRecordState? {
+        parentStateLookupCountForTesting += 1
+        return database.query(
+            "canonical_record",
+            arrayOf(
+                "record_version",
+                "tombstone",
+                "kind",
+                "parent_canonical_id",
+                "type",
+            ),
+            "canonical_id = ?",
+            arrayOf(canonicalId),
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            if (cursor.moveToFirst()) {
+                StoredRecordState(
+                    recordVersion = cursor.getLong(0),
+                    tombstone = cursor.getInt(1) != 0,
+                    kind = cursor.getString(2),
+                    parentCanonicalId = if (cursor.isNull(3)) {
+                        null
+                    } else {
+                        cursor.getString(3)
+                    },
+                    type = cursor.getString(4),
+                )
+            } else {
+                null
+            }
         }
     }
 
@@ -1631,7 +1944,40 @@ class SqliteCanonicalRecordStore(
                     lineage_json TEXT NOT NULL,
                     tombstone INTEGER NOT NULL,
                     raw_json TEXT NOT NULL,
+                    merge_depth INTEGER,
                     PRIMARY KEY (session_id, canonical_id)
+                )
+                """.trimIndent(),
+            )
+            database.execSQL(
+                """
+                CREATE INDEX IF NOT EXISTS canonical_record_stage_parent
+                ON canonical_record_stage (
+                    session_id,
+                    parent_canonical_id,
+                    canonical_id
+                )
+                """.trimIndent(),
+            )
+            database.execSQL(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS canonical_parent_winner_graph (
+                    canonical_id TEXT PRIMARY KEY,
+                    parent_canonical_id TEXT,
+                    merge_depth INTEGER
+                )
+                """.trimIndent(),
+            )
+            database.execSQL(
+                """
+                CREATE INDEX IF NOT EXISTS canonical_parent_winner_graph_parent
+                ON canonical_parent_winner_graph (parent_canonical_id)
+                """.trimIndent(),
+            )
+            database.execSQL(
+                """
+                CREATE TEMP TABLE IF NOT EXISTS canonical_parent_graph_seed (
+                    canonical_id TEXT PRIMARY KEY
                 )
                 """.trimIndent(),
             )

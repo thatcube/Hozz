@@ -9,6 +9,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.thatcube.hozz.core.ArchiveFormatException
 import com.thatcube.hozz.core.ArchiveImportResult
+import com.thatcube.hozz.core.HozzCoreSnapshot
 import com.thatcube.hozz.core.HozzCoreService
 import com.thatcube.hozz.core.SafArchiveTransport
 import com.thatcube.hozz.core.SafArchiveSink
@@ -40,6 +41,12 @@ data class HozzUiState(
     val healthConnectStatus: Int = HealthConnectClient.SDK_UNAVAILABLE,
 )
 
+internal fun HozzUiState.beginningOperation(status: String): HozzUiState = copy(
+    busy = true,
+    timelineLoading = false,
+    status = status,
+)
+
 internal fun HozzUiState.appending(page: TimelineItemPage): HozzUiState {
     val existing = timeline.mapTo(hashSetOf()) { it.canonicalId }
     val additions = page.records.filter { existing.add(it.canonicalId) }
@@ -60,13 +67,133 @@ internal data class TimelineLoadRequest(
         generation == currentGeneration && cursor == currentCursor
 }
 
+internal class HozzRefreshGeneration {
+    var current: Long = 0
+        private set
+
+    fun beginRefresh(): Long {
+        current += 1
+        return current
+    }
+
+    fun beginOperation() {
+        current += 1
+    }
+
+    fun isCurrent(generation: Long): Boolean = generation == current
+}
+
+internal class HozzStateRefresher(
+    private val state: MutableStateFlow<HozzUiState>,
+    private val loadSnapshot: suspend () -> HozzCoreSnapshot,
+    private val healthConnectStatus: () -> Int,
+) {
+    private val generation = HozzRefreshGeneration()
+
+    val currentGeneration: Long
+        get() = generation.current
+
+    fun beginOperation(status: String) {
+        generation.beginOperation()
+        state.value = state.value.beginningOperation(status)
+    }
+
+    suspend fun refresh(
+        lastImport: ArchiveImportResult? = state.value.lastImport,
+        status: String? = state.value.status,
+    ) = loadAndApply(
+        lastImport = lastImport,
+        status = status,
+        settleOnFailure = false,
+    )
+
+    suspend fun finishOperation(
+        status: String,
+        lastImport: ArchiveImportResult? = state.value.lastImport,
+    ) = loadAndApply(
+        lastImport = lastImport,
+        status = status,
+        settleOnFailure = true,
+    )
+
+    private suspend fun loadAndApply(
+        lastImport: ArchiveImportResult?,
+        status: String?,
+        settleOnFailure: Boolean,
+    ) {
+        val refresh = generation.beginRefresh()
+        val snapshot = try {
+            loadSnapshot()
+        } catch (error: CancellationException) {
+            throw error
+        } catch (error: Exception) {
+            if (!settleOnFailure) throw error
+            if (generation.isCurrent(refresh)) {
+                val refreshFailure = error.message?.let {
+                    "The local archive view could not be refreshed: $it"
+                } ?: "The local archive view could not be refreshed."
+                state.value = state.value.copy(
+                    busy = false,
+                    timelineLoading = false,
+                    lastImport = lastImport,
+                    status = listOfNotNull(status, refreshFailure)
+                        .joinToString(" "),
+                    healthConnectStatus = healthConnectStatus(),
+                )
+            }
+            return
+        }
+        if (!generation.isCurrent(refresh)) return
+        state.value = HozzUiState(
+            busy = false,
+            timeline = snapshot.timeline,
+            timelineNextCursor = snapshot.timelineNextCursor,
+            timelineLoading = false,
+            projection = snapshot.projection,
+            totalRecordCount = snapshot.totalRecordCount,
+            lastImport = lastImport,
+            status = status,
+            healthConnectStatus = healthConnectStatus(),
+        )
+    }
+}
+
+internal fun healthConnectCompletionStatus(
+    result: ProjectionExecutionResult,
+    permissionDeferred: Int,
+): String = buildString {
+    append("Health Connect applied ")
+    append(result.inserted)
+    append(" inserts, ")
+    append(result.updated)
+    append(" updates, and ")
+    append(result.deleted)
+    append(" deletions.")
+    if (result.failureCount > 0) {
+        append(" ")
+        append(result.failureCount)
+        append(" records failed and remain pending.")
+    }
+    if (permissionDeferred > 0) {
+        append(" ")
+        append(permissionDeferred)
+        append(" records remain pending because write access was not granted.")
+    }
+}
+
 class HozzViewModel(application: Application) : AndroidViewModel(application) {
     private val core = HozzCoreService(application)
     private val healthConnect = HealthConnectWriter(application)
     private val mutableState = MutableStateFlow(
         HozzUiState(healthConnectStatus = healthConnect.availability),
     )
-    private var timelineGeneration = 0L
+    private val stateRefresher = HozzStateRefresher(
+        state = mutableState,
+        loadSnapshot = {
+            withContext(Dispatchers.IO) { core.snapshot() }
+        },
+        healthConnectStatus = { healthConnect.availability },
+    )
 
     val state: StateFlow<HozzUiState> = mutableState.asStateFlow()
 
@@ -78,10 +205,7 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
 
     fun importArchive(uri: Uri) {
         viewModelScope.launch {
-            mutableState.value = mutableState.value.copy(
-                busy = true,
-                status = "Reading the selected Hozz archive…",
-            )
+            beginOperation("Reading the selected Hozz archive…")
             try {
                 val result = withContext(Dispatchers.IO) {
                     core.import(
@@ -92,7 +216,7 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                     )
                 }
 
-                refresh(
+                stateRefresher.finishOperation(
                     lastImport = result,
                     status = buildString {
                         append("Archive imported: ")
@@ -132,7 +256,7 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
     fun loadMoreTimeline() {
         val cursor = mutableState.value.timelineNextCursor ?: return
         if (mutableState.value.timelineLoading) return
-        val request = TimelineLoadRequest(timelineGeneration, cursor)
+        val request = TimelineLoadRequest(stateRefresher.currentGeneration, cursor)
         mutableState.value = mutableState.value.copy(timelineLoading = true)
         viewModelScope.launch {
             try {
@@ -140,7 +264,7 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                     core.timelinePage(cursor)
                 }
                 if (!request.isCurrent(
-                        timelineGeneration,
+                        stateRefresher.currentGeneration,
                         mutableState.value.timelineNextCursor,
                     )
                 ) {
@@ -161,10 +285,7 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
 
     fun exportArchive(uri: Uri) {
         viewModelScope.launch {
-            mutableState.value = mutableState.value.copy(
-                busy = true,
-                status = "Writing the canonical Hozz archive…",
-            )
+            beginOperation("Writing the canonical Hozz archive…")
             try {
                 val result = withContext(Dispatchers.IO) {
                     core.export(
@@ -175,9 +296,8 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                         ),
                     )
                 }
-                mutableState.value = mutableState.value.copy(
-                    busy = false,
-                    status = "Saved ${result.recordCount} canonical records.",
+                stateRefresher.finishOperation(
+                    "Saved ${result.recordCount} canonical records.",
                 )
             } catch (error: ArchiveFormatException) {
                 fail(error.message ?: "Android could not create the archive.")
@@ -185,6 +305,8 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                 throw error
             } catch (error: IOException) {
                 fail(error.message ?: "Android could not write the archive.")
+            } catch (error: SQLiteException) {
+                fail(error.message ?: "The local Hozz archive could not be read.")
             } catch (error: SecurityException) {
                 fail("Android did not grant access to the selected location.")
             }
@@ -202,10 +324,7 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                 )
                 return@launch
             }
-            mutableState.value = mutableState.value.copy(
-                busy = true,
-                status = "Checking Health Connect write access…",
-            )
+            beginOperation("Checking Health Connect write access…")
             try {
                 val missing = healthConnect.missingPermissions(
                     projection.targetRecords,
@@ -215,13 +334,14 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                         healthConnect.requiredPermissions(projection.targetRecords),
                     )
                 } else {
-                    mutableState.value = mutableState.value.copy(busy = false)
+                    stateRefresher.finishOperation(
+                        mutableState.value.status
+                            ?: "Health Connect write access is required.",
+                    )
                     requestPermissions(missing)
                 }
             } catch (error: IOException) {
                 fail(error.message ?: "Health Connect could not check permissions.")
-            } catch (error: CancellationException) {
-                throw error
             } catch (error: CancellationException) {
                 throw error
             } catch (error: RemoteException) {
@@ -237,10 +357,7 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
     fun finishHealthConnectPermission(@Suppress("UNUSED_PARAMETER") granted: Set<String>) {
         viewModelScope.launch {
             val projection = mutableState.value.projection
-            mutableState.value = mutableState.value.copy(
-                busy = true,
-                status = "Confirming Health Connect write access…",
-            )
+            beginOperation("Confirming Health Connect write access…")
             val missing = try {
                 healthConnect.missingPermissions(projection.targetRecords)
             } catch (error: CancellationException) {
@@ -248,8 +365,6 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
             } catch (error: IOException) {
                 fail(error.message ?: "Health Connect could not check permissions.")
                 return@launch
-            } catch (error: CancellationException) {
-                throw error
             } catch (error: RemoteException) {
                 fail(error.message ?: "Health Connect could not check permissions.")
                 return@launch
@@ -263,9 +378,8 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
             val permitted =
                 healthConnect.requiredPermissions(projection.targetRecords) - missing
             if (permitted.isEmpty()) {
-                mutableState.value = mutableState.value.copy(
-                    busy = false,
-                    status = "No records were written because write access was not granted.",
+                stateRefresher.finishOperation(
+                    "No records were written because write access was not granted.",
                 )
                 return@launch
             }
@@ -276,10 +390,7 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun writeToHealthConnect(
         permitted: Set<String>,
     ) {
-        mutableState.value = mutableState.value.copy(
-            busy = true,
-            status = "Writing mapped records to Health Connect…",
-        )
+        beginOperation("Writing mapped records to Health Connect…")
         try {
             var after: String? = null
             var result = ProjectionExecutionResult()
@@ -308,26 +419,11 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                 }
                 after = page.nextCanonicalId
             } while (after != null)
-            refresh(
-                status = buildString {
-                    append("Health Connect applied ")
-                    append(result.inserted)
-                    append(" inserts, ")
-                    append(result.updated)
-                    append(" updates, and ")
-                    append(result.deleted)
-                    append(" deletions.")
-                    if (result.failures.isNotEmpty()) {
-                        append(" ")
-                        append(result.failures.size)
-                        append(" records failed and remain pending.")
-                    }
-                    if (permissionDeferred > 0) {
-                        append(" ")
-                        append(permissionDeferred)
-                        append(" records remain pending because write access was not granted.")
-                    }
-                },
+            stateRefresher.finishOperation(
+                status = healthConnectCompletionStatus(
+                    result,
+                    permissionDeferred,
+                ),
             )
         } catch (error: CancellationException) {
             throw error
@@ -349,29 +445,14 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
     private suspend fun refresh(
         lastImport: ArchiveImportResult? = mutableState.value.lastImport,
         status: String? = mutableState.value.status,
-    ) {
-        timelineGeneration += 1
-        val generation = timelineGeneration
-        val snapshot = withContext(Dispatchers.IO) { core.snapshot() }
-        if (generation != timelineGeneration) return
-        mutableState.value = HozzUiState(
-            busy = false,
-            timeline = snapshot.timeline,
-            timelineNextCursor = snapshot.timelineNextCursor,
-            timelineLoading = false,
-            projection = snapshot.projection,
-            totalRecordCount = snapshot.totalRecordCount,
-            lastImport = lastImport,
-            status = status,
-            healthConnectStatus = healthConnect.availability,
-        )
+    ) = stateRefresher.refresh(lastImport, status)
+
+    private fun beginOperation(status: String) {
+        stateRefresher.beginOperation(status)
     }
 
-    private fun fail(message: String) {
-        mutableState.value = mutableState.value.copy(
-            busy = false,
-            status = message,
-        )
+    private suspend fun fail(message: String) {
+        stateRefresher.finishOperation(message)
     }
 
     override fun onCleared() {

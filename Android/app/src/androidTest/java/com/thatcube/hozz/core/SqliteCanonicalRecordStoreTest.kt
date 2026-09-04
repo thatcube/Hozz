@@ -63,6 +63,527 @@ class SqliteCanonicalRecordStoreTest {
     }
 
     @Test
+    fun stagedChildSortedBeforeNewerLiveParentUsesFinalParentWinner() = runBlocking {
+        val sourceId = "ffffffff-ffff-4fff-8fff-ffffffffffff"
+        val parentId = "apple.healthkit:$sourceId"
+        val childId = "apple.healthkit:" + CanonicalRecordParser.seriesRecordId(
+            sourceId,
+            "HKQuantityTypeIdentifierStepCount",
+            "readings-0",
+        )
+        val oldParent = record(version = 2, tombstone = true).copy(
+            canonicalId = parentId,
+            sourceRecordId = sourceId,
+            lineage = listOf(SourceLineage("apple.healthkit", recordId = sourceId)),
+        )
+        val oldChild = record(version = 2, tombstone = false).copy(
+            canonicalId = childId,
+            parentCanonicalId = parentId,
+            kind = "quantitySeriesReadings",
+            canonicalType = "series.readings",
+            sourceRecordId = sourceId,
+            lineage = listOf(SourceLineage("apple.healthkit", recordId = sourceId)),
+        )
+        val liveParent = record(version = 3, tombstone = false).copy(
+            canonicalId = parentId,
+            sourceRecordId = sourceId,
+            lineage = listOf(SourceLineage("apple.healthkit", recordId = sourceId)),
+        )
+        val liveChild = oldChild.copy(recordVersion = 3)
+        assertTrue(liveChild.canonicalId < liveParent.canonicalId)
+        store.upsert(listOf(oldParent, oldChild))
+
+        val import = store.beginImport()
+        import.append(listOf(liveChild, liveParent))
+        import.commit()
+
+        val merged = store.allRecords().associateBy(CanonicalRecord::canonicalId)
+        assertTrue(!merged.getValue(liveParent.canonicalId).tombstone)
+        assertTrue(!merged.getValue(liveChild.canonicalId).tombstone)
+
+        val replay = store.beginImport()
+        replay.append(listOf(liveChild, liveParent))
+        assertEquals(2, replay.commit().ignored)
+        assertTrue(
+            !store.allRecords()
+                .single { it.canonicalId == liveChild.canonicalId }
+                .tombstone,
+        )
+    }
+
+    @Test
+    fun directAndStagedNestedChainsUseFinalParentWinners() = runBlocking {
+        for ((prefix, staged) in listOf("direct" to false, "staged" to true)) {
+            val old = nestedChain(prefix, version = 2, rootTombstone = true)
+            store.upsert(old)
+            assertTrue(
+                store.allRecords()
+                    .filter { it.canonicalId.startsWith("apple.healthkit:$prefix-") }
+                    .all(CanonicalRecord::tombstone),
+            )
+
+            val live = nestedChain(prefix, version = 3, rootTombstone = false)
+                .asReversed()
+            val merge = if (staged) {
+                store.beginImport().let { import ->
+                    import.append(live)
+                    import.commit()
+                }
+            } else {
+                store.upsert(live)
+            }
+            assertEquals(3, merge.updated)
+            assertTrue(
+                store.allRecords()
+                    .filter { it.canonicalId.startsWith("apple.healthkit:$prefix-") }
+                    .none(CanonicalRecord::tombstone),
+            )
+
+            val replay = if (staged) {
+                store.beginImport().let { import ->
+                    import.append(live)
+                    import.commit()
+                }
+            } else {
+                store.upsert(live)
+            }
+            assertEquals(3, replay.ignored)
+            assertTrue(
+                store.allRecords()
+                    .filter { it.canonicalId.startsWith("apple.healthkit:$prefix-") }
+                    .none(CanonicalRecord::tombstone),
+            )
+        }
+    }
+
+    @Test
+    fun newerChildWaitsForMissingParentInDirectAndStagedMerges() = runBlocking {
+        suspend fun merge(
+            records: List<CanonicalRecord>,
+            staged: Boolean,
+        ): MergeResult = if (staged) {
+            store.beginImport().let { import ->
+                import.append(records)
+                import.commit()
+            }
+        } else {
+            store.upsert(records)
+        }
+
+        for ((prefix, staged) in listOf("direct-missing" to false, "staged-missing" to true)) {
+            val parentId = "$prefix-parent"
+            val oldParent = nestedNode(
+                id = parentId,
+                parentCanonicalId = null,
+                version = 2,
+                tombstone = true,
+            )
+            val liveChild = nestedNode(
+                id = "$prefix-child",
+                parentCanonicalId = oldParent.canonicalId,
+                version = 3,
+                tombstone = false,
+            )
+            store.upsert(listOf(oldParent))
+
+            merge(listOf(liveChild), staged)
+
+            assertTrue(
+                store.allRecords().none { it.canonicalId == liveChild.canonicalId },
+            )
+
+            val liveParent = nestedNode(
+                id = parentId,
+                parentCanonicalId = null,
+                version = 3,
+                tombstone = false,
+            )
+            merge(listOf(liveChild, liveParent), staged)
+
+            val liveIds = setOf(liveParent.canonicalId, liveChild.canonicalId)
+            assertTrue(
+                store.allRecords()
+                    .filter { it.canonicalId in liveIds }
+                    .none(CanonicalRecord::tombstone),
+            )
+            assertEquals(2, merge(listOf(liveChild, liveParent), staged).ignored)
+        }
+    }
+
+    @Test
+    fun directAndStagedSingleSelfParentRejectConsistently() = runBlocking {
+        val selfParent = nestedNode(
+            id = "self-parent",
+            parentCanonicalId = "apple.healthkit:self-parent",
+            version = 1,
+            tombstone = false,
+        )
+
+        val directError = try {
+            store.upsert(listOf(selfParent))
+            null
+        } catch (error: ArchiveFormatException) {
+            error
+        }
+        assertEquals(
+            "Canonical records contain a parent cycle.",
+            directError?.message,
+        )
+        assertTrue(store.allRecords().isEmpty())
+
+        val import = store.beginImport()
+        import.append(listOf(selfParent))
+        val stagedError = try {
+            import.commit()
+            null
+        } catch (error: ArchiveFormatException) {
+            error
+        }
+        assertEquals(
+            "Canonical records contain a parent cycle.",
+            stagedError?.message,
+        )
+        import.discard()
+        assertTrue(store.allRecords().isEmpty())
+    }
+
+    @Test
+    fun splitImportCyclesRejectAgainstPersistedGraphInDirectAndStagedMerges() =
+        runBlocking {
+            for ((prefix, staged) in
+                listOf("direct-cycle" to false, "staged-cycle" to true)) {
+                val first = nestedNode(
+                    id = "$prefix-a",
+                    parentCanonicalId = "apple.healthkit:$prefix-b",
+                    version = 1,
+                    tombstone = false,
+                )
+                if (staged) {
+                    store.beginImport().let { import ->
+                        import.append(listOf(first))
+                        import.commit()
+                    }
+                } else {
+                    store.upsert(listOf(first))
+                }
+                val closing = nestedNode(
+                    id = "$prefix-b",
+                    parentCanonicalId = first.canonicalId,
+                    version = 1,
+                    tombstone = false,
+                )
+
+                val error = try {
+                    if (staged) {
+                        store.beginImport().let { import ->
+                            import.append(listOf(closing))
+                            import.commit()
+                        }
+                    } else {
+                        store.upsert(listOf(closing))
+                    }
+                    null
+                } catch (failure: ArchiveFormatException) {
+                    failure
+                }
+
+                assertEquals(
+                    "Canonical records contain a parent cycle.",
+                    error?.message,
+                )
+                assertTrue(
+                    store.allRecords().none { it.canonicalId == closing.canonicalId },
+                )
+            }
+        }
+
+    @Test
+    fun deferredWinnerCannotHideResultingCycleInDirectAndStagedMerges() =
+        runBlocking {
+            for ((prefix, staged) in
+                listOf("direct-effective" to false, "staged-effective" to true)) {
+                val persistedB = nestedNode(
+                    id = "$prefix-b",
+                    parentCanonicalId = null,
+                    version = 1,
+                    tombstone = false,
+                )
+                val persistedA = nestedNode(
+                    id = "$prefix-a",
+                    parentCanonicalId = persistedB.canonicalId,
+                    version = 1,
+                    tombstone = false,
+                )
+                val tombstonedC = nestedNode(
+                    id = "$prefix-c",
+                    parentCanonicalId = null,
+                    version = 2,
+                    tombstone = true,
+                )
+                store.upsert(listOf(persistedA, persistedB, tombstonedC))
+                val before = store.allRecords()
+                    .filter { it.canonicalId.startsWith("apple.healthkit:$prefix-") }
+                    .associateBy(CanonicalRecord::canonicalId)
+                val deferredA = nestedNode(
+                    id = "$prefix-a",
+                    parentCanonicalId = tombstonedC.canonicalId,
+                    version = 3,
+                    tombstone = false,
+                )
+                val closingB = nestedNode(
+                    id = "$prefix-b",
+                    parentCanonicalId = persistedA.canonicalId,
+                    version = 2,
+                    tombstone = false,
+                )
+
+                val error = if (staged) {
+                    val import = store.beginImport()
+                    import.append(listOf(deferredA, closingB))
+                    try {
+                        import.commit()
+                        null
+                    } catch (failure: ArchiveFormatException) {
+                        import.discard()
+                        failure
+                    }
+                } else {
+                    try {
+                        store.upsert(listOf(deferredA, closingB))
+                        null
+                    } catch (failure: ArchiveFormatException) {
+                        failure
+                    }
+                }
+
+                assertEquals(
+                    "Canonical records contain a parent cycle.",
+                    error?.message,
+                )
+                assertEquals(
+                    before,
+                    store.allRecords()
+                        .filter {
+                            it.canonicalId.startsWith("apple.healthkit:$prefix-")
+                        }
+                        .associateBy(CanonicalRecord::canonicalId),
+                )
+            }
+        }
+
+    @Test
+    fun parentDepthLimitIsConsistentInDirectAndStagedMerges() = runBlocking {
+        suspend fun merge(
+            records: List<CanonicalRecord>,
+            staged: Boolean,
+        ): MergeResult = if (staged) {
+            store.beginImport().let { import ->
+                import.append(records)
+                import.commit()
+            }
+        } else {
+            store.upsert(records)
+        }
+
+        for ((prefix, staged) in
+            listOf("direct-depth" to false, "staged-depth" to true)) {
+            val chain = (0..MAX_CANONICAL_PARENT_DEPTH).map { index ->
+                nestedNode(
+                    id = "$prefix-$index",
+                    parentCanonicalId = if (index == 0) {
+                        null
+                    } else {
+                        "apple.healthkit:$prefix-${index - 1}"
+                    },
+                    version = 1,
+                    tombstone = false,
+                )
+            }
+            val lookupsBefore = store.parentStateLookupCountForTesting
+            merge(chain.asReversed(), staged)
+            val parentLookups =
+                store.parentStateLookupCountForTesting - lookupsBefore
+            val maximumLookupsPerRecord = if (staged) 4 else 6
+            assertTrue(
+                "$prefix used $parentLookups parent lookups",
+                parentLookups <= chain.size * maximumLookupsPerRecord,
+            )
+            val tooDeep = nestedNode(
+                id = "$prefix-${MAX_CANONICAL_PARENT_DEPTH + 1}",
+                parentCanonicalId = chain.last().canonicalId,
+                version = 1,
+                tombstone = false,
+            )
+
+            val error = try {
+                merge(listOf(tooDeep), staged)
+                null
+            } catch (failure: ArchiveFormatException) {
+                failure
+            }
+
+            assertEquals(
+                "Canonical parent depth exceeds the 64 level limit.",
+                error?.message,
+            )
+            assertTrue(
+                store.allRecords().none {
+                    it.canonicalId == tooDeep.canonicalId
+                },
+            )
+        }
+    }
+
+    @Test
+    fun reparentingAncestorPastDepthLimitRollsBackDirectAndStagedMerges() =
+        runBlocking {
+            for ((prefix, staged) in
+                listOf("direct-reparent" to false, "staged-reparent" to true)) {
+                val newRoot = nestedNode(
+                    id = "$prefix-new-root",
+                    parentCanonicalId = null,
+                    version = 1,
+                    tombstone = false,
+                )
+                val chain = (0..MAX_CANONICAL_PARENT_DEPTH).map { index ->
+                    nestedNode(
+                        id = "$prefix-$index",
+                        parentCanonicalId = if (index == 0) {
+                            null
+                        } else {
+                            "apple.healthkit:$prefix-${index - 1}"
+                        },
+                        version = 1,
+                        tombstone = false,
+                    )
+                }
+                store.upsert(listOf(newRoot) + chain.asReversed())
+                val ids = (chain.map(CanonicalRecord::canonicalId) +
+                    newRoot.canonicalId).toSet()
+                val before = store.allRecords()
+                    .filter { it.canonicalId in ids }
+                    .associateBy(CanonicalRecord::canonicalId)
+                val reparented = chain.first().copy(
+                    parentCanonicalId = newRoot.canonicalId,
+                    recordVersion = 2,
+                )
+
+                val error = if (staged) {
+                    val import = store.beginImport()
+                    import.append(listOf(reparented))
+                    try {
+                        import.commit()
+                        null
+                    } catch (failure: ArchiveFormatException) {
+                        import.discard()
+                        failure
+                    }
+                } else {
+                    try {
+                        store.upsert(listOf(reparented))
+                        null
+                    } catch (failure: ArchiveFormatException) {
+                        failure
+                    }
+                }
+
+                assertEquals(
+                    "Canonical parent depth exceeds the 64 level limit.",
+                    error?.message,
+                )
+                assertEquals(
+                    before,
+                    store.allRecords()
+                        .filter { it.canonicalId in ids }
+                        .associateBy(CanonicalRecord::canonicalId),
+                )
+            }
+        }
+
+    @Test
+    fun missingRootTransitionsReconcileDeepDescendantsInDirectAndStagedMerges() =
+        runBlocking {
+            suspend fun merge(
+                records: List<CanonicalRecord>,
+                staged: Boolean,
+            ): MergeResult = if (staged) {
+                store.beginImport().let { import ->
+                    import.append(records)
+                    import.commit()
+                }
+            } else {
+                store.upsert(records)
+            }
+
+            for ((prefix, staged) in
+                listOf("direct-deep" to false, "staged-deep" to true)) {
+                val rootId = "apple.healthkit:$prefix-root"
+                val parent = nestedNode("$prefix-parent", rootId, 1, false)
+                val child = nestedNode(
+                    "$prefix-child",
+                    parent.canonicalId,
+                    1,
+                    false,
+                )
+                val grandchild = nestedNode(
+                    "$prefix-grandchild",
+                    child.canonicalId,
+                    1,
+                    false,
+                )
+                merge(listOf(grandchild, child, parent), staged)
+
+                val tombstone = nestedNode("$prefix-root", null, 2, true)
+                merge(listOf(tombstone), staged)
+                val ids = setOf(
+                    tombstone.canonicalId,
+                    parent.canonicalId,
+                    child.canonicalId,
+                    grandchild.canonicalId,
+                )
+                assertTrue(
+                    store.allRecords()
+                        .filter { it.canonicalId in ids }
+                        .all(CanonicalRecord::tombstone),
+                )
+
+                val liveRoot = nestedNode("$prefix-root", null, 3, false)
+                val liveParent = nestedNode(
+                    "$prefix-parent",
+                    liveRoot.canonicalId,
+                    3,
+                    false,
+                )
+                val liveChild = nestedNode(
+                    "$prefix-child",
+                    liveParent.canonicalId,
+                    3,
+                    false,
+                )
+                val liveGrandchild = nestedNode(
+                    "$prefix-grandchild",
+                    liveChild.canonicalId,
+                    3,
+                    false,
+                )
+                val live = listOf(
+                    liveGrandchild,
+                    liveChild,
+                    liveParent,
+                    liveRoot,
+                )
+                merge(live, staged)
+
+                assertTrue(
+                    store.allRecords()
+                        .filter { it.canonicalId in ids }
+                        .none(CanonicalRecord::tombstone),
+                )
+                assertEquals(4, merge(live, staged).ignored)
+            }
+        }
+
+    @Test
     fun malformedArchiveDoesNotCommitEarlierBatches() = runBlocking {
         val valid =
             """
@@ -836,5 +1357,38 @@ class SqliteCanonicalRecordStoreTest {
         ),
         tombstone = tombstone,
         rawJson = "{}",
+    )
+
+    private fun nestedChain(
+        prefix: String,
+        version: Long,
+        rootTombstone: Boolean,
+    ): List<CanonicalRecord> {
+        val root = nestedNode("$prefix-z-root", null, version, rootTombstone)
+        val parent = nestedNode(
+            "$prefix-m-parent",
+            root.canonicalId,
+            version,
+            tombstone = false,
+        )
+        val child = nestedNode(
+            "$prefix-a-child",
+            parent.canonicalId,
+            version,
+            tombstone = false,
+        )
+        return listOf(root, parent, child)
+    }
+
+    private fun nestedNode(
+        id: String,
+        parentCanonicalId: String?,
+        version: Long,
+        tombstone: Boolean,
+    ): CanonicalRecord = record(version, tombstone).copy(
+        canonicalId = "apple.healthkit:$id",
+        parentCanonicalId = parentCanonicalId,
+        sourceRecordId = id,
+        lineage = listOf(SourceLineage("apple.healthkit", recordId = id)),
     )
 }

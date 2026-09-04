@@ -1,6 +1,7 @@
 package com.thatcube.hozz.projection
 
 import android.content.Context
+import android.os.Build
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
@@ -17,11 +18,27 @@ import androidx.health.connect.client.units.Energy
 import androidx.health.connect.client.units.Length
 import androidx.health.connect.client.units.Mass
 import com.thatcube.hozz.core.HealthConnectProjection
+import java.io.IOException
 
 data class HealthConnectWriteResult(
     val attempted: Int,
     val projections: List<HealthConnectProjection>,
 )
+
+internal class HealthConnectProviderProtocolException(
+    message: String,
+) : IOException(message)
+
+internal fun validateHealthConnectReceiptCount(
+    expected: Int,
+    actual: Int,
+) {
+    if (actual != expected) {
+        throw HealthConnectProviderProtocolException(
+            "Health Connect returned a different number of record IDs.",
+        )
+    }
+}
 
 interface HealthConnectProjectionWriter {
     suspend fun writeUpserts(
@@ -37,7 +54,9 @@ class HealthConnectWriter(
     private val context: Context,
 ) : HealthConnectProjectionWriter {
     val availability: Int
-        get() = HealthConnectClient.getSdkStatus(context)
+        get() = healthConnectProjectionStatus(Build.VERSION.SDK_INT) {
+            HealthConnectClient.getSdkStatus(context)
+        }
 
     fun requiredPermissions(drafts: List<ProjectionDraft>): Set<String> =
         drafts.mapTo(linkedSetOf()) { draft ->
@@ -69,9 +88,10 @@ class HealthConnectWriter(
         val insertions = drafts.filterNot { it is ProjectionDraft.Delete }
         for (chunk in insertions.chunked(MAX_INSERT_RECORDS)) {
             val response = client.insertRecords(chunk.map(::record))
-            require(response.recordIdsList.size == chunk.size) {
-                "Health Connect returned a different number of record IDs."
-            }
+            validateHealthConnectReceiptCount(
+                expected = chunk.size,
+                actual = response.recordIdsList.size,
+            )
             projections += chunk.zip(response.recordIdsList) { draft, recordId ->
                 HealthConnectProjection(
                     canonicalId = draft.canonicalId,
@@ -242,6 +262,20 @@ class HealthConnectWriter(
         "OTHER_WORKOUT" -> ExerciseSessionRecord.EXERCISE_TYPE_OTHER_WORKOUT
         else -> error("Unknown generated exercise type $type")
     }
+}
+
+internal fun healthConnectProjectionStatus(
+    deviceSdk: Int,
+    providerStatus: () -> Int,
+): Int {
+    // The APK provider documents repeated identifier deletion as an IPC failure.
+    // Without broad historical read access there is no safe way to distinguish
+    // "already absent" from a provider failure after a crash between deletion
+    // and ledger commit.
+    if (deviceSdk < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+        return HealthConnectClient.SDK_UNAVAILABLE
+    }
+    return providerStatus()
 }
 
 internal fun healthConnectMetadata(draft: ProjectionDraft): Metadata =

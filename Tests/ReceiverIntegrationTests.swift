@@ -256,6 +256,50 @@ final class ReceiverIntegrationTests: XCTestCase {
         XCTAssertEqual(retryCount, 1)
     }
 
+    func testTruncatedJSONArrayRejectsWithoutReceiptAndCanRetry() async throws {
+        try await assertRejectedArrayIsRetryable(
+            "[\(sample(id: "truncated", value: 1))",
+            key: "truncated-array"
+        )
+    }
+
+    func testTruncatedArrayContainingConnectionTestKindIsRejectedAndRetryable() async throws {
+        try await assertRejectedArrayIsRetryable(
+            #"[{"kind":"hozzConnectionTest","schemaVersion":1}"#,
+            key: "truncated-connection-test-array"
+        )
+    }
+
+    func testBOMPrefixedTruncatedArrayIsRejectedAndRetryable() async throws {
+        try await assertRejectedArrayIsRetryable(
+            "\u{FEFF}[\(sample(id: "bom-truncated", value: 1))",
+            key: "bom-truncated-array"
+        )
+    }
+
+    private func assertRejectedArrayIsRetryable(
+        _ body: String,
+        key: String
+    ) async throws {
+        let rejected = try await post(
+            body: body,
+            token: token,
+            idempotencyKey: key
+        )
+        XCTAssertEqual(rejected.status, 400)
+        let rejectedCount = try await store.totalRecordCount()
+        XCTAssertEqual(rejectedCount, 0)
+        let retry = try await post(
+            body: sample(id: "recovered", value: 2),
+            token: token,
+            idempotencyKey: key
+        )
+        XCTAssertEqual(retry.status, 200)
+        XCTAssertEqual(retry.json["duplicate"] as? Bool, false)
+        let retryCount = try await store.totalRecordCount()
+        XCTAssertEqual(retryCount, 1)
+    }
+
     func testDateLessStableDeletionWithLegacyAliasReturnsRetryableConflict() async throws {
         let date = "2026-01-01 10:00:00 +0000"
         let legacy = """

@@ -324,6 +324,11 @@ public struct IngestResult: Hashable, Sendable {
 ///
 /// Nothing here ever leaves the machine.
 public actor IngestStore {
+    private static let currentBatchReceiptVersion: Int64 = 1
+    private static let canonicalWorkoutType = "HKWorkoutTypeIdentifier"
+    private static let compatibilityWorkoutType = "workout"
+    private static let historicalWorkoutType = "Workout"
+
     /// Visible to the module rather than this file so the dashboard queries can
     /// live in files of their own. They are still actor-isolated, so every read
     /// is serialised against ingest exactly as it was before.
@@ -357,6 +362,37 @@ public actor IngestStore {
         try migrateToNine(database, from: version)
         try migrateToTen(database, from: version)
         try migrateToEleven(database, from: version)
+        try migrateToTwelve(database, from: version)
+    }
+
+    private static func migrateToTwelve(
+        _ database: SQLiteDatabase,
+        from version: Int64
+    ) throws {
+        guard version < 12 else {
+            return
+        }
+        try database.transaction {
+            let columns = try database.query(
+                "PRAGMA table_info(batch)",
+                row: { $0.text(1) }
+            )
+            if !columns.contains("receipt_version") {
+                try database.execute(
+                    """
+                    ALTER TABLE batch
+                        ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 0
+                    """
+                )
+            }
+            // A row in a version-ten or version-eleven database may have been
+            // written there, or may have arrived from version nine. The schema
+            // carries no provenance that can tell those cases apart, so every
+            // inherited receipt remains zero. Only a receipt written after
+            // this migration is allowed to claim version one semantics.
+            try database.run("UPDATE batch SET receipt_version = 0")
+            try database.execute("PRAGMA user_version = 12")
+        }
     }
 
     private static func migrateToEleven(
@@ -774,7 +810,10 @@ public actor IngestStore {
                 CREATE TABLE IF NOT EXISTS batch (
                     key TEXT PRIMARY KEY,
                     received_at TEXT NOT NULL,
-                    record_count INTEGER NOT NULL
+                    record_count INTEGER NOT NULL,
+                    -- Version zero predates durable deletion tombstones. Those
+                    -- receipts must be replayed once rather than trusted.
+                    receipt_version INTEGER NOT NULL DEFAULT 0
                 );
 
                 -- Facts about the person rather than measurements of a moment:
@@ -1190,16 +1229,46 @@ public actor IngestStore {
     public func ingest(
         _ batch: ParsedBatch,
         idempotencyKey: String?,
+        legacyIdempotencyKeys: [String] = [],
         now: Date = .now
     ) throws -> IngestResult {
-        if let idempotencyKey, try isKnownBatch(idempotencyKey) {
-            return IngestResult(
-                stored: 0,
-                deleted: 0,
-                duplicate: true,
-                unreadable: batch.unreadableCount
-            )
+        enum ReceiptReconciliation {
+            case inheritedReceipt
+            case unknownFilename
         }
+
+        var reconciliation: ReceiptReconciliation?
+        if let idempotencyKey {
+            if let receiptVersion = try receiptVersion(for: idempotencyKey) {
+                if receiptVersion >= Self.currentBatchReceiptVersion {
+                    return duplicateResult(for: batch)
+                }
+                if batch.deletions.isEmpty {
+                    try bridgeReceipt(
+                        from: idempotencyKey,
+                        to: idempotencyKey,
+                        batch: batch,
+                        now: now
+                    )
+                    return duplicateResult(for: batch)
+                }
+                reconciliation = .inheritedReceipt
+            } else {
+                for legacyKey in legacyIdempotencyKeys
+                    where legacyKey != idempotencyKey {
+                    guard try receiptVersion(for: legacyKey) != nil else {
+                        continue
+                    }
+                    // A filename proves only which path was read, never which
+                    // bytes were there. The file may since have been replaced.
+                    // Reconcile its current contents instead of promoting the
+                    // name to a content receipt.
+                    reconciliation = .unknownFilename
+                    break
+                }
+            }
+        }
+
         // Checked after the duplicate test, so a batch already on disk is
         // still answered as stored when the disk is full — it *is* stored, and
         // refusing it would make the phone keep resending something this Mac
@@ -1217,17 +1286,35 @@ public actor IngestStore {
         // A half-applied batch would be indistinguishable from a complete one
         // on the next delivery, and the missing half would never be resent.
         try database.transaction {
+            let batchToWrite: ParsedBatch
+            switch reconciliation {
+            case .inheritedReceipt:
+                // The old receipt says this payload was accepted, but not
+                // whether its deletions gained durable tombstones. Replay only
+                // the monotonic part; an old upsert must never replace a value
+                // that arrived later.
+                batchToWrite = ParsedBatch(
+                    records: [],
+                    deletions: batch.deletions,
+                    unreadableCount: 0
+                )
+            case .unknownFilename:
+                batchToWrite = try Self.reconcileUnknownFilenameBatch(
+                    batch,
+                    in: database
+                )
+            case nil:
+                batchToWrite = batch
+            }
             (stored, deleted, storedCharacteristics, storedUnhandled, storedSeriesPages) =
-                try Self.write(batch, at: timestamp, into: database)
+                try Self.write(batchToWrite, at: timestamp, into: database)
 
             if let idempotencyKey {
-                try database.run(
-                    "INSERT OR REPLACE INTO batch (key, received_at, record_count) VALUES (?, ?, ?)",
-                    [
-                        .text(idempotencyKey),
-                        .text(timestamp),
-                        .integer(Int64(batch.records.count))
-                    ]
+                try Self.writeReceipt(
+                    key: idempotencyKey,
+                    batch: batch,
+                    timestamp: timestamp,
+                    into: database
                 )
             }
         }
@@ -1241,6 +1328,259 @@ public actor IngestStore {
             unhandled: storedUnhandled,
             seriesPages: storedSeriesPages
         )
+    }
+
+    /// Reconciles bytes found at a path that has an old filename receipt.
+    ///
+    /// A matching name cannot prove matching content. Existing identities are
+    /// therefore immutable in this pass, while genuinely new identities and
+    /// every deletion still apply. Current facts use their own observation
+    /// clocks: characteristics advance only past `readAt`, and coverage only
+    /// past `observedAt`. Equal-clock conflicts preserve the fact already held.
+    private static func reconcileUnknownFilenameBatch(
+        _ batch: ParsedBatch,
+        in database: SQLiteDatabase
+    ) throws -> ParsedBatch {
+        func absent(_ sql: String, _ parameters: [SQLiteValue]) throws -> Bool {
+            try database.query(sql, parameters, row: { _ in true }).isEmpty
+        }
+
+        var newRecordIDs = Set<String>()
+        let records = try batch.records.filter { record in
+            let include: Bool
+            if record.kind == "workout",
+               record.type == Self.canonicalWorkoutType {
+                // A canonical workout is allowed to replace a same-id
+                // compatibility row. An already-canonical sample blocks a
+                // replay only when no noncanonical workout row remains for the
+                // canonical write to clean up.
+                let canonicalExists = try !database.query(
+                    """
+                    SELECT 1 FROM sample
+                    WHERE id = ? AND kind = 'workout' AND type = ?
+                    LIMIT 1
+                    """,
+                    [.text(record.id), .text(Self.canonicalWorkoutType)],
+                    row: { _ in true }
+                ).isEmpty
+                let noncanonicalExists = try !database.query(
+                    """
+                    SELECT 1 FROM sample
+                    WHERE id = ? AND kind = 'workout' AND type != ?
+                    LIMIT 1
+                    """,
+                    [.text(record.id), .text(Self.canonicalWorkoutType)],
+                    row: { _ in true }
+                ).isEmpty
+                include = !canonicalExists || noncanonicalExists
+            } else if record.kind == "workout",
+                      record.type == Self.compatibilityWorkoutType {
+                // Compatibility may neither duplicate nor downgrade a
+                // canonical sample. Without one, an exact activity-derived or
+                // historical Workout alias is admitted so the normal writer
+                // can retire that proven alias.
+                let canonicalExists = try !database.query(
+                    """
+                    SELECT 1 FROM sample
+                    WHERE id = ? AND kind = 'workout' AND type = ?
+                    LIMIT 1
+                    """,
+                    [.text(record.id), .text(Self.canonicalWorkoutType)],
+                    row: { _ in true }
+                ).isEmpty
+                if canonicalExists {
+                    include = false
+                } else if let alias = record.legacyTypeAlias {
+                    let repairableAliasExists = try !database.query(
+                        """
+                        SELECT 1 FROM sample
+                        WHERE id = ? AND kind = 'workout'
+                          AND (type = ? OR type = ?)
+                        LIMIT 1
+                        """,
+                        [
+                            .text(record.id),
+                            .text(alias),
+                            .text(Self.historicalWorkoutType)
+                        ],
+                        row: { _ in true }
+                    ).isEmpty
+                    if repairableAliasExists {
+                        include = true
+                    } else {
+                        include = try absent(
+                            "SELECT 1 FROM sample WHERE id = ? LIMIT 1",
+                            [.text(record.id)]
+                        )
+                    }
+                } else {
+                    include = try absent(
+                        "SELECT 1 FROM sample WHERE id = ? LIMIT 1",
+                        [.text(record.id)]
+                    )
+                }
+            } else {
+                include = try absent(
+                    "SELECT 1 FROM sample WHERE id = ? LIMIT 1",
+                    [.text(record.id)]
+                )
+            }
+            if include {
+                newRecordIDs.insert(record.id)
+            }
+            return include
+        }
+        let electrocardiograms = try batch.electrocardiograms.filter {
+            try absent(
+                "SELECT 1 FROM electrocardiogram WHERE id = ? LIMIT 1",
+                [.text($0.id)]
+            )
+        }
+        let voltagePages = try batch.voltagePages.filter {
+            try absent(
+                """
+                SELECT 1 FROM electrocardiogram_voltage_page
+                WHERE sample_id = ? AND sequence = ? LIMIT 1
+                """,
+                [.text($0.sampleID), .integer(Int64($0.sequence))]
+            )
+        }
+        let quantitySeriesPages = try batch.quantitySeriesPages.filter {
+            try absent(
+                """
+                SELECT 1 FROM quantity_series_page
+                WHERE sample_id = ? AND sequence = ? LIMIT 1
+                """,
+                [.text($0.sampleID), .integer(Int64($0.sequence))]
+            )
+        }
+        let quantitySeriesEnds = try batch.quantitySeriesEnds.filter {
+            try absent(
+                "SELECT 1 FROM quantity_series WHERE sample_id = ? LIMIT 1",
+                [.text($0.sampleID)]
+            )
+        }
+        let audiograms = try batch.audiograms.filter {
+            try absent(
+                "SELECT 1 FROM audiogram WHERE id = ? LIMIT 1",
+                [.text($0.id)]
+            )
+        }
+        let moodEntries = try batch.moodEntries.filter {
+            try absent(
+                "SELECT 1 FROM state_of_mind WHERE id = ? LIMIT 1",
+                [.text($0.id)]
+            )
+        }
+        let medicationDoses = try batch.medicationDoses.filter {
+            try absent(
+                "SELECT 1 FROM medication_dose WHERE id = ? LIMIT 1",
+                [.text($0.id)]
+            )
+        }
+        let workoutDetails = try batch.workoutDetails.filter {
+            // A new sample and its detail are one new identity. An existing
+            // sample may still gain a detail row only if none was ever stored;
+            // neither case overwrites an existing workout fact.
+            if newRecordIDs.contains($0.id) {
+                return true
+            }
+            if $0.provenance == .compatibility {
+                let canonicalExists = try !database.query(
+                    """
+                    SELECT 1 FROM sample
+                    WHERE id = ? AND kind = 'workout' AND type = ?
+                    LIMIT 1
+                    """,
+                    [.text($0.id), .text(Self.canonicalWorkoutType)],
+                    row: { _ in true }
+                ).isEmpty
+                if canonicalExists {
+                    return false
+                }
+            }
+            return try absent(
+                "SELECT 1 FROM workout_detail WHERE id = ? LIMIT 1",
+                [.text($0.id)]
+            )
+        }
+        let unhandled = try batch.unhandled.filter {
+            try absent(
+                "SELECT 1 FROM unhandled_record WHERE fingerprint = ? LIMIT 1",
+                [.text($0.fingerprint)]
+            )
+        }
+        let characteristics = try batch.characteristics.filter {
+            let existing = try database.query(
+                "SELECT read_at FROM characteristic WHERE type = ?",
+                [.text($0.type)],
+                row: { $0.optionalText(0) }
+            )
+            guard !existing.isEmpty else {
+                return true
+            }
+            guard let incoming = $0.readAt else {
+                return false
+            }
+            guard
+                let existingText = existing[0],
+                let existingDate = Timestamps.date(from: existingText)
+            else {
+                return true
+            }
+            return Self.wireMilliseconds(incoming)
+                > Self.wireMilliseconds(existingDate)
+        }
+        let coverageReports = try batch.coverageReports.filter {
+            let existing = try database.query(
+                "SELECT observed_at FROM type_coverage WHERE type = ?",
+                [.text($0.type)],
+                row: { $0.text(0) }
+            ).first
+            guard
+                let existing,
+                let existingDate = Timestamps.date(from: existing)
+            else {
+                return true
+            }
+            return Self.wireMilliseconds($0.observedAt)
+                > Self.wireMilliseconds(existingDate)
+        }
+
+        return ParsedBatch(
+            records: records,
+            deletions: batch.deletions,
+            characteristics: characteristics,
+            electrocardiograms: electrocardiograms,
+            voltagePages: voltagePages,
+            quantitySeriesPages: quantitySeriesPages,
+            quantitySeriesEnds: quantitySeriesEnds,
+            audiograms: audiograms,
+            moodEntries: moodEntries,
+            medicationDoses: medicationDoses,
+            workoutDetails: workoutDetails,
+            coverageReports: coverageReports,
+            unhandled: unhandled,
+            unreadableCount: batch.unreadableCount
+        )
+    }
+
+    private static func wireMilliseconds(_ date: Date) -> Int64 {
+        Int64((date.timeIntervalSince1970 * 1_000).rounded())
+    }
+
+    private static func preciseWireTimestamp(_ date: Date) -> String {
+        let milliseconds = wireMilliseconds(date)
+        var seconds = milliseconds / 1_000
+        var remainder = milliseconds % 1_000
+        if remainder < 0 {
+            seconds -= 1
+            remainder += 1_000
+        }
+        let whole = Date.ISO8601FormatStyle(timeZone: .gmt).format(
+            Date(timeIntervalSince1970: TimeInterval(seconds))
+        )
+        return "\(whole.dropLast()).\(String(format: "%03lld", remainder))Z"
     }
 
     /// Writes a batch's contents. The caller owns the transaction, because both
@@ -1597,14 +1937,54 @@ public actor IngestStore {
                     throw UnresolvedLegacyAliasError(type: record.type)
                 }
             }
-            if let legacyTypeAlias = record.legacyTypeAlias,
-               legacyTypeAlias != record.type {
+            if record.kind == "workout",
+               record.type == Self.compatibilityWorkoutType,
+               let legacyTypeAlias = record.legacyTypeAlias {
+                // The compatibility format historically stored either the
+                // activity-derived name or the generic "Workout" as the sample
+                // type. A matching stable id proves those exact aliases; no
+                // other same-id type is guessed to be one.
                 try database.run(
                     """
                     DELETE FROM sample
-                    WHERE id = ? AND kind = 'workout' AND type != ?
+                    WHERE id = ? AND kind = 'workout'
+                      AND type != ?
+                      AND (type = ? OR type = ?)
                     """,
-                    [.text(record.id), .text(record.type)]
+                    [
+                        .text(record.id),
+                        .text(Self.canonicalWorkoutType),
+                        .text(legacyTypeAlias),
+                        .text(Self.historicalWorkoutType)
+                    ]
+                )
+                let canonicalExists = try database.query(
+                    """
+                    SELECT 1 FROM sample
+                    WHERE id = ? AND kind = 'workout' AND type = ?
+                    LIMIT 1
+                    """,
+                    [.text(record.id), .text(Self.canonicalWorkoutType)],
+                    row: { _ in true }
+                ).first ?? false
+                if canonicalExists {
+                    continue
+                }
+            } else if record.kind == "workout",
+                      record.type == Self.canonicalWorkoutType {
+                // The canonical HealthKit sample is authoritative. The two
+                // records share both a stable id and workout kind, so no
+                // compatibility-named copy may survive beside it.
+                try database.run(
+                    """
+                    DELETE FROM sample
+                    WHERE id = ? AND kind = 'workout'
+                      AND type != ?
+                    """,
+                    [
+                        .text(record.id),
+                        .text(Self.canonicalWorkoutType)
+                    ]
                 )
             }
             if let legacyAliasID = record.legacyAliasID,
@@ -2074,6 +2454,11 @@ public actor IngestStore {
                     read_at = excluded.read_at,
                     raw = excluded.raw,
                     received_at = excluded.received_at
+                WHERE excluded.read_at IS NOT NULL
+                  AND (
+                    characteristic.read_at IS NULL
+                    OR excluded.read_at >= characteristic.read_at
+                  )
                 """,
                 [
                     .text(characteristic.type),
@@ -2082,13 +2467,13 @@ public actor IngestStore {
                     characteristic.rawValue
                         .map { SQLiteValue.integer(Int64($0)) } ?? .null,
                     characteristic.readAt
-                        .map { SQLiteValue.text(Timestamps.text(from: $0)) }
+                        .map { SQLiteValue.text(Self.preciseWireTimestamp($0)) }
                         ?? .null,
                     .blob(characteristic.raw),
                     .text(timestamp)
                 ]
             )
-            storedCharacteristics += 1
+            storedCharacteristics += database.changeCount
         }
 
         // Kept rather than dropped. Keyed by content, so a retried
@@ -2245,6 +2630,33 @@ public actor IngestStore {
 
         for workout in batch.workoutDetails {
             if try isTombstoned(workout.id) { continue }
+            let conflictUpdate = switch workout.provenance {
+            case .canonical:
+                """
+                start_date = excluded.start_date,
+                end_date = excluded.end_date,
+                activity_type = excluded.activity_type,
+                duration_seconds = excluded.duration_seconds,
+                source_name = excluded.source_name
+                """
+            case .compatibility:
+                """
+                start_date = workout_detail.start_date,
+                end_date = COALESCE(workout_detail.end_date, excluded.end_date),
+                activity_type = COALESCE(
+                    workout_detail.activity_type,
+                    excluded.activity_type
+                ),
+                duration_seconds = COALESCE(
+                    workout_detail.duration_seconds,
+                    excluded.duration_seconds
+                ),
+                source_name = COALESCE(
+                    workout_detail.source_name,
+                    excluded.source_name
+                )
+                """
+            }
             try database.run(
                 """
                 INSERT INTO workout_detail
@@ -2252,11 +2664,7 @@ public actor IngestStore {
                      source_name, received_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT (id) DO UPDATE SET
-                    start_date = excluded.start_date,
-                    end_date = excluded.end_date,
-                    activity_type = excluded.activity_type,
-                    duration_seconds = excluded.duration_seconds,
-                    source_name = excluded.source_name
+                    \(conflictUpdate)
                 """,
                 [
                     .text(workout.id),
@@ -2441,7 +2849,7 @@ public actor IngestStore {
                 report.deliveredCount.map { SQLiteValue.integer(Int64($0)) } ?? .null,
                 report.primedFrom.map { SQLiteValue.text(Timestamps.text(from: $0)) } ?? .null,
                 report.primedThrough.map { SQLiteValue.text(Timestamps.text(from: $0)) } ?? .null,
-                .text(Timestamps.text(from: report.observedAt)),
+                .text(Self.preciseWireTimestamp(report.observedAt)),
                 .text(timestamp)
             ]
         )
@@ -2481,12 +2889,65 @@ public actor IngestStore {
         }
     }
 
-    private func isKnownBatch(_ key: String) throws -> Bool {
-        try !database.query(
-            "SELECT 1 FROM batch WHERE key = ?",
+    private func receiptVersion(for key: String) throws -> Int64? {
+        try database.query(
+            "SELECT receipt_version FROM batch WHERE key = ?",
             [.text(key)],
             row: { $0.integer(0) }
-        ).isEmpty
+        ).first
+    }
+
+    private func duplicateResult(for batch: ParsedBatch) -> IngestResult {
+        IngestResult(
+            stored: 0,
+            deleted: 0,
+            duplicate: true,
+            unreadable: batch.unreadableCount
+        )
+    }
+
+    private func bridgeReceipt(
+        from legacyKey: String,
+        to key: String,
+        batch: ParsedBatch,
+        now: Date
+    ) throws {
+        let timestamp = Timestamps.text(from: now)
+        try database.transaction {
+            try Self.writeReceipt(
+                key: key,
+                batch: batch,
+                timestamp: timestamp,
+                into: database
+            )
+            if legacyKey != key {
+                try database.run(
+                    "DELETE FROM batch WHERE key = ?",
+                    [.text(legacyKey)]
+                )
+            }
+        }
+    }
+
+    private static func writeReceipt(
+        key: String,
+        batch: ParsedBatch,
+        timestamp: String,
+        into database: SQLiteDatabase
+    ) throws {
+        try database.run(
+            """
+            INSERT OR REPLACE INTO batch
+                (key, received_at, record_count, receipt_version)
+            VALUES (?, ?, ?, ?)
+            """,
+            [
+                .text(key),
+                .text(timestamp),
+                .integer(Int64(batch.records.count)),
+                .integer(Self.currentBatchReceiptVersion)
+            ]
+        )
     }
 
     /// Records that a phone delivered, and how much.
@@ -3210,6 +3671,7 @@ public actor IngestStore {
     public struct StoredWorkout: Hashable, Sendable {
         public let id: String
         public let startDate: Date
+        public let endDate: Date?
         public let activityType: Int?
         public let duration: Double?
         public let sourceName: String?
@@ -3248,7 +3710,8 @@ public actor IngestStore {
         limit: Int = 100
     ) throws -> [StoredWorkout] {
         var sql = """
-            SELECT id, start_date, activity_type, duration_seconds, source_name
+            SELECT id, start_date, end_date, activity_type,
+                   duration_seconds, source_name
               FROM workout_detail
             """
         var parameters: [SQLiteValue] = []
@@ -3263,13 +3726,14 @@ public actor IngestStore {
             (
                 row.text(0),
                 Timestamps.date(from: row.text(1)) ?? .distantPast,
-                row.optionalInteger(2).map { Int($0) },
-                row.optionalReal(3),
-                row.optionalText(4)
+                row.optionalText(2).flatMap(Timestamps.date(from:)),
+                row.optionalInteger(3).map { Int($0) },
+                row.optionalReal(4),
+                row.optionalText(5)
             )
         }
 
-        return try rows.map { id, start, activityType, duration, source in
+        return try rows.map { id, start, end, activityType, duration, source in
             let legs = try database.query(
                 """
                 SELECT id, activity_type, start_date FROM workout_activity
@@ -3281,6 +3745,7 @@ public actor IngestStore {
             return StoredWorkout(
                 id: id,
                 startDate: start,
+                endDate: end,
                 activityType: activityType,
                 duration: duration,
                 sourceName: source,

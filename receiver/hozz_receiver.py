@@ -31,14 +31,17 @@ import re
 import sqlite3
 import socket
 import ssl
+import stat
 import struct
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 import uuid
 import zipfile
-from datetime import datetime
+from contextlib import contextmanager
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from socketserver import ThreadingMixIn
 from pathlib import Path
@@ -70,6 +73,7 @@ MAX_INFLATED_BYTES = 64 * 1_024 * 1_024 * 1_024
 MAX_RECORD_LINES = 50_000_000
 MAX_RECORD_BYTES = 16 * 1_024 * 1_024
 MAX_PENDING_BATCH_BYTES = 64 * 1_024 * 1_024
+MAX_SNAPSHOT_MEMORY_BYTES = 256 * 1_024
 MAX_NETWORK_BODY_BYTES = 8 * 1_024 * 1_024
 MAX_ENVELOPE_BYTES = 1 * 1_024 * 1_024
 MAX_RUN_OCCURRENCE_KEYS = 100_000
@@ -85,6 +89,12 @@ GLOBAL_RATIO_SLACK_BYTES = 32 * 1_024 * 1_024
 RFC3339 = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
     r"(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$"
+)
+COMPATIBLE_TIMESTAMP = re.compile(
+    r"^(?P<date>\d{4}-\d{2}-\d{2})[T ]"
+    r"(?P<time>\d{2}:\d{2}:\d{2})"
+    r"(?P<fraction>\.\d+)? ?"
+    r"(?P<zone>Z|[+-]\d{2}:?\d{2})$"
 )
 SOURCE_NAMESPACE = re.compile(r"^[A-Za-z0-9._-]+$")
 SUPPORTED_ZIP_METHODS = {zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED}
@@ -127,7 +137,9 @@ CREATE TABLE IF NOT EXISTS ingested_files (
     device      INTEGER,
     inode       INTEGER,
     size        INTEGER,
-    mtime_ns    INTEGER
+    mtime_ns    INTEGER,
+    ctime_ns    INTEGER,
+    digest      TEXT
 );
 
 CREATE TABLE IF NOT EXISTS archive_run_records (
@@ -139,14 +151,14 @@ CREATE TABLE IF NOT EXISTS archive_run_records (
 );
 CREATE TABLE IF NOT EXISTS compatible_alias_retirement (
     type        TEXT NOT NULL,
-    start_epoch INTEGER NOT NULL,
-    end_epoch   INTEGER,
+    start_instant TEXT NOT NULL,
+    end_instant TEXT,
     value       REAL,
     unit        TEXT,
     source      TEXT,
     kind        TEXT,
     stable_id   TEXT NOT NULL,
-    PRIMARY KEY (type, start_epoch, stable_id)
+    PRIMARY KEY (type, start_instant, stable_id)
 );
 CREATE INDEX IF NOT EXISTS compatible_alias_retirement_stable
     ON compatible_alias_retirement (stable_id);
@@ -218,13 +230,20 @@ def ensure_compatible_alias_retirement_schema(db):
     ]
     column_names = {row[1] for row in columns}
     expected_columns = {
-        "type", "start_epoch", "end_epoch", "value",
+        "type", "start_instant", "end_instant", "value",
         "unit", "source", "kind", "stable_id",
     }
     if (
-        primary_key == ["type", "start_epoch", "stable_id"]
+        primary_key == ["type", "start_instant", "stable_id"]
         and expected_columns.issubset(column_names)
     ):
+        db.execute(
+            """
+            CREATE INDEX IF NOT EXISTS compatible_alias_retirement_signature
+            ON compatible_alias_retirement
+               (type, start_instant, end_instant, value, unit, source, kind)
+            """
+        )
         return
     db.execute(
         """
@@ -251,18 +270,21 @@ def ensure_compatible_alias_retirement_schema(db):
          AND tombstone.tombstone = 1
         """
     )
+    # Mappings made against millisecond timestamps cannot prove which
+    # submillisecond record they identified.
+    db.execute("DELETE FROM compatible_alias_identity")
     db.execute(
         """
         CREATE TABLE compatible_alias_retirement (
             type        TEXT NOT NULL,
-            start_epoch INTEGER NOT NULL,
-            end_epoch   INTEGER,
+            start_instant TEXT NOT NULL,
+            end_instant TEXT,
             value       REAL,
             unit        TEXT,
             source      TEXT,
             kind        TEXT,
             stable_id   TEXT NOT NULL,
-            PRIMARY KEY (type, start_epoch, stable_id)
+            PRIMARY KEY (type, start_instant, stable_id)
         )
         """
     )
@@ -273,8 +295,13 @@ def ensure_compatible_alias_retirement_schema(db):
         ON compatible_alias_retirement (stable_id)
         """
     )
-
-
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS compatible_alias_retirement_signature
+        ON compatible_alias_retirement
+           (type, start_instant, end_instant, value, unit, source, kind)
+        """
+    )
 def backfill_compatible_alias_signatures(db):
     rows = db.execute(
         """
@@ -297,8 +324,8 @@ def backfill_compatible_alias_signatures(db):
         source,
     ) in rows:
         try:
-            start_epoch = compatible_epoch_milliseconds(start_date)
-            end_epoch = compatible_epoch_milliseconds(
+            start_instant = compatible_normalized_timestamp(start_date)
+            end_instant = compatible_normalized_timestamp(
                 end_date if isinstance(end_date, str) else start_date
             )
         except PartialBatch:
@@ -306,12 +333,12 @@ def backfill_compatible_alias_signatures(db):
         db.execute(
             """
             INSERT OR IGNORE INTO compatible_alias_retirement
-                (type, start_epoch, end_epoch, value, unit,
+                (type, start_instant, end_instant, value, unit,
                  source, kind, stable_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                record_type, start_epoch, end_epoch, value,
+                record_type, start_instant, end_instant, value,
                 unit, source, kind, stable_id,
             ),
         )
@@ -406,9 +433,11 @@ def ensure_current_columns(db):
     file_columns = {
         row[1] for row in db.execute("PRAGMA table_info(ingested_files)")
     }
-    for name in ("device", "inode", "size", "mtime_ns"):
+    for name in ("device", "inode", "size", "mtime_ns", "ctime_ns"):
         if name not in file_columns:
             db.execute(f"ALTER TABLE ingested_files ADD COLUMN {name} INTEGER")
+    if "digest" not in file_columns:
+        db.execute("ALTER TABLE ingested_files ADD COLUMN digest TEXT")
     restore_continuation_errors(db)
     reconcile_parent_tombstones(db)
     reconcile_encoding_errors(db)
@@ -1073,6 +1102,7 @@ def _ingest_lines(
             legacy_receipt = True
 
     stored = deleted = canonical_count = 0
+    pending_null_heart_aliases = []
     scope_key = run_scope_key or batch_key
     current_run = f"batch:{scope_key}" if scope_key else None
     occurrences = {}
@@ -1204,6 +1234,31 @@ def _ingest_lines(
                     "legacy identity cannot be reconciled with a pending deletion"
                 )
             signature = compatibility_record_signature(record)
+            quantity = record.get("quantity")
+            source_object = record.get("source")
+            known_null_heart_rate = is_known_legacy_heart_rate_alias(
+                source_id,
+                start_date,
+                record.get("endDate"),
+                (
+                    quantity.get("value")
+                    if isinstance(quantity, dict)
+                    else record.get("value")
+                ),
+                quantity.get("unit") if isinstance(quantity, dict) else None,
+                (
+                    source_object.get("name")
+                    if isinstance(source_object, dict)
+                    else None
+                ),
+                kind,
+                parse_line,
+            )
+            if known_null_heart_rate:
+                pending_null_heart_aliases.append(
+                    (canonical_id, version, signature)
+                )
+                continue
             if signature is None:
                 if (
                     record_type == "sleep_analysis"
@@ -1240,8 +1295,8 @@ def _ingest_lines(
                 retired_ids = db.execute(
                     """
                     SELECT stable_id FROM compatible_alias_retirement
-                    WHERE type = ? AND start_epoch = ?
-                      AND end_epoch IS ? AND value IS ? AND unit IS ?
+                    WHERE type = ? AND start_instant = ?
+                      AND end_instant IS ? AND value IS ? AND unit IS ?
                       AND source IS ? AND kind IS ?
                     """,
                     signature,
@@ -1271,7 +1326,7 @@ def _ingest_lines(
                         db.execute(
                             """
                             INSERT OR IGNORE INTO compatible_alias_retirement
-                                (type, start_epoch, end_epoch, value, unit,
+                                (type, start_instant, end_instant, value, unit,
                                  source, kind, stable_id)
                             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                             """,
@@ -1399,6 +1454,30 @@ def _ingest_lines(
                     """,
                     (winner[0] if winner else version, canonical_id),
                 )
+
+    verified_null_heart_aliases = resolve_pending_null_heart_aliases(
+        db,
+        pending_null_heart_aliases,
+    )
+    for stable_id, canonical_id, version in verified_null_heart_aliases:
+        db.execute(
+            """
+            INSERT OR IGNORE INTO compatible_alias_identity
+                (stable_id, legacy_id)
+            VALUES (?, ?)
+            """,
+            (stable_id, canonical_id),
+        )
+        retired_cursor = db.execute(
+            """
+            UPDATE samples
+            SET tombstone = 1,
+                record_version = MAX(record_version + 1, ?)
+            WHERE canonical_id = ? AND tombstone = 0
+            """,
+            (version + 1, canonical_id),
+        )
+        deleted += retired_cursor.rowcount
 
     if batch_key:
         if legacy_receipt:
@@ -1633,7 +1712,88 @@ def ingest_payload(db, payload, batch_key=None):
     )
 
 
+class LengthLimitedRawReader(io.RawIOBase):
+    def __init__(self, source, length):
+        super().__init__()
+        self.source = source
+        self.length = length
+        self.position = 0
+        self.source.seek(0)
+
+    def readable(self):
+        return True
+
+    def seekable(self):
+        return True
+
+    def readinto(self, buffer):
+        if self.closed:
+            raise ValueError("I/O operation on closed stream")
+        remaining = self.length - self.position
+        if remaining <= 0:
+            return 0
+        data = self.source.read(min(len(buffer), remaining))
+        if not data:
+            return 0
+        size = len(data)
+        buffer[:size] = data
+        self.position += size
+        return size
+
+    def seek(self, offset, whence=os.SEEK_SET):
+        if self.closed:
+            raise ValueError("I/O operation on closed stream")
+        if whence == os.SEEK_SET:
+            position = offset
+        elif whence == os.SEEK_CUR:
+            position = self.position + offset
+        elif whence == os.SEEK_END:
+            position = self.length + offset
+        else:
+            raise ValueError("invalid whence")
+        if position < 0 or position > self.length:
+            raise ValueError("seek outside captured file length")
+        self.source.seek(position)
+        self.position = position
+        return position
+
+    def tell(self):
+        return self.position
+
+
+@contextmanager
+def length_limited_stream(source, length):
+    raw = LengthLimitedRawReader(source, length)
+    bounded = io.BufferedReader(raw, buffer_size=64 * 1_024)
+    try:
+        yield bounded
+    finally:
+        bounded.close()
+        source.seek(0)
+
+
 def ingest_seekable_stream(
+    db,
+    stream,
+    length,
+    batch_key=None,
+    commit=True,
+    run_scope_key=None,
+    replay_run_occurrences=False,
+):
+    with length_limited_stream(stream, length) as bounded:
+        return _ingest_seekable_stream(
+            db,
+            bounded,
+            length,
+            batch_key,
+            commit,
+            run_scope_key,
+            replay_run_occurrences,
+        )
+
+
+def _ingest_seekable_stream(
     db,
     stream,
     length,
@@ -1921,18 +2081,26 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
             identity = require_text(point, "id", f"{name} point")
             stable_canonical_id = canonical_id_for("healthAutoExport", identity)
             incoming_stable_ids.add(stable_canonical_id)
-            date_alias = point.get("date")
-            if isinstance(date_alias, str) and date_alias:
+            if name == "heart_rate":
+                start = require_compatible_timestamp(
+                    point,
+                    "date",
+                    "heart-rate point",
+                )
+                end = require_compatible_timestamp(
+                    point,
+                    "endDate",
+                    "heart-rate point",
+                    default=start,
+                )
                 legacy_aliases.append(
                     (
                         name,
-                        date_alias,
-                        compatible_epoch_milliseconds(date_alias),
+                        start,
+                        compatible_normalized_timestamp(start),
                         stable_canonical_id,
                     )
                 )
-            if name == "heart_rate":
-                start = require_text(point, "date", "heart-rate point")
                 values = [
                     finite_number(point, field, "heart-rate point")
                     for field in ("Min", "Avg", "Max")
@@ -1946,7 +2114,7 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
                     name,
                     units,
                     start,
-                    point.get("endDate", start),
+                    end,
                     values[1],
                     source,
                     point,
@@ -1954,13 +2122,21 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
                     maximum=values[2],
                 )
             elif name == "sleep_analysis":
-                start = require_text(point, "startDate", "sleep point")
-                end = require_text(point, "endDate", "sleep point")
+                start = require_compatible_timestamp(
+                    point,
+                    "startDate",
+                    "sleep point",
+                )
+                end = require_compatible_timestamp(
+                    point,
+                    "endDate",
+                    "sleep point",
+                )
                 legacy_aliases.append(
                     (
                         name,
                         start,
-                        compatible_epoch_milliseconds(start),
+                        compatible_normalized_timestamp(start),
                         stable_canonical_id,
                     )
                 )
@@ -2004,10 +2180,25 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
                 if source:
                     line["source"] = {"name": source}
             else:
-                start = require_text(point, "date", f"{name} point")
-                end = point.get("endDate", start)
-                if not isinstance(end, str) or not end:
-                    raise PartialBatch(f"compatible metric {name} has invalid endDate")
+                start = require_compatible_timestamp(
+                    point,
+                    "date",
+                    f"{name} point",
+                )
+                end = require_compatible_timestamp(
+                    point,
+                    "endDate",
+                    f"{name} point",
+                    default=start,
+                )
+                legacy_aliases.append(
+                    (
+                        name,
+                        start,
+                        compatible_normalized_timestamp(start),
+                        stable_canonical_id,
+                    )
+                )
                 line = compatibility_quantity(
                     identity,
                     name,
@@ -2025,8 +2216,16 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
             raise PartialBatch("compatible workout is not an object")
         identity = require_text(workout, "id", "compatible workout")
         name = require_text(workout, "name", "compatible workout")
-        start = require_text(workout, "start", "compatible workout")
-        end = require_text(workout, "end", "compatible workout")
+        start = require_compatible_timestamp(
+            workout,
+            "start",
+            "compatible workout",
+        )
+        end = require_compatible_timestamp(
+            workout,
+            "end",
+            "compatible workout",
+        )
         duration = finite_number(workout, "duration", "compatible workout")
         add_compatible_line(
             lines,
@@ -2057,6 +2256,11 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
         stable_identity = require_text(deletion, "id", "compatible deletion")
         name = require_text(deletion, "name", "compatible deletion")
         record_type = require_text(deletion, "type", "compatible deletion")
+        deletion_date = deletion.get("date")
+        if not isinstance(deletion_date, str):
+            raise PartialBatch("compatible deletion has an invalid timestamp")
+        if deletion_date:
+            compatible_normalized_timestamp(deletion_date)
         canonical_id = canonical_id_for("healthAutoExport", stable_identity)
         stable_row = db.execute(
             """
@@ -2077,14 +2281,11 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
                 (
                     name,
                     stable_row[0],
-                    compatible_epoch_milliseconds(stable_row[0]),
+                    compatible_normalized_timestamp(stable_row[0]),
                     canonical_id,
                 )
             )
         if not repair_legacy_deletions:
-            deletion_date = deletion.get("date")
-            if not isinstance(deletion_date, str):
-                raise PartialBatch("compatible deletion has invalid date")
             if not deletion_date:
                 stable_exists = db.execute(
                     "SELECT 1 FROM samples WHERE canonical_id = ?",
@@ -2125,12 +2326,12 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
                         (
                             name,
                             deletion_date,
-                            compatible_epoch_milliseconds(deletion_date),
+                            compatible_normalized_timestamp(deletion_date),
                             canonical_id,
                         )
                     )
                 else:
-                    deletion_epoch = compatible_epoch_milliseconds(
+                    deletion_instant = compatible_normalized_timestamp(
                         deletion_date
                     )
                     for (legacy_start,) in db.execute(
@@ -2144,8 +2345,8 @@ def ingest_compatible(db, envelope, batch_key=None, commit=True):
                         try:
                             same_instant = (
                                 isinstance(legacy_start, str)
-                                and compatible_epoch_milliseconds(legacy_start)
-                                    == deletion_epoch
+                                and compatible_normalized_timestamp(legacy_start)
+                                    == deletion_instant
                             )
                         except PartialBatch:
                             same_instant = False
@@ -2278,12 +2479,12 @@ def reconcile_compatible_aliases(db, aliases, records):
         if signature is not None:
             record_signatures[stable_id] = signature
     targets = {}
-    for record_type, date_text, epoch, stable_id in dict.fromkeys(aliases):
+    for record_type, _date_text, _instant, stable_id in dict.fromkeys(aliases):
         signature = record_signatures.get(stable_id)
         if signature is None:
             stored = db.execute(
                 """
-                SELECT type, start_epoch, end_epoch, value,
+                SELECT type, start_instant, end_instant, value,
                        unit, source, kind
                 FROM compatible_alias_retirement
                 WHERE stable_id = ?
@@ -2296,7 +2497,7 @@ def reconcile_compatible_aliases(db, aliases, records):
             continue
         existing_signatures = db.execute(
             """
-            SELECT type, start_epoch, end_epoch, value, unit, source, kind
+            SELECT type, start_instant, end_instant, value, unit, source, kind
             FROM compatible_alias_retirement
             WHERE stable_id = ?
             """,
@@ -2312,7 +2513,7 @@ def reconcile_compatible_aliases(db, aliases, records):
         db.execute(
             """
             INSERT OR IGNORE INTO compatible_alias_retirement
-                (type, start_epoch, end_epoch, value, unit,
+                (type, start_instant, end_instant, value, unit,
                  source, kind, stable_id)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -2338,7 +2539,7 @@ def reconcile_compatible_aliases(db, aliases, records):
         rows = db.execute(
             """
             SELECT source_id, start_date, end_date, value, unit,
-                   source, kind, record_version
+                   source, kind, record_version, raw
             FROM samples
             WHERE type = ? AND tombstone = 0
               AND canonical_id LIKE 'apple.healthkit:%'
@@ -2355,6 +2556,7 @@ def reconcile_compatible_aliases(db, aliases, records):
             source,
             kind,
             version,
+            raw,
         ) in rows:
             if (
                 record_type == "sleep_analysis"
@@ -2383,28 +2585,80 @@ def reconcile_compatible_aliases(db, aliases, records):
                 )
             except PartialBatch:
                 continue
-            candidates.append((source_id, version, candidate))
-        for source_id, version, candidate in candidates:
-            matching_targets = {
-                stable_id
-                for stable_id, signature in target_signatures.items()
-                if candidate == signature
-            }
-            matching_targets.update(
-                row[0] for row in db.execute(
-                    """
-                    SELECT stable_id FROM compatible_alias_retirement
-                    WHERE type = ? AND start_epoch = ?
-                      AND end_epoch IS ? AND value IS ? AND unit IS ?
-                      AND source IS ? AND kind IS ?
-                    """,
-                    candidate,
+            known_null_heart_rate = is_known_legacy_heart_rate_alias(
+                source_id,
+                start_date,
+                end_date,
+                value,
+                unit,
+                source,
+                kind,
+                raw,
+            )
+            candidates.append(
+                (source_id, version, candidate, known_null_heart_rate)
+            )
+
+        regular_counts = {}
+        null_heart_rate_counts = {}
+        for _, _, candidate, known_null_heart_rate in candidates:
+            if known_null_heart_rate:
+                key = heart_rate_alias_key(candidate)
+                null_heart_rate_counts[key] = (
+                    null_heart_rate_counts.get(key, 0) + 1
                 )
+            else:
+                regular_counts[candidate] = regular_counts.get(candidate, 0) + 1
+
+        stable_ids_by_signature = {}
+        heart_rate_ids_by_key = {}
+        heart_rate_signatures_by_key = {}
+        starts = sorted({candidate[1] for _, _, candidate, _ in candidates})
+        for offset in range(0, len(starts), 500):
+            chunk = starts[offset:offset + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = db.execute(
+                f"""
+                SELECT start_instant, end_instant, value, unit, source, kind,
+                       stable_id
+                FROM compatible_alias_retirement
+                WHERE type = ? AND start_instant IN ({placeholders})
+                """,
+                (record_type, *chunk),
             )
-            matching_candidates = sum(
-                other_signature == candidate
-                for _, _, other_signature in candidates
-            )
+            for row in rows:
+                signature = (record_type, *row[:6])
+                stable_id = row[6]
+                stable_ids_by_signature.setdefault(signature, set()).add(
+                    stable_id
+                )
+                key = heart_rate_alias_key(signature)
+                if key is not None and finite_signature_value(signature[3]):
+                    heart_rate_ids_by_key.setdefault(key, set()).add(stable_id)
+                    heart_rate_signatures_by_key.setdefault(key, set()).add(
+                        signature
+                    )
+
+        regular_heart_rate_matches = {
+            key: sum(regular_counts.get(signature, 0) for signature in signatures)
+            for key, signatures in heart_rate_signatures_by_key.items()
+        }
+
+        for source_id, version, candidate, known_null_heart_rate in candidates:
+            key = heart_rate_alias_key(candidate)
+            if known_null_heart_rate:
+                matching_targets = set(heart_rate_ids_by_key.get(key, ()))
+                matching_candidates = (
+                    null_heart_rate_counts.get(key, 0)
+                    + regular_heart_rate_matches.get(key, 0)
+                )
+            else:
+                matching_targets = set(
+                    stable_ids_by_signature.get(candidate, ())
+                )
+                matching_candidates = regular_counts.get(candidate, 0)
+                if key is not None and finite_signature_value(candidate[3]):
+                    matching_candidates += null_heart_rate_counts.get(key, 0)
             if matching_targets and (
                 len(matching_targets) != 1 or matching_candidates != 1
             ):
@@ -2443,14 +2697,202 @@ def reconcile_compatible_aliases(db, aliases, records):
     return deleted
 
 
-def compatible_epoch_milliseconds(value):
+def is_known_legacy_heart_rate_alias(
+    source_id,
+    start_date,
+    end_date,
+    value,
+    unit,
+    source,
+    kind,
+    raw,
+):
+    if (
+        kind != "quantity"
+        or value is not None
+        or not isinstance(start_date, str)
+        or source_id != f"heart_rate:{start_date}"
+    ):
+        return False
     try:
-        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except (AttributeError, ValueError) as error:
+        record = parse_json(raw)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(record, dict) or set(record) != {
+        "id",
+        "type",
+        "kind",
+        "startDate",
+        "endDate",
+        "quantity",
+        "source",
+    }:
+        return False
+    quantity = record.get("quantity")
+    source_object = record.get("source")
+    return bool(
+        record.get("id") == source_id
+        and record.get("type") == "heart_rate"
+        and record.get("kind") == "quantity"
+        and record.get("startDate") == start_date
+        and record.get("endDate") == end_date
+        and isinstance(quantity, dict)
+        and set(quantity) == {"value", "unit"}
+        and quantity.get("value") is None
+        and quantity.get("unit") == unit
+        and isinstance(source_object, dict)
+        and set(source_object) == {"name"}
+        and source_object.get("name") == source
+    )
+
+
+def resolve_pending_null_heart_aliases(db, pending):
+    if not pending:
+        return []
+    pending_by_key = {}
+    for canonical_id, version, signature in pending:
+        key = heart_rate_alias_key(signature)
+        if key is None:
+            raise PartialBatch(
+                "legacy null heart-rate identity is not unambiguous"
+            )
+        pending_by_key.setdefault(key, []).append(
+            (canonical_id, version, signature)
+        )
+
+    stable_ids_by_key = {}
+    starts = sorted({signature[1] for _, _, signature in pending})
+    for offset in range(0, len(starts), 800):
+        chunk = starts[offset:offset + 800]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in db.execute(
+            f"""
+            SELECT type, start_instant, end_instant, value, unit,
+                   source, kind, stable_id
+            FROM compatible_alias_retirement
+            WHERE type = 'heart_rate'
+              AND value IS NOT NULL
+              AND start_instant IN ({placeholders})
+            """,
+            chunk,
+        ):
+            signature = tuple(row[:7])
+            key = heart_rate_alias_key(signature)
+            if key in pending_by_key:
+                stable_ids_by_key.setdefault(key, set()).add(row[7])
+
+    competitors_by_key = {}
+    for row in db.execute(
+        """
+        SELECT canonical_id, source_id, type, start_date, end_date,
+               value, unit, source, kind
+        FROM samples
+        WHERE type = 'heart_rate'
+          AND tombstone = 0
+          AND value IS NOT NULL
+          AND (
+            canonical_id LIKE 'healthAutoExport:%'
+            OR canonical_id LIKE 'apple.healthkit:%'
+          )
+        """
+    ):
+        canonical_id, source_id = row[:2]
+        try:
+            signature = compatibility_stored_signature(row[2:])
+        except PartialBatch:
+            continue
+        if not finite_signature_value(signature[3]):
+            continue
+        key = heart_rate_alias_key(signature)
+        if key not in pending_by_key:
+            continue
+        if canonical_id.startswith("healthAutoExport:"):
+            stable_ids_by_key.setdefault(key, set()).add(canonical_id)
+        elif source_id.startswith("heart_rate:"):
+            competitors_by_key.setdefault(key, set()).add(canonical_id)
+
+    resolved = []
+    for key, aliases in pending_by_key.items():
+        stable_ids = stable_ids_by_key.get(key, set())
+        competitors = competitors_by_key.get(key, set())
+        if len(aliases) != 1 or len(stable_ids) != 1 or competitors:
+            raise PartialBatch(
+                "legacy null heart-rate identity is not unambiguous"
+            )
+        canonical_id, version, _ = aliases[0]
+        resolved.append((next(iter(stable_ids)), canonical_id, version))
+    return resolved
+
+
+def heart_rate_alias_key(signature):
+    if signature is None or signature[0] != "heart_rate":
+        return None
+    return (
+        signature[0],
+        signature[1],
+        signature[2],
+        signature[4],
+        signature[5],
+        signature[6],
+    )
+
+
+def finite_signature_value(value):
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
+
+
+def require_compatible_timestamp(record, field, context, default=None):
+    value = record.get(field, default)
+    if not isinstance(value, str) or not value:
+        raise PartialBatch(f"{context} has an invalid timestamp")
+    compatible_normalized_timestamp(value)
+    return value
+
+
+def compatible_normalized_timestamp(value):
+    match = (
+        COMPATIBLE_TIMESTAMP.fullmatch(value)
+        if isinstance(value, str)
+        else None
+    )
+    if match is None:
+        raise PartialBatch("compatible point has an invalid timestamp")
+    hour, minute, second = (
+        int(component) for component in match.group("time").split(":")
+    )
+    if hour > 23 or minute > 59 or second > 59:
+        raise PartialBatch("compatible point has an invalid timestamp")
+    zone = match.group("zone")
+    if zone == "Z":
+        zone = "+00:00"
+    else:
+        compact_zone = zone[1:].replace(":", "")
+        offset_hour = int(compact_zone[:2])
+        offset_minute = int(compact_zone[2:])
+        if offset_hour > 23 or offset_minute > 59:
+            raise PartialBatch("compatible point has an invalid timestamp")
+        zone = f"{zone[0]}{compact_zone[:2]}:{compact_zone[2:]}"
+    try:
+        parsed = datetime.fromisoformat(
+            f"{match.group('date')}T{match.group('time')}{zone}"
+        )
+        utc = parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError) as error:
         raise PartialBatch("compatible point has an invalid timestamp") from error
-    if parsed.tzinfo is None:
-        raise PartialBatch("compatible point timestamp has no time zone")
-    return int(parsed.timestamp() * 1_000)
+    normalized = (
+        f"{utc.year:04d}-{utc.month:02d}-{utc.day:02d}"
+        f"T{utc.hour:02d}:{utc.minute:02d}:{utc.second:02d}"
+    )
+    fraction = match.group("fraction")
+    if fraction is not None:
+        digits = fraction[1:].rstrip("0")
+        if digits:
+            normalized += f".{digits}"
+    return f"{normalized}Z"
 
 
 def compatibility_record_signature(record):
@@ -2458,9 +2900,9 @@ def compatibility_record_signature(record):
     if not isinstance(start, str):
         return None
     try:
-        start_epoch = compatible_epoch_milliseconds(start)
+        start_instant = compatible_normalized_timestamp(start)
         end = record.get("endDate")
-        end_epoch = compatible_epoch_milliseconds(
+        end_instant = compatible_normalized_timestamp(
             end if isinstance(end, str) else start
         )
     except PartialBatch:
@@ -2473,8 +2915,8 @@ def compatibility_record_signature(record):
         source = {}
     return (
         record.get("type", ""),
-        start_epoch,
-        end_epoch,
+        start_instant,
+        end_instant,
         quantity.get("value", record.get("value", record.get("duration"))),
         quantity.get("unit", record.get("unit")),
         source.get("name"),
@@ -2496,8 +2938,8 @@ def compatibility_stored_signature(values):
         return None
     return (
         record_type,
-        compatible_epoch_milliseconds(start_date),
-        compatible_epoch_milliseconds(
+        compatible_normalized_timestamp(start_date),
+        compatible_normalized_timestamp(
             end_date if isinstance(end_date, str) else start_date
         ),
         value,
@@ -2780,6 +3222,133 @@ def serve_security(host, certificate, key):
     return context, family
 
 
+RELIABLE_CHANGE_TIME_FILESYSTEMS = frozenset({"apfs"})
+_FILESYSTEM_TYPE_CACHE = {}
+
+
+def parse_darwin_mounts(output):
+    mounts = []
+    for line in output.splitlines():
+        location, separator, options = line.rpartition(" (")
+        if not separator or not options.endswith(")"):
+            continue
+        _, separator, mount_point = location.rpartition(" on ")
+        if not separator:
+            continue
+        filesystem = options[:-1].split(",", 1)[0].strip().lower()
+        if filesystem:
+            mounts.append((Path(mount_point), filesystem))
+    return tuple(mounts)
+
+
+def darwin_mounts():
+    try:
+        result = subprocess.run(
+            ["/sbin/mount"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=2,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ()
+    if result.returncode != 0:
+        return ()
+    return parse_darwin_mounts(result.stdout)
+
+
+def filesystem_type_from_mounts(path, mounts, stat_function=os.stat):
+    try:
+        target_device = stat_function(path).st_dev
+    except OSError:
+        return None
+    matches = set()
+    for mount_point, filesystem in mounts:
+        try:
+            mount_device = stat_function(mount_point).st_dev
+        except OSError:
+            continue
+        if mount_device == target_device:
+            matches.add(filesystem)
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
+def filesystem_type(path):
+    if sys.platform == "darwin":
+        try:
+            device = path.stat().st_dev
+        except OSError:
+            return None
+        cache_key = ("darwin", device)
+        if cache_key not in _FILESYSTEM_TYPE_CACHE:
+            _FILESYSTEM_TYPE_CACHE[cache_key] = filesystem_type_from_mounts(
+                path,
+                darwin_mounts(),
+            )
+        return _FILESYSTEM_TYPE_CACHE[cache_key]
+    statvfs = getattr(os, "statvfs", None)
+    if statvfs is None:
+        return None
+    try:
+        name = getattr(statvfs(path), "f_fstypename", None)
+    except OSError:
+        return None
+    if isinstance(name, bytes):
+        name = name.decode("ascii", errors="ignore")
+    return name.lower() if isinstance(name, str) and name else None
+
+
+def file_change_time_is_reliable(path):
+    return filesystem_type(path) in RELIABLE_CHANGE_TIME_FILESYSTEMS
+
+
+def cached_file_failure_is_active(
+    name,
+    key,
+    deterministic_failures,
+    transient_failures,
+):
+    if deterministic_failures.get(name) == key:
+        return True
+    transient = transient_failures.get(name)
+    if (
+        transient is not None
+        and transient[0] == key
+        and time.monotonic() < transient[1]
+    ):
+        return True
+    if deterministic_failures.get(name) != key:
+        deterministic_failures.pop(name, None)
+    if transient is not None and transient[0] != key:
+        transient_failures.pop(name, None)
+    return False
+
+
+def file_generation_was_ingested(db, name, generation):
+    return db.execute(
+        """
+        SELECT 1 FROM ingested_files
+        WHERE name = ? AND device = ? AND inode = ?
+          AND size = ? AND mtime_ns = ? AND ctime_ns = ?
+          AND digest IS NOT NULL
+        """,
+        (name, *generation),
+    ).fetchone() is not None
+
+
+def file_digest_was_ingested(db, name, digest):
+    return db.execute(
+        """
+        SELECT 1 FROM ingested_files
+        WHERE name = ? AND digest = ?
+        """,
+        (name, digest),
+    ).fetchone() is not None
+
+
 def watch(args):
     """Import files Hozz drops into a synced folder."""
     db = connect(args.database)
@@ -2792,51 +3361,93 @@ def watch(args):
     while True:
         for path in sorted(folder.glob("hozz-*")):
             try:
-                snapshot = file_snapshot(path.stat())
+                generation = validated_file_snapshot(path.stat())
+            except PartialBatch as error:
+                print(f"skipped {path.name}: {error}")
+                continue
             except OSError:
                 continue
-            if deterministic_failures.get(path.name) == snapshot:
-                continue
-            transient = transient_failures.get(path.name)
-            if (
-                transient is not None
-                and transient[0] == snapshot
-                and time.monotonic() < transient[1]
+            reliable_change_time = file_change_time_is_reliable(path)
+            failure_key = generation if reliable_change_time else None
+            if failure_key is not None and cached_file_failure_is_active(
+                path.name,
+                failure_key,
+                deterministic_failures,
+                transient_failures,
             ):
                 continue
-            if deterministic_failures.get(path.name) != snapshot:
-                deterministic_failures.pop(path.name, None)
-            if transient is not None and transient[0] != snapshot:
-                transient_failures.pop(path.name, None)
-            done = db.execute(
-                """
-                SELECT 1 FROM ingested_files
-                WHERE name = ? AND device = ? AND inode = ?
-                  AND size = ? AND mtime_ns = ?
-                """,
-                (path.name, *snapshot),
-            ).fetchone()
-            if done:
-                continue
             try:
-                stored, deleted = ingest_file(
+                if reliable_change_time and file_generation_was_ingested(
                     db,
+                    path.name,
+                    generation,
+                ):
+                    continue
+                spool_directory = snapshot_spool_directory(db, path)
+                with open_hashed_file(
                     path,
-                    watch_receipt_name=path.name,
-                )
+                    generation,
+                    spool_directory,
+                    capture=reliable_change_time,
+                ) as prepared:
+                    captured, source, snapshot, file_batch_key, digest = prepared
+                    if not reliable_change_time:
+                        failure_key = (generation, digest)
+                        if cached_file_failure_is_active(
+                            path.name,
+                            failure_key,
+                            deterministic_failures,
+                            transient_failures,
+                        ):
+                            continue
+                        if file_digest_was_ingested(db, path.name, digest):
+                            continue
+                        with captured_file_snapshot(
+                            source,
+                            snapshot,
+                            spool_directory,
+                            expected_digest=digest,
+                        ) as immutable:
+                            captured = immutable[0]
+                            verify_file_snapshot(path, source, snapshot)
+                            stored, deleted = ingest_hashed_file(
+                                db,
+                                path,
+                                captured,
+                                source,
+                                snapshot,
+                                file_batch_key,
+                                digest,
+                                path.name,
+                            )
+                    else:
+                        stored, deleted = ingest_hashed_file(
+                            db,
+                            path,
+                            captured,
+                            source,
+                            snapshot,
+                            file_batch_key,
+                            digest,
+                            path.name,
+                        )
             except PartialBatch as error:
-                deterministic_failures[path.name] = snapshot
+                if failure_key is not None:
+                    deterministic_failures[path.name] = failure_key
                 print(f"skipped {path.name}: {error}")
                 continue
             except Exception as error:  # noqa: BLE001
+                if failure_key is None:
+                    print(f"skipped {path.name}: {error}")
+                    continue
                 previous = transient_failures.get(path.name)
                 delay = (
                     min(previous[2] * 2, 60.0)
-                    if previous is not None and previous[0] == snapshot
+                    if previous is not None and previous[0] == failure_key
                     else max(float(args.interval), 1.0)
                 )
                 transient_failures[path.name] = (
-                    snapshot,
+                    failure_key,
                     time.monotonic() + delay,
                     delay,
                 )
@@ -2847,69 +3458,110 @@ def watch(args):
             print(f"{path.name}: stored {stored}, deleted {deleted}")
 
         if args.once:
+            db.close()
             return
         time.sleep(args.interval)
 
 
 def ingest_file(db, path, watch_receipt_name=None):
     """A ZIP from a full export, or a plain batch file."""
-    try:
-        with path.open("rb") as source:
-            initial = file_snapshot(os.fstat(source.fileno()))
-            file_batch_key = file_content_key(source)
-            legacy_scope = legacy_file_receipt_scope(db, path.name, initial)
-            legacy_receipt = legacy_file_receipt(db, path.name)
-            if (
-                legacy_scope is None
-                and legacy_receipt is not None
-                and legacy_receipt[3] >= 0
-                and file_matches_legacy_receipt(
-                    db,
-                    path,
-                    source,
-                    initial,
-                    legacy_receipt[0],
-                )
-            ):
-                db.execute(
-                    """
-                    INSERT OR IGNORE INTO batches
-                        (key, received_at, records, deletions)
-                    VALUES (?, ?, ?, ?)
-                    """,
-                    (file_batch_key, *legacy_receipt[1:]),
-                )
-                verify_file_snapshot(path, source, initial)
-                record_file_receipt(db, watch_receipt_name, initial)
-                db.commit()
-                return 0, 0
-            if path.suffix == ".zip":
-                return ingest_zip_stream(
-                    db,
-                    path,
-                    source,
-                    initial,
-                    file_batch_key,
-                    watch_receipt_name,
-                    legacy_scope,
-                )
+    with open_hashed_file(
+        path,
+        spool_directory=snapshot_spool_directory(db, path),
+    ) as prepared:
+        captured, source, initial, file_batch_key, digest = prepared
+        return ingest_hashed_file(
+            db,
+            path,
+            captured,
+            source,
+            initial,
+            file_batch_key,
+            digest,
+            watch_receipt_name,
+        )
 
-            file_size = initial[2]
-            if file_size > MAX_INFLATED_BYTES:
-                raise PartialBatch("file exceeds the import byte limit")
-            stored, deleted, _ = ingest_seekable_stream(
+
+def ingest_hashed_file(
+    db,
+    path,
+    captured,
+    source,
+    initial,
+    file_batch_key,
+    digest,
+    watch_receipt_name,
+):
+    try:
+        legacy_scope = legacy_file_receipt_scope(
+            db,
+            path.name,
+            initial,
+            digest,
+        )
+        legacy_receipt = legacy_file_receipt(db, path.name)
+        if (
+            legacy_scope is None
+            and legacy_receipt is not None
+            and legacy_receipt[3] >= 0
+            and file_matches_legacy_receipt(
                 db,
+                path,
+                captured,
                 source,
-                file_size,
-                file_batch_key,
-                commit=False,
-                run_scope_key=legacy_scope,
-                replay_run_occurrences=legacy_scope is not None,
+                initial,
+                legacy_receipt[0],
             )
-            verify_file_snapshot(path, source, initial)
-            record_file_receipt(db, watch_receipt_name, initial)
+        ):
+            db.execute(
+                """
+                INSERT OR IGNORE INTO batches
+                    (key, received_at, records, deletions)
+                VALUES (?, ?, ?, ?)
+                """,
+                (file_batch_key, *legacy_receipt[1:]),
+            )
+            verify_file_content(path, source, initial, digest)
+            record_file_receipt(
+                db,
+                watch_receipt_name,
+                initial,
+                digest,
+            )
             db.commit()
-            return stored, deleted
+            return 0, 0
+        if path.suffix == ".zip":
+            return ingest_zip_stream(
+                db,
+                path,
+                captured,
+                initial,
+                file_batch_key,
+                watch_receipt_name,
+                legacy_scope,
+                verification_source=source,
+                file_digest=digest,
+            )
+
+        file_size = initial[2]
+        stored, deleted, _ = ingest_seekable_stream(
+            db,
+            captured,
+            file_size,
+            file_batch_key,
+            commit=False,
+            run_scope_key=legacy_scope,
+            replay_run_occurrences=legacy_scope is not None,
+        )
+        verify_file_content(path, source, initial, digest)
+        record_file_receipt(
+            db,
+            watch_receipt_name,
+            initial,
+            digest,
+        )
+        db.commit()
+        return stored, deleted
     except Exception:
         db.rollback()
         raise
@@ -2923,6 +3575,8 @@ def ingest_zip_stream(
     file_batch_key,
     watch_receipt_name,
     legacy_scope,
+    verification_source=None,
+    file_digest=None,
     commit=True,
 ):
     stored = deleted = canonical_count = line_count = 0
@@ -3023,39 +3677,150 @@ def ingest_zip_stream(
             raise PartialBatch(
                 "archive record count does not match its manifest"
             )
-        verify_file_snapshot(path, source, initial)
+        verification = verification_source or source
+        if file_digest is None:
+            verify_file_snapshot(path, verification, initial)
+        else:
+            verify_file_content(path, verification, initial, file_digest)
         if commit:
-            record_file_receipt(db, watch_receipt_name, initial)
+            record_file_receipt(
+                db,
+                watch_receipt_name,
+                initial,
+                file_digest,
+            )
             db.commit()
         return stored, deleted
 
 
-def file_snapshot(stat):
-    return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+def file_snapshot(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
 
 
-def file_content_key(stream):
+def validated_file_snapshot(metadata):
+    if not stat.S_ISREG(metadata.st_mode):
+        raise PartialBatch("folder candidate is not a regular file")
+    snapshot = file_snapshot(metadata)
+    if snapshot[2] > MAX_INFLATED_BYTES:
+        raise PartialBatch("file exceeds the import byte limit")
+    return snapshot
+
+
+@contextmanager
+def open_hashed_file(
+    path,
+    expected_snapshot=None,
+    spool_directory=None,
+    capture=True,
+):
+    if expected_snapshot is None:
+        try:
+            path_metadata = path.stat()
+        except OSError as error:
+            raise TransientFileError(
+                "file could not be inspected before ingestion"
+            ) from error
+        path_snapshot = validated_file_snapshot(path_metadata)
+    else:
+        path_snapshot = expected_snapshot
+    try:
+        stream = path.open("rb", buffering=0)
+    except OSError as error:
+        raise TransientFileError(
+            "file could not be opened for ingestion"
+        ) from error
+    with stream:
+        snapshot = validated_file_snapshot(os.fstat(stream.fileno()))
+        if snapshot != path_snapshot:
+            raise PartialBatch("file changed before hashing")
+        if capture:
+            with captured_file_snapshot(
+                stream,
+                snapshot,
+                spool_directory,
+            ) as immutable:
+                captured, key, digest = immutable
+                verify_file_snapshot(path, stream, snapshot)
+                yield captured, stream, snapshot, key, digest
+        else:
+            key = file_content_key(stream, snapshot)
+            verify_file_snapshot(path, stream, snapshot)
+            yield None, stream, snapshot, key, key[len("file:v3:"):]
+
+
+@contextmanager
+def captured_file_snapshot(
+    source,
+    initial,
+    spool_directory,
+    expected_digest=None,
+):
+    with tempfile.SpooledTemporaryFile(
+        max_size=MAX_SNAPSHOT_MEMORY_BYTES,
+        mode="w+b",
+        dir=spool_directory,
+        prefix=".hozz-snapshot-",
+    ) as captured:
+        key = file_content_key(source, initial, captured)
+        digest = key[len("file:v3:"):]
+        if expected_digest is not None and digest != expected_digest:
+            raise PartialBatch("file content changed while capturing snapshot")
+        captured.seek(0)
+        yield captured, key, digest
+
+
+def file_content_key(stream, initial, captured=None):
     digest = hashlib.sha256()
-    stream.seek(0)
-    while True:
-        chunk = stream.read(64 * 1_024)
-        if not chunk:
-            break
-        digest.update(chunk)
-    stream.seek(0)
-    return f"file:v3:{digest.hexdigest()}"
+    remaining = initial[2]
+    try:
+        if captured is not None:
+            captured.seek(0)
+            captured.truncate()
+        stream.seek(0)
+        while remaining:
+            chunk = stream.read(min(64 * 1_024, remaining))
+            if not chunk:
+                raise PartialBatch("file changed during hashing")
+            if len(chunk) > remaining:
+                raise PartialBatch("file changed during hashing")
+            digest.update(chunk)
+            if captured is not None:
+                captured.write(chunk)
+            remaining -= len(chunk)
+        if stream.read(1):
+            raise PartialBatch("file changed during hashing")
+        if file_snapshot(os.fstat(stream.fileno())) != initial:
+            raise PartialBatch("file changed during hashing")
+        if captured is not None:
+            captured.seek(0)
+        return f"file:v3:{digest.hexdigest()}"
+    finally:
+        stream.seek(0)
 
 
-def legacy_file_receipt_scope(db, name, snapshot):
+def snapshot_spool_directory(db, path):
+    for _, name, filename in db.execute("PRAGMA database_list"):
+        if name == "main" and filename:
+            return str(Path(filename).resolve().parent)
+    return str(path.resolve().parent)
+
+
+def legacy_file_receipt_scope(db, name, snapshot, digest):
     receipt = legacy_file_receipt(db, name)
     if receipt:
         exact_file = db.execute(
             """
             SELECT 1 FROM ingested_files
             WHERE name = ? AND device = ? AND inode = ?
-              AND size = ? AND mtime_ns = ?
+              AND size = ? AND mtime_ns = ? AND ctime_ns = ? AND digest = ?
             """,
-            (name, *snapshot),
+            (name, *snapshot, digest),
         ).fetchone()
         if exact_file:
             return receipt[0]
@@ -3076,7 +3841,14 @@ def legacy_file_receipt(db, name):
     return None
 
 
-def file_matches_legacy_receipt(db, path, source, initial, legacy_key):
+def file_matches_legacy_receipt(
+    db,
+    path,
+    captured,
+    verification_source,
+    initial,
+    legacy_key,
+):
     savepoint = "legacy_file_probe"
     db.execute(f"SAVEPOINT {savepoint}")
     before = db.total_changes
@@ -3085,17 +3857,18 @@ def file_matches_legacy_receipt(db, path, source, initial, legacy_key):
             ingest_zip_stream(
                 db,
                 path,
-                source,
+                captured,
                 initial,
                 None,
                 None,
                 legacy_key,
+                verification_source=verification_source,
                 commit=False,
             )
         else:
             ingest_seekable_stream(
                 db,
-                source,
+                captured,
                 initial[2],
                 batch_key=None,
                 commit=False,
@@ -3105,11 +3878,11 @@ def file_matches_legacy_receipt(db, path, source, initial, legacy_key):
         unchanged = db.total_changes == before
         db.execute(f"ROLLBACK TO {savepoint}")
         db.execute(f"RELEASE {savepoint}")
-        source.seek(0)
+        captured.seek(0)
         return unchanged
     except Exception:  # noqa: BLE001 - a failed probe falls back to normal ingest
         db.rollback()
-        source.seek(0)
+        captured.seek(0)
         return False
 
 
@@ -3123,16 +3896,28 @@ def verify_file_snapshot(path, stream, initial):
         raise PartialBatch("file changed during ingestion")
 
 
-def record_file_receipt(db, name, snapshot):
+def verify_file_content(path, stream, initial, expected_digest):
+    verify_file_snapshot(path, stream, initial)
+    try:
+        current_key = file_content_key(stream, initial)
+    except PartialBatch as error:
+        raise PartialBatch("file content changed during ingestion") from error
+    current_digest = current_key[len("file:v3:"):]
+    if current_digest != expected_digest:
+        raise PartialBatch("file content changed during ingestion")
+    verify_file_snapshot(path, stream, initial)
+
+
+def record_file_receipt(db, name, snapshot, digest=None):
     if name is None:
         return
     db.execute(
         """
         INSERT OR REPLACE INTO ingested_files
-            (name, ingested_at, device, inode, size, mtime_ns)
-        VALUES (?, ?, ?, ?, ?, ?)
+            (name, ingested_at, device, inode, size, mtime_ns, ctime_ns, digest)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        (name, time.time(), *snapshot),
+        (name, time.time(), *snapshot, digest),
     )
 
 

@@ -1,6 +1,7 @@
 package com.thatcube.hozz.projection
 
 import android.content.pm.PackageManager
+import android.os.Build
 import android.util.Log
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.permission.HealthPermission
@@ -29,11 +30,22 @@ import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class HealthConnectWriterIntegrationTest {
+    @Test
+    fun standaloneProviderProjectionIsGatedBeforeNonIdempotentDeleteRecovery() {
+        assumeTrue(Build.VERSION.SDK_INT in 28..33)
+
+        assertEquals(
+            HealthConnectClient.SDK_UNAVAILABLE,
+            HealthConnectWriter(context()).availability,
+        )
+    }
+
     @Test
     @Suppress("DEPRECATION")
     fun declaresWriteOnlyPermissionsIncludingLegacyCleanup() {
@@ -351,6 +363,7 @@ class HealthConnectWriterIntegrationTest {
         context: android.content.Context,
         recordName: String,
     ) {
+        assumeTrue(Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE)
         assertEquals(
             HealthConnectClient.SDK_AVAILABLE,
             HealthConnectClient.getSdkStatus(context),

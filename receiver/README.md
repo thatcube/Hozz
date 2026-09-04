@@ -66,14 +66,22 @@ manifest and bounded entry, expansion, record, and compression-ratio limits
 before any part of the archive commits. ZIP entries must use Stored or Deflate;
 encrypted, BZIP2, LZMA, and unknown methods are rejected before decompression.
 Network requests are capped and spooled, while NDJSON and JSON arrays are
-decoded one record at a time.
+decoded one record at a time. Folder candidates must be regular files and fit
+the raw import limit before hashing begins.
 
-Folder imports open each candidate once and use its content digest as the
-idempotent batch identity. Device, inode, size, and nanosecond modification time
-form a freshness snapshot recorded in the same transaction as its records. If
-either the descriptor or pathname changes before commit, the import rolls back
-and the next scan retries the completed file. Changing only filesystem metadata
-does not duplicate archive run or coverage records.
+Folder receipts persist the content digest with device, inode, size, and
+nanosecond modification and change times. The no-hash generation shortcut is
+used only when the runtime identifies a whitelisted filesystem with reliable
+change-time semantics (currently APFS). On Darwin, a fixed `/sbin/mount` command
+is invoked without a shell; mount types are matched by device identity and
+cached per device. HFS+, Windows, and unknown filesystems rehash and compare the
+persisted digest before skipping; that work is bounded by the raw file limit. A
+file that needs ingestion is copied while its initial hash is computed, with
+memory capped before the copy spills beside the receiver database. Parsing uses
+that immutable, length-bounded copy, then the original is verified again before
+its receipt commits. A growing, rewritten, or ABA-swapped file therefore cannot
+extend work indefinitely or mix bytes under the wrong identity. Changing only
+filesystem metadata does not duplicate archive run or coverage records.
 
 Health Auto Export metric points must include their source record ID. Without
 it, a later date-less deletion cannot identify the record it supersedes, so the

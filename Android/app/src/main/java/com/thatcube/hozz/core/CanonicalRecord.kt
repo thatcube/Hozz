@@ -5,7 +5,6 @@ import java.security.MessageDigest
 import java.time.Instant
 import java.nio.ByteBuffer
 import java.util.UUID
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -15,9 +14,6 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.intOrNull
-import kotlinx.serialization.json.jsonArray
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.put
 
@@ -86,7 +82,7 @@ object CanonicalRecordParser {
     )
 
     fun parse(line: String, strictV1: Boolean = false): CanonicalRecord? {
-        val jsonObject = Json.parseToJsonElement(line).jsonObject
+        val jsonObject = recordJsonObject(line)
         val kind = jsonObject.string("kind")
             ?: throw ArchiveFormatException("A record has no kind.")
         val schemaVersion = jsonObject.int("schemaVersion")
@@ -304,16 +300,16 @@ object CanonicalRecordParser {
     }
 
     internal fun kind(line: String): String =
-        Json.parseToJsonElement(line).jsonObject.string("kind")
+        recordJsonObject(line).string("kind")
             ?: throw ArchiveFormatException("A record has no kind.")
 
     internal fun isRunKind(kind: String): Boolean = kind in runKinds
 
     internal fun runIdentifier(line: String): String? =
-        Json.parseToJsonElement(line).jsonObject.string("run")
+        recordJsonObject(line).string("run")
 
     internal fun normalizedRunLine(line: String): String {
-        val raw = Json.parseToJsonElement(line).jsonObject
+        val raw = recordJsonObject(line)
         if (raw.containsKey("schemaVersion")) {
             validateStrict(line)
             return line
@@ -341,7 +337,7 @@ object CanonicalRecordParser {
     }
 
     internal fun validateStrict(line: String) {
-        val jsonObject = Json.parseToJsonElement(line).jsonObject
+        val jsonObject = recordJsonObject(line)
         val kind = jsonObject.string("kind")
             ?: throw ArchiveFormatException("A record has no kind.")
         val schemaVersion = strictLong(jsonObject, "schemaVersion")
@@ -613,7 +609,9 @@ object CanonicalRecordParser {
     ).toString()
 
     fun lineage(json: String): List<SourceLineage> =
-        Json.parseToJsonElement(json).jsonArray.mapNotNull { item ->
+        (ArchiveJson.element(json, "Record lineage") as? JsonArray
+            ?: throw ArchiveFormatException("Record lineage must be a JSON array."))
+            .mapNotNull { item ->
             val jsonObject = item as? JsonObject ?: return@mapNotNull null
             jsonObject.string("store")?.let {
                 SourceLineage(
@@ -623,6 +621,13 @@ object CanonicalRecordParser {
                 )
             }
         }
+
+    private fun recordJsonObject(line: String): JsonObject =
+        ArchiveJson.objectValue(
+            json = line,
+            subject = "Record JSON",
+            rootError = "A record must be a JSON object.",
+        )
 
     private fun validateKindFields(jsonObject: JsonObject, kind: String) {
         when (kind) {
@@ -931,7 +936,7 @@ object CanonicalRecordParser {
 open class ArchiveFormatException(message: String) : Exception(message)
 
 private fun JsonObject.string(name: String): String? =
-    this[name]?.jsonPrimitive?.contentOrNull
+    (this[name] as? JsonPrimitive)?.contentOrNull
 
 private fun JsonObject.nonblank(name: String): String {
     val primitive = this[name] as? JsonPrimitive
@@ -947,16 +952,16 @@ private fun JsonObject.nonblank(name: String): String {
 }
 
 private fun JsonObject.int(name: String): Int? =
-    this[name]?.jsonPrimitive?.intOrNull
+    (this[name] as? JsonPrimitive)?.intOrNull
 
 private fun JsonObject.long(name: String): Long? =
-    this[name]?.jsonPrimitive?.longOrNull
+    (this[name] as? JsonPrimitive)?.longOrNull
 
 private fun JsonObject.double(name: String): Double? =
-    this[name]?.jsonPrimitive?.doubleOrNull
+    (this[name] as? JsonPrimitive)?.doubleOrNull
 
 private fun JsonObject.boolean(name: String): Boolean? =
-    this[name]?.jsonPrimitive?.booleanOrNull
+    (this[name] as? JsonPrimitive)?.booleanOrNull
 
 private fun JsonObject.instant(name: String): Instant? =
     string(name)?.let {
