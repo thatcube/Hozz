@@ -1,7 +1,9 @@
 package com.thatcube.hozz.projection
 
 import com.thatcube.hozz.core.CanonicalRecord
+import com.thatcube.hozz.core.CanonicalRecordParser
 import com.thatcube.hozz.core.CanonicalValue
+import com.thatcube.hozz.core.ArchiveFormatException
 import com.thatcube.hozz.core.HealthConnectProjection
 import com.thatcube.hozz.core.HealthConnectPendingAction
 import com.thatcube.hozz.core.InMemoryCanonicalRecordStore
@@ -12,6 +14,7 @@ import kotlin.math.roundToLong
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -73,6 +76,60 @@ class ProjectionPlannerTest {
         assertEquals(ProjectionQuality.ARCHIVE_ONLY, planned.quality)
         assertEquals("heart-rate-aggregate", planned.warnings.single().code)
         assertNull(planned.draft)
+    }
+
+    @Test
+    fun heartRateRequiresAnExplicitSingletonSampleCount() {
+        val base = quantity(
+            "heart-count",
+            "HKQuantityTypeIdentifierHeartRate",
+            1.0,
+            "count/s",
+        )
+        for (count in listOf<Int?>(null, 0, -1, 2)) {
+            val planned = ProjectionPlanner.plan(base.copy(quantityCount = count))
+
+            assertEquals(count.toString(), ProjectionQuality.ARCHIVE_ONLY, planned.quality)
+            assertEquals(count.toString(), ProjectionAction.NONE, planned.action)
+            assertNull(count.toString(), planned.draft)
+        }
+
+        for ((encodedCount, parsedCount) in listOf(
+            "" to null,
+            "\"count\":0," to null,
+            "\"count\":-1," to null,
+            "\"count\":1.5," to null,
+            "\"count\":2," to 2,
+        )) {
+            val parsed = CanonicalRecordParser.parse(
+                """
+                {"endDate":"2026-01-01T00:00:00Z","id":"parsed-heart","kind":"quantity","quantity":{$encodedCount"unit":"count/s","value":1},"schemaVersion":1,"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierHeartRate"}
+                """.trimIndent(),
+            )!!
+            assertEquals(encodedCount, parsedCount, parsed.quantityCount)
+            assertEquals(
+                encodedCount,
+                ProjectionQuality.ARCHIVE_ONLY,
+                ProjectionPlanner.plan(parsed).quality,
+            )
+        }
+    }
+
+    @Test
+    fun strictHeartRateCountAcceptsOnlyPositiveIntegers() {
+        fun line(count: String): String =
+            """
+            {"canonicalId":"apple.healthkit:strict-heart","canonicalType":"vitals.heart-rate","endDate":"2026-01-01T00:00:00Z","id":"strict-heart","kind":"quantity","lineage":[{"recordId":"strict-heart","store":"apple.healthkit"}],"quantity":{$count"unit":"count/s","value":1},"recordVersion":1,"schemaVersion":1,"sourceRecord":{"id":"strict-heart","store":"apple.healthkit","type":"HKQuantityTypeIdentifierHeartRate"},"startDate":"2026-01-01T00:00:00Z","type":"HKQuantityTypeIdentifierHeartRate"}
+            """.trimIndent()
+
+        CanonicalRecordParser.validateStrict(line("\"count\":1,"))
+        CanonicalRecordParser.validateStrict(line("\"count\":2,"))
+        CanonicalRecordParser.validateStrict(line(""))
+        for (invalid in listOf("0", "-1", "1.5", "\"1\"")) {
+            assertThrows(ArchiveFormatException::class.java) {
+                CanonicalRecordParser.validateStrict(line("\"count\":$invalid,"))
+            }
+        }
     }
 
     @Test

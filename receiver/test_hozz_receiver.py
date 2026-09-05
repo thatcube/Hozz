@@ -506,6 +506,10 @@ class CanonicalIdentityTests(unittest.TestCase):
             """,
             (json.dumps(raw_object),),
         )
+        self.db.execute(
+            "DELETE FROM receiver_migrations WHERE version = ?",
+            (receiver.DATA_MIGRATION_ENCODING_RECONCILIATION,),
+        )
         self.db.commit()
         self.db.close()
 
@@ -553,6 +557,10 @@ class CanonicalIdentityTests(unittest.TestCase):
                 tombstone = 0
             WHERE kind = 'sampleEncodingError'
             """
+        )
+        self.db.execute(
+            "DELETE FROM receiver_migrations WHERE version = ?",
+            (receiver.DATA_MIGRATION_ENCODING_RECONCILIATION,),
         )
         self.db.commit()
         self.db.close()
@@ -619,6 +627,223 @@ class CanonicalIdentityTests(unittest.TestCase):
 
 
 class MigrationTests(unittest.TestCase):
+    def test_data_backfills_are_versioned_and_not_repeated_on_open(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receiver.sqlite"
+            db = connect(path)
+            self.assertEqual(
+                [
+                    receiver.DATA_MIGRATION_ENCODING_RECONCILIATION,
+                    receiver.DATA_MIGRATION_COMPATIBLE_ALIAS_BACKFILL,
+                    receiver.DATA_MIGRATION_COMPATIBLE_IDENTITY_SAFETY,
+                ],
+                [
+                    row[0] for row in db.execute(
+                        "SELECT version FROM receiver_migrations ORDER BY version"
+                    )
+                ],
+            )
+            db.close()
+
+            with (
+                mock.patch.object(
+                    receiver,
+                    "migrate_encoding_reconciliation",
+                    side_effect=AssertionError("repeated encoding migration"),
+                ),
+                mock.patch.object(
+                    receiver,
+                    "migrate_compatible_alias_state",
+                    side_effect=AssertionError("repeated alias backfill"),
+                ),
+                mock.patch.object(
+                    receiver,
+                    "migrate_compatible_identity_safety",
+                    side_effect=AssertionError("repeated identity migration"),
+                ),
+            ):
+                reopened = connect(path)
+            reopened.close()
+
+    def test_pre_upgrade_direct_tombstone_creates_legacy_replay_barrier(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receiver.sqlite"
+            stable_id = "healthAutoExport:direct-deleted-step"
+            raw = json.dumps({
+                "canonicalId": stable_id,
+                "deleted": True,
+                "id": "direct-deleted-step",
+                "kind": "deletion",
+                "recordVersion": 2,
+                "schemaVersion": 1,
+                "sourceRecord": {
+                    "id": "direct-deleted-step",
+                    "store": "healthAutoExport",
+                    "type": "steps",
+                },
+                "type": "steps",
+            })
+            old = sqlite3.connect(path)
+            receiver.create_schema(old)
+            old.executemany(
+                """
+                INSERT INTO receiver_migrations (version, applied_at)
+                VALUES (?, 0)
+                """,
+                [
+                    (receiver.DATA_MIGRATION_ENCODING_RECONCILIATION,),
+                    (receiver.DATA_MIGRATION_COMPATIBLE_ALIAS_BACKFILL,),
+                ],
+            )
+            old.execute(
+                """
+                INSERT INTO samples
+                    (canonical_id, source_id, record_version, tombstone,
+                     type, kind, raw)
+                VALUES (?, 'direct-deleted-step', 2, 1,
+                        'steps', 'deletion', ?)
+                """,
+                (stable_id, raw),
+            )
+            old.commit()
+            old.close()
+
+            migrated = connect(path)
+            self.assertEqual(
+                [(stable_id, "steps")],
+                migrated.execute(
+                    """
+                    SELECT stable_id, type
+                    FROM compatible_unresolved_deletion
+                    """
+                ).fetchall(),
+            )
+            delayed = {
+                "id": "steps:2026-01-01T00:00:00Z",
+                "kind": "quantity",
+                "quantity": {"unit": "count", "value": 10},
+                "startDate": "2026-01-01T00:00:00Z",
+                "endDate": "2026-01-01T00:00:00Z",
+                "type": "steps",
+            }
+
+            with self.assertRaisesRegex(PartialBatch, "pending deletion"):
+                ingest_lines(
+                    migrated,
+                    [json.dumps(delayed)],
+                    batch_key="delayed-pre-upgrade-legacy",
+                )
+
+            self.assertEqual(
+                [(stable_id, 1)],
+                migrated.execute(
+                    "SELECT canonical_id, tombstone FROM samples"
+                ).fetchall(),
+            )
+            self.assertIsNone(
+                migrated.execute(
+                    """
+                    SELECT 1 FROM batches
+                    WHERE key = 'delayed-pre-upgrade-legacy'
+                    """
+                ).fetchone()
+            )
+            migrated.close()
+
+    def test_compatible_alias_identity_is_unique_after_migration(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receiver.sqlite"
+            old = sqlite3.connect(path)
+            receiver.create_schema(old)
+            old.executemany(
+                """
+                INSERT INTO receiver_migrations (version, applied_at)
+                VALUES (?, 0)
+                """,
+                [
+                    (receiver.DATA_MIGRATION_ENCODING_RECONCILIATION,),
+                    (receiver.DATA_MIGRATION_COMPATIBLE_ALIAS_BACKFILL,),
+                ],
+            )
+            old.executemany(
+                """
+                INSERT INTO compatible_alias_identity (stable_id, legacy_id)
+                VALUES (?, 'apple.healthkit:heart_rate:shared')
+                """,
+                [
+                    ("healthAutoExport:watch-62",),
+                    ("healthAutoExport:phone-63",),
+                ],
+            )
+            old.commit()
+            old.close()
+
+            migrated = connect(path)
+            self.assertEqual(
+                [],
+                migrated.execute(
+                    "SELECT stable_id, legacy_id FROM compatible_alias_identity"
+                ).fetchall(),
+            )
+            migrated.execute(
+                """
+                INSERT INTO compatible_alias_identity (stable_id, legacy_id)
+                VALUES ('healthAutoExport:watch-62',
+                        'apple.healthkit:heart_rate:shared')
+                """
+            )
+            migrated.commit()
+            with self.assertRaises(sqlite3.IntegrityError):
+                migrated.execute(
+                    """
+                    INSERT INTO compatible_alias_identity
+                        (stable_id, legacy_id)
+                    VALUES ('healthAutoExport:phone-63',
+                            'apple.healthkit:heart_rate:shared')
+                    """
+                )
+            migrated.rollback()
+            migrated.close()
+
+    def test_reconciliation_lookup_indexes_have_million_row_plan_shape(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "receiver.sqlite"
+            db = connect(path)
+            db.execute("ANALYZE")
+            db.execute("DELETE FROM sqlite_stat1 WHERE tbl = 'samples'")
+            db.executemany(
+                """
+                INSERT INTO sqlite_stat1 (tbl, idx, stat)
+                VALUES ('samples', ?, '1000000 10 1 1')
+                """,
+                [
+                    ("samples_parent_kind",),
+                    ("samples_resolution_kind",),
+                ],
+            )
+            db.execute("ANALYZE sqlite_schema")
+            plans = {}
+            for column, index in (
+                ("parent_canonical_id", "samples_parent_kind"),
+                ("resolution_canonical_id", "samples_resolution_kind"),
+            ):
+                plan = " ".join(
+                    row[3] for row in db.execute(
+                        f"""
+                        EXPLAIN QUERY PLAN
+                        SELECT canonical_id FROM samples
+                        WHERE {column} = 'apple.healthkit:affected'
+                          AND kind = 'sampleEncodingError'
+                        """
+                    )
+                )
+                plans[index] = plan
+            db.close()
+
+            for index, plan in plans.items():
+                with self.subTest(index=index):
+                    self.assertIn(index, plan)
+
     def test_a07df_millisecond_evidence_never_aliases_submillisecond_heart_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "receiver.sqlite"
@@ -1430,6 +1655,119 @@ class MigrationTests(unittest.TestCase):
             )
             migrated.close()
 
+    def test_migrated_filename_receipt_repairs_under_legacy_run_scope(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / "hozz-legacy-run.ndjson"
+            database = root / "receiver.sqlite"
+            run = json.dumps({
+                "kind": "typeCoverage",
+                "schemaVersion": 1,
+                "state": "complete",
+                "type": "heart.rate",
+            })
+            path.write_text(run + "\n")
+            legacy_key = f"file:{path.name}"
+            scope = f"batch:{legacy_key}"
+            fingerprint = hashlib.sha256(
+                f"{scope}\0{run}".encode()
+            ).hexdigest()
+
+            db = sqlite3.connect(database)
+            db.execute(
+                """
+                CREATE TABLE batches (
+                    key TEXT PRIMARY KEY,
+                    received_at REAL NOT NULL,
+                    records INTEGER NOT NULL
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE ingested_files (
+                    name TEXT PRIMARY KEY,
+                    ingested_at REAL NOT NULL
+                )
+                """
+            )
+            db.execute(
+                """
+                CREATE TABLE archive_run_records (
+                    fingerprint TEXT NOT NULL,
+                    occurrence INTEGER NOT NULL,
+                    kind TEXT NOT NULL,
+                    raw TEXT NOT NULL,
+                    PRIMARY KEY (fingerprint, occurrence)
+                )
+                """
+            )
+            db.execute(
+                "INSERT INTO batches VALUES (?, 0, 0)",
+                (legacy_key,),
+            )
+            db.execute(
+                "INSERT INTO ingested_files VALUES (?, 0)",
+                (path.name,),
+            )
+            db.execute(
+                """
+                INSERT INTO archive_run_records
+                    (fingerprint, occurrence, kind, raw)
+                VALUES (?, 0, 'typeCoverage', ?)
+                """,
+                (fingerprint, run),
+            )
+            db.commit()
+            db.close()
+
+            migrated = connect(database)
+            self.assertEqual(
+                (-1, None),
+                migrated.execute(
+                    """
+                    SELECT batches.deletions, ingested_files.digest
+                    FROM batches, ingested_files
+                    WHERE batches.key = ? AND ingested_files.name = ?
+                    """,
+                    (legacy_key, path.name),
+                ).fetchone(),
+            )
+
+            self.assertEqual(
+                (0, 0),
+                ingest_file(
+                    migrated,
+                    path,
+                    watch_receipt_name=path.name,
+                ),
+            )
+            self.assertEqual(
+                1,
+                migrated.execute(
+                    "SELECT COUNT(*) FROM archive_run_records"
+                ).fetchone()[0],
+            )
+            self.assertIsNotNone(
+                migrated.execute(
+                    """
+                    SELECT digest FROM ingested_files
+                    WHERE name = ?
+                    """,
+                    (path.name,),
+                ).fetchone()[0]
+            )
+            self.assertEqual(
+                1,
+                migrated.execute(
+                    """
+                    SELECT COUNT(*) FROM batches
+                    WHERE key LIKE 'file:v3:%'
+                    """
+                ).fetchone()[0],
+            )
+            migrated.close()
+
 
 class TransactionAndArchiveTests(unittest.TestCase):
     def setUp(self):
@@ -1468,6 +1806,207 @@ class TransactionAndArchiveTests(unittest.TestCase):
             1,
             self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
         )
+
+    def test_equal_version_live_and_deletion_conflicts_are_order_independent(self):
+        live = {
+            "canonicalId": "apple.healthkit:equal-version",
+            "id": "equal-version",
+            "kind": "quantity",
+            "quantity": {"unit": "count", "value": 1},
+            "recordVersion": 1,
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": "equal-version",
+                "store": "apple.healthkit",
+                "type": "steps",
+            },
+            "type": "steps",
+        }
+        deletion = {
+            **live,
+            "deleted": True,
+            "kind": "deletion",
+        }
+
+        for index, records in enumerate(
+            ((live, deletion), (deletion, live))
+        ):
+            with (
+                self.subTest(order=index),
+                self.assertRaisesRegex(PartialBatch, "same version"),
+            ):
+                ingest_lines(
+                    self.db,
+                    [json.dumps(record) for record in records],
+                    batch_key=f"equal-version-{index}",
+                )
+            self.assertEqual(
+                0,
+                self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+            )
+            self.assertIsNone(
+                self.db.execute(
+                    "SELECT 1 FROM batches WHERE key = ?",
+                    (f"equal-version-{index}",),
+                ).fetchone()
+            )
+
+    def test_equal_version_semantically_identical_retry_is_accepted(self):
+        record = self.strict_record("semantic-retry")
+        original = json.dumps(record, separators=(",", ":"))
+        reordered = json.dumps(
+            dict(reversed(list(record.items()))),
+            indent=2,
+        )
+
+        self.assertEqual((1, 0, False), ingest_lines(self.db, [original]))
+        self.assertEqual(
+            (0, 0, False),
+            ingest_lines(
+                self.db,
+                [reordered],
+                batch_key="semantic-retry",
+            ),
+        )
+        self.assertIsNotNone(
+            self.db.execute(
+                "SELECT 1 FROM batches WHERE key = 'semantic-retry'"
+            ).fetchone()
+        )
+
+    def test_equal_version_conflict_rolls_back_other_rows_and_receipt(self):
+        existing = self.strict_record("existing-v1")
+        ingest_lines(self.db, [json.dumps(existing)])
+        conflict = {
+            **existing,
+            "quantity": {"unit": "count", "value": 99},
+        }
+        unrelated = self.strict_record("must-roll-back")
+
+        with self.assertRaisesRegex(PartialBatch, "same version"):
+            ingest_lines(
+                self.db,
+                [json.dumps(unrelated), json.dumps(conflict)],
+                batch_key="equal-version-rollback",
+            )
+
+        self.assertEqual(
+            ["apple.healthkit:existing-v1"],
+            [
+                row[0] for row in self.db.execute(
+                    "SELECT canonical_id FROM samples ORDER BY canonical_id"
+                )
+            ],
+        )
+        self.assertIsNone(
+            self.db.execute(
+                "SELECT 1 FROM batches WHERE key = 'equal-version-rollback'"
+            ).fetchone()
+        )
+
+    def test_two_null_heart_records_with_one_id_conflict_before_deferral(self):
+        date = "2026-01-01T12:34:56Z"
+        ingest_compatible(self.db, {
+            "data": {
+                "metrics": [{
+                    "name": "heart_rate",
+                    "units": "bpm",
+                    "data": [
+                        {
+                            "id": "watch-62",
+                            "date": date,
+                            "Min": 62,
+                            "Avg": 62,
+                            "Max": 62,
+                            "source": "Watch",
+                        },
+                        {
+                            "id": "phone-63",
+                            "date": date,
+                            "Min": 63,
+                            "Avg": 63,
+                            "Max": 63,
+                            "source": "Phone",
+                        },
+                    ],
+                }],
+            },
+        })
+        legacy_id = f"heart_rate:{date}"
+        watch = {
+            "id": legacy_id,
+            "type": "heart_rate",
+            "kind": "quantity",
+            "startDate": date,
+            "endDate": date,
+            "quantity": {"value": None, "unit": "bpm"},
+            "source": {"name": "Watch"},
+        }
+        phone = {
+            **watch,
+            "source": {"name": "Phone"},
+        }
+
+        for order, records in enumerate(((watch, phone), (phone, watch))):
+            batch_key = f"null-heart-conflict-{order}"
+            with (
+                self.subTest(order=order),
+                self.assertRaisesRegex(PartialBatch, "same version"),
+            ):
+                ingest_lines(
+                    self.db,
+                    [json.dumps(record) for record in records],
+                    batch_key=batch_key,
+                )
+            self.assertIsNone(
+                self.db.execute(
+                    "SELECT 1 FROM batches WHERE key = ?",
+                    (batch_key,),
+                ).fetchone()
+            )
+
+        self.assertEqual(
+            [
+                ("healthAutoExport:phone-63", 63),
+                ("healthAutoExport:watch-62", 62),
+            ],
+            self.db.execute(
+                """
+                SELECT canonical_id, value FROM samples
+                WHERE tombstone = 0
+                ORDER BY canonical_id
+                """
+            ).fetchall(),
+        )
+        self.assertEqual(
+            0,
+            self.db.execute(
+                "SELECT COUNT(*) FROM compatible_alias_identity"
+            ).fetchone()[0],
+        )
+
+    def test_batch_reconciliation_is_limited_to_affected_error_ids(self):
+        statements = []
+        self.db.set_trace_callback(
+            lambda statement: statements.append(" ".join(statement.split()))
+        )
+        try:
+            ingest_lines(
+                self.db,
+                [json.dumps(self.strict_record("affected-only"))],
+            )
+        finally:
+            self.db.set_trace_callback(None)
+
+        reconciliation_updates = [
+            statement for statement in statements
+            if statement.startswith("UPDATE samples AS child")
+        ]
+        self.assertEqual(2, len(reconciliation_updates))
+        self.assertTrue(all(
+            "receiver_affected_encoding_errors" in statement
+            for statement in reconciliation_updates
+        ))
 
     def test_future_schema_does_not_commit_batch_identity(self):
         future = json.dumps({
@@ -2275,6 +2814,245 @@ class TransactionAndArchiveTests(unittest.TestCase):
                 """
             ).fetchall(),
         )
+
+    def test_direct_stable_signature_survives_date_less_deletion(self):
+        date = "2026-01-01T00:30:00Z"
+        stable = {
+            "canonicalId": "healthAutoExport:direct-stable-step",
+            "id": "direct-stable-step",
+            "kind": "quantity",
+            "quantity": {"unit": "count", "value": 100},
+            "recordVersion": 1,
+            "schemaVersion": 1,
+            "sourceRecord": {
+                "id": "direct-stable-step",
+                "store": "healthAutoExport",
+                "type": "steps",
+            },
+            "startDate": date,
+            "endDate": date,
+            "type": "steps",
+        }
+        ingest_lines(self.db, [json.dumps(stable)])
+        self.assertEqual(
+            [("healthAutoExport:direct-stable-step",)],
+            self.db.execute(
+                """
+                SELECT stable_id FROM compatible_alias_retirement
+                WHERE type = 'steps'
+                """
+            ).fetchall(),
+        )
+        ingest_compatible(self.db, {
+            "data": {
+                "deletions": [{
+                    "id": "direct-stable-step",
+                    "name": "steps",
+                    "type": "steps",
+                    "date": "",
+                }],
+            },
+        })
+        delayed_legacy = {
+            "id": f"steps:{date}",
+            "kind": "quantity",
+            "quantity": {"unit": "count", "value": 100},
+            "startDate": date,
+            "endDate": date,
+            "type": "steps",
+        }
+
+        with self.assertRaisesRegex(PartialBatch, "unambiguous stable mapping"):
+            ingest_lines(
+                self.db,
+                [json.dumps(delayed_legacy)],
+                batch_key="delayed-after-direct-delete",
+            )
+
+        self.assertEqual(
+            [("healthAutoExport:direct-stable-step", 1)],
+            self.db.execute(
+                """
+                SELECT canonical_id, tombstone FROM samples
+                ORDER BY canonical_id
+                """
+            ).fetchall(),
+        )
+        self.assertIsNone(
+            self.db.execute(
+                """
+                SELECT 1 FROM batches
+                WHERE key = 'delayed-after-direct-delete'
+                """
+            ).fetchone()
+        )
+
+    def test_bulk_null_heart_rate_counts_every_finite_competitor(self):
+        date = "2026-01-01T12:34:56Z"
+        null_legacy = {
+            "id": f"heart_rate:{date}",
+            "type": "heart_rate",
+            "kind": "quantity",
+            "startDate": date,
+            "endDate": date,
+            "quantity": {"value": None, "unit": "bpm"},
+            "source": {"name": "Watch"},
+        }
+        finite_legacy = {
+            **null_legacy,
+            "id": f"heart_rate:{date}:finite",
+            "quantity": {"value": 63, "unit": "bpm"},
+        }
+        direct_stable = {
+            "canonicalId": "healthAutoExport:direct-63",
+            "id": "direct-63",
+            "kind": "quantity",
+            "quantity": {"unit": "bpm", "value": 63},
+            "recordVersion": 1,
+            "schemaVersion": 1,
+            "source": {"name": "Watch"},
+            "sourceRecord": {
+                "id": "direct-63",
+                "store": "healthAutoExport",
+                "type": "heart_rate",
+            },
+            "startDate": date,
+            "endDate": date,
+            "type": "heart_rate",
+        }
+        stable_62 = {
+            "data": {
+                "metrics": [{
+                    "name": "heart_rate",
+                    "units": "bpm",
+                    "data": [{
+                        "id": "incoming-62",
+                        "date": date,
+                        "Min": 62,
+                        "Avg": 62,
+                        "Max": 62,
+                        "source": "Watch",
+                    }],
+                }],
+            },
+        }
+
+        def insert_legacy(record):
+            self.db.execute(
+                """
+                INSERT INTO samples
+                    (canonical_id, source_id, record_version, tombstone,
+                     type, kind, start_date, end_date, value, unit, source, raw)
+                VALUES (?, ?, 1, 0, 'heart_rate', 'quantity',
+                        ?, ?, ?, 'bpm', 'Watch', ?)
+                """,
+                (
+                    f"apple.healthkit:{record['id']}",
+                    record["id"],
+                    date,
+                    date,
+                    record["quantity"]["value"],
+                    json.dumps(record),
+                ),
+            )
+
+        for competitor_kind in ("legacy", "direct"):
+            for null_first in (False, True):
+                with self.subTest(
+                    competitor=competitor_kind,
+                    null_first=null_first,
+                ):
+                    actions = ["null", "competitor"]
+                    if not null_first:
+                        actions.reverse()
+                    for action in actions:
+                        if action == "null":
+                            insert_legacy(null_legacy)
+                        elif competitor_kind == "legacy":
+                            insert_legacy(finite_legacy)
+                        else:
+                            ingest_lines(self.db, [json.dumps(direct_stable)])
+                    self.db.commit()
+
+                    with self.assertRaisesRegex(
+                        PartialBatch,
+                        "ambiguous",
+                    ):
+                        ingest_compatible(
+                            self.db,
+                            stable_62,
+                            batch_key=(
+                                f"bulk-{competitor_kind}-{int(null_first)}"
+                            ),
+                        )
+
+                    self.assertEqual(
+                        2,
+                        self.db.execute(
+                            "SELECT COUNT(*) FROM samples WHERE tombstone = 0"
+                        ).fetchone()[0],
+                    )
+                    self.assertIsNone(
+                        self.db.execute(
+                            """
+                            SELECT 1 FROM batches
+                            WHERE key = ?
+                            """,
+                            (f"bulk-{competitor_kind}-{int(null_first)}",),
+                        ).fetchone()
+                    )
+                    for table in (
+                        "samples",
+                        "batches",
+                        "compatible_alias_identity",
+                        "compatible_alias_retirement",
+                        "compatible_resolved_deletion",
+                        "compatible_unresolved_deletion",
+                    ):
+                        self.db.execute(f"DELETE FROM {table}")
+                    self.db.commit()
+
+        for null_first in (False, True):
+            with self.subTest(
+                competitor="legacy",
+                stable_first=True,
+                null_first=null_first,
+            ):
+                ingest_compatible(self.db, stable_62)
+                legacy_records = [null_legacy, finite_legacy]
+                if not null_first:
+                    legacy_records.reverse()
+                with self.assertRaisesRegex(PartialBatch, "not unambiguous"):
+                    ingest_lines(
+                        self.db,
+                        [json.dumps(record) for record in legacy_records],
+                        batch_key=f"stable-first-{int(null_first)}",
+                    )
+                self.assertEqual(
+                    [("healthAutoExport:incoming-62", 62)],
+                    self.db.execute(
+                        """
+                        SELECT canonical_id, value FROM samples
+                        WHERE tombstone = 0
+                        """
+                    ).fetchall(),
+                )
+                self.assertIsNone(
+                    self.db.execute(
+                        "SELECT 1 FROM batches WHERE key = ?",
+                        (f"stable-first-{int(null_first)}",),
+                    ).fetchone()
+                )
+                for table in (
+                    "samples",
+                    "batches",
+                    "compatible_alias_identity",
+                    "compatible_alias_retirement",
+                    "compatible_resolved_deletion",
+                    "compatible_unresolved_deletion",
+                ):
+                    self.db.execute(f"DELETE FROM {table}")
+                self.db.commit()
 
     def test_same_timestamp_distinct_sources_are_not_aliases(self):
         date = "2026-01-01T00:00:00Z"
@@ -4332,6 +5110,94 @@ class TransactionAndArchiveTests(unittest.TestCase):
         ):
             ingest_file(self.db, archive)
 
+    def test_last_fake_eocd_comment_mismatch_rejects_before_zipfile_read(self):
+        archive = Path(self.directory.name) / "fake-comment-eocd.zip"
+        self.write_zip(archive, {"records.ndjson": ""})
+        payload = bytearray(archive.read_bytes())
+        real_eocd = payload.rfind(b"PK\x05\x06")
+        directory_size = struct.unpack_from("<I", payload, real_eocd + 12)[0]
+        directory_limit = directory_size + 8
+        fake_directory_size = directory_limit + 1
+        fake_eocd = bytearray(22)
+        fake_eocd[:4] = b"PK\x05\x06"
+        struct.pack_into("<H", fake_eocd, 8, 1)
+        struct.pack_into("<H", fake_eocd, 10, 1)
+        struct.pack_into("<I", fake_eocd, 12, fake_directory_size)
+        comment = (
+            b"A" * (fake_directory_size + 32)
+            + fake_eocd
+            + b"!"
+        )
+        struct.pack_into("<H", payload, real_eocd + 20, len(comment))
+        archive.write_bytes(payload[:real_eocd + 22] + comment)
+
+        with (
+            mock.patch.object(
+                receiver,
+                "MAX_ZIP_DIRECTORY_BYTES",
+                directory_limit,
+            ),
+            mock.patch.object(receiver.zipfile, "ZipFile") as zip_reader,
+            self.assertRaisesRegex(PartialBatch, "comment length"),
+        ):
+            ingest_file(self.db, archive)
+        zip_reader.assert_not_called()
+
+    def test_prepended_zip_uses_adjusted_central_directory_for_preflight(self):
+        archive = Path(self.directory.name) / "prepended.zip"
+        self.write_zip(
+            archive,
+            {
+                "records.ndjson": "",
+                "second.bin": "",
+            },
+        )
+        original = bytearray(archive.read_bytes())
+        original_eocd = original.rfind(b"PK\x05\x06")
+        directory_size = struct.unpack_from("<I", original, original_eocd + 12)[0]
+        directory_offset = struct.unpack_from("<I", original, original_eocd + 16)[0]
+        self.assertGreaterEqual(directory_size, 46)
+        fake_directory = bytearray(directory_size)
+        fake_directory[:4] = b"PK\x01\x02"
+        struct.pack_into(
+            "<H",
+            fake_directory,
+            32,
+            directory_size - 46,
+        )
+        prefix = bytearray(directory_offset) + fake_directory
+        payload = prefix + original
+        eocd = len(prefix) + original_eocd
+        struct.pack_into("<H", payload, eocd + 8, 1)
+        struct.pack_into("<H", payload, eocd + 10, 1)
+        archive.write_bytes(payload)
+
+        with (
+            mock.patch.object(receiver, "MAX_ZIP_ENTRIES", 1),
+            mock.patch.object(
+                receiver.zipfile,
+                "ZipFile",
+                side_effect=AssertionError("central directory was allocated"),
+            ),
+            self.assertRaises(PartialBatch),
+        ):
+            ingest_file(self.db, archive)
+
+    def test_zip_directory_byte_limit_is_checked_before_zipfile_allocation(self):
+        archive = Path(self.directory.name) / "large-directory.zip"
+        self.write_zip(archive, {"records.ndjson": ""})
+
+        with (
+            mock.patch.object(receiver, "MAX_ZIP_DIRECTORY_BYTES", 1),
+            mock.patch.object(
+                receiver.zipfile,
+                "ZipFile",
+                side_effect=AssertionError("central directory was allocated"),
+            ),
+            self.assertRaisesRegex(PartialBatch, "directory exceeds"),
+        ):
+            ingest_file(self.db, archive)
+
     def test_unsupported_or_encrypted_zip_rejects_before_decompression(self):
         for name, offset, value in (
             ("unsupported", 10, 99),
@@ -4377,6 +5243,95 @@ class TransactionAndArchiveTests(unittest.TestCase):
         path.write_bytes(central + zip64 + locator + eocd)
 
         receiver.preflight_zip_entry_count(path)
+
+    def test_ambiguous_prepended_zip64_rejects_both_directory_views(self):
+        path = Path(self.directory.name) / "ambiguous-zip64.zip"
+        relative_record_offset = 256
+        prefix_size = 512
+        preceding_record_offset = relative_record_offset + prefix_size
+        fake_directory_size = 46
+        real_directory_size = 92
+        locator_offset = preceding_record_offset + 56
+        payload = bytearray(locator_offset + 20 + 22)
+
+        fake_directory_offset = (
+            relative_record_offset - fake_directory_size
+        )
+        payload[
+            fake_directory_offset:fake_directory_offset + 4
+        ] = b"PK\x01\x02"
+        real_directory_offset = (
+            preceding_record_offset - real_directory_size
+        )
+        for offset in (
+            real_directory_offset,
+            real_directory_offset + 46,
+        ):
+            payload[offset:offset + 4] = b"PK\x01\x02"
+
+        fake_zip64 = bytearray(56)
+        fake_zip64[:4] = b"PK\x06\x06"
+        struct.pack_into(
+            "<Q",
+            fake_zip64,
+            4,
+            44 + prefix_size,
+        )
+        struct.pack_into("<Q", fake_zip64, 24, 1)
+        struct.pack_into("<Q", fake_zip64, 32, 1)
+        struct.pack_into("<Q", fake_zip64, 40, fake_directory_size)
+        struct.pack_into("<Q", fake_zip64, 48, fake_directory_offset)
+        payload[
+            relative_record_offset:relative_record_offset + 56
+        ] = fake_zip64
+
+        real_zip64 = bytearray(56)
+        real_zip64[:4] = b"PK\x06\x06"
+        struct.pack_into("<Q", real_zip64, 4, 44)
+        struct.pack_into("<Q", real_zip64, 24, 2)
+        struct.pack_into("<Q", real_zip64, 32, 2)
+        struct.pack_into("<Q", real_zip64, 40, real_directory_size)
+        struct.pack_into(
+            "<Q",
+            real_zip64,
+            48,
+            relative_record_offset - real_directory_size,
+        )
+        payload[
+            preceding_record_offset:preceding_record_offset + 56
+        ] = real_zip64
+
+        locator = bytearray(20)
+        locator[:4] = b"PK\x06\x07"
+        struct.pack_into("<Q", locator, 8, relative_record_offset)
+        struct.pack_into("<I", locator, 16, 1)
+        payload[locator_offset:locator_offset + 20] = locator
+
+        eocd = bytearray(22)
+        eocd[:4] = b"PK\x05\x06"
+        struct.pack_into("<H", eocd, 8, 0xFFFF)
+        struct.pack_into("<H", eocd, 10, 0xFFFF)
+        struct.pack_into("<I", eocd, 12, 0xFFFFFFFF)
+        struct.pack_into("<I", eocd, 16, 0xFFFFFFFF)
+        payload[locator_offset + 20:] = eocd
+        path.write_bytes(payload)
+
+        for directory_limit, message in (
+            (real_directory_size, "differs across Python versions"),
+            (fake_directory_size, "directory exceeds"),
+        ):
+            with (
+                self.subTest(directory_limit=directory_limit),
+                mock.patch.object(
+                    receiver,
+                    "MAX_ZIP_DIRECTORY_BYTES",
+                    directory_limit,
+                ),
+                mock.patch.object(receiver.zipfile, "ZipFile") as zip_reader,
+                self.assertRaisesRegex(PartialBatch, message),
+            ):
+                ingest_file(self.db, path)
+            zip_reader.assert_not_called()
 
     def test_strict_zip_rejects_non_rfc3339_timestamp(self):
         record = self.strict_record("naive-time")

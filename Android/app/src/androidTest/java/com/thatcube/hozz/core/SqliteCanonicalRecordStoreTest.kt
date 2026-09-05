@@ -3,6 +3,7 @@ package com.thatcube.hozz.core
 import android.content.ContentValues
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
+import com.thatcube.hozz.projection.ProjectionPlanner
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
 import java.io.OutputStream
@@ -580,6 +581,49 @@ class SqliteCanonicalRecordStoreTest {
                         .none(CanonicalRecord::tombstone),
                 )
                 assertEquals(4, merge(live, staged).ignored)
+            }
+        }
+
+    @Test
+    fun ignoredLiveChildBlocksItsIncomingSubtreeInDirectAndStagedMerges() =
+        runBlocking {
+            suspend fun merge(
+                records: List<CanonicalRecord>,
+                staged: Boolean,
+            ): MergeResult = if (staged) {
+                store.beginImport().let { import ->
+                    import.append(records)
+                    import.commit()
+                }
+            } else {
+                store.upsert(records)
+            }
+
+            for ((prefix, staged) in
+                listOf("direct-blocked" to false, "staged-blocked" to true)) {
+                val root = nestedNode("$prefix-root", null, 2, true)
+                val child = nestedNode(
+                    "$prefix-child",
+                    root.canonicalId,
+                    3,
+                    false,
+                )
+                val grandchild = nestedNode(
+                    "$prefix-grandchild",
+                    child.canonicalId,
+                    3,
+                    false,
+                )
+                merge(listOf(root), staged)
+
+                val result = merge(listOf(grandchild, child), staged)
+                val stored = store.allRecords().filter {
+                    it.canonicalId.startsWith("apple.healthkit:$prefix-")
+                }
+
+                assertEquals(2, result.ignored)
+                assertEquals(listOf(root), stored)
+                assertTrue(stored.none { !it.tombstone })
             }
         }
 
@@ -1327,6 +1371,160 @@ class SqliteCanonicalRecordStoreTest {
                     .tombstone,
             )
         }
+
+    @Test
+    fun persistedOverviewPreservesWarningsTargetsAndDeletionCounts() = runBlocking {
+        val weight = record(version = 1, tombstone = false).copy(
+            canonicalId = "apple.healthkit:overview-weight",
+            canonicalType = "body.weight",
+            type = "HKQuantityTypeIdentifierBodyMass",
+            canonicalValue = CanonicalValue(70.0, "kg"),
+            originalValue = CanonicalValue(70.0, "kg"),
+            sourceRecordId = "overview-weight",
+            lineage = listOf(
+                SourceLineage("apple.healthkit", recordId = "overview-weight"),
+            ),
+        )
+        val aggregateHeart = weight.copy(
+            canonicalId = "apple.healthkit:overview-heart",
+            canonicalType = "vitals.heart-rate",
+            type = "HKQuantityTypeIdentifierHeartRate",
+            canonicalValue = CanonicalValue(1.0, "count/s"),
+            originalValue = CanonicalValue(1.0, "count/s"),
+            quantityCount = 2,
+            sourceRecordId = "overview-heart",
+            lineage = listOf(
+                SourceLineage("apple.healthkit", recordId = "overview-heart"),
+            ),
+        )
+        val deleted = record(version = 2, tombstone = true).copy(
+            canonicalId = "apple.healthkit:overview-deleted",
+            canonicalType = "body.weight",
+            type = "HKQuantityTypeIdentifierBodyMass",
+            sourceRecordId = "overview-deleted",
+            lineage = listOf(
+                SourceLineage("apple.healthkit", recordId = "overview-deleted"),
+            ),
+        )
+        val currentHeight = weight.copy(
+            canonicalId = "apple.healthkit:overview-height",
+            canonicalType = "body.height",
+            type = "HKQuantityTypeIdentifierHeight",
+            canonicalValue = CanonicalValue(1.8, "m"),
+            originalValue = CanonicalValue(1.8, "m"),
+            sourceRecordId = "overview-height",
+            lineage = listOf(
+                SourceLineage("apple.healthkit", recordId = "overview-height"),
+            ),
+        )
+        val prior = HealthConnectProjection(
+            canonicalId = deleted.canonicalId,
+            targetRecord = "WeightRecord",
+            canonicalVersion = 1,
+            healthConnectRecordId = "health-overview-deleted",
+        )
+        val currentProjection = HealthConnectProjection(
+            canonicalId = currentHeight.canonicalId,
+            targetRecord = "HeightRecord",
+            canonicalVersion = currentHeight.recordVersion,
+            healthConnectRecordId = "health-overview-height",
+        )
+        val projections = listOf(prior, currentProjection)
+        store.upsert(listOf(weight, aggregateHeart, deleted, currentHeight))
+        store.saveHealthConnectProjections(projections)
+
+        val expected = ProjectionPlanner.plan(
+            store.allRecords(),
+            projections.associateBy(HealthConnectProjection::canonicalId),
+        ).summary()
+        val overview = store.archiveOverview()
+
+        assertEquals(4, overview.canonicalRecordCount)
+        assertEquals(0, overview.runRecordCount)
+        assertTrue(overview.hasArchive)
+        assertEquals(expected, overview.projection)
+        assertEquals(1, overview.projection.warningCounts["heart-rate-aggregate"])
+        assertEquals(1, overview.projection.deleteCount)
+    }
+
+    @Test
+    fun largeSnapshotMaterializesOnlyOneBoundedTimelinePage() = runBlocking {
+        val archiveSize = 2_000
+        val start = Instant.parse("2026-01-31T00:00:00Z")
+        (0 until archiveSize).chunked(250).forEach { indexes ->
+            store.upsert(
+                indexes.map { index ->
+                    record(version = 1, tombstone = false).copy(
+                        canonicalId = "apple.healthkit:large-$index",
+                        canonicalType = "body.weight",
+                        type = "HKQuantityTypeIdentifierBodyMass",
+                        startTime = start.minusSeconds(index.toLong()),
+                        endTime = start.minusSeconds(index.toLong()),
+                        canonicalValue = CanonicalValue(70.0, "kg"),
+                        originalValue = CanonicalValue(70.0, "kg"),
+                        sourceRecordId = "large-$index",
+                        lineage = listOf(
+                            SourceLineage(
+                                "apple.healthkit",
+                                recordId = "large-$index",
+                            ),
+                        ),
+                    )
+                },
+            )
+        }
+        val before = store.recordMaterializationCountForTesting
+
+        val snapshot = HozzCoreService(store).snapshot()
+
+        val refreshMaterializations =
+            store.recordMaterializationCountForTesting - before
+        assertEquals(archiveSize, snapshot.totalRecordCount)
+        assertEquals(archiveSize, snapshot.projection.exactCount)
+        assertEquals(archiveSize, snapshot.projection.insertCount)
+        assertTrue(snapshot.timeline.size <= 200)
+        assertTrue(refreshMaterializations <= 200)
+
+        val older = store.timelinePage(snapshot.timelineNextCursor)
+        val reloaded = store.timelinePageBefore(
+            TimelineCursor(
+                older.records.first().endTime ?: older.records.first().startTime,
+                older.records.first().canonicalId,
+            ),
+        )
+        assertEquals(
+            snapshot.timeline.map { it.canonicalId },
+            reloaded.records.map { it.canonicalId },
+        )
+    }
+
+    @Test
+    fun runOnlyArchiveSurvivesRestartAndExports() = runBlocking {
+        val line =
+            """{"kind":"typeSummary","schemaVersion":1,"state":"complete","type":"steps"}"""
+        val imported = ArchiveImporter(store).import(
+            ByteArrayInputStream("$line\n".toByteArray()),
+        )
+        assertEquals(1, imported.runRecordsPreserved)
+        assertTrue(store.archiveOverview().hasArchive)
+        store.close()
+        store = SqliteCanonicalRecordStore(context, databaseName)
+
+        val overview = store.archiveOverview()
+        val output = ByteArrayOutputStream()
+        val exported = CanonicalArchiveExporter(store).export(output)
+        val restored = InMemoryCanonicalRecordStore()
+        ArchiveImporter(restored).import(ByteArrayInputStream(output.toByteArray()))
+
+        assertEquals(0, overview.canonicalRecordCount)
+        assertEquals(1, overview.runRecordCount)
+        assertTrue(overview.hasArchive)
+        assertEquals(0, exported.recordCount)
+        assertEquals(
+            listOf(line),
+            restored.runRecordsPage(null, 10).map(ArchiveRunRecord::rawJson),
+        )
+    }
 
     private fun record(
         version: Long,

@@ -1,5 +1,16 @@
 import Foundation
 
+public enum CompatiblePayloadError: Error, LocalizedError, Equatable {
+    case unsupportedRecord(kind: String, type: String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .unsupportedRecord(let kind, let type):
+            "Metrics JSON cannot represent \(kind) record \(type) without losing its value. Use NDJSON, JSON, or CSV for this type."
+        }
+    }
+}
+
 /// Builds a payload grouped by metric rather than by sample.
 ///
 /// Home Assistant sensors, MQTT topics, and most dashboards want "here is
@@ -111,16 +122,20 @@ public enum CompatiblePayloadBuilder {
                 continue
             }
 
+            guard let value = record.value else {
+                throw CompatiblePayloadError.unsupportedRecord(
+                    kind: record.kind,
+                    type: record.typeIdentifier
+                )
+            }
             let name = MetricNameMap.metricName(for: record.typeIdentifier)
             let units = record.unit ?? "count"
             var point: [String: Any] = [
                 "id": record.identifier,
                 "date": record.startDate,
-                "units": units
+                "units": units,
+                "qty": value
             ]
-            if let value = record.value {
-                point["qty"] = value
-            }
             if let sourceName = record.sourceName {
                 point["source"] = sourceName
             }

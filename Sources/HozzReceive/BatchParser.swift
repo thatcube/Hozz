@@ -669,10 +669,8 @@ public enum BatchParser {
             // on the receiver permanently and kept being served as live data.
             let isDeletion = (object["deleted"] as? Bool == true)
                 || (object["kind"] as? String == "deletion")
-            if isDeletion, let id = object["id"] as? String {
-                deletions.append(
-                    HealthDeletion(id: id, type: object["type"] as? String)
-                )
+            if isDeletion, let deletion = canonicalDeletion(from: object) {
+                deletions.append(deletion)
                 continue
             }
 
@@ -1278,10 +1276,8 @@ public enum BatchParser {
             }
             if let deleted = object["deleted"] as? String,
                deleted == "true" || deleted == "1",
-               let id = object["id"] as? String {
-                deletions.append(
-                    HealthDeletion(id: id, type: object["type"] as? String)
-                )
+               let deletion = canonicalDeletion(from: object) {
+                deletions.append(deletion)
                 continue
             }
             // CSV carries every field as text, so the numeric column is
@@ -1300,6 +1296,23 @@ public enum BatchParser {
             records: records,
             deletions: deletions,
             unreadableCount: unreadable
+        )
+    }
+
+    private static func canonicalDeletion(
+        from object: [String: Any]
+    ) -> HealthDeletion? {
+        guard let id = object["id"] as? String, !id.isEmpty else {
+            return nil
+        }
+        let sourceType = object["type"] as? String
+        let legacyType = sourceType.flatMap(
+            CompatibilityMetricName.legacyNamespace(for:)
+        )
+        return HealthDeletion(
+            id: id,
+            type: legacyType ?? sourceType,
+            requiresLegacyAliasResolution: legacyType != nil
         )
     }
 

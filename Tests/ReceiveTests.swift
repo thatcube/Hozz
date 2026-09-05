@@ -103,6 +103,71 @@ final class ReceiveTests: XCTestCase {
         XCTAssertEqual(batch.records.first?.type, "HKQuantityTypeIdentifierStepCount")
     }
 
+    func testCSVCanonicalDeletionUsesTheLegacyAliasBridgeAndRemainsRetryable()
+        async throws
+    {
+        let store = try makeStore()
+        let date = "2026-01-01T10:00:00.000Z"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":120}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "old-step-count"
+        )
+
+        let unresolved = try BatchParser.parse(
+            Data(
+                """
+                id,type,kind,startDate,endDate,value,unit,sourceName,deleted
+                stable-step,HKQuantityTypeIdentifierStepCount,deletion,,,,,,true
+                """.utf8
+            )
+        )
+        XCTAssertEqual(unresolved.deletions.first?.type, "step_count")
+        XCTAssertEqual(
+            unresolved.deletions.first?.requiresLegacyAliasResolution,
+            true
+        )
+        do {
+            _ = try await store.ingest(
+                unresolved,
+                idempotencyKey: "csv-canonical-delete"
+            )
+            XCTFail("An unmatched canonical CSV deletion must stay retryable.")
+        } catch is UnresolvedLegacyAliasError {
+        }
+
+        let corrected = try BatchParser.parse(
+            Data(
+                """
+                id,type,kind,startDate,endDate,value,unit,sourceName,deleted
+                step_count:\(date),HKQuantityTypeIdentifierStepCount,deletion,,,,,,true
+                """.utf8
+            )
+        )
+        let retry = try await store.ingest(
+            corrected,
+            idempotencyKey: "csv-canonical-delete"
+        )
+        XCTAssertFalse(
+            retry.duplicate,
+            "A rejected deletion must not leave a receipt that suppresses its retry."
+        )
+        let duplicate = try await store.ingest(
+            corrected,
+            idempotencyKey: "csv-canonical-delete"
+        )
+        XCTAssertTrue(duplicate.duplicate)
+        let remaining = try await store.totalRecordCount()
+        XCTAssertEqual(remaining, 0)
+    }
+
     func testTheMetricsEnvelopeIsFlattened() throws {
         let payload = Data(
             """
@@ -639,6 +704,78 @@ final class ReceiveTests: XCTestCase {
         XCTAssertEqual(records.map(\.id), ["stable"])
     }
 
+    func testExactLegacyTombstoneSuppressesLaterStableCompatibilityUpsert() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[],"deletions":[
+                      {"name":"step_count","date":"\(date)"}
+                    ]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "legacy-time-delete"
+        )
+
+        let result = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"stable-after-delete","date":"\(date)","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "stable-after-time-delete"
+        )
+
+        XCTAssertEqual(result.stored, 0)
+        let remaining = try await store.samples(type: "step_count")
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
+    func testNormalizedLegacyRetirementRejectsAmbiguousStableCompatibilityUpsert() async throws {
+        let store = try makeStore()
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[],"deletions":[
+                      {"name":"step_count","date":"2026-01-01 10:00:00 +0000"}
+                    ]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "normalized-time-delete"
+        )
+        let ambiguous = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                  {"id":"stable-offset","date":"2026-01-01 05:00:00 -0500","qty":20}
+                ]}]}}
+                """.utf8
+            )
+        )
+
+        for _ in 0..<2 {
+            do {
+                _ = try await store.ingest(
+                    ambiguous,
+                    idempotencyKey: "ambiguous-stable"
+                )
+                XCTFail("A normalized retirement without an exact alias is ambiguous.")
+            } catch is UnresolvedLegacyAliasError {
+            }
+        }
+        let remaining = try await store.samples(type: "step_count")
+        XCTAssertTrue(remaining.isEmpty)
+    }
+
     func testSameTimestampDistinctSourceAndValueAreNotAliases() async throws {
         let store = try makeStore()
         let date = "2026-01-01 10:00:00 +0000"
@@ -1146,7 +1283,123 @@ final class ReceiveTests: XCTestCase {
 
         XCTAssertEqual(batch.deletions.count, 1, "A kind=deletion line is a deletion.")
         XCTAssertEqual(batch.deletions.first?.id, "gone")
+        XCTAssertEqual(batch.deletions.first?.type, "step_count")
+        XCTAssertEqual(
+            batch.deletions.first?.requiresLegacyAliasResolution,
+            true
+        )
         XCTAssertEqual(batch.unreadableCount, 0, "It must not be counted as junk.")
+    }
+
+    func testCanonicalDeletionRefusesReceiptWhileLegacyAliasIsUnresolved() async throws {
+        let store = try makeStore()
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"2026-01-01 10:00:00 +0000","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "canonical-delete-legacy"
+        )
+        let deletion = try BatchParser.parse(
+            Data(
+                #"{"id":"canonical-id","kind":"deletion","schemaVersion":1,"type":"HKQuantityTypeIdentifierStepCount"}"#
+                    .utf8
+            )
+        )
+
+        for _ in 0..<2 {
+            do {
+                _ = try await store.ingest(
+                    deletion,
+                    idempotencyKey: "canonical-delete"
+                )
+                XCTFail("The old timestamp identity has not been resolved.")
+            } catch is UnresolvedLegacyAliasError {
+            }
+        }
+        let remaining = try await store.totalRecordCount()
+        XCTAssertEqual(remaining, 1)
+    }
+
+    func testCanonicalDeletionRemovesSafelyResolvedCompatibilityAlias() async throws {
+        let store = try makeStore()
+        let date = "2026-01-01 10:00:00 +0000"
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"\(date)","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "canonical-delete-old"
+        )
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"canonical-id","date":"\(date)","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "canonical-delete-bridge"
+        )
+
+        let result = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    #"{"id":"canonical-id","kind":"deletion","schemaVersion":1,"type":"HKQuantityTypeIdentifierStepCount"}"#
+                        .utf8
+                )
+            ),
+            idempotencyKey: "canonical-delete-resolved"
+        )
+
+        XCTAssertEqual(result.deleted, 1)
+        let remaining = try await store.totalRecordCount()
+        XCTAssertEqual(remaining, 0)
+    }
+
+    func testCanonicalDeletionBlocksDelayedLegacyAlias() async throws {
+        let store = try makeStore()
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    #"{"id":"canonical-id","kind":"deletion","schemaVersion":1,"type":"HKQuantityTypeIdentifierStepCount"}"#
+                        .utf8
+                )
+            ),
+            idempotencyKey: "canonical-delete-first"
+        )
+        let delayedLegacy = try BatchParser.parse(
+            Data(
+                """
+                {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                  {"date":"2026-01-01 10:00:00 +0000","qty":20}
+                ]}]}}
+                """.utf8
+            )
+        )
+
+        do {
+            _ = try await store.ingest(
+                delayedLegacy,
+                idempotencyKey: "canonical-delete-delayed-legacy"
+            )
+            XCTFail("A delayed legacy identity must not bypass the tombstone.")
+        } catch is UnresolvedLegacyAliasError {
+        }
+        let remaining = try await store.totalRecordCount()
+        XCTAssertEqual(remaining, 0)
     }
 
     func testAnNDJSONDeletionActuallyRemovesTheSample() async throws {

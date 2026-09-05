@@ -25,6 +25,7 @@ data class ProjectionExecutionResult(
     val deleted: Int = 0,
     val failures: List<ProjectionFailure> = emptyList(),
     val failureCount: Int = failures.size,
+    val retryCeilingReached: Boolean = false,
 ) {
     operator fun plus(other: ProjectionExecutionResult) =
         ProjectionExecutionResult(
@@ -40,6 +41,8 @@ data class ProjectionExecutionResult(
                 )
             },
             failureCount = failureCount + other.failureCount,
+            retryCeilingReached =
+                retryCeilingReached || other.retryCeilingReached,
         )
 }
 
@@ -52,6 +55,9 @@ class ProjectionExecutor(
     private val completeDeletes:
         suspend (List<PendingHealthConnectOperation>) -> Unit,
 ) {
+    private var remainingSingletonAttempts =
+        MAX_RECORD_LOCAL_RETRIES_PER_RUN
+
     suspend fun apply(
         operations: List<PlannedRecord>,
     ): ProjectionExecutionResult = executionMutex.withLock {
@@ -71,6 +77,9 @@ class ProjectionExecutor(
                 .values
                 .flatMap { it.chunked(MAX_PROJECTION_BATCH) }
         ) {
+            if (remainingSingletonAttempts == 0) {
+                return result.copy(retryCeilingReached = true)
+            }
             stageOperations(
                 chunk.map {
                     it.pending(HealthConnectPendingAction.DELETE)
@@ -93,11 +102,19 @@ class ProjectionExecutor(
             }
             if (batch != null) {
                 if (chunk.size == 1) {
+                    remainingSingletonAttempts -= 1
                     result += ProjectionExecutionResult(
                         failures = listOfNotNull(batch.failure),
                     )
+                    if (remainingSingletonAttempts == 0) {
+                        return result.copy(retryCeilingReached = true)
+                    }
                 } else {
                     for (draft in chunk) {
+                        if (remainingSingletonAttempts == 0) {
+                            return result.copy(retryCeilingReached = true)
+                        }
+                        remainingSingletonAttempts -= 1
                         currentCoroutineContext().ensureActive()
                         result += withContext(NonCancellable) {
                             val single = attempt(
@@ -115,6 +132,9 @@ class ProjectionExecutor(
                                 acceptDeletions(listOf(draft), removed)
                             }
                         }
+                        if (remainingSingletonAttempts == 0) {
+                            return result.copy(retryCeilingReached = true)
+                        }
                     }
                 }
             }
@@ -125,6 +145,9 @@ class ProjectionExecutor(
                 it.action == ProjectionAction.UPDATE
         }
         for (chunk in upserts.chunked(MAX_PROJECTION_BATCH)) {
+            if (remainingSingletonAttempts == 0) {
+                return result.copy(retryCeilingReached = true)
+            }
             val drafts = chunk.map { requireNotNull(it.draft) }
             stageOperations(
                 drafts.map {
@@ -148,12 +171,20 @@ class ProjectionExecutor(
             }
             if (batch != null) {
                 if (chunk.size == 1) {
+                    remainingSingletonAttempts -= 1
                     result += ProjectionExecutionResult(
                         failures = listOfNotNull(batch.failure),
                     )
+                    if (remainingSingletonAttempts == 0) {
+                        return result.copy(retryCeilingReached = true)
+                    }
                 } else {
                     for (operation in chunk) {
+                        if (remainingSingletonAttempts == 0) {
+                            return result.copy(retryCeilingReached = true)
+                        }
                         val draft = operation.draft ?: continue
+                        remainingSingletonAttempts -= 1
                         currentCoroutineContext().ensureActive()
                         result += withContext(NonCancellable) {
                             val single = attempt(
@@ -170,6 +201,9 @@ class ProjectionExecutor(
                             } else {
                                 acceptUpserts(listOf(operation), written)
                             }
+                        }
+                        if (remainingSingletonAttempts == 0) {
+                            return result.copy(retryCeilingReached = true)
                         }
                     }
                 }
@@ -297,4 +331,5 @@ private enum class ProjectionFailureScope {
 }
 
 internal const val MAX_RETAINED_PROJECTION_FAILURES = 100
+internal const val MAX_RECORD_LOCAL_RETRIES_PER_RUN = 100
 private const val MAX_PROJECTION_BATCH = 500

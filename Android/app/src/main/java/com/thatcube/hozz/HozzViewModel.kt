@@ -32,14 +32,19 @@ import kotlinx.coroutines.withContext
 data class HozzUiState(
     val busy: Boolean = false,
     val timeline: List<TimelineItem> = emptyList(),
+    val timelinePreviousCursor: TimelineCursor? = null,
     val timelineNextCursor: TimelineCursor? = null,
     val timelineLoading: Boolean = false,
     val projection: ProjectionSummary = ProjectionSummary(),
     val totalRecordCount: Int = 0,
+    val runRecordCount: Int = 0,
     val lastImport: ArchiveImportResult? = null,
     val status: String? = null,
     val healthConnectStatus: Int = HealthConnectClient.SDK_UNAVAILABLE,
-)
+) {
+    val hasArchive: Boolean
+        get() = totalRecordCount > 0 || runRecordCount > 0
+}
 
 internal fun HozzUiState.beginningOperation(status: String): HozzUiState = copy(
     busy = true,
@@ -50,14 +55,47 @@ internal fun HozzUiState.beginningOperation(status: String): HozzUiState = copy(
 internal fun HozzUiState.appending(page: TimelineItemPage): HozzUiState {
     val existing = timeline.mapTo(hashSetOf()) { it.canonicalId }
     val additions = page.records.filter { existing.add(it.canonicalId) }
+    val combined = timeline + additions
+    val dropped = (combined.size - MAX_RETAINED_TIMELINE_ITEMS).coerceAtLeast(0)
+    val retained = combined.drop(dropped)
     return copy(
-        timeline = timeline + additions,
+        timeline = retained,
+        timelinePreviousCursor = if (dropped > 0) {
+            retained.firstOrNull()?.cursor()
+        } else {
+            timelinePreviousCursor
+        },
         timelineNextCursor = page.nextCursor.takeIf {
             page.records.isNotEmpty()
         },
         timelineLoading = false,
     )
 }
+
+internal fun HozzUiState.prepending(page: TimelineItemPage): HozzUiState {
+    val existing = timeline.mapTo(hashSetOf()) { it.canonicalId }
+    val additions = page.records.filter { existing.add(it.canonicalId) }
+    val combined = additions + timeline
+    val dropped = (combined.size - MAX_RETAINED_TIMELINE_ITEMS).coerceAtLeast(0)
+    val retained = combined.take(MAX_RETAINED_TIMELINE_ITEMS)
+    return copy(
+        timeline = retained,
+        timelinePreviousCursor = page.previousCursor.takeIf {
+            page.records.isNotEmpty()
+        },
+        timelineNextCursor = if (dropped > 0) {
+            retained.lastOrNull()?.cursor()
+        } else {
+            timelineNextCursor
+        },
+        timelineLoading = false,
+    )
+}
+
+private fun TimelineItem.cursor(): TimelineCursor =
+    TimelineCursor(endTime, canonicalId)
+
+internal const val MAX_RETAINED_TIMELINE_ITEMS = 400
 
 internal data class TimelineLoadRequest(
     val generation: Long,
@@ -104,7 +142,6 @@ internal class HozzStateRefresher(
     ) = loadAndApply(
         lastImport = lastImport,
         status = status,
-        settleOnFailure = false,
     )
 
     suspend fun finishOperation(
@@ -113,13 +150,11 @@ internal class HozzStateRefresher(
     ) = loadAndApply(
         lastImport = lastImport,
         status = status,
-        settleOnFailure = true,
     )
 
     private suspend fun loadAndApply(
         lastImport: ArchiveImportResult?,
         status: String?,
-        settleOnFailure: Boolean,
     ) {
         val refresh = generation.beginRefresh()
         val snapshot = try {
@@ -127,7 +162,6 @@ internal class HozzStateRefresher(
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
-            if (!settleOnFailure) throw error
             if (generation.isCurrent(refresh)) {
                 val refreshFailure = error.message?.let {
                     "The local archive view could not be refreshed: $it"
@@ -147,10 +181,12 @@ internal class HozzStateRefresher(
         state.value = HozzUiState(
             busy = false,
             timeline = snapshot.timeline,
+            timelinePreviousCursor = snapshot.timelinePreviousCursor,
             timelineNextCursor = snapshot.timelineNextCursor,
             timelineLoading = false,
             projection = snapshot.projection,
             totalRecordCount = snapshot.totalRecordCount,
+            runRecordCount = snapshot.runRecordCount,
             lastImport = lastImport,
             status = status,
             healthConnectStatus = healthConnectStatus(),
@@ -173,6 +209,9 @@ internal fun healthConnectCompletionStatus(
         append(" ")
         append(result.failureCount)
         append(" records failed and remain pending.")
+    }
+    if (result.retryCeilingReached) {
+        append(" The per-run retry limit was reached; remaining records stay pending.")
     }
     if (permissionDeferred > 0) {
         append(" ")
@@ -278,6 +317,36 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                     timelineLoading = false,
                     status = error.message
                         ?: "The next archive records could not be loaded.",
+                )
+            }
+        }
+    }
+
+    fun loadPreviousTimeline() {
+        val cursor = mutableState.value.timelinePreviousCursor ?: return
+        if (mutableState.value.timelineLoading) return
+        val request = TimelineLoadRequest(stateRefresher.currentGeneration, cursor)
+        mutableState.value = mutableState.value.copy(timelineLoading = true)
+        viewModelScope.launch {
+            try {
+                val page = withContext(Dispatchers.IO) {
+                    core.timelinePageBefore(cursor)
+                }
+                if (!request.isCurrent(
+                        stateRefresher.currentGeneration,
+                        mutableState.value.timelinePreviousCursor,
+                    )
+                ) {
+                    return@launch
+                }
+                mutableState.value = mutableState.value.prepending(page)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: SQLiteException) {
+                mutableState.value = mutableState.value.copy(
+                    timelineLoading = false,
+                    status = error.message
+                        ?: "The previous archive records could not be loaded.",
                 )
             }
         }
@@ -414,8 +483,12 @@ class HozzViewModel(application: Application) : AndroidViewModel(application) {
                     }
                     allowed
                 }
-                result += withContext(Dispatchers.IO) {
+                val pageResult = withContext(Dispatchers.IO) {
                     executor.apply(permittedOperations)
+                }
+                result += pageResult
+                if (pageResult.retryCeilingReached) {
+                    break
                 }
                 after = page.nextCanonicalId
             } while (after != null)

@@ -28,6 +28,139 @@ final class FolderIngestWatcherTests: XCTestCase {
         }
     }
 
+    private final class FakeFileSystem:
+        FolderIngestFileSystem,
+        @unchecked Sendable
+    {
+        struct Counts {
+            let fullListings: Int
+            let pageRequests: Int
+            let metadataNames: Set<String>
+        }
+
+        private let lock = NSLock()
+        private var names: [String] = []
+        private var pageOffset = 0
+        private var fullListings = 0
+        private var pageRequests = 0
+        private var metadataNames: Set<String> = []
+        private var contentGenerationAvailable = true
+        private var payloads: [String: Data] = [:]
+
+        func replaceNames(_ names: [String]) {
+            lock.lock()
+            self.names = names
+            pageOffset = 0
+            lock.unlock()
+        }
+
+        func resetCounts() {
+            lock.lock()
+            fullListings = 0
+            pageRequests = 0
+            metadataNames.removeAll()
+            lock.unlock()
+        }
+
+        func setContentGenerationAvailable(_ available: Bool) {
+            lock.lock()
+            contentGenerationAvailable = available
+            lock.unlock()
+        }
+
+        func replacePayload(_ data: Data, for name: String) {
+            lock.lock()
+            payloads[name] = data
+            lock.unlock()
+        }
+
+        func data(for name: String) -> Data {
+            lock.lock()
+            defer { lock.unlock() }
+            return payloadLocked(for: name)
+        }
+
+        func counts() -> Counts {
+            lock.lock()
+            defer { lock.unlock() }
+            return Counts(
+                fullListings: fullListings,
+                pageRequests: pageRequests,
+                metadataNames: metadataNames
+            )
+        }
+
+        func allNames(in folder: URL) -> [String] {
+            lock.lock()
+            defer { lock.unlock() }
+            fullListings += 1
+            pageOffset = 0
+            return names
+        }
+
+        func nextNamePage(in folder: URL, limit: Int) -> FolderDirectoryPage {
+            lock.lock()
+            defer { lock.unlock() }
+            pageRequests += 1
+            guard pageOffset < names.count else {
+                pageOffset = 0
+                return FolderDirectoryPage(names: [], completedCycle: true)
+            }
+            let end = min(pageOffset + limit, names.count)
+            let page = Array(names[pageOffset..<end])
+            pageOffset = end == names.count ? 0 : end
+            return FolderDirectoryPage(
+                names: page,
+                completedCycle: end == names.count
+            )
+        }
+
+        func generation(of url: URL) -> FolderFileGeneration? {
+            lock.lock()
+            metadataNames.insert(url.lastPathComponent)
+            let exists = names.contains(url.lastPathComponent)
+            let data = payloadLocked(for: url.lastPathComponent)
+            let contentGeneration = contentGenerationAvailable
+                ? Data(("generation-" + url.lastPathComponent).utf8)
+                : nil
+            lock.unlock()
+            guard exists else {
+                return nil
+            }
+            return FolderFileGeneration(
+                size: UInt64(data.count),
+                modified: Date(timeIntervalSince1970: 1),
+                resourceIdentifier: Data(url.lastPathComponent.utf8),
+                contentGeneration: contentGeneration
+            )
+        }
+
+        func isSettled(_ url: URL) -> Bool {
+            true
+        }
+
+        func read(_ url: URL) throws -> Data {
+            data(for: url.lastPathComponent)
+        }
+
+        func resetPaging() {
+            lock.lock()
+            pageOffset = 0
+            lock.unlock()
+        }
+
+        private func payloadLocked(for name: String) -> Data {
+            payloads[name] ?? Data(
+                """
+                {"id":"\(name)","type":"steps","kind":"quantity",\
+                "startDate":"2026-01-01T10:00:00.000Z",\
+                "quantity":{"value":1,"unit":"count"}}
+
+                """.utf8
+            )
+        }
+    }
+
     func testMalformedCompatibilityFileRemainsRetryableAtTheSameName() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appending(path: "hozz-folder-retry-\(UUID().uuidString)")
@@ -806,6 +939,128 @@ final class FolderIngestWatcherTests: XCTestCase {
         XCTAssertEqual(ids, ["first", "second"])
         auditCycles = await recorder.recordedCycles()
         XCTAssertTrue(auditCycles.isEmpty)
+        await watcher.stop()
+        await store.close()
+    }
+
+    func testPeriodicMetadataPassUsesABoundedPageWhileEventsStayImmediate() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "hozz-folder-metadata-page-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try IngestStore(directory: root.appending(path: "store"))
+        let fileSystem = FakeFileSystem()
+        let watcher = FolderIngestWatcher(
+            store: store,
+            reconciliationInterval: .seconds(60),
+            observesDirectoryChanges: false,
+            metadataPageLimit: 7,
+            fileSystem: fileSystem
+        )
+
+        await watcher.start(folder: root.appending(path: "virtual-incoming"))
+        fileSystem.resetCounts()
+        let historical = (0..<10_000).map {
+            String(format: "%05d.ndjson", $0)
+        }
+        fileSystem.replaceNames(historical)
+
+        await watcher.runPeriodicReconciliationForTesting()
+
+        var counts = fileSystem.counts()
+        XCTAssertEqual(counts.fullListings, 0)
+        XCTAssertEqual(counts.pageRequests, 1)
+        XCTAssertLessThanOrEqual(counts.metadataNames.count, 7)
+        let periodicCount = try await store.totalRecordCount()
+        XCTAssertEqual(periodicCount, 7)
+
+        let immediate = "immediate.ndjson"
+        fileSystem.replaceNames(Array(historical.prefix(7)) + [immediate])
+        fileSystem.resetCounts()
+        await watcher.directoryDidChange()
+
+        counts = fileSystem.counts()
+        XCTAssertEqual(counts.fullListings, 1)
+        let samples = try await store.samples(type: "steps")
+        XCTAssertTrue(samples.contains { $0.id == immediate })
+        await watcher.stop()
+        await store.close()
+    }
+
+    func testPagedGenerationlessAuditEventuallyVisitsEntriesBeyondTheFirstSlice()
+        async throws
+    {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "hozz-folder-paged-audit-\(UUID().uuidString)")
+        let folder = root.appending(path: "incoming")
+        try FileManager.default.createDirectory(
+            at: folder,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try IngestStore(directory: root.appending(path: "store"))
+        let recorder = AuditRecorder()
+        let fileSystem = FakeFileSystem()
+        let names = (0..<80).map { String(format: "%02d.ndjson", $0) }
+        fileSystem.replaceNames(names)
+        fileSystem.setContentGenerationAvailable(false)
+        for name in names {
+            try fileSystem.data(for: name).write(
+                to: folder.appending(path: name)
+            )
+        }
+        let watcher = FolderIngestWatcher(
+            store: store,
+            reconciliationInterval: .seconds(60),
+            observesDirectoryChanges: false,
+            metadataPageLimit: 64,
+            generationlessAuditFileLimit: 8,
+            didCompleteGenerationlessAudit: { files, bytes in
+                await recorder.record(files: files, bytes: bytes)
+            },
+            fileSystem: fileSystem
+        )
+
+        await watcher.start(folder: folder)
+        let initialCount = try await store.totalRecordCount()
+        XCTAssertEqual(initialCount, 80)
+        await recorder.reset()
+
+        let rewrittenIDs = Set((8..<64).map { String(format: "hidden-%02d", $0) })
+        for index in 8..<64 {
+            let name = String(format: "%02d.ndjson", index)
+            let replacement = Data(
+                String(decoding: fileSystem.data(for: name), as: UTF8.self)
+                    .replacingOccurrences(
+                        of: name,
+                        with: String(format: "hidden-%02d", index)
+                    )
+                    .utf8
+            )
+            XCTAssertEqual(replacement.count, fileSystem.data(for: name).count)
+            fileSystem.replacePayload(replacement, for: name)
+            try replacement.write(to: folder.appending(path: name))
+        }
+
+        for _ in 0..<16 {
+            await watcher.runPeriodicReconciliationForTesting()
+        }
+
+        let samples = try await store.samples(type: "steps")
+        let sampleIDs = Set(samples.map(\.id))
+        XCTAssertTrue(
+            rewrittenIDs.isSubset(of: sampleIDs),
+            "Entries 8 through 63 in a 64-name page must all eventually be audited."
+        )
+        let cycles = await recorder.recordedCycles()
+        XCTAssertEqual(cycles.count, 16)
+        XCTAssertTrue(
+            cycles.allSatisfy { $0.files <= 8 },
+            "Page-local progress must not relax the per-cycle file bound: \(cycles)"
+        )
+        XCTAssertTrue(
+            cycles.allSatisfy { $0.bytes <= 16 * 1_024 * 1_024 },
+            "Page-local progress must not relax the per-cycle byte bound: \(cycles)"
+        )
         await watcher.stop()
         await store.close()
     }

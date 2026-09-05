@@ -641,6 +641,36 @@ class ArchiveImporterTest {
         }
 
     @Test
+    fun ignoredLiveChildBlocksItsIncomingSubtreeInMemory() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val root = nestedRecord(
+            "blocked-root",
+            parentCanonicalId = null,
+            version = 2,
+            deleted = true,
+        )
+        val child = nestedRecord(
+            "blocked-child",
+            parentCanonicalId = root.canonicalId,
+            version = 3,
+            deleted = false,
+        )
+        val grandchild = nestedRecord(
+            "blocked-grandchild",
+            parentCanonicalId = child.canonicalId,
+            version = 3,
+            deleted = false,
+        )
+        store.upsert(listOf(root))
+
+        val result = store.upsert(listOf(grandchild, child))
+
+        assertEquals(2, result.ignored)
+        assertEquals(listOf(root), store.allRecords())
+        assertTrue(store.timeline().isEmpty())
+    }
+
+    @Test
     fun deferredChildKeepsLedgerTransitionMonotonicWhenParentReturns() =
         runBlocking {
             val store = InMemoryCanonicalRecordStore()

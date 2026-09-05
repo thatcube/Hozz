@@ -3,6 +3,7 @@ import HozzCore
 import HozzDeliver
 import HozzHealth
 import HozzHealthFake
+import HozzReceive
 import HozzStore
 import XCTest
 
@@ -93,6 +94,7 @@ final class SyncEngineTests: XCTestCase {
     private var directory: TemporaryDirectory!
     private let steps = HealthTypeKey("HKQuantityTypeIdentifierStepCount")
     private let heart = HealthTypeKey("HKQuantityTypeIdentifierHeartRate")
+    private let audiogram = HealthTypeKey("HKDataTypeIdentifierAudiogram")
 
     override func setUpWithError() throws {
         directory = try TemporaryDirectory()
@@ -123,6 +125,47 @@ final class SyncEngineTests: XCTestCase {
                     withJSONObject: payload,
                     options: [.sortedKeys]
                 )
+            )
+        )
+    }
+
+    private func metricSample(
+        _ identifier: String,
+        type: HealthTypeKey,
+        value: Double
+    ) -> HealthChange {
+        let payload: [String: Any] = [
+            "kind": "quantity",
+            "id": identifier,
+            "type": type.rawValue,
+            "startDate": "2026-01-01T00:00:00.000Z",
+            "endDate": "2026-01-01T00:00:00.000Z",
+            "quantity": ["value": value, "unit": "count"]
+        ]
+        return .upsert(
+            CapturedHealthObject(
+                id: UUID(),
+                type: type,
+                canonicalPayload: try! JSONSerialization.data(
+                    withJSONObject: payload,
+                    options: [.sortedKeys]
+                )
+            )
+        )
+    }
+
+    private func encodingFailure(type: HealthTypeKey) throws -> HealthChange {
+        let sourceID = UUID()
+        return .upsert(
+            CapturedHealthObject(
+                id: sourceID,
+                type: type,
+                canonicalPayload: try HealthSampleEncoder()
+                    .encodeEncodingFailure(
+                        id: sourceID,
+                        typeIdentifier: type.rawValue,
+                        message: "The sample could not be encoded."
+                    )
             )
         )
     }
@@ -342,6 +385,182 @@ final class SyncEngineTests: XCTestCase {
             heartCursor,
             "An excluded type must not have its cursor advanced."
         )
+    }
+
+    func testMetricsDestinationSkipsUnrepresentableTypeWithoutBlockingSupportedData() async throws {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = Destination(
+            name: "Metrics",
+            kind: .folder,
+            format: .metrics,
+            folderBookmark: Data("metrics".utf8)
+        )
+        try await delivery.save(destination)
+        let unsupported = HealthChange.upsert(
+            CapturedHealthObject(
+                id: UUID(),
+                type: audiogram,
+                canonicalPayload: Data(
+                    """
+                    {"kind":"audiogram","id":"hearing","type":"HKDataTypeIdentifierAudiogram",
+                     "startDate":"2026-01-01T00:00:00.000Z",
+                     "endDate":"2026-01-01T00:00:00.000Z","sensitivityPoints":[]}
+                    """.utf8
+                )
+            )
+        )
+        let source = ScriptedHealthDataSource(
+            streams: [
+                steps: [metricSample("step-1", type: steps, value: 1)],
+                audiogram: [unsupported]
+            ]
+        )
+        let engine = makeEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [audiogram, steps]
+        )
+
+        _ = try await engine.sync()
+        try await source.append(
+            metricSample("step-2", type: steps, value: 2),
+            to: steps
+        )
+        _ = try await engine.sync(
+            ignoringCadence: true,
+            now: Date(timeIntervalSinceNow: 60)
+        )
+
+        let unsupportedQueries = await source.queryCount(for: audiogram)
+        let unsupportedAnchor = try await store.committedAnchor(
+            scope: .destination(destination.id),
+            type: audiogram
+        )
+        let payloadCount = await channel.payloads(for: destination.id).count
+        let supportedAnchor = try await store.committedAnchor(
+            scope: .destination(destination.id),
+            type: steps
+        )
+        XCTAssertEqual(unsupportedQueries, 0)
+        XCTAssertNil(unsupportedAnchor)
+        XCTAssertEqual(payloadCount, 2)
+        XCTAssertNotNil(supportedAnchor)
+    }
+
+    func testEncodingFailureDoesNotWedgeMetricsAndRemainsOwedToLosslessDestination()
+        async throws
+    {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let metrics = Destination(
+            name: "Metrics",
+            kind: .folder,
+            format: .metrics,
+            folderBookmark: Data("metrics".utf8)
+        )
+        var compatibleMetrics = Destination(
+            name: "Compatible metrics",
+            kind: .folder,
+            format: .metrics,
+            folderBookmark: Data("compatible-metrics".utf8)
+        )
+        compatibleMetrics.payloadSchema = .healthAutoExport
+        let lossless = Destination(
+            name: "Archive",
+            kind: .folder,
+            format: .ndjson,
+            folderBookmark: Data("archive".utf8)
+        )
+        try await delivery.save(metrics)
+        try await delivery.save(compatibleMetrics)
+        try await delivery.save(lossless)
+        await channel.fail(lossless.id)
+
+        let source = ScriptedHealthDataSource(
+            streams: [
+                steps: [
+                    metricSample("valid-step", type: steps, value: 12),
+                    try encodingFailure(type: steps)
+                ]
+            ]
+        )
+        let engine = makeEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps]
+        )
+
+        let first = try await engine.sync()
+
+        XCTAssertEqual(first.deliveredRecords, 2)
+        for destination in [metrics, compatibleMetrics] {
+            let payloads = await channel.payloads(for: destination.id)
+            let payload = try XCTUnwrap(payloads.first)
+            let roundTrip = try BatchParser.parse(payload)
+            XCTAssertEqual(roundTrip.records.map(\.id), ["valid-step"])
+            XCTAssertFalse(
+                String(decoding: payload, as: UTF8.self)
+                    .contains("sampleEncodingError")
+            )
+        }
+        let metricsAnchor = try await store.committedAnchor(
+            scope: .destination(metrics.id),
+            type: steps
+        )
+        let compatibleMetricsAnchor = try await store.committedAnchor(
+            scope: .destination(compatibleMetrics.id),
+            type: steps
+        )
+        let losslessAnchorBeforeRetry = try await store.committedAnchor(
+            scope: .destination(lossless.id),
+            type: steps
+        )
+        XCTAssertNotNil(
+            metricsAnchor,
+            "The intentionally omitted error must not hold valid metrics behind it."
+        )
+        XCTAssertNotNil(compatibleMetricsAnchor)
+        XCTAssertNil(
+            losslessAnchorBeforeRetry,
+            "A failed lossless delivery must keep every source record owed."
+        )
+
+        await channel.recover(lossless.id)
+        let second = try await engine.sync(
+            ignoringCadence: true,
+            now: Date(timeIntervalSinceNow: 60)
+        )
+        XCTAssertEqual(second.deliveredRecords, 2)
+        let losslessPayloads = await channel.payloads(for: lossless.id)
+        let losslessText = String(
+            decoding: try XCTUnwrap(losslessPayloads.first),
+            as: UTF8.self
+        )
+        XCTAssertTrue(losslessText.contains("\"id\":\"valid-step\""))
+        XCTAssertTrue(losslessText.contains("\"kind\":\"sampleEncodingError\""))
+        let losslessAnchorAfterRetry = try await store.committedAnchor(
+            scope: .destination(lossless.id),
+            type: steps
+        )
+        XCTAssertNotNil(losslessAnchorAfterRetry)
+
+        _ = try await engine.sync(
+            ignoringCadence: true,
+            now: Date(timeIntervalSinceNow: 120)
+        )
+        let finalMetricsPayloads = await channel.payloads(for: metrics.id)
+        let finalCompatibleMetricsPayloads = await channel.payloads(
+            for: compatibleMetrics.id
+        )
+        let finalLosslessPayloads = await channel.payloads(for: lossless.id)
+        XCTAssertEqual(finalMetricsPayloads.count, 1)
+        XCTAssertEqual(finalCompatibleMetricsPayloads.count, 1)
+        XCTAssertEqual(finalLosslessPayloads.count, 1)
     }
 
     func testNothingIsSentWhenThereAreNoDestinations() async throws {

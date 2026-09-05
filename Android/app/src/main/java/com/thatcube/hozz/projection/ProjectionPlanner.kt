@@ -372,7 +372,7 @@ object ProjectionPlanner {
     }
 
     private fun heartRate(record: CanonicalRecord): PlannedRecord {
-        if ((record.quantityCount ?: 1) > 1) {
+        if (record.quantityCount != 1) {
             return archiveOnly(record, "heart-rate-aggregate", "quantity.count")
         }
         val value = record.canonicalValue

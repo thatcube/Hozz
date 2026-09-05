@@ -141,6 +141,28 @@ public final class SQLiteDatabase {
         return rows
     }
 
+    /// Visits query rows without first retaining the whole result.
+    ///
+    /// Migrations use this for legacy tables that can grow with a person's
+    /// archive. Holding every row only to process it once turns an otherwise
+    /// bounded upgrade into a second in-memory copy of the table.
+    @discardableResult
+    public func forEachRow(
+        _ sql: String,
+        _ parameters: [SQLiteValue] = [],
+        _ body: (SQLiteRow) throws -> Void
+    ) throws -> Int {
+        let statement = try prepare(sql, parameters)
+        defer { sqlite3_finalize(statement) }
+
+        var count = 0
+        while try step(statement, expectingRow: true) {
+            try body(SQLiteRow(statement: statement))
+            count += 1
+        }
+        return count
+    }
+
     /// The number of rows changed by the most recent statement.
     public var changeCount: Int {
         guard let handle else {

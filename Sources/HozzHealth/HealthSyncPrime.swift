@@ -74,6 +74,10 @@ extension HealthSyncEngine {
 
         let eligible = allTypes
             .filter { destination.includes($0) }
+            .filter {
+                destination.format != .metrics
+                    || DeliveryPayloadBuilder.supportsMetrics(type: $0)
+            }
             .filter(Self.canPrime)
         guard !eligible.isEmpty else {
             return round

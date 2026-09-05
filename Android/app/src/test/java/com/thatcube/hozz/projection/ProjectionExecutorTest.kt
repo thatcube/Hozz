@@ -104,13 +104,30 @@ class ProjectionExecutorTest {
         }
         val failedIds = operations.mapTo(hashSetOf()) { it.source.canonicalId }
         val writer = FakeWriter(failUpserts = failedIds)
+        val executor = executor(store, writer)
 
-        val result = executor(store, writer).apply(operations)
+        val firstPage = executor.apply(operations.take(500))
+        val callsAtCeiling = writer.batchSizes.size
+        val secondPage = executor.apply(operations.drop(500))
 
-        assertEquals(0, result.inserted)
-        assertEquals(1_000, result.failureCount)
-        assertEquals(MAX_RETAINED_PROJECTION_FAILURES, result.failures.size)
-        assertEquals(1_002, writer.batchSizes.size)
+        assertEquals(0, firstPage.inserted)
+        assertEquals(100, firstPage.failureCount)
+        assertEquals(MAX_RETAINED_PROJECTION_FAILURES, firstPage.failures.size)
+        assertTrue(firstPage.retryCeilingReached)
+        assertTrue(secondPage.retryCeilingReached)
+        assertEquals(callsAtCeiling, writer.batchSizes.size)
+        assertTrue(writer.batchSizes.size <= 101)
+        val ids = operations.mapTo(linkedSetOf()) { it.source.canonicalId }
+        val pending = store.pendingHealthConnectOperations(ids)
+        assertEquals(500, pending.size)
+        assertEquals(
+            1_000,
+            ProjectionPlanner.plan(
+                operations.map(PlannedRecord::source),
+                projections = store.healthConnectProjections(ids),
+                pending = pending,
+            ).summary().pendingCount,
+        )
     }
 
     @Test

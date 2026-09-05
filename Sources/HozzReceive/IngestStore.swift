@@ -31,6 +31,54 @@ private struct CompatibilityRecordSignature: Hashable {
     }
 }
 
+private enum LegacyCompatibilityShape: String {
+    case heartRateRange
+    case sleepDuration
+}
+
+private struct StoredCompatibilitySignature {
+    let type: String
+    let kind: String?
+    let startTime: String
+    let endTime: String
+    let value: Double?
+    let unit: String?
+    let sourceName: String?
+
+    init(_ record: HealthRecord) {
+        type = record.type
+        kind = record.kind
+        startTime = Timestamps.text(from: record.startDate)
+        endTime = Timestamps.text(from: record.endDate)
+        value = record.value
+        unit = record.unit
+        sourceName = record.sourceName
+    }
+
+    init(
+        type: String,
+        kind: String?,
+        startTime: String,
+        endTime: String,
+        value: Double?,
+        unit: String?,
+        sourceName: String?
+    ) {
+        self.type = type
+        self.kind = kind
+        self.startTime = startTime
+        self.endTime = endTime
+        self.value = value
+        self.unit = unit
+        self.sourceName = sourceName
+    }
+}
+
+struct LegacyTombstoneMigrationStatistics: Equatable, Sendable {
+    var tombstonesScanned = 0
+    var retirementLookups = 0
+}
+
 /// One reading from inside a quantity series, back out of the store.
 public struct QuantitySeriesReading: Hashable, Sendable {
     /// Its absolute position in the sample, which is what makes it the same
@@ -363,6 +411,123 @@ public actor IngestStore {
         try migrateToTen(database, from: version)
         try migrateToEleven(database, from: version)
         try migrateToTwelve(database, from: version)
+        _ = try migrateToThirteen(database, from: version)
+    }
+
+    @discardableResult
+    static func migrateToThirteen(
+        _ database: SQLiteDatabase,
+        from version: Int64
+    ) throws -> LegacyTombstoneMigrationStatistics {
+        guard version < 13 else {
+            return LegacyTombstoneMigrationStatistics()
+        }
+        return try database.transaction {
+            var statistics = LegacyTombstoneMigrationStatistics()
+            try database.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sample_legacy_compatibility_shape (
+                    legacy_id TEXT PRIMARY KEY,
+                    shape TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS sample_legacy_tombstone (
+                    type TEXT NOT NULL,
+                    start_time TEXT NOT NULL,
+                    legacy_id TEXT NOT NULL,
+                    PRIMARY KEY (type, start_time, legacy_id)
+                );
+                """
+            )
+
+            let legacy = try database.query(
+                """
+                SELECT id, type, kind, start_date, end_date,
+                       value, unit, source_name
+                FROM sample
+                WHERE substr(id, 1, length(type) + 1) = type || ':'
+                  AND type IN ('heart_rate', 'sleep_analysis')
+                """,
+                row: {
+                    (
+                        $0.text(0), $0.text(1), $0.optionalText(2),
+                        $0.text(3), $0.text(4), $0.optionalReal(5),
+                        $0.optionalText(6), $0.optionalText(7)
+                    )
+                }
+            )
+            for row in legacy {
+                let signature = StoredCompatibilitySignature(
+                    type: row.1,
+                    kind: row.2,
+                    startTime: row.3,
+                    endTime: row.4,
+                    value: row.5,
+                    unit: row.6,
+                    sourceName: row.7
+                )
+                guard let shape = legacyCompatibilityShape(for: signature) else {
+                    continue
+                }
+                try database.run(
+                    """
+                    INSERT OR IGNORE INTO sample_legacy_compatibility_shape
+                        (legacy_id, shape)
+                    VALUES (?, ?)
+                    """,
+                    [.text(row.0), .text(shape.rawValue)]
+                )
+            }
+
+            let retireLegacyTombstone = try database.prepared(
+                """
+                INSERT OR IGNORE INTO sample_legacy_tombstone
+                    (type, start_time, legacy_id)
+                SELECT ?, ?, ?
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM sample_alias_retirement
+                    WHERE type = ? AND start_time = ?
+                )
+                """
+            )
+            defer { retireLegacyTombstone.finalize() }
+            statistics.tombstonesScanned = try database.forEachRow(
+                """
+                SELECT id
+                FROM sample_tombstone
+                WHERE instr(id, ':') > 1
+                """
+            ) { row in
+                let legacyID = row.text(0)
+                guard
+                    let delimiter = legacyID.firstIndex(of: ":"),
+                    delimiter != legacyID.startIndex
+                else {
+                    return
+                }
+                let type = String(legacyID[..<delimiter])
+                guard !type.isEmpty,
+                      let legacyDate = legacyDate(from: legacyID, type: type)
+                else {
+                    return
+                }
+                let normalizedStart = Timestamps.text(from: legacyDate)
+                statistics.retirementLookups += 1
+                try retireLegacyTombstone.run(
+                    [
+                        .text(type),
+                        .text(normalizedStart),
+                        .text(legacyID),
+                        .text(type),
+                        .text(normalizedStart)
+                    ]
+                )
+            }
+
+            try reconcileMarkedLegacyCompatibilityAliases(in: database)
+            try database.execute("PRAGMA user_version = 13")
+            return statistics
+        }
     }
 
     private static func migrateToTwelve(
@@ -1583,6 +1748,299 @@ public actor IngestStore {
         return "\(whole.dropLast()).\(String(format: "%03lld", remainder))Z"
     }
 
+    private static func legacyDate(from identifier: String, type: String) -> Date? {
+        let prefix = "\(type):"
+        guard identifier.hasPrefix(prefix) else {
+            return nil
+        }
+        let text = String(identifier.dropFirst(prefix.count))
+        if let date = Timestamps.date(from: text) {
+            return date
+        }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .gmt
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss Z"
+        return formatter.date(from: text)
+    }
+
+    private static func legacyCompatibilityShape(
+        for signature: StoredCompatibilitySignature
+    ) -> LegacyCompatibilityShape? {
+        if
+            signature.type == "heart_rate",
+            signature.kind == "quantity",
+            signature.value == nil,
+            signature.unit == "bpm" || signature.unit == "count/min"
+        {
+            return .heartRateRange
+        }
+        if
+            signature.type == "sleep_analysis",
+            signature.kind == "quantity",
+            signature.unit == "hr",
+            let value = signature.value,
+            value >= 0,
+            let start = Timestamps.date(from: signature.startTime),
+            let end = Timestamps.date(from: signature.endTime),
+            abs(end.timeIntervalSince(start) - value * 3_600) <= 1
+        {
+            return .sleepDuration
+        }
+        return nil
+    }
+
+    private static func currentSignature(
+        _ signature: StoredCompatibilitySignature,
+        matches shape: LegacyCompatibilityShape
+    ) -> Bool {
+        switch shape {
+        case .heartRateRange:
+            return signature.type == "heart_rate"
+                && signature.kind == "quantity"
+                && signature.value != nil
+                && (
+                    signature.unit == "bpm"
+                        || signature.unit == "count/min"
+                )
+        case .sleepDuration:
+            return signature.type == "sleep_analysis"
+                && signature.kind == "category"
+                && signature.value != nil
+        }
+    }
+
+    private static func matchingLegacyAliasIDs(
+        for signature: StoredCompatibilitySignature,
+        in database: SQLiteDatabase
+    ) throws -> Set<String> {
+        var identifiers = Set(
+            try database.query(
+                """
+                SELECT id FROM sample
+                WHERE type = ?
+                  AND substr(id, 1, length(type) + 1) = type || ':'
+                  AND kind IS ?
+                  AND start_date = ?
+                  AND end_date = ?
+                  AND value IS ?
+                  AND unit IS ?
+                  AND source_name IS ?
+                """,
+                [
+                    .text(signature.type),
+                    signature.kind.map(SQLiteValue.text) ?? .null,
+                    .text(signature.startTime),
+                    .text(signature.endTime),
+                    signature.value.map(SQLiteValue.real) ?? .null,
+                    signature.unit.map(SQLiteValue.text) ?? .null,
+                    signature.sourceName.map(SQLiteValue.text) ?? .null
+                ],
+                row: { $0.text(0) }
+            )
+        )
+
+        let historical = try database.query(
+            """
+            SELECT sample.id, sample.type, sample.kind,
+                   sample.start_date, sample.end_date, sample.value,
+                   sample.unit, sample.source_name, legacy.shape
+            FROM sample
+            JOIN sample_legacy_compatibility_shape AS legacy
+              ON legacy.legacy_id = sample.id
+            WHERE sample.type = ?
+              AND sample.start_date = ?
+              AND sample.end_date = ?
+              AND sample.source_name IS ?
+            """,
+            [
+                .text(signature.type),
+                .text(signature.startTime),
+                .text(signature.endTime),
+                signature.sourceName.map(SQLiteValue.text) ?? .null
+            ],
+            row: {
+                (
+                    $0.text(0),
+                    StoredCompatibilitySignature(
+                        type: $0.text(1),
+                        kind: $0.optionalText(2),
+                        startTime: $0.text(3),
+                        endTime: $0.text(4),
+                        value: $0.optionalReal(5),
+                        unit: $0.optionalText(6),
+                        sourceName: $0.optionalText(7)
+                    ),
+                    $0.text(8)
+                )
+            }
+        )
+        for (identifier, storedSignature, rawShape) in historical {
+            guard
+                let shape = LegacyCompatibilityShape(rawValue: rawShape),
+                legacyCompatibilityShape(for: storedSignature) == shape,
+                currentSignature(signature, matches: shape)
+            else {
+                continue
+            }
+            identifiers.insert(identifier)
+        }
+        return identifiers
+    }
+
+    private static func reconcileMarkedLegacyCompatibilityAliases(
+        in database: SQLiteDatabase
+    ) throws {
+        let legacy = try database.query(
+            """
+            SELECT sample.id, sample.type, sample.kind,
+                   sample.start_date, sample.end_date, sample.value,
+                   sample.unit, sample.source_name, legacy.shape
+            FROM sample
+            JOIN sample_legacy_compatibility_shape AS legacy
+              ON legacy.legacy_id = sample.id
+            ORDER BY sample.id
+            """,
+            row: {
+                (
+                    $0.text(0), $0.text(1), $0.optionalText(2),
+                    $0.text(3), $0.text(4), $0.optionalReal(5),
+                    $0.optionalText(6), $0.optionalText(7), $0.text(8)
+                )
+            }
+        )
+
+        for row in legacy {
+            guard let shape = LegacyCompatibilityShape(rawValue: row.8) else {
+                continue
+            }
+            let markedSignature = StoredCompatibilitySignature(
+                type: row.1,
+                kind: row.2,
+                startTime: row.3,
+                endTime: row.4,
+                value: row.5,
+                unit: row.6,
+                sourceName: row.7
+            )
+            guard legacyCompatibilityShape(for: markedSignature) == shape else {
+                try database.run(
+                    """
+                    DELETE FROM sample_legacy_compatibility_shape
+                    WHERE legacy_id = ?
+                    """,
+                    [.text(row.0)]
+                )
+                continue
+            }
+            let stable = try database.query(
+                """
+                SELECT stable_id, type, kind, start_time, end_time,
+                       value, unit, source_name
+                FROM sample_alias_signature
+                WHERE type = ? AND start_time = ? AND end_time = ?
+                  AND source_name IS ?
+                """,
+                [
+                    .text(row.1), .text(row.3), .text(row.4),
+                    row.7.map(SQLiteValue.text) ?? .null
+                ],
+                row: {
+                    (
+                        $0.text(0),
+                        StoredCompatibilitySignature(
+                            type: $0.text(1),
+                            kind: $0.optionalText(2),
+                            startTime: $0.text(3),
+                            endTime: $0.text(4),
+                            value: $0.optionalReal(5),
+                            unit: $0.optionalText(6),
+                            sourceName: $0.optionalText(7)
+                        )
+                    )
+                }
+            ).filter { currentSignature($0.1, matches: shape) }
+            guard stable.count == 1, let stableID = stable.first?.0 else {
+                continue
+            }
+            let candidates = try matchingLegacyAliasIDs(
+                for: stable[0].1,
+                in: database
+            )
+            guard candidates == Set([row.0]) else {
+                continue
+            }
+            let otherMappings = try database.query(
+                """
+                SELECT stable_id FROM sample_identity_alias
+                WHERE legacy_id = ? AND stable_id != ?
+                """,
+                [.text(row.0), .text(stableID)],
+                row: { $0.text(0) }
+            )
+            guard otherMappings.isEmpty else {
+                continue
+            }
+
+            try database.run(
+                """
+                INSERT OR REPLACE INTO sample_identity_alias
+                    (stable_id, legacy_id)
+                VALUES (?, ?)
+                """,
+                [.text(stableID), .text(row.0)]
+            )
+            try database.run(
+                """
+                INSERT OR REPLACE INTO sample_alias_retirement
+                    (type, start_time)
+                VALUES (?, ?)
+                """,
+                [.text(row.1), .text(row.3)]
+            )
+
+            let tombstone = try database.query(
+                """
+                SELECT received_at FROM sample_tombstone
+                WHERE id IN (?, ?)
+                ORDER BY received_at DESC
+                LIMIT 1
+                """,
+                [.text(stableID), .text(row.0)],
+                row: { $0.text(0) }
+            ).first
+            if let tombstone {
+                for identifier in [stableID, row.0] {
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_tombstone
+                            (id, received_at)
+                        VALUES (?, ?)
+                        """,
+                        [.text(identifier), .text(tombstone)]
+                    )
+                    try database.run(
+                        "DELETE FROM sample WHERE id = ?",
+                        [.text(identifier)]
+                    )
+                }
+                try database.run(
+                    """
+                    DELETE FROM sample_unresolved_legacy_deletion
+                    WHERE stable_id = ?
+                    """,
+                    [.text(stableID)]
+                )
+            } else {
+                try database.run(
+                    "DELETE FROM sample WHERE id = ?",
+                    [.text(row.0)]
+                )
+            }
+        }
+    }
+
     /// Writes a batch's contents. The caller owns the transaction, because both
     /// callers need other work committed alongside these rows: `ingest` records
     /// the idempotency key, and promotion deletes the quarantined copy.
@@ -1666,7 +2124,7 @@ public actor IngestStore {
         }
         for record in batch.records {
             var matchedLegacyAliasID: String?
-            if record.legacyAliasID != nil {
+            if let legacyAliasID = record.legacyAliasID {
                 let existingSignatureCount = try database.query(
                     """
                     SELECT COUNT(*) FROM sample_alias_signature
@@ -1701,6 +2159,116 @@ public actor IngestStore {
                 ).first ?? 0
                 if existingSignatureCount > 0 &&
                     matchingExistingSignatureCount == 0 {
+                    throw UnresolvedLegacyAliasError(type: record.type)
+                }
+
+                let stableIDsForExactAlias = Set(try database.query(
+                    """
+                    SELECT stable_id FROM sample_identity_alias
+                    WHERE legacy_id = ?
+                    """,
+                    [.text(legacyAliasID)],
+                    row: { $0.text(0) }
+                ))
+                if !stableIDsForExactAlias.subtracting([record.id]).isEmpty {
+                    throw UnresolvedLegacyAliasError(type: record.type)
+                }
+                let legacyIDsForStable = Set(try database.query(
+                    """
+                    SELECT legacy_id FROM sample_identity_alias
+                    WHERE stable_id = ?
+                    """,
+                    [.text(record.id)],
+                    row: { $0.text(0) }
+                ))
+                if !legacyIDsForStable.subtracting([legacyAliasID]).isEmpty {
+                    throw UnresolvedLegacyAliasError(type: record.type)
+                }
+
+                if try isTombstoned(legacyAliasID) {
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_tombstone (id, received_at)
+                        VALUES (?, ?)
+                        """,
+                        [.text(record.id), .text(timestamp)]
+                    )
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_identity_alias
+                            (stable_id, legacy_id)
+                        VALUES (?, ?)
+                        """,
+                        [.text(record.id), .text(legacyAliasID)]
+                    )
+                    try database.run(
+                        """
+                        INSERT OR IGNORE INTO sample_alias_signature
+                            (stable_id, type, kind, start_time, end_time,
+                             value, unit, source_name)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        [
+                            .text(record.id),
+                            .text(record.type),
+                            record.kind.map(SQLiteValue.text) ?? .null,
+                            .text(Timestamps.text(from: record.startDate)),
+                            .text(Timestamps.text(from: record.endDate)),
+                            record.value.map(SQLiteValue.real) ?? .null,
+                            record.unit.map(SQLiteValue.text) ?? .null,
+                            record.sourceName.map(SQLiteValue.text) ?? .null
+                        ]
+                    )
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_alias_retirement
+                            (type, start_time)
+                        VALUES (?, ?)
+                        """,
+                        [
+                            .text(record.type),
+                            .text(Timestamps.text(from: record.startDate))
+                        ]
+                    )
+                    for identifier in [record.id, legacyAliasID] {
+                        try database.run(
+                            "DELETE FROM sample WHERE id = ?",
+                            [.text(identifier)]
+                        )
+                        deleted += database.changeCount
+                        try removeSpecializedRecords(for: identifier)
+                    }
+                    try database.run(
+                        """
+                        DELETE FROM sample_unresolved_legacy_deletion
+                        WHERE stable_id = ?
+                        """,
+                        [.text(record.id)]
+                    )
+                    continue
+                }
+
+                let normalizedTombstone = try database.query(
+                    """
+                    SELECT 1
+                    FROM sample_alias_retirement AS retirement
+                    JOIN sample_legacy_tombstone AS tombstone
+                      ON tombstone.type = retirement.type
+                     AND tombstone.start_time = retirement.start_time
+                    WHERE retirement.type = ? AND retirement.start_time = ?
+                    LIMIT 1
+                    """,
+                    [
+                        .text(record.type),
+                        .text(Timestamps.text(from: record.startDate))
+                    ],
+                    row: { _ in true }
+                ).first ?? false
+                let establishedIdentity =
+                    matchingExistingSignatureCount == 1
+                    || stableIDsForExactAlias == Set([record.id])
+                    || legacyIDsForStable == Set([legacyAliasID])
+                if normalizedTombstone && !establishedIdentity {
                     throw UnresolvedLegacyAliasError(type: record.type)
                 }
             }
@@ -1807,30 +2375,10 @@ public actor IngestStore {
             }
             if try isTombstoned(record.id) {
                 if record.legacyAliasID != nil {
-                    let matchedLegacyIDs = try database.query(
-                            """
-                            SELECT id FROM sample
-                            WHERE type = ?
-                              AND kind IS ?
-                              AND start_date = ?
-                              AND end_date = ?
-                              AND value IS ?
-                              AND unit IS ?
-                              AND source_name IS ?
-                              AND substr(id, 1, length(type) + 1) = type || ':'
-                            """,
-                            [
-                                .text(record.type),
-                                record.kind.map(SQLiteValue.text) ?? .null,
-                                .text(Timestamps.text(from: record.startDate)),
-                                .text(Timestamps.text(from: record.endDate)),
-                                record.value.map(SQLiteValue.real) ?? .null,
-                                record.unit.map(SQLiteValue.text) ?? .null,
-                                record.sourceName.map(SQLiteValue.text) ?? .null
-                            ],
-                            row: { $0.text(0) }
-                        )
-                    var allMatchedLegacyIDs = Set(matchedLegacyIDs)
+                    var allMatchedLegacyIDs = try matchingLegacyAliasIDs(
+                        for: StoredCompatibilitySignature(record),
+                        in: database
+                    )
                     allMatchedLegacyIDs.formUnion(incomingLegacyIDs[signature] ?? [])
                     if allMatchedLegacyIDs.count > 1 {
                         throw UnresolvedLegacyAliasError(type: record.type)
@@ -1989,30 +2537,10 @@ public actor IngestStore {
             }
             if let legacyAliasID = record.legacyAliasID,
                legacyAliasID != record.id {
-                let matchingLegacyIDs = try database.query(
-                    """
-                    SELECT id FROM sample
-                    WHERE type = ?
-                      AND substr(id, 1, length(type) + 1) = type || ':'
-                      AND kind IS ?
-                      AND start_date = ?
-                      AND end_date = ?
-                      AND value IS ?
-                      AND unit IS ?
-                      AND source_name IS ?
-                    """,
-                    [
-                        .text(record.type),
-                        record.kind.map(SQLiteValue.text) ?? .null,
-                        .text(Timestamps.text(from: record.startDate)),
-                        .text(Timestamps.text(from: record.endDate)),
-                        record.value.map(SQLiteValue.real) ?? .null,
-                        record.unit.map(SQLiteValue.text) ?? .null,
-                        record.sourceName.map(SQLiteValue.text) ?? .null
-                    ],
-                    row: { $0.text(0) }
+                var allMatchingLegacyIDs = try matchingLegacyAliasIDs(
+                    for: StoredCompatibilitySignature(record),
+                    in: database
                 )
-                var allMatchingLegacyIDs = Set(matchingLegacyIDs)
                 allMatchingLegacyIDs.formUnion(incomingLegacyIDs[signature] ?? [])
                 if allMatchingLegacyIDs.count > 1 {
                     throw UnresolvedLegacyAliasError(type: record.type)
@@ -2085,6 +2613,27 @@ public actor IngestStore {
                     .text(timestamp)
                 ]
             )
+            if record.isLegacyCompatibilityIdentity {
+                let signature = StoredCompatibilitySignature(record)
+                if let shape = legacyCompatibilityShape(for: signature) {
+                    try database.run(
+                        """
+                        INSERT OR REPLACE INTO sample_legacy_compatibility_shape
+                            (legacy_id, shape)
+                        VALUES (?, ?)
+                        """,
+                        [.text(record.id), .text(shape.rawValue)]
+                    )
+                } else {
+                    try database.run(
+                        """
+                        DELETE FROM sample_legacy_compatibility_shape
+                        WHERE legacy_id = ?
+                        """,
+                        [.text(record.id)]
+                    )
+                }
+            }
             if record.legacyAliasID != nil {
                 if let matchedLegacyAliasID {
                     try database.run(
@@ -2236,6 +2785,18 @@ public actor IngestStore {
                     """,
                     [.text(type), .text(normalizedStart)]
                 )
+                try database.run(
+                    """
+                    INSERT OR REPLACE INTO sample_legacy_tombstone
+                        (type, start_time, legacy_id)
+                    VALUES (?, ?, ?)
+                    """,
+                    [
+                        .text(type),
+                        .text(normalizedStart),
+                        .text(deletion.id)
+                    ]
+                )
             }
             var legacyAliases = Set(try database.query(
                 """
@@ -2261,28 +2822,18 @@ public actor IngestStore {
                     )
                 }
             ).first {
-                let candidates = try database.query(
-                    """
-                    SELECT id FROM sample
-                    WHERE type = ?
-                      AND kind IS ?
-                      AND start_date = ?
-                      AND end_date = ?
-                      AND value IS ?
-                      AND unit IS ?
-                      AND source_name IS ?
-                      AND substr(id, 1, length(type) + 1) = type || ':'
-                    """,
-                    [
-                        .text(signature.0),
-                        signature.1.map(SQLiteValue.text) ?? .null,
-                        .text(signature.2),
-                        .text(signature.3),
-                        signature.4.map(SQLiteValue.real) ?? .null,
-                        signature.5.map(SQLiteValue.text) ?? .null,
-                        signature.6.map(SQLiteValue.text) ?? .null
-                    ],
-                    row: { $0.text(0) }
+                let storedSignature = StoredCompatibilitySignature(
+                    type: signature.0,
+                    kind: signature.1,
+                    startTime: signature.2,
+                    endTime: signature.3,
+                    value: signature.4,
+                    unit: signature.5,
+                    sourceName: signature.6
+                )
+                let candidates = try matchingLegacyAliasIDs(
+                    for: storedSignature,
+                    in: database
                 )
                 let stableCandidateCount = try database.query(
                     """

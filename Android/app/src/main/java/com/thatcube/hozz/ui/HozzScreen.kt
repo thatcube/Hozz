@@ -57,6 +57,7 @@ fun HozzScreen(
     onWriteHealthConnect: () -> Unit,
     onExport: () -> Unit,
     onLoadMoreTimeline: () -> Unit,
+    onLoadPreviousTimeline: () -> Unit = {},
 ) {
     val listState = rememberLazyListState()
     val nearTimelineEnd by remember {
@@ -128,16 +129,27 @@ fun HozzScreen(
                     )
                 }
             }
-            if (state.totalRecordCount == 0) {
+            if (!state.hasArchive) {
                 item {
                     EmptyArchive()
                 }
             } else {
-                item {
-                    ProjectionPreview(
-                        state = state,
-                        onWriteHealthConnect = onWriteHealthConnect,
-                    )
+                if (state.totalRecordCount > 0) {
+                    item {
+                        ProjectionPreview(
+                            state = state,
+                            onWriteHealthConnect = onWriteHealthConnect,
+                        )
+                    }
+                } else {
+                    item {
+                        Text(
+                            text = "This archive contains ${state.runRecordCount} " +
+                                "run and coverage records and no canonical samples.",
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodyMedium,
+                        )
+                    }
                 }
                 item {
                     ExportCard(
@@ -145,55 +157,68 @@ fun HozzScreen(
                         onExport = onExport,
                     )
                 }
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(top = 8.dp),
-                        verticalAlignment = Alignment.Bottom,
-                        horizontalArrangement = Arrangement.SpaceBetween,
-                    ) {
-                        Text(
-                            text = "Timeline",
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.SemiBold,
-                        )
-                        Text(
-                            text = "${state.timeline.size} records shown",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            modifier = Modifier.testTag("timeline-count"),
-                        )
-                    }
-                }
-                if (state.timeline.isEmpty()) {
+                if (state.totalRecordCount > 0) {
                     item {
-                        Text(
-                            text = "This archive contains tombstones but no live records.",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(top = 8.dp),
+                            verticalAlignment = Alignment.Bottom,
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                        ) {
+                            Text(
+                                text = "Timeline",
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            Text(
+                                text = "${state.timeline.size} records in view",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.testTag("timeline-count"),
+                            )
+                        }
                     }
-                } else {
-                    items(
-                        items = state.timeline,
-                        key = TimelineItem::canonicalId,
-                    ) { record ->
-                        TimelineRow(record)
-                    }
-                    if (state.timelineNextCursor != null) {
+                    if (state.timeline.isEmpty()) {
                         item {
-                            TextButton(
-                                onClick = onLoadMoreTimeline,
-                                enabled = !state.timelineLoading && !state.busy,
-                                modifier = Modifier.fillMaxWidth(),
-                            ) {
-                                Text(
-                                    if (state.timelineLoading) {
-                                        "Loading more records…"
-                                    } else {
-                                        "Load more records"
-                                    }
-                                )
+                            Text(
+                                text = "This archive contains tombstones but no live records.",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            )
+                        }
+                    } else {
+                        if (state.timelinePreviousCursor != null) {
+                            item {
+                                TextButton(
+                                    onClick = onLoadPreviousTimeline,
+                                    enabled = !state.timelineLoading && !state.busy,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text("Load newer records")
+                                }
+                            }
+                        }
+                        items(
+                            items = state.timeline,
+                            key = TimelineItem::canonicalId,
+                        ) { record ->
+                            TimelineRow(record)
+                        }
+                        if (state.timelineNextCursor != null) {
+                            item {
+                                TextButton(
+                                    onClick = onLoadMoreTimeline,
+                                    enabled = !state.timelineLoading && !state.busy,
+                                    modifier = Modifier.fillMaxWidth(),
+                                ) {
+                                    Text(
+                                        if (state.timelineLoading) {
+                                            "Loading more records…"
+                                        } else {
+                                            "Load older records"
+                                        }
+                                    )
+                                }
                             }
                         }
                     }

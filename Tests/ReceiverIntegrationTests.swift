@@ -342,6 +342,33 @@ final class ReceiverIntegrationTests: XCTestCase {
         XCTAssertEqual(remaining, 1)
     }
 
+    func testCanonicalHealthKitDeletionWithLegacyAliasReturnsRetryableConflict() async throws {
+        let legacy = """
+            {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+              {"date":"2026-01-01 10:00:00 +0000","qty":1}
+            ]}]}}
+            """
+        let accepted = try await post(
+            body: legacy,
+            token: token,
+            idempotencyKey: "canonical-legacy-alias"
+        )
+        XCTAssertEqual(accepted.status, 200)
+
+        let canonicalDeletion =
+            #"{"id":"healthkit-stable","kind":"deletion","schemaVersion":1,"type":"HKQuantityTypeIdentifierStepCount"}"#
+        for _ in 0..<2 {
+            let rejected = try await post(
+                body: canonicalDeletion,
+                token: token,
+                idempotencyKey: "canonical-healthkit-delete"
+            )
+            XCTAssertEqual(rejected.status, 409)
+        }
+        let remaining = try await store.totalRecordCount()
+        XCTAssertEqual(remaining, 1)
+    }
+
     /// A connection test has to succeed visibly, or the user checking their
     /// setup is told it is broken when it is not.
     func testAConnectionTestSucceeds() async throws {

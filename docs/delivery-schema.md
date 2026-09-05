@@ -398,7 +398,7 @@ device, and workout detail are dropped.
 | `metrics[].name` | String | Short snake_case name — see [metric names](#metric-names). |
 | `metrics[].units` | String | HealthKit's unit string, or `count` when the type has none. |
 | `metrics[].data[].date` | String | ISO 8601 UTC. The sample's `startDate`. |
-| `metrics[].data[].qty` | Number | Absent when the record has no numeric value. |
+| `metrics[].data[].qty` | Number | Always present. Metrics JSON carries quantity and category samples; types without a defensible numeric value are not drained for this destination, so their anchors remain available if the destination is changed to a lossless format. |
 | `metrics[].data[].units` | String | Repeated per point. |
 | `metrics[].data[].source` | String | Absent when HealthKit named no source. |
 | `metrics[].data[].endDate` | String | **Present only when the sample covers an interval.** |

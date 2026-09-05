@@ -284,7 +284,7 @@ object CanonicalRecordParser {
             originalValue = originalValue,
             categoryValue = if (kind == "category") jsonObject.int("value") else null,
             activityType = jsonObject.int("activityType"),
-            quantityCount = quantity?.int("count"),
+            quantityCount = quantity?.int("count")?.takeIf { it > 0 },
             sourceRecordId = sourceId,
             sourceRecordVersion = sourceRecord?.long("version"),
             sourceStore = sourceStore,
@@ -642,6 +642,14 @@ object CanonicalRecordParser {
                 }
                 quantity.nonblank("unit")
                 quantity.strictDouble("value")
+                if (quantity.containsKey("count")) {
+                    val count = strictLong(quantity, "count", minimum = 1)
+                    if (count > Int.MAX_VALUE) {
+                        throw ArchiveFormatException(
+                            "Record field quantity.count is outside the supported integer range.",
+                        )
+                    }
+                }
                 if (quantity.containsKey("canonical")) {
                     val canonical = quantity["canonical"] as? JsonObject
                         ?: throw ArchiveFormatException(

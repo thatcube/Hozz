@@ -1,5 +1,7 @@
 package com.thatcube.hozz.core
 
+import com.thatcube.hozz.projection.ProjectionPlanner
+import com.thatcube.hozz.projection.ProjectionSummary
 import java.time.Instant
 import java.util.ArrayDeque
 
@@ -54,7 +56,17 @@ data class TimelineCursor(
 data class TimelinePage(
     val records: List<CanonicalRecord>,
     val nextCursor: TimelineCursor?,
+    val previousCursor: TimelineCursor? = null,
 )
+
+data class ArchiveOverview(
+    val canonicalRecordCount: Int,
+    val runRecordCount: Int,
+    val projection: ProjectionSummary,
+) {
+    val hasArchive: Boolean
+        get() = canonicalRecordCount > 0 || runRecordCount > 0
+}
 
 interface CanonicalExportSnapshot {
     fun recordsPage(afterCanonicalId: String?, limit: Int): List<CanonicalRecord>
@@ -68,12 +80,17 @@ interface CanonicalRecordStore {
         after: TimelineCursor? = null,
         limit: Int = 200,
     ): TimelinePage
+    suspend fun timelinePageBefore(
+        before: TimelineCursor,
+        limit: Int = 200,
+    ): TimelinePage
     suspend fun timeline(limit: Int = 200): List<CanonicalRecord> =
         timelinePage(limit = limit).records
     suspend fun recordsPage(afterCanonicalId: String?, limit: Int): List<CanonicalRecord>
     suspend fun recordCount(): Int
     suspend fun allRecords(): List<CanonicalRecord>
     suspend fun runRecordsPage(afterSequence: Long?, limit: Int): List<ArchiveRunRecord>
+    suspend fun archiveOverview(): ArchiveOverview
     suspend fun healthConnectProjections(
         canonicalIds: Set<String>,
     ): Map<String, HealthConnectProjection>
@@ -98,6 +115,7 @@ interface CanonicalRecordStore {
     suspend fun <T> withExportSnapshot(
         block: (CanonicalExportSnapshot) -> T,
     ): T
+    fun close() = Unit
 }
 
 interface CanonicalImportSession {
@@ -320,6 +338,7 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
 
     private fun mergeApplying(records: List<CanonicalRecord>): MergeResult {
         var result = MergeResult()
+        val blockedIncomingSubtrees = hashSetOf<String>()
         val ordered = recordsInParentWinnerOrder(records) { canonicalId ->
             this.records[canonicalId]?.let {
                 CanonicalParentWinner(
@@ -329,6 +348,14 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
             }
         }
         for (incoming in ordered) {
+            if (
+                !incoming.tombstone &&
+                incoming.parentCanonicalId in blockedIncomingSubtrees
+            ) {
+                blockedIncomingSubtrees += incoming.canonicalId
+                result += MergeResult(ignored = 1)
+                continue
+            }
             val parent =
                 incoming.parentCanonicalId?.let(this.records::get)
             if (
@@ -336,6 +363,9 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
                 !incoming.tombstone &&
                 incoming.recordVersion > parent.recordVersion
             ) {
+                if (this.records[incoming.canonicalId]?.tombstone != false) {
+                    blockedIncomingSubtrees += incoming.canonicalId
+                }
                 result += MergeResult(ignored = 1)
                 continue
             }
@@ -549,6 +579,26 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
         )
     }
 
+    override suspend fun timelinePageBefore(
+        before: TimelineCursor,
+        limit: Int,
+    ): TimelinePage {
+        val ordered = records.values
+            .asSequence()
+            .filterNot(CanonicalRecord::tombstone)
+            .filter { record -> isBefore(record, before) }
+            .sortedWith(::compareTimelineRecords)
+            .toList()
+            .takeLast(limit)
+        return TimelinePage(
+            records = ordered,
+            previousCursor = ordered.firstOrNull()?.let {
+                TimelineCursor(it.endTime ?: it.startTime, it.canonicalId)
+            },
+            nextCursor = null,
+        )
+    }
+
     private fun isAfter(record: CanonicalRecord, cursor: TimelineCursor?): Boolean {
         if (cursor == null) return true
         val time = record.endTime ?: record.startTime
@@ -559,6 +609,19 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
             time < cursorTime -> true
             time > cursorTime -> false
             else -> record.canonicalId > cursor.canonicalId
+        }
+    }
+
+    private fun isBefore(record: CanonicalRecord, cursor: TimelineCursor): Boolean {
+        val time = record.endTime ?: record.startTime
+        val cursorTime = cursor.sortTime
+        return when {
+            cursorTime == null ->
+                time != null || (record.canonicalId < cursor.canonicalId)
+            time == null -> false
+            time > cursorTime -> true
+            time < cursorTime -> false
+            else -> record.canonicalId < cursor.canonicalId
         }
     }
 
@@ -637,6 +700,17 @@ class InMemoryCanonicalRecordStore : CanonicalRecordStore {
         .sortedBy(ArchiveRunRecord::ordinal)
         .take(limit)
         .toList()
+
+    override suspend fun archiveOverview(): ArchiveOverview =
+        ArchiveOverview(
+            canonicalRecordCount = records.size,
+            runRecordCount = runRecords.size,
+            projection = ProjectionPlanner.plan(
+                records.values.toList(),
+                healthConnectProjections,
+                pendingHealthConnectOperations,
+            ).summary(),
+        )
 
     override suspend fun healthConnectProjections(
         canonicalIds: Set<String>,

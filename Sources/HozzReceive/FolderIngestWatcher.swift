@@ -3,6 +3,115 @@ import Foundation
 import HozzCore
 import os
 
+struct FolderDirectoryPage: Sendable {
+    let names: [String]
+    let completedCycle: Bool
+}
+
+struct FolderFileGeneration: Equatable, Sendable {
+    let size: UInt64?
+    let modified: Date?
+    let resourceIdentifier: Data?
+    let contentGeneration: Data?
+}
+
+protocol FolderIngestFileSystem: AnyObject, Sendable {
+    func allNames(in folder: URL) -> [String]
+    func nextNamePage(in folder: URL, limit: Int) -> FolderDirectoryPage
+    func generation(of url: URL) -> FolderFileGeneration?
+    func isSettled(_ url: URL) -> Bool
+    func read(_ url: URL) throws -> Data
+    func resetPaging()
+}
+
+private final class LocalFolderIngestFileSystem:
+    FolderIngestFileSystem,
+    @unchecked Sendable
+{
+    private let generationIdentifierProvider: @Sendable (URL) -> Data?
+    private var enumerator: FileManager.DirectoryEnumerator?
+    private var enumeratedFolder: URL?
+
+    init(
+        generationIdentifierProvider:
+            @escaping @Sendable (URL) -> Data?
+    ) {
+        self.generationIdentifierProvider = generationIdentifierProvider
+    }
+
+    func allNames(in folder: URL) -> [String] {
+        resetPaging()
+        return (try? FileManager.default.contentsOfDirectory(atPath: folder.path))
+            ?? []
+    }
+
+    func nextNamePage(in folder: URL, limit: Int) -> FolderDirectoryPage {
+        if enumeratedFolder != folder || enumerator == nil {
+            enumerator = FileManager.default.enumerator(
+                at: folder,
+                includingPropertiesForKeys: nil,
+                options: [.skipsSubdirectoryDescendants]
+            )
+            enumeratedFolder = folder
+        }
+
+        var names: [String] = []
+        while names.count < limit {
+            guard let url = enumerator?.nextObject() as? URL else {
+                enumerator = nil
+                return FolderDirectoryPage(
+                    names: names,
+                    completedCycle: true
+                )
+            }
+            names.append(url.lastPathComponent)
+        }
+        return FolderDirectoryPage(names: names, completedCycle: false)
+    }
+
+    func generation(of url: URL) -> FolderFileGeneration? {
+        guard let values = try? url.resourceValues(forKeys: [
+            .fileSizeKey,
+            .contentModificationDateKey,
+            .fileResourceIdentifierKey
+        ]) else {
+            return nil
+        }
+        return FolderFileGeneration(
+            size: values.fileSize.map(UInt64.init),
+            modified: values.contentModificationDate,
+            resourceIdentifier: values.fileResourceIdentifier as? Data,
+            contentGeneration: generationIdentifierProvider(url)
+        )
+    }
+
+    func isSettled(_ url: URL) -> Bool {
+        let values = try? url.resourceValues(forKeys: [
+            .ubiquitousItemDownloadingStatusKey,
+            .isUbiquitousItemKey,
+            .contentModificationDateKey
+        ])
+        if values?.isUbiquitousItem == true,
+           values?.ubiquitousItemDownloadingStatus != .current {
+            return false
+        }
+        if let modified = values?.contentModificationDate,
+           Date().timeIntervalSince(modified) < 1 {
+            return false
+        }
+        return true
+    }
+
+    func read(_ url: URL) throws -> Data {
+        try Data(contentsOf: url)
+    }
+
+    func resetPaging() {
+        enumerator = nil
+        enumeratedFolder = nil
+    }
+}
+
 /// Ingests batches the phone writes to a folder.
 ///
 /// This is the path that works everywhere. Receiving over the local network is
@@ -26,8 +135,10 @@ public actor FolderIngestWatcher {
     private static let readable: Set<String> = ["ndjson", "json", "csv"]
     private static let defaultAuditFileLimit = 8
     private static let defaultAuditReadByteLimit: UInt64 = 16 * 1_024 * 1_024
+    private static let defaultMetadataPageLimit = 64
 
     private let store: IngestStore
+    private let fileSystem: any FolderIngestFileSystem
     private var folder: URL?
     private var source: DispatchSourceFileSystemObject?
     private var descriptor: CInt = -1
@@ -38,7 +149,10 @@ public actor FolderIngestWatcher {
     private var attemptedSnapshots: [String: FileIdentity] = [:]
     /// The content generation last read at each name.
     private var seen: [String: ObservedFile] = [:]
-    private var generationlessAuditCursor: String?
+    private var knownNames: Set<String> = []
+    private var namesSeenInPeriodicCycle: Set<String> = []
+    private var generationlessAuditPageCursors: [String: String] = [:]
+    private var auditPagesSeenInPeriodicCycle: Set<String> = []
     private var generationlessAuditStates:
         [String: GenerationlessAuditState] = [:]
     private var isReconciling = false
@@ -47,8 +161,8 @@ public actor FolderIngestWatcher {
     private var observers: [@Sendable (ReceiverEvent) -> Void] = []
     private let didVerifySnapshot: (@Sendable (URL) -> Void)?
     private let reconciliationInterval: Duration
-    private let generationIdentifierProvider: @Sendable (URL) -> Data?
     private let observesDirectoryChanges: Bool
+    private let metadataPageLimit: Int
     private let generationlessAuditFileLimit: Int
     private let generationlessAuditReadByteLimit: UInt64
     private let didCompleteGenerationlessAudit:
@@ -56,10 +170,13 @@ public actor FolderIngestWatcher {
 
     public init(store: IngestStore) {
         self.store = store
+        self.fileSystem = LocalFolderIngestFileSystem(
+            generationIdentifierProvider: Self.contentGenerationIdentifier
+        )
         self.didVerifySnapshot = nil
         self.reconciliationInterval = .seconds(5)
-        self.generationIdentifierProvider = Self.contentGenerationIdentifier
         self.observesDirectoryChanges = true
+        self.metadataPageLimit = Self.defaultMetadataPageLimit
         self.generationlessAuditFileLimit = Self.defaultAuditFileLimit
         self.generationlessAuditReadByteLimit =
             Self.defaultAuditReadByteLimit
@@ -72,17 +189,22 @@ public actor FolderIngestWatcher {
         didVerifySnapshot: (@Sendable (URL) -> Void)? = nil,
         generationIdentifierProvider: (@Sendable (URL) -> Data?)? = nil,
         observesDirectoryChanges: Bool = true,
+        metadataPageLimit: Int = defaultMetadataPageLimit,
         generationlessAuditFileLimit: Int = defaultAuditFileLimit,
         generationlessAuditReadByteLimit: UInt64 = defaultAuditReadByteLimit,
         didCompleteGenerationlessAudit:
-            (@Sendable (Int, UInt64) async -> Void)? = nil
+            (@Sendable (Int, UInt64) async -> Void)? = nil,
+        fileSystem: (any FolderIngestFileSystem)? = nil
     ) {
         self.store = store
+        self.fileSystem = fileSystem ?? LocalFolderIngestFileSystem(
+            generationIdentifierProvider:
+                generationIdentifierProvider ?? Self.contentGenerationIdentifier
+        )
         self.didVerifySnapshot = didVerifySnapshot
         self.reconciliationInterval = reconciliationInterval
-        self.generationIdentifierProvider =
-            generationIdentifierProvider ?? Self.contentGenerationIdentifier
         self.observesDirectoryChanges = observesDirectoryChanges
+        self.metadataPageLimit = max(1, metadataPageLimit)
         self.generationlessAuditFileLimit = max(
             1,
             generationlessAuditFileLimit
@@ -118,7 +240,10 @@ public actor FolderIngestWatcher {
 
         // Read what is already there first. A folder chosen after the phone has
         // been syncing for a while is the normal case, not the exception.
-        await ingestNewFiles(auditGenerationless: false)
+        await ingestNewFiles(
+            auditGenerationless: false,
+            scanAllEntries: true
+        )
     }
 
     private func armDirectory(_ folder: URL) {
@@ -153,8 +278,12 @@ public actor FolderIngestWatcher {
         retryDelayMilliseconds = 1_100
         failedSnapshots.removeAll()
         attemptedSnapshots.removeAll()
-        generationlessAuditCursor = nil
+        generationlessAuditPageCursors.removeAll()
+        auditPagesSeenInPeriodicCycle.removeAll()
         generationlessAuditStates.removeAll()
+        knownNames.removeAll()
+        namesSeenInPeriodicCycle.removeAll()
+        fileSystem.resetPaging()
         priorityReconciliationRequested = false
         auditReconciliationRequested = false
         folder = nil
@@ -165,11 +294,17 @@ public actor FolderIngestWatcher {
     /// Generation-less content audits stay on their bounded periodic cadence, so
     /// a burst of ignored NOTE_WRITE events cannot multiply full-file reads.
     func directoryDidChange() async {
-        await ingestNewFiles(auditGenerationless: false)
+        await ingestNewFiles(
+            auditGenerationless: false,
+            scanAllEntries: true
+        )
     }
 
     /// Reads every new or changed file, plus one bounded audit slice when asked.
-    private func ingestNewFiles(auditGenerationless: Bool) async {
+    private func ingestNewFiles(
+        auditGenerationless: Bool,
+        scanAllEntries: Bool
+    ) async {
         guard !isReconciling else {
             if auditGenerationless {
                 auditReconciliationRequested = true
@@ -184,29 +319,44 @@ public actor FolderIngestWatcher {
         guard let folder else {
             return
         }
-        let names = (
-            (try? FileManager.default.contentsOfDirectory(atPath: folder.path))
-                ?? []
-        ).filter {
+        let rawNames: [String]
+        let completedPeriodicCycle: Bool
+        if scanAllEntries {
+            rawNames = fileSystem.allNames(in: folder)
+            completedPeriodicCycle = false
+            namesSeenInPeriodicCycle.removeAll()
+            auditPagesSeenInPeriodicCycle.removeAll()
+            fileSystem.resetPaging()
+        } else {
+            let page = fileSystem.nextNamePage(
+                in: folder,
+                limit: metadataPageLimit
+            )
+            rawNames = page.names
+            completedPeriodicCycle = page.completedCycle
+        }
+        let names = rawNames.filter {
             Self.readable.contains(
                 ($0 as NSString).pathExtension.lowercased()
             )
-        }.sorted()
-        let namesOnDisk = Set(names)
-        seen = seen.filter { namesOnDisk.contains($0.key) }
-        failedSnapshots = failedSnapshots.filter {
-            namesOnDisk.contains($0.key)
         }
-        attemptedSnapshots = attemptedSnapshots.filter {
-            namesOnDisk.contains($0.key)
-        }
-        generationlessAuditStates = generationlessAuditStates.filter {
-            namesOnDisk.contains($0.key)
+        if scanAllEntries {
+            let namesOnDisk = Set(names)
+            knownNames = namesOnDisk
+            pruneCachedFiles(keeping: namesOnDisk)
+        } else {
+            namesSeenInPeriodicCycle.formUnion(names)
+            knownNames.formUnion(names)
+            if completedPeriodicCycle {
+                knownNames = namesSeenInPeriodicCycle
+                pruneCachedFiles(keeping: knownNames)
+                namesSeenInPeriodicCycle.removeAll()
+            }
         }
 
         var priority: [FileCandidate] = []
         var generationlessAudit: [FileCandidate] = []
-        for name in names {
+        for name in names.sorted() {
             let url = folder.appending(path: name)
             guard let observedGeneration = generation(of: url) else {
                 scheduleRetry(backingOff: true)
@@ -255,6 +405,27 @@ public actor FolderIngestWatcher {
                 )
             }
         }
+        if !scanAllEntries && completedPeriodicCycle {
+            generationlessAuditPageCursors = generationlessAuditPageCursors
+                .filter { auditPagesSeenInPeriodicCycle.contains($0.key) }
+            auditPagesSeenInPeriodicCycle.removeAll()
+        }
+    }
+
+    private func pruneCachedFiles(keeping names: Set<String>) {
+        seen = seen.filter { names.contains($0.key) }
+        failedSnapshots = failedSnapshots.filter { names.contains($0.key) }
+        attemptedSnapshots = attemptedSnapshots.filter { names.contains($0.key) }
+        generationlessAuditStates = generationlessAuditStates.filter {
+            names.contains($0.key)
+        }
+    }
+
+    func runPeriodicReconciliationForTesting() async {
+        await ingestNewFiles(
+            auditGenerationless: true,
+            scanAllEntries: false
+        )
     }
 
     private func inspect(_ candidate: FileCandidate) async {
@@ -263,7 +434,7 @@ public actor FolderIngestWatcher {
         // A file still being written, or still downloading from iCloud, is
         // skipped rather than half-read. It will be picked up on the next pass
         // once it has settled.
-        guard Self.isSettled(url) else {
+        guard fileSystem.isSettled(url) else {
             scheduleRetry()
             return
         }
@@ -359,7 +530,12 @@ public actor FolderIngestWatcher {
         guard !candidates.isEmpty else {
             return FileAuditResult(files: 0, readBytes: 0)
         }
-        var ordered = rotatedAuditCandidates(candidates)
+        let pageKey = Self.auditPageKey(for: candidates)
+        auditPagesSeenInPeriodicCycle.insert(pageKey)
+        var ordered = rotatedAuditCandidates(
+            candidates,
+            after: generationlessAuditPageCursors[pageKey]
+        )
         if let activeName = generationlessAuditStates.keys.sorted().first,
            let activeIndex = ordered.firstIndex(where: {
                $0.name == activeName
@@ -385,7 +561,7 @@ public actor FolderIngestWatcher {
             files += 1
             readBytes += advance.readBytes
             if advance.advancesCursor {
-                generationlessAuditCursor = candidate.name
+                generationlessAuditPageCursors[pageKey] = candidate.name
             }
             if !advance.isComplete {
                 break
@@ -395,16 +571,22 @@ public actor FolderIngestWatcher {
     }
 
     private func rotatedAuditCandidates(
-        _ candidates: [FileCandidate]
+        _ candidates: [FileCandidate],
+        after cursor: String?
     ) -> [FileCandidate] {
         let sorted = candidates.sorted { $0.name < $1.name }
         guard
-            let cursor = generationlessAuditCursor,
+            let cursor,
             let next = sorted.firstIndex(where: { $0.name > cursor })
         else {
             return sorted
         }
         return Array(sorted[next...]) + Array(sorted[..<next])
+    }
+
+    private static func auditPageKey(for candidates: [FileCandidate]) -> String {
+        let names = candidates.map(\.name).sorted().joined(separator: "\u{0}")
+        return hexDigest(Data(SHA256.hash(data: Data(names.utf8))))
     }
 
     private func advanceGenerationlessAudit(
@@ -418,7 +600,7 @@ public actor FolderIngestWatcher {
                 advancesCursor: false
             )
         }
-        guard Self.isSettled(candidate.url) else {
+        guard fileSystem.isSettled(candidate.url) else {
             scheduleRetry()
             return FileAuditAdvance(
                 readBytes: 0,
@@ -570,7 +752,8 @@ public actor FolderIngestWatcher {
         }
         Task { [weak self] in
             await self?.ingestNewFiles(
-                auditGenerationless: shouldAudit
+                auditGenerationless: shouldAudit,
+                scanAllEntries: shouldReconcilePriority
             )
         }
     }
@@ -619,7 +802,10 @@ public actor FolderIngestWatcher {
 
     private func runScheduledRetry() async {
         retryTask = nil
-        await ingestNewFiles(auditGenerationless: false)
+        await ingestNewFiles(
+            auditGenerationless: false,
+            scanAllEntries: true
+        )
     }
 
     private func startPeriodicReconciliation() {
@@ -637,38 +823,20 @@ public actor FolderIngestWatcher {
                 guard let self else {
                     return
                 }
-                await self.ingestNewFiles(auditGenerationless: true)
+                await self.ingestNewFiles(
+                    auditGenerationless: true,
+                    scanAllEntries: false
+                )
             }
         }
-    }
-
-    /// Whether a file has finished being written or downloaded.
-    private static func isSettled(_ url: URL) -> Bool {
-        let values = try? url.resourceValues(forKeys: [
-            .ubiquitousItemDownloadingStatusKey,
-            .isUbiquitousItemKey,
-            .contentModificationDateKey
-        ])
-        // An iCloud placeholder has no contents yet; reading it returns nothing
-        // and would mark the batch as seen without storing anything.
-        if values?.isUbiquitousItem == true,
-           values?.ubiquitousItemDownloadingStatus != .current {
-            return false
-        }
-        // A file written moments ago may still be growing.
-        if let modified = values?.contentModificationDate,
-           Date().timeIntervalSince(modified) < 1 {
-            return false
-        }
-        return true
     }
 
     private func stableSnapshot(of url: URL) -> StableFileSnapshot? {
         guard
             let before = generation(of: url),
-            let first = try? Data(contentsOf: url),
+            let first = try? fileSystem.read(url),
             generation(of: url) == before,
-            let verification = try? Data(contentsOf: url),
+            let verification = try? fileSystem.read(url),
             verification == first,
             generation(of: url) == before
         else {
@@ -686,20 +854,8 @@ public actor FolderIngestWatcher {
         digest.map { String(format: "%02x", $0) }.joined()
     }
 
-    private func generation(of url: URL) -> FileGeneration? {
-        guard let values = try? url.resourceValues(forKeys: [
-            .fileSizeKey,
-            .contentModificationDateKey,
-            .fileResourceIdentifierKey
-        ]) else {
-            return nil
-        }
-        return FileGeneration(
-            size: values.fileSize.map(UInt64.init),
-            modified: values.contentModificationDate,
-            resourceIdentifier: values.fileResourceIdentifier as? Data,
-            contentGeneration: generationIdentifierProvider(url)
-        )
+    private func generation(of url: URL) -> FolderFileGeneration? {
+        fileSystem.generation(of: url)
     }
 
     private static func contentGenerationIdentifier(of url: URL) -> Data? {
@@ -716,17 +872,10 @@ public actor FolderIngestWatcher {
     }
 }
 
-private struct FileGeneration: Equatable {
-    let size: UInt64?
-    let modified: Date?
-    let resourceIdentifier: Data?
-    let contentGeneration: Data?
-}
-
 private struct FileCandidate {
     let name: String
     let url: URL
-    let generation: FileGeneration
+    let generation: FolderFileGeneration
 }
 
 private struct FileAuditResult {
@@ -748,7 +897,7 @@ private struct GenerationlessAuditState {
 
     static let chunkBytes: UInt64 = 256 * 1_024
 
-    let generation: FileGeneration
+    let generation: FolderFileGeneration
     var phase = Phase.fingerprint
     var offset: UInt64 = 0
     var hasher = SHA256()
@@ -776,7 +925,7 @@ private struct FileIdentity: Equatable {
 }
 
 private struct ObservedFile: Equatable {
-    let generation: FileGeneration
+    let generation: FolderFileGeneration
     let identity: FileIdentity
 
     init(_ snapshot: StableFileSnapshot) {
@@ -787,6 +936,6 @@ private struct ObservedFile: Equatable {
 
 private struct StableFileSnapshot {
     let data: Data
-    let generation: FileGeneration
+    let generation: FolderFileGeneration
     let identity: FileIdentity
 }

@@ -61,6 +61,64 @@ class HozzViewModelTest {
     }
 
     @Test
+    fun startupRefreshFailureSettlesAsCurrentGenerationError() = runBlocking {
+        val state = MutableStateFlow(HozzUiState())
+        val refresher = HozzStateRefresher(
+            state = state,
+            loadSnapshot = { throw IOException("migration failed") },
+            healthConnectStatus = { 42 },
+        )
+
+        refresher.refresh()
+
+        assertFalse(state.value.busy)
+        assertEquals(
+            "The local archive view could not be refreshed: migration failed",
+            state.value.status,
+        )
+        assertEquals(42, state.value.healthConnectStatus)
+    }
+
+    @Test
+    fun staleStartupRefreshFailureCannotReplaceNewerSnapshot() = runBlocking {
+        coroutineScope {
+            val startupStarted = CompletableDeferred<Unit>()
+            val failStartup = CompletableDeferred<Unit>()
+            var loads = 0
+            val current = HozzCoreSnapshot(
+                timeline = listOf(item("current")),
+                timelineNextCursor = null,
+                projection = ProjectionSummary(),
+                totalRecordCount = 1,
+            )
+            val state = MutableStateFlow(HozzUiState())
+            val refresher = HozzStateRefresher(
+                state = state,
+                loadSnapshot = {
+                    loads += 1
+                    if (loads == 1) {
+                        startupStarted.complete(Unit)
+                        failStartup.await()
+                        throw IOException("stale failure")
+                    }
+                    current
+                },
+                healthConnectStatus = { 42 },
+            )
+            val stale = async { refresher.refresh() }
+            startupStarted.await()
+
+            refresher.refresh(status = "Current")
+            failStartup.complete(Unit)
+            stale.await()
+
+            assertEquals(listOf(item("current")), state.value.timeline)
+            assertEquals(1, state.value.totalRecordCount)
+            assertEquals("Current", state.value.status)
+        }
+    }
+
+    @Test
     fun healthConnectStatusReportsTotalFailureCountBeyondRetainedDetails() {
         val retainedFailures = List(100) { index ->
             ProjectionFailure(
@@ -147,6 +205,64 @@ class HozzViewModelTest {
         assertEquals(listOf(first, second), appended.timeline)
         assertEquals(cursor, appended.timelineNextCursor)
         assertFalse(appended.timelineLoading)
+    }
+
+    @Test
+    fun timelineWindowStaysBoundedAndCanReloadEvictedNewerRecords() {
+        val initial = (0 until 250).map { item("test:$it") }
+        val older = (250 until 500).map { item("test:$it") }
+        val state = HozzUiState(
+            timeline = initial,
+            timelineNextCursor = TimelineCursor(Instant.EPOCH, "test:249"),
+        )
+
+        val appended = state.appending(
+            TimelineItemPage(
+                records = older,
+                nextCursor = TimelineCursor(Instant.EPOCH, "test:499"),
+            ),
+        )
+
+        assertEquals(MAX_RETAINED_TIMELINE_ITEMS, appended.timeline.size)
+        assertEquals("test:100", appended.timeline.first().canonicalId)
+        assertEquals("test:100", appended.timelinePreviousCursor?.canonicalId)
+
+        val restored = appended.prepending(
+            TimelineItemPage(
+                records = initial.take(100),
+                previousCursor = TimelineCursor(Instant.EPOCH, "test:0"),
+                nextCursor = null,
+            ),
+        )
+
+        assertEquals(MAX_RETAINED_TIMELINE_ITEMS, restored.timeline.size)
+        assertEquals("test:0", restored.timeline.first().canonicalId)
+        assertEquals("test:399", restored.timeline.last().canonicalId)
+        assertEquals("test:399", restored.timelineNextCursor?.canonicalId)
+    }
+
+    @Test
+    fun runOnlySnapshotStillMarksArchivePresentAfterRefresh() = runBlocking {
+        val state = MutableStateFlow(HozzUiState())
+        val refresher = HozzStateRefresher(
+            state = state,
+            loadSnapshot = {
+                HozzCoreSnapshot(
+                    timeline = emptyList(),
+                    timelineNextCursor = null,
+                    projection = ProjectionSummary(),
+                    totalRecordCount = 0,
+                    runRecordCount = 3,
+                )
+            },
+            healthConnectStatus = { 42 },
+        )
+
+        refresher.refresh()
+
+        assertTrue(state.value.hasArchive)
+        assertEquals(3, state.value.runRecordCount)
+        assertEquals(0, state.value.totalRecordCount)
     }
 
     private fun item(id: String): TimelineItem = TimelineItem(

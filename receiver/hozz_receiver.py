@@ -69,6 +69,8 @@ SERIES_END_KINDS = {
     "workoutRouteEnd",
 }
 MAX_ZIP_ENTRIES = 1_024
+MAX_ZIP_DIRECTORY_BYTES = 16 * 1_024 * 1_024
+MAX_ZIP64_END_RECORD_BYTES = 1 * 1_024 * 1_024
 MAX_INFLATED_BYTES = 64 * 1_024 * 1_024 * 1_024
 MAX_RECORD_LINES = 50_000_000
 MAX_RECORD_BYTES = 16 * 1_024 * 1_024
@@ -176,12 +178,21 @@ CREATE TABLE IF NOT EXISTS compatible_alias_identity (
 );
 CREATE INDEX IF NOT EXISTS compatible_alias_identity_legacy
     ON compatible_alias_identity (legacy_id);
+CREATE TABLE IF NOT EXISTS receiver_migrations (
+    version     INTEGER PRIMARY KEY,
+    applied_at  REAL NOT NULL
+);
 """
+
+DATA_MIGRATION_ENCODING_RECONCILIATION = 1
+DATA_MIGRATION_COMPATIBLE_ALIAS_BACKFILL = 2
+DATA_MIGRATION_COMPATIBLE_IDENTITY_SAFETY = 3
 
 
 def connect(path):
     db = sqlite3.connect(path, check_same_thread=False)
     try:
+        db.execute("BEGIN IMMEDIATE")
         columns = {
             row[1] for row in db.execute("PRAGMA table_info(samples)").fetchall()
         }
@@ -191,7 +202,6 @@ def connect(path):
         ).fetchone() is not None
         needs_migration = columns and "canonical_id" not in columns
         if needs_migration or legacy_exists:
-            db.execute("BEGIN IMMEDIATE")
             if needs_migration:
                 if legacy_exists:
                     raise RuntimeError(
@@ -204,9 +214,16 @@ def connect(path):
         else:
             create_schema(db)
         ensure_current_columns(db)
-        ensure_compatible_alias_retirement_schema(db)
-        backfill_compatible_alias_signatures(db)
-        backfill_compatible_deletion_state(db)
+        alias_schema_rebuilt = ensure_compatible_alias_retirement_schema(db)
+        if alias_schema_rebuilt:
+            db.execute(
+                "DELETE FROM receiver_migrations WHERE version IN (?, ?)",
+                (
+                    DATA_MIGRATION_COMPATIBLE_ALIAS_BACKFILL,
+                    DATA_MIGRATION_COMPATIBLE_IDENTITY_SAFETY,
+                ),
+            )
+        run_data_migrations(db)
         db.commit()
         return db
     except Exception:
@@ -244,7 +261,7 @@ def ensure_compatible_alias_retirement_schema(db):
                (type, start_instant, end_instant, value, unit, source, kind)
             """
         )
-        return
+        return False
     db.execute(
         """
         DELETE FROM compatible_resolved_deletion
@@ -302,6 +319,96 @@ def ensure_compatible_alias_retirement_schema(db):
            (type, start_instant, end_instant, value, unit, source, kind)
         """
     )
+    return True
+
+
+def run_data_migrations(db):
+    migrations = (
+        (
+            DATA_MIGRATION_ENCODING_RECONCILIATION,
+            migrate_encoding_reconciliation,
+        ),
+        (
+            DATA_MIGRATION_COMPATIBLE_ALIAS_BACKFILL,
+            migrate_compatible_alias_state,
+        ),
+        (
+            DATA_MIGRATION_COMPATIBLE_IDENTITY_SAFETY,
+            migrate_compatible_identity_safety,
+        ),
+    )
+    applied = {
+        row[0] for row in db.execute(
+            "SELECT version FROM receiver_migrations"
+        )
+    }
+    for version, migration in migrations:
+        if version in applied:
+            continue
+        migration(db)
+        db.execute(
+            """
+            INSERT INTO receiver_migrations (version, applied_at)
+            VALUES (?, ?)
+            """,
+            (version, time.time()),
+        )
+
+
+def migrate_encoding_reconciliation(db):
+    restore_continuation_errors(db)
+    reconcile_parent_tombstones(db)
+    reconcile_encoding_errors(db)
+
+
+def migrate_compatible_alias_state(db):
+    backfill_compatible_alias_signatures(db)
+    backfill_compatible_deletion_state(db)
+
+
+def migrate_compatible_identity_safety(db):
+    db.execute(
+        """
+        DELETE FROM compatible_unresolved_deletion
+        WHERE stable_id IN (
+            SELECT stable_id FROM compatible_resolved_deletion
+        )
+        """
+    )
+    db.execute(
+        """
+        INSERT OR REPLACE INTO compatible_unresolved_deletion
+            (stable_id, type)
+        SELECT tombstone.canonical_id, tombstone.type
+        FROM samples AS tombstone
+        WHERE tombstone.tombstone = 1
+          AND tombstone.canonical_id LIKE 'healthAutoExport:%'
+          AND NOT EXISTS (
+              SELECT 1 FROM compatible_resolved_deletion AS resolved
+              WHERE resolved.stable_id = tombstone.canonical_id
+          )
+        """
+    )
+    db.execute(
+        """
+        DELETE FROM compatible_alias_identity
+        WHERE legacy_id IN (
+            SELECT legacy_id
+            FROM compatible_alias_identity
+            GROUP BY legacy_id
+            HAVING COUNT(*) > 1
+        )
+        """
+    )
+    db.execute("DROP INDEX IF EXISTS compatible_alias_identity_legacy")
+    db.execute(
+        """
+        CREATE UNIQUE INDEX compatible_alias_identity_legacy
+        ON compatible_alias_identity (legacy_id)
+        """
+    )
+
+
 def backfill_compatible_alias_signatures(db):
     rows = db.execute(
         """
@@ -312,7 +419,7 @@ def backfill_compatible_alias_signatures(db):
           AND canonical_id LIKE 'healthAutoExport:%'
           AND start_date IS NOT NULL
         """
-    ).fetchall()
+    )
     for (
         stable_id,
         record_type,
@@ -358,7 +465,7 @@ def backfill_compatible_deletion_state(db):
         WHERE tombstone = 1
           AND canonical_id LIKE 'healthAutoExport:%'
         """
-    ).fetchall()
+    )
     for canonical_id, raw in rows:
         try:
             record = parse_json(raw)
@@ -438,9 +545,24 @@ def ensure_current_columns(db):
             db.execute(f"ALTER TABLE ingested_files ADD COLUMN {name} INTEGER")
     if "digest" not in file_columns:
         db.execute("ALTER TABLE ingested_files ADD COLUMN digest TEXT")
-    restore_continuation_errors(db)
-    reconcile_parent_tombstones(db)
-    reconcile_encoding_errors(db)
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS samples_parent_kind
+        ON samples(parent_canonical_id, kind, tombstone)
+        """
+    )
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS samples_resolution_kind
+        ON samples(resolution_canonical_id, kind, tombstone)
+        """
+    )
+    db.execute(
+        """
+        CREATE INDEX IF NOT EXISTS samples_kind_tombstone
+        ON samples(kind, tombstone)
+        """
+    )
 
 
 def migrate_legacy_rows(db):
@@ -505,9 +627,6 @@ def migrate_legacy_rows(db):
                 raw,
             ),
         )
-    restore_continuation_errors(db)
-    reconcile_parent_tombstones(db)
-    reconcile_encoding_errors(db)
 
 
 def parse_json(value):
@@ -1101,6 +1220,8 @@ def _ingest_lines(
                 return 0, 0, True, 0
             legacy_receipt = True
 
+    reset_affected_sample_ids(db)
+    reset_batch_record_semantics(db)
     stored = deleted = canonical_count = 0
     pending_null_heart_aliases = []
     scope_key = run_scope_key or batch_key
@@ -1191,6 +1312,18 @@ def _ingest_lines(
         canonical_count += 1
         canonical_id, source_id, parent_id, version = identity
         resolution_id = nonempty_text(record.get("resolutionCanonicalId"))
+        duplicate_in_batch = prevalidate_canonical_record(
+            db,
+            canonical_id,
+            version,
+            record,
+        )
+        mark_affected_sample_ids(
+            db,
+            (canonical_id, parent_id, resolution_id),
+        )
+        if duplicate_in_batch:
+            continue
         tombstone = kind == "deletion" or record.get("deleted") is True
         record_type = record.get("type", "")
         start_date = record.get("startDate")
@@ -1429,6 +1562,13 @@ def _ingest_lines(
             "WHERE canonical_id = ?",
             (canonical_id,),
         ).fetchone()
+        preserve_compatible_stable_state(
+            db,
+            canonical_id,
+            version,
+            record,
+            winner,
+        )
         if winner and winner[1]:
             cascade = db.execute(
                 """
@@ -1460,13 +1600,10 @@ def _ingest_lines(
         pending_null_heart_aliases,
     )
     for stable_id, canonical_id, version in verified_null_heart_aliases:
-        db.execute(
-            """
-            INSERT OR IGNORE INTO compatible_alias_identity
-                (stable_id, legacy_id)
-            VALUES (?, ?)
-            """,
-            (stable_id, canonical_id),
+        record_compatible_alias_identity(
+            db,
+            stable_id,
+            canonical_id,
         )
         retired_cursor = db.execute(
             """
@@ -1494,14 +1631,290 @@ def _ingest_lines(
                 """,
                 (batch_key, time.time(), stored, deleted),
             )
-    restore_unresolved_continuation_errors(db)
-    reconcile_encoding_errors(db)
+    if canonical_count:
+        reconcile_affected_encoding_errors(db)
     return stored, deleted, legacy_receipt, canonical_count
 
 
-def reconcile_encoding_errors(db):
+def reset_batch_record_semantics(db):
     db.execute(
         """
+        CREATE TEMP TABLE IF NOT EXISTS receiver_batch_record_semantics (
+            canonical_id TEXT NOT NULL,
+            record_version INTEGER NOT NULL,
+            semantics TEXT NOT NULL,
+            PRIMARY KEY (canonical_id, record_version)
+        ) WITHOUT ROWID
+        """
+    )
+    db.execute("DELETE FROM receiver_batch_record_semantics")
+
+
+def prevalidate_canonical_record(db, canonical_id, version, record):
+    semantics = normalized_record_semantics(record)
+    existing = db.execute(
+        """
+        SELECT raw FROM samples
+        WHERE canonical_id = ? AND record_version = ?
+        """,
+        (canonical_id, version),
+    ).fetchone()
+    if (
+        existing is not None
+        and not records_semantically_identical(existing[0], record)
+    ):
+        raise PartialBatch(
+            "record conflicts with an existing record at the same version"
+        )
+    seen = db.execute(
+        """
+        SELECT semantics FROM receiver_batch_record_semantics
+        WHERE canonical_id = ? AND record_version = ?
+        """,
+        (canonical_id, version),
+    ).fetchone()
+    if seen is not None:
+        if seen[0] != semantics:
+            raise PartialBatch(
+                "record conflicts with another record at the same version"
+            )
+        return True
+    db.execute(
+        """
+        INSERT INTO receiver_batch_record_semantics
+            (canonical_id, record_version, semantics)
+        VALUES (?, ?, ?)
+        """,
+        (canonical_id, version, semantics),
+    )
+    return False
+
+
+def normalized_record_semantics(record):
+    return json.dumps(
+        record,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+
+
+def records_semantically_identical(stored_raw, incoming):
+    try:
+        stored = parse_json(stored_raw)
+    except (TypeError, ValueError):
+        return False
+    return normalized_record_semantics(stored) == normalized_record_semantics(
+        incoming
+    )
+
+
+def record_compatible_alias_identity(db, stable_id, legacy_id):
+    existing = db.execute(
+        """
+        SELECT stable_id FROM compatible_alias_identity
+        WHERE legacy_id = ?
+        """,
+        (legacy_id,),
+    ).fetchone()
+    if existing is not None and existing[0] != stable_id:
+        raise PartialBatch(
+            "legacy identity maps to more than one stable record"
+        )
+    db.execute(
+        """
+        INSERT OR IGNORE INTO compatible_alias_identity
+            (stable_id, legacy_id)
+        VALUES (?, ?)
+        """,
+        (stable_id, legacy_id),
+    )
+
+
+def preserve_compatible_stable_state(
+    db,
+    canonical_id,
+    incoming_version,
+    record,
+    winner,
+):
+    if (
+        not canonical_id.startswith("healthAutoExport:")
+        or winner is None
+        or winner[0] != incoming_version
+    ):
+        return
+    stable_id = canonical_id
+    record_type = record.get("type", "")
+    if winner[1]:
+        has_signature = db.execute(
+            """
+            SELECT 1 FROM compatible_alias_retirement
+            WHERE stable_id = ? LIMIT 1
+            """,
+            (stable_id,),
+        ).fetchone()
+        if has_signature:
+            db.execute(
+                """
+                INSERT OR IGNORE INTO compatible_resolved_deletion (stable_id)
+                VALUES (?)
+                """,
+                (stable_id,),
+            )
+            db.execute(
+                """
+                DELETE FROM compatible_unresolved_deletion
+                WHERE stable_id = ?
+                """,
+                (stable_id,),
+            )
+        else:
+            db.execute(
+                """
+                INSERT OR REPLACE INTO compatible_unresolved_deletion
+                    (stable_id, type)
+                VALUES (?, ?)
+                """,
+                (stable_id, record_type),
+            )
+        return
+
+    signature = compatibility_record_signature(record)
+    if signature is None:
+        db.execute(
+            """
+            INSERT OR REPLACE INTO compatible_unresolved_deletion
+                (stable_id, type)
+            VALUES (?, ?)
+            """,
+            (stable_id, record_type),
+        )
+        return
+    existing = {
+        tuple(row) for row in db.execute(
+            """
+            SELECT type, start_instant, end_instant, value, unit, source, kind
+            FROM compatible_alias_retirement
+            WHERE stable_id = ?
+            """,
+            (stable_id,),
+        )
+    }
+    if existing and signature not in existing:
+        raise PartialBatch(
+            "stable identity conflicts with its preserved alias signature"
+        )
+    db.execute(
+        """
+        INSERT OR IGNORE INTO compatible_alias_retirement
+            (type, start_instant, end_instant, value, unit,
+             source, kind, stable_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (*signature, stable_id),
+    )
+    db.execute(
+        """
+        INSERT OR IGNORE INTO compatible_resolved_deletion (stable_id)
+        VALUES (?)
+        """,
+        (stable_id,),
+    )
+    db.execute(
+        """
+        DELETE FROM compatible_unresolved_deletion
+        WHERE stable_id = ?
+        """,
+        (stable_id,),
+    )
+
+
+def reset_affected_sample_ids(db):
+    db.execute(
+        """
+        CREATE TEMP TABLE IF NOT EXISTS receiver_affected_sample_ids (
+            canonical_id TEXT PRIMARY KEY
+        ) WITHOUT ROWID
+        """
+    )
+    db.execute("DELETE FROM receiver_affected_sample_ids")
+
+
+def mark_affected_sample_ids(db, canonical_ids):
+    db.executemany(
+        """
+        INSERT OR IGNORE INTO receiver_affected_sample_ids (canonical_id)
+        VALUES (?)
+        """,
+        (
+            (canonical_id,)
+            for canonical_id in canonical_ids
+            if canonical_id is not None
+        ),
+    )
+
+
+def reconcile_affected_encoding_errors(db):
+    db.execute(
+        """
+        CREATE TEMP TABLE IF NOT EXISTS receiver_affected_encoding_errors (
+            canonical_id TEXT PRIMARY KEY
+        ) WITHOUT ROWID
+        """
+    )
+    db.execute("DELETE FROM receiver_affected_encoding_errors")
+    db.execute(
+        """
+        INSERT OR IGNORE INTO receiver_affected_encoding_errors (canonical_id)
+        SELECT sample.canonical_id
+        FROM receiver_affected_sample_ids AS affected
+        CROSS JOIN samples AS sample
+          ON sample.canonical_id = affected.canonical_id
+        WHERE sample.kind = 'sampleEncodingError'
+        """
+    )
+    db.execute(
+        """
+        INSERT OR IGNORE INTO receiver_affected_encoding_errors (canonical_id)
+        SELECT child.canonical_id
+        FROM samples AS child INDEXED BY samples_parent_kind
+        WHERE child.parent_canonical_id IN (
+            SELECT canonical_id FROM receiver_affected_sample_ids
+        )
+          AND child.kind = 'sampleEncodingError'
+        """
+    )
+    db.execute(
+        """
+        INSERT OR IGNORE INTO receiver_affected_encoding_errors (canonical_id)
+        SELECT child.canonical_id
+        FROM samples AS child INDEXED BY samples_resolution_kind
+        WHERE child.resolution_canonical_id IN (
+            SELECT canonical_id FROM receiver_affected_sample_ids
+        )
+          AND child.kind = 'sampleEncodingError'
+        """
+    )
+    restore_unresolved_continuation_errors(db, affected_only=True)
+    reconcile_encoding_errors(db, affected_only=True)
+
+
+def reconcile_encoding_errors(db, affected_only=False):
+    affected_clause = (
+        """
+          AND child.rowid IN (
+              SELECT candidate.rowid
+              FROM receiver_affected_encoding_errors AS affected
+              CROSS JOIN samples AS candidate
+                ON candidate.canonical_id = affected.canonical_id
+          )
+        """
+        if affected_only
+        else ""
+    )
+    db.execute(
+        f"""
         UPDATE samples AS child
         SET tombstone = 1,
             record_version = MAX(
@@ -1544,13 +1957,26 @@ def reconcile_encoding_errors(db):
                     )
                 )
           )
+          {affected_clause}
         """
     )
 
 
-def restore_unresolved_continuation_errors(db):
-    db.execute(
+def restore_unresolved_continuation_errors(db, affected_only=False):
+    affected_clause = (
         """
+          AND child.rowid IN (
+              SELECT candidate.rowid
+              FROM receiver_affected_encoding_errors AS affected
+              CROSS JOIN samples AS candidate
+                ON candidate.canonical_id = affected.canonical_id
+          )
+        """
+        if affected_only
+        else ""
+    )
+    db.execute(
+        f"""
         UPDATE samples AS child
         SET tombstone = 0,
             record_version = child.record_version + 1
@@ -1580,6 +2006,7 @@ def restore_unresolved_continuation_errors(db):
                     ELSE 'quantitySeriesEnd'
                 END
           )
+          {affected_clause}
         """
     )
 
@@ -2600,6 +3027,7 @@ def reconcile_compatible_aliases(db, aliases, records):
             )
 
         regular_counts = {}
+        finite_legacy_counts_by_key = {}
         null_heart_rate_counts = {}
         for _, _, candidate, known_null_heart_rate in candidates:
             if known_null_heart_rate:
@@ -2609,10 +3037,14 @@ def reconcile_compatible_aliases(db, aliases, records):
                 )
             else:
                 regular_counts[candidate] = regular_counts.get(candidate, 0) + 1
+                key = heart_rate_alias_key(candidate)
+                if key is not None and finite_signature_value(candidate[3]):
+                    finite_legacy_counts_by_key[key] = (
+                        finite_legacy_counts_by_key.get(key, 0) + 1
+                    )
 
         stable_ids_by_signature = {}
         heart_rate_ids_by_key = {}
-        heart_rate_signatures_by_key = {}
         starts = sorted({candidate[1] for _, _, candidate, _ in candidates})
         for offset in range(0, len(starts), 500):
             chunk = starts[offset:offset + 500]
@@ -2635,14 +3067,6 @@ def reconcile_compatible_aliases(db, aliases, records):
                 key = heart_rate_alias_key(signature)
                 if key is not None and finite_signature_value(signature[3]):
                     heart_rate_ids_by_key.setdefault(key, set()).add(stable_id)
-                    heart_rate_signatures_by_key.setdefault(key, set()).add(
-                        signature
-                    )
-
-        regular_heart_rate_matches = {
-            key: sum(regular_counts.get(signature, 0) for signature in signatures)
-            for key, signatures in heart_rate_signatures_by_key.items()
-        }
 
         for source_id, version, candidate, known_null_heart_rate in candidates:
             key = heart_rate_alias_key(candidate)
@@ -2650,7 +3074,7 @@ def reconcile_compatible_aliases(db, aliases, records):
                 matching_targets = set(heart_rate_ids_by_key.get(key, ()))
                 matching_candidates = (
                     null_heart_rate_counts.get(key, 0)
-                    + regular_heart_rate_matches.get(key, 0)
+                    + finite_legacy_counts_by_key.get(key, 0)
                 )
             else:
                 matching_targets = set(
@@ -2667,16 +3091,10 @@ def reconcile_compatible_aliases(db, aliases, records):
                 )
             if not matching_targets:
                 continue
-            db.execute(
-                """
-                INSERT OR IGNORE INTO compatible_alias_identity
-                    (stable_id, legacy_id)
-                VALUES (?, ?)
-                """,
-                (
-                    next(iter(matching_targets)),
-                    canonical_id_for("apple.healthkit", source_id),
-                ),
+            record_compatible_alias_identity(
+                db,
+                next(iter(matching_targets)),
+                canonical_id_for("apple.healthkit", source_id),
             )
             tombstones.append(json.dumps({
                 "deleted": True,
@@ -3824,6 +4242,15 @@ def legacy_file_receipt_scope(db, name, snapshot, digest):
         ).fetchone()
         if exact_file:
             return receipt[0]
+        migrated_filename_receipt = db.execute(
+            """
+            SELECT 1 FROM ingested_files
+            WHERE name = ? AND digest IS NULL
+            """,
+            (name,),
+        ).fetchone()
+        if receipt[3] < 0 and migrated_filename_receipt:
+            return receipt[0]
     return None
 
 
@@ -3955,41 +4382,50 @@ def preflight_zip_entry_count_stream(stream):
     original = stream.tell()
     try:
         stream.seek(0, os.SEEK_END)
-        size = stream.tell()
-        tail_size = min(size, 65_557)
-        stream.seek(size - tail_size)
+        file_size = stream.tell()
+        tail_size = min(file_size, 65_557)
+        tail_offset = file_size - tail_size
+        stream.seek(tail_offset)
         tail = stream.read(tail_size)
-        eocd_index = tail.rfind(b"PK\x05\x06")
-        if eocd_index < 0 or len(tail) - eocd_index < 22:
+        eocd_index = find_exact_eocd(tail, tail_offset, file_size)
+        if eocd_index is None:
             raise PartialBatch("archive has no valid ZIP directory")
-        entries = struct.unpack_from("<H", tail, eocd_index + 10)[0]
+        eocd_offset = tail_offset + eocd_index
+        disk_number, directory_disk, disk_entries, entries = struct.unpack_from(
+            "<HHHH",
+            tail,
+            eocd_index + 4,
+        )
         directory_size = struct.unpack_from("<I", tail, eocd_index + 12)[0]
         directory_offset = struct.unpack_from("<I", tail, eocd_index + 16)[0]
-        if (
+        zip64 = read_zip64_directory(stream, eocd_offset, file_size)
+        if zip64 is not None:
+            entries, directory_size, directory_offset, directory_end = zip64
+        elif (
             entries == 0xFFFF
             or directory_size == 0xFFFFFFFF
             or directory_offset == 0xFFFFFFFF
         ):
-            locator_index = tail.rfind(
-                b"PK\x06\x07",
-                max(0, eocd_index - 1_024),
-                eocd_index,
-            )
-            if locator_index < 0 or len(tail) - locator_index < 20:
-                raise PartialBatch("archive has no valid ZIP64 directory")
-            zip64_offset = struct.unpack_from("<Q", tail, locator_index + 8)[0]
-            stream.seek(zip64_offset)
-            header = stream.read(56)
-            if len(header) < 56 or header[:4] != b"PK\x06\x06":
-                raise PartialBatch("archive has no valid ZIP64 directory")
-            entries = struct.unpack_from("<Q", header, 32)[0]
-            directory_size = struct.unpack_from("<Q", header, 40)[0]
-            directory_offset = struct.unpack_from("<Q", header, 48)[0]
+            raise PartialBatch("archive has no valid ZIP64 directory")
+        else:
+            if disk_number != 0 or directory_disk != 0:
+                raise PartialBatch("multi-disk ZIP archives are not supported")
+            if disk_entries != entries:
+                raise PartialBatch("archive ZIP directory count is inconsistent")
+            prefix_size = eocd_offset - directory_size - directory_offset
+            if prefix_size < 0:
+                raise PartialBatch("archive ZIP directory is out of bounds")
+            directory_offset += prefix_size
+            directory_end = eocd_offset
+        if directory_size > MAX_ZIP_DIRECTORY_BYTES:
+            raise PartialBatch("archive ZIP directory exceeds the byte limit")
+        if directory_offset + directory_size != directory_end:
+            raise PartialBatch("archive ZIP directory is out of bounds")
         parsed_entries = count_central_directory_entries(
             stream,
             directory_offset,
             directory_size,
-            size,
+            file_size,
         )
         if entries != parsed_entries:
             raise PartialBatch("archive ZIP directory count is inconsistent")
@@ -3997,6 +4433,119 @@ def preflight_zip_entry_count_stream(stream):
             raise PartialBatch("archive contains too many entries")
     finally:
         stream.seek(original)
+
+
+def find_exact_eocd(tail, tail_offset, file_size):
+    if (
+        len(tail) >= 22
+        and tail[-22:-18] == b"PK\x05\x06"
+        and tail[-2:] == b"\0\0"
+    ):
+        return len(tail) - 22
+    index = tail.rfind(b"PK\x05\x06")
+    if index < 0 or len(tail) - index < 22:
+        return None
+    comment_length = struct.unpack_from("<H", tail, index + 20)[0]
+    if tail_offset + index + 22 + comment_length != file_size:
+        raise PartialBatch(
+            "archive ZIP end record comment length is inconsistent"
+        )
+    return index
+
+
+def read_zip64_directory(stream, eocd_offset, file_size):
+    locator_offset = eocd_offset - 20
+    if locator_offset < 0:
+        return None
+    stream.seek(locator_offset)
+    locator = stream.read(20)
+    if len(locator) != 20 or locator[:4] != b"PK\x06\x07":
+        return None
+    disk_number = struct.unpack_from("<I", locator, 4)[0]
+    relative_offset = struct.unpack_from("<Q", locator, 8)[0]
+    disk_count = struct.unpack_from("<I", locator, 16)[0]
+    if disk_number != 0 or disk_count > 1:
+        raise PartialBatch("multi-disk ZIP archives are not supported")
+
+    expected_record_offset = locator_offset - 56
+    if expected_record_offset < 0 or relative_offset > expected_record_offset:
+        raise PartialBatch("archive has no valid ZIP64 directory")
+
+    # Python 3.9 reads the record immediately before the locator, while newer
+    # versions first follow the locator offset. Both views must describe the
+    # same bounded central directory before either runtime may open the file.
+    relative_candidate = read_zip64_directory_candidate(
+        stream,
+        relative_offset,
+        56 + expected_record_offset - relative_offset,
+        relative_offset,
+        file_size,
+    )
+    if relative_offset == expected_record_offset:
+        if relative_candidate is None:
+            raise PartialBatch("archive has no valid ZIP64 directory")
+        return relative_candidate
+
+    preceding_candidate = read_zip64_directory_candidate(
+        stream,
+        expected_record_offset,
+        56,
+        relative_offset,
+        file_size,
+    )
+    if relative_candidate is not None:
+        if (
+            preceding_candidate is None
+            or relative_candidate[:3] != preceding_candidate[:3]
+        ):
+            raise PartialBatch(
+                "archive ZIP64 directory differs across Python versions"
+            )
+        return relative_candidate
+    if preceding_candidate is None:
+        raise PartialBatch("archive has no valid ZIP64 directory")
+    return preceding_candidate
+
+
+def read_zip64_directory_candidate(
+    stream,
+    record_offset,
+    record_size,
+    relative_offset,
+    file_size,
+):
+    stream.seek(record_offset)
+    header = stream.read(56)
+    if len(header) != 56 or header[:4] != b"PK\x06\x06":
+        return None
+    declared_size = struct.unpack_from("<Q", header, 4)[0] + 12
+    if (
+        declared_size != record_size
+        or record_size > MAX_ZIP64_END_RECORD_BYTES
+    ):
+        raise PartialBatch("archive has no valid ZIP64 directory")
+    disk_number = struct.unpack_from("<I", header, 16)[0]
+    directory_disk = struct.unpack_from("<I", header, 20)[0]
+    disk_entries = struct.unpack_from("<Q", header, 24)[0]
+    entries = struct.unpack_from("<Q", header, 32)[0]
+    directory_size = struct.unpack_from("<Q", header, 40)[0]
+    directory_offset = struct.unpack_from("<Q", header, 48)[0]
+    if disk_number != 0 or directory_disk != 0 or disk_entries != entries:
+        raise PartialBatch("multi-disk ZIP archives are not supported")
+    if directory_offset + directory_size != relative_offset:
+        raise PartialBatch("archive ZIP64 directory is out of bounds")
+    if directory_size > MAX_ZIP_DIRECTORY_BYTES:
+        raise PartialBatch("archive ZIP directory exceeds the byte limit")
+    resolved_offset = record_offset - directory_size
+    if (
+        resolved_offset < 0
+        or resolved_offset > file_size
+        or directory_size > file_size - resolved_offset
+    ):
+        raise PartialBatch("archive ZIP64 directory is out of bounds")
+    if entries > MAX_ZIP_ENTRIES:
+        raise PartialBatch("archive contains too many entries")
+    return entries, directory_size, resolved_offset, record_offset
 
 
 def count_central_directory_entries(stream, offset, length, file_size):

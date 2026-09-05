@@ -268,6 +268,10 @@ public actor HealthSyncEngine {
         let candidates = Self.rotated(
             allTypes
                 .filter { destination.includes($0) }
+                .filter {
+                    destination.format != .metrics
+                        || DeliveryPayloadBuilder.supportsMetrics(type: $0)
+                }
                 .filter { dirtyTypes.isEmpty || dirtyTypes.contains($0) },
             at: now
         )
@@ -413,8 +417,12 @@ public actor HealthSyncEngine {
         )
         let coverageIsNews = destination.format.carriesCoverage
             && digest != destination.reportedCoverageDigest
+        let deliverableRecords = DeliveryPayloadBuilder.recordsCompatibleWith(
+            destination,
+            from: records
+        )
 
-        guard !records.isEmpty || coverageIsNews else {
+        guard !deliverableRecords.isEmpty || coverageIsNews else {
             // Nothing new for this destination. Still commit any cursor that
             // moved without data, so an empty stream is not re-read forever.
             //
@@ -443,7 +451,7 @@ public actor HealthSyncEngine {
         }
 
         let payload = try DeliveryPayloadBuilder.build(
-            records: records,
+            records: deliverableRecords,
             coverage: destination.format.carriesCoverage ? coverage : [],
             destination: destination
         )
@@ -455,7 +463,7 @@ public actor HealthSyncEngine {
             id: DeliveryBatch.identifier(for: payload),
             sequence: try await delivery.nextSequence(for: destination.id),
             createdAt: now,
-            recordCount: records.count,
+            recordCount: deliverableRecords.count,
             payload: payload,
             format: destination.format
         )
@@ -489,12 +497,15 @@ public actor HealthSyncEngine {
         }
 
         return SyncOutcome(
-            deliveredRecords: records.count,
+            deliveredRecords: deliverableRecords.count,
             destinationCount: 1,
             typesDrained: touched.count,
             wasInterrupted: interrupted,
             waitingForUnlock: waitingForUnlock,
-            primedRecords: prime.changes.count,
+            primedRecords: DeliveryPayloadBuilder.recordsCompatibleWith(
+                destination,
+                from: prime.changes
+            ).count,
             primingRemains: prime.remains
         )
     }
@@ -735,6 +746,46 @@ public actor HealthSyncEngine {
 
 /// Turns drained records into the bytes a destination expects.
 enum DeliveryPayloadBuilder {
+    static func supportsMetrics(type: HealthTypeKey) -> Bool {
+        let identifier = type.rawValue
+        return identifier.hasPrefix("HKQuantityTypeIdentifier")
+            || identifier.hasPrefix("HKCategoryTypeIdentifier")
+            || identifier == "HKWorkoutTypeIdentifier"
+    }
+
+    /// Applies format compatibility at record granularity.
+    ///
+    /// An encoding failure deliberately keeps the Health type that could not
+    /// be encoded. That makes it part of a supported quantity/category stream,
+    /// but it still has no numeric value for a grouped metrics point. Omitting
+    /// only that explicit stand-in lets valid readings from the same page move
+    /// forward. When there are valid records, the cursor advances only after
+    /// they are accepted; a page containing only stand-ins is complete for this
+    /// deliberately lossy destination without making an empty request.
+    /// Lossless destinations have independent cursors and continue to receive
+    /// the failure record itself.
+    static func recordsCompatibleWith(
+        _ destination: Destination,
+        from records: [HealthChange]
+    ) -> [HealthChange] {
+        guard destination.format == .metrics else {
+            return records
+        }
+        return records.filter { record in
+            guard case .upsert(let object) = record else {
+                return true
+            }
+            guard
+                let decoded = try? JSONSerialization.jsonObject(
+                    with: object.canonicalPayload
+                ) as? [String: Any]
+            else {
+                return true
+            }
+            return decoded["kind"] as? String != "sampleEncodingError"
+        }
+    }
+
     /// Turns a pass's records into the destination's own format.
     ///
     /// The metrics and InfluxDB shapes reduce a record to one number, and a

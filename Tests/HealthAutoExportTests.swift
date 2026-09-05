@@ -1,5 +1,6 @@
 import Foundation
 @testable import HozzDeliver
+@testable import HozzReceive
 import XCTest
 
 /// Covers the opt-in schema that matches another exporter's field names, and
@@ -322,6 +323,66 @@ final class HealthAutoExportTests: XCTestCase {
         XCTAssertTrue(String(decoding: hozz, as: UTF8.self).contains("\"id\":\"abc-123\""))
         XCTAssertTrue(String(decoding: hozz, as: UTF8.self).contains("\"qty\""))
         XCTAssertTrue(String(decoding: compatible, as: UTF8.self).contains("\"Avg\""))
+    }
+
+    func testHozzMetricsRoundTripEveryRepresentableKind() throws {
+        let records = [
+            record(),
+            record(
+                type: "HKCategoryTypeIdentifierSleepAnalysis",
+                kind: "category",
+                value: 5,
+                unit: nil,
+                start: "2026-02-06T07:00:00.000Z",
+                end: "2026-02-06T08:30:00.000Z",
+                identifier: "sleep"
+            ),
+            record(
+                type: "HKWorkoutTypeIdentifier",
+                kind: "workout",
+                value: nil,
+                unit: nil,
+                identifier: "workout",
+                duration: 1_800,
+                activityType: 37
+            ),
+            record(
+                value: nil,
+                unit: nil,
+                identifier: "deleted",
+                isDeletion: true
+            )
+        ]
+
+        let parsed = try BatchParser.parse(
+            try CompatiblePayloadBuilder.build(records: records)
+        )
+
+        XCTAssertEqual(parsed.records.map(\.id), ["sleep", "abc-123", "workout"])
+        XCTAssertEqual(parsed.records.map(\.value), [5, 8_500, 1_800])
+        XCTAssertEqual(parsed.deletions.map(\.id), ["deleted"])
+        XCTAssertEqual(parsed.unreadableCount, 0)
+    }
+
+    func testHozzMetricsRejectANonNumericKindInsteadOfEmittingAnInvalidPoint() {
+        let unsupported = record(
+            type: "HKDataTypeStateOfMind",
+            kind: "stateOfMind",
+            value: nil,
+            unit: nil
+        )
+
+        XCTAssertThrowsError(
+            try CompatiblePayloadBuilder.build(records: [unsupported])
+        ) { error in
+            XCTAssertEqual(
+                error as? CompatiblePayloadError,
+                .unsupportedRecord(
+                    kind: "stateOfMind",
+                    type: "HKDataTypeStateOfMind"
+                )
+            )
+        }
     }
 
     func testTheChosenSchemaSurvivesBeingSaved() throws {

@@ -8,6 +8,7 @@ import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.v2.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollToIndex
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -151,6 +152,30 @@ class HozzTimelinePaginationTest {
         assertEquals(208, state.timeline.map(TimelineItem::canonicalId).toSet().size)
         compose.onNodeWithTag("timeline-list").performScrollToIndex(213)
         compose.onNodeWithText("Timeline Final").assertIsDisplayed()
+    }
+
+    @Test
+    fun runOnlyArchiveRemainsVisibleAndExportable() {
+        var exported = false
+        compose.activity.runOnUiThread {
+            compose.activity.setContent {
+                HozzTheme {
+                    HozzScreen(
+                        state = HozzUiState(runRecordCount = 3),
+                        onImport = {},
+                        onWriteHealthConnect = {},
+                        onExport = { exported = true },
+                        onLoadMoreTimeline = {},
+                    )
+                }
+            }
+        }
+
+        compose.onNodeWithText(
+            "This archive contains 3 run and coverage records and no canonical samples.",
+        ).assertIsDisplayed()
+        compose.onNodeWithText("Save Hozz archive").performClick()
+        compose.runOnIdle { assertTrue(exported) }
     }
 
     private fun record(

@@ -5,6 +5,11 @@ import android.content.Context
 import android.database.Cursor
 import android.database.sqlite.SQLiteDatabase
 import android.database.sqlite.SQLiteOpenHelper
+import com.thatcube.hozz.projection.ProjectionAction
+import com.thatcube.hozz.projection.ProjectionPlanner
+import com.thatcube.hozz.projection.ProjectionQuality
+import com.thatcube.hozz.projection.ProjectionSummary
+import com.thatcube.hozz.projection.targetRecord
 import java.time.Instant
 import java.util.Locale
 import java.util.UUID
@@ -15,10 +20,12 @@ class SqliteCanonicalRecordStore(
     context: Context,
     databaseName: String = "hozz-archive.sqlite",
 ) :
-    SQLiteOpenHelper(context, databaseName, null, 12),
+    SQLiteOpenHelper(context, databaseName, null, 13),
     CanonicalRecordStore {
 
     internal var parentStateLookupCountForTesting = 0L
+        private set
+    internal var recordMaterializationCountForTesting = 0L
         private set
 
     override fun onCreate(database: SQLiteDatabase) {
@@ -61,6 +68,7 @@ class SqliteCanonicalRecordStore(
         createHealthConnectProjectionTable(database)
         createHealthConnectPendingTable(database)
         createHealthConnectOperationStateTable(database)
+        createProjectionFactTables(database)
         database.execSQL(
             """
             CREATE INDEX canonical_record_timeline
@@ -199,11 +207,19 @@ class SqliteCanonicalRecordStore(
             createHealthConnectOperationStateTable(database)
         }
         reconcileEncodingFailures(database)
+        if (oldVersion < 13) {
+            createProjectionFactTables(database)
+            refreshAllProjectionFacts(database)
+        }
     }
 
     override fun onOpen(database: SQLiteDatabase) {
         super.onOpen(database)
         createTemporaryStageTables(database)
+    }
+
+    override fun close() {
+        super<SQLiteOpenHelper>.close()
     }
 
     override suspend fun upsert(records: List<CanonicalRecord>): MergeResult {
@@ -309,6 +325,7 @@ class SqliteCanonicalRecordStore(
                     var result = MergeResult()
                     materializeStagedParentGraph(database, sessionId)
                     var mergedCount = 0L
+                    val blockedIncomingSubtrees = hashSetOf<String>()
                     database.query(
                         "canonical_record_stage",
                         null,
@@ -319,7 +336,11 @@ class SqliteCanonicalRecordStore(
                         "merge_depth, canonical_id",
                     ).use { cursor ->
                         while (cursor.moveToNext()) {
-                            result += mergeOne(database, cursor.record())
+                            result += mergeOne(
+                                database,
+                                cursor.record(),
+                                blockedIncomingSubtrees,
+                            )
                             mergedCount += 1
                         }
                     }
@@ -331,6 +352,10 @@ class SqliteCanonicalRecordStore(
                     validateStagedAppliedParentGraph(database, sessionId)
                     restoreUnresolvedContinuationErrors(database)
                     reconcileEncodingFailures(database)
+                    refreshProjectionFacts(
+                        database,
+                        stagedCanonicalIds(database, sessionId),
+                    )
                     database.execSQL(
                         """
                         INSERT OR IGNORE INTO archive_run_record
@@ -446,6 +471,57 @@ class SqliteCanonicalRecordStore(
         )
     }
 
+    override suspend fun timelinePageBefore(
+        before: TimelineCursor,
+        limit: Int,
+    ): TimelinePage {
+        val time = before.sortTime?.let(::timelineSortKey)
+        val selection = if (time == null) {
+            "tombstone = 0 AND (" +
+                "timeline_sort_key IS NOT NULL OR " +
+                "(timeline_sort_key IS NULL AND canonical_id < ?))"
+        } else {
+            "tombstone = 0 AND timeline_sort_key IS NOT NULL AND (" +
+                "timeline_sort_key > ? OR " +
+                "(timeline_sort_key = ? AND canonical_id < ?))"
+        }
+        val arguments = if (time == null) {
+            arrayOf(before.canonicalId)
+        } else {
+            arrayOf(time, time, before.canonicalId)
+        }
+        val records = readableDatabase.query(
+            "canonical_record",
+            null,
+            selection,
+            arguments,
+            null,
+            null,
+            "timeline_sort_key ASC, canonical_id DESC",
+            limit.coerceIn(1, 1_000).toString(),
+        ).use { cursor ->
+            buildList {
+                var pageBytes = 0
+                while (cursor.moveToNext()) {
+                    val record = cursor.record()
+                    val bytes = record.rawJson.toByteArray().size
+                    if (isNotEmpty() && pageBytes + bytes > PAGE_RAW_BYTES) {
+                        break
+                    }
+                    add(record)
+                    pageBytes += bytes
+                }
+            }.asReversed()
+        }
+        return TimelinePage(
+            records = records,
+            previousCursor = records.firstOrNull()?.let {
+                TimelineCursor(it.endTime ?: it.startTime, it.canonicalId)
+            },
+            nextCursor = null,
+        )
+    }
+
     internal fun timelineQueryPlan(after: TimelineCursor?): List<String> {
         val time = after?.sortTime?.let(::timelineSortKey)
         val sql: String
@@ -535,6 +611,162 @@ class SqliteCanonicalRecordStore(
         ).use { cursor ->
             if (cursor.moveToFirst()) cursor.getInt(0) else 0
         }
+
+    override suspend fun archiveOverview(): ArchiveOverview {
+        val database = readableDatabase
+        database.beginTransaction()
+        return try {
+            val counts = database.rawQuery(
+                """
+                SELECT
+                    (SELECT COUNT(*) FROM canonical_record),
+                    (SELECT COUNT(*) FROM archive_run_record)
+                """.trimIndent(),
+                null,
+            ).use { cursor ->
+                check(cursor.moveToFirst())
+                cursor.getInt(0) to cursor.getInt(1)
+            }
+            var exactCount = 0
+            var lossyCount = 0
+            var archiveOnlyCount = 0
+            var insertCount = 0
+            var updateCount = 0
+            var deleteCount = 0
+            val targetRecords = linkedSetOf<String>()
+            database.rawQuery(
+                """
+                WITH projection_state AS (
+                    SELECT
+                        canonical.tombstone,
+                        canonical.record_version,
+                        fact.quality AS base_quality,
+                        fact.target_record AS base_target,
+                        ledger.target_record AS ledger_target,
+                        ledger.canonical_version AS ledger_version,
+                        pending.target_record AS pending_target,
+                        pending.action AS pending_action,
+                        CASE
+                            WHEN ledger.canonical_id IS NOT NULL
+                              OR pending.canonical_id IS NOT NULL
+                            THEN 1
+                            ELSE 0
+                        END AS has_projection_state
+                    FROM canonical_record AS canonical
+                    JOIN canonical_projection_fact AS fact
+                      ON fact.canonical_id = canonical.canonical_id
+                    LEFT JOIN health_connect_projection AS ledger
+                      ON ledger.canonical_id = canonical.canonical_id
+                    LEFT JOIN health_connect_pending_operation AS pending
+                      ON pending.canonical_id = canonical.canonical_id
+                ),
+                effective AS (
+                    SELECT
+                        CASE
+                            WHEN tombstone = 1 AND has_projection_state = 1
+                                THEN 'DELETE'
+                            ELSE base_quality
+                        END AS quality,
+                        CASE
+                            WHEN tombstone = 1 OR base_target IS NULL
+                                THEN CASE
+                                    WHEN has_projection_state = 1 THEN 'DELETE'
+                                    ELSE 'NONE'
+                                END
+                            WHEN ledger_target IS NULL
+                                THEN CASE
+                                    WHEN pending_action = 'UPSERT' THEN 'UPDATE'
+                                    ELSE 'INSERT'
+                                END
+                            WHEN ledger_version >= record_version
+                              AND pending_target IS NULL
+                                THEN 'NONE'
+                            ELSE 'UPDATE'
+                        END AS action,
+                        base_target,
+                        ledger_target,
+                        pending_target
+                    FROM projection_state
+                )
+                SELECT
+                    quality,
+                    action,
+                    CASE
+                        WHEN action = 'DELETE'
+                            THEN COALESCE(ledger_target, pending_target)
+                        WHEN action IN ('INSERT', 'UPDATE')
+                            THEN base_target
+                        ELSE NULL
+                    END AS target_record,
+                    COUNT(*)
+                FROM effective
+                GROUP BY quality, action, target_record
+                """.trimIndent(),
+                null,
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    val count = cursor.getInt(3)
+                    when (ProjectionQuality.valueOf(cursor.getString(0))) {
+                        ProjectionQuality.EXACT -> exactCount += count
+                        ProjectionQuality.LOSSY -> lossyCount += count
+                        ProjectionQuality.ARCHIVE_ONLY -> archiveOnlyCount += count
+                        ProjectionQuality.DELETE -> Unit
+                    }
+                    when (ProjectionAction.valueOf(cursor.getString(1))) {
+                        ProjectionAction.INSERT -> insertCount += count
+                        ProjectionAction.UPDATE -> updateCount += count
+                        ProjectionAction.DELETE -> deleteCount += count
+                        ProjectionAction.NONE -> Unit
+                    }
+                    if (!cursor.isNull(2)) {
+                        targetRecords += cursor.getString(2)
+                    }
+                }
+            }
+            val warningCounts = linkedMapOf<String, Int>()
+            database.rawQuery(
+                """
+                SELECT warning.code, COUNT(*)
+                FROM canonical_projection_warning AS warning
+                JOIN canonical_record AS canonical
+                  ON canonical.canonical_id = warning.canonical_id
+                LEFT JOIN health_connect_projection AS ledger
+                  ON ledger.canonical_id = canonical.canonical_id
+                LEFT JOIN health_connect_pending_operation AS pending
+                  ON pending.canonical_id = canonical.canonical_id
+                WHERE canonical.tombstone = 0
+                   OR (
+                       ledger.canonical_id IS NULL
+                       AND pending.canonical_id IS NULL
+                   )
+                GROUP BY warning.code
+                ORDER BY warning.code
+                """.trimIndent(),
+                null,
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    warningCounts[cursor.getString(0)] = cursor.getInt(1)
+                }
+            }
+            database.setTransactionSuccessful()
+            ArchiveOverview(
+                canonicalRecordCount = counts.first,
+                runRecordCount = counts.second,
+                projection = ProjectionSummary(
+                    exactCount = exactCount,
+                    lossyCount = lossyCount,
+                    archiveOnlyCount = archiveOnlyCount,
+                    warningCounts = warningCounts,
+                    targetRecords = targetRecords,
+                    insertCount = insertCount,
+                    updateCount = updateCount,
+                    deleteCount = deleteCount,
+                ),
+            )
+        } finally {
+            database.endTransaction()
+        }
+    }
 
     override suspend fun allRecords(): List<CanonicalRecord> =
         readableDatabase.query(
@@ -1293,8 +1525,9 @@ class SqliteCanonicalRecordStore(
                 )
             }
         }
+        val blockedIncomingSubtrees = hashSetOf<String>()
         for (record in ordered) {
-            result += mergeOne(database, record)
+            result += mergeOne(database, record, blockedIncomingSubtrees)
         }
         validateStoredParentGraph(
             database,
@@ -1302,6 +1535,10 @@ class SqliteCanonicalRecordStore(
         )
         restoreUnresolvedContinuationErrors(database)
         reconcileEncodingFailures(database)
+        refreshProjectionFacts(
+            database,
+            ordered.map(CanonicalRecord::canonicalId),
+        )
         return result
     }
 
@@ -1454,13 +1691,24 @@ class SqliteCanonicalRecordStore(
     private fun mergeOne(
         database: SQLiteDatabase,
         record: CanonicalRecord,
+        blockedIncomingSubtrees: MutableSet<String>,
     ): MergeResult {
+        if (
+            !record.tombstone &&
+            record.parentCanonicalId in blockedIncomingSubtrees
+        ) {
+            blockedIncomingSubtrees += record.canonicalId
+            return MergeResult(ignored = 1)
+        }
         val parent = record.parentCanonicalId?.let { parentState(database, it) }
         if (
             parent?.tombstone == true &&
             !record.tombstone &&
             record.recordVersion > parent.recordVersion
         ) {
+            if (parentState(database, record.canonicalId)?.tombstone != false) {
+                blockedIncomingSubtrees += record.canonicalId
+            }
             return MergeResult(ignored = 1)
         }
         val effective = if (parent?.tombstone == true) {
@@ -1667,6 +1915,118 @@ class SqliteCanonicalRecordStore(
         }
     }
 
+    private fun stagedCanonicalIds(
+        database: SQLiteDatabase,
+        sessionId: String,
+    ): List<String> = database.query(
+        "canonical_record_stage",
+        arrayOf("canonical_id"),
+        "session_id = ?",
+        arrayOf(sessionId),
+        null,
+        null,
+        null,
+    ).use { cursor ->
+        buildList {
+            while (cursor.moveToNext()) add(cursor.getString(0))
+        }
+    }
+
+    private fun refreshAllProjectionFacts(database: SQLiteDatabase) {
+        database.delete("canonical_projection_fact", null, null)
+        database.delete("canonical_projection_warning", null, null)
+        database.query(
+            "canonical_record",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+        ).use { cursor ->
+            while (cursor.moveToNext()) {
+                saveProjectionFact(database, cursor.record())
+            }
+        }
+    }
+
+    private fun refreshProjectionFacts(
+        database: SQLiteDatabase,
+        seedCanonicalIds: Iterable<String>,
+    ) {
+        database.delete("canonical_parent_graph_seed", null, null)
+        var hasSeeds = false
+        for (canonicalId in seedCanonicalIds) {
+            hasSeeds = true
+            database.insertWithOnConflict(
+                "canonical_parent_graph_seed",
+                null,
+                ContentValues().apply { put("canonical_id", canonicalId) },
+                SQLiteDatabase.CONFLICT_IGNORE,
+            )
+        }
+        if (!hasSeeds) return
+        try {
+            database.rawQuery(
+                """
+                WITH RECURSIVE affected(canonical_id) AS (
+                    SELECT canonical_id
+                    FROM canonical_parent_graph_seed
+                    UNION
+                    SELECT child.canonical_id
+                    FROM canonical_record AS child
+                    JOIN affected
+                      ON child.parent_canonical_id = affected.canonical_id
+                      OR child.resolution_canonical_id = affected.canonical_id
+                )
+                SELECT canonical.*
+                FROM canonical_record AS canonical
+                JOIN affected
+                  ON affected.canonical_id = canonical.canonical_id
+                """.trimIndent(),
+                null,
+            ).use { cursor ->
+                while (cursor.moveToNext()) {
+                    saveProjectionFact(database, cursor.record())
+                }
+            }
+        } finally {
+            database.delete("canonical_parent_graph_seed", null, null)
+        }
+    }
+
+    private fun saveProjectionFact(
+        database: SQLiteDatabase,
+        record: CanonicalRecord,
+    ) {
+        val planned = ProjectionPlanner.plan(record)
+        database.insertWithOnConflict(
+            "canonical_projection_fact",
+            null,
+            ContentValues().apply {
+                put("canonical_id", record.canonicalId)
+                put("quality", planned.quality.name)
+                put("target_record", planned.draft?.targetRecord())
+            },
+            SQLiteDatabase.CONFLICT_REPLACE,
+        )
+        database.delete(
+            "canonical_projection_warning",
+            "canonical_id = ?",
+            arrayOf(record.canonicalId),
+        )
+        for (warning in planned.warnings) {
+            database.insertOrThrow(
+                "canonical_projection_warning",
+                null,
+                ContentValues().apply {
+                    put("canonical_id", record.canonicalId)
+                    put("code", warning.code)
+                },
+            )
+        }
+    }
+
     private fun pendingValues(
         operation: PendingHealthConnectOperation,
     ): ContentValues = ContentValues().apply {
@@ -1803,44 +2163,47 @@ class SqliteCanonicalRecordStore(
         put("raw_json", record.rawJson)
     }
 
-    private fun Cursor.record(): CanonicalRecord = CanonicalRecord(
-        canonicalId = string("canonical_id"),
-        parentCanonicalId = nullableString("parent_canonical_id"),
-        recordVersion = long("record_version"),
-        kind = string("kind"),
-        canonicalType = string("canonical_type"),
-        type = string("type"),
-        startTime = nullableString("start_time")?.let(Instant::parse),
-        endTime = nullableString("end_time")?.let(Instant::parse),
-        canonicalValue = nullableDouble("canonical_value")?.let {
-            CanonicalValue(
-                value = it,
-                unit = nullableString("canonical_unit"),
-                description = nullableString("canonical_description"),
-            )
-        },
-        originalValue = nullableDouble("original_value")?.let {
-            CanonicalValue(
-                value = it,
-                unit = nullableString("original_unit"),
-                description = nullableString("original_description"),
-            )
-        },
-        categoryValue = nullableInt("category_value"),
-        activityType = nullableInt("activity_type"),
-        quantityCount = nullableInt("quantity_count"),
-        sourceRecordId = string("source_record_id"),
-        sourceRecordVersion = nullableLong("source_record_version"),
-        sourceStore = string("source_store"),
-        sourceBundleIdentifier = nullableString("source_bundle_identifier"),
-        sourceName = nullableString("source_name"),
-        deviceJson = nullableString("device_json"),
-        metadataJson = nullableString("metadata_json"),
-        lineage = CanonicalRecordParser.lineage(string("lineage_json")),
-        tombstone = int("tombstone") != 0,
-        rawJson = string("raw_json"),
-        resolutionCanonicalId = nullableString("resolution_canonical_id"),
-    )
+    private fun Cursor.record(): CanonicalRecord {
+        recordMaterializationCountForTesting += 1
+        return CanonicalRecord(
+            canonicalId = string("canonical_id"),
+            parentCanonicalId = nullableString("parent_canonical_id"),
+            recordVersion = long("record_version"),
+            kind = string("kind"),
+            canonicalType = string("canonical_type"),
+            type = string("type"),
+            startTime = nullableString("start_time")?.let(Instant::parse),
+            endTime = nullableString("end_time")?.let(Instant::parse),
+            canonicalValue = nullableDouble("canonical_value")?.let {
+                CanonicalValue(
+                    value = it,
+                    unit = nullableString("canonical_unit"),
+                    description = nullableString("canonical_description"),
+                )
+            },
+            originalValue = nullableDouble("original_value")?.let {
+                CanonicalValue(
+                    value = it,
+                    unit = nullableString("original_unit"),
+                    description = nullableString("original_description"),
+                )
+            },
+            categoryValue = nullableInt("category_value"),
+            activityType = nullableInt("activity_type"),
+            quantityCount = nullableInt("quantity_count"),
+            sourceRecordId = string("source_record_id"),
+            sourceRecordVersion = nullableLong("source_record_version"),
+            sourceStore = string("source_store"),
+            sourceBundleIdentifier = nullableString("source_bundle_identifier"),
+            sourceName = nullableString("source_name"),
+            deviceJson = nullableString("device_json"),
+            metadataJson = nullableString("metadata_json"),
+            lineage = CanonicalRecordParser.lineage(string("lineage_json")),
+            tombstone = int("tombstone") != 0,
+            rawJson = string("raw_json"),
+            resolutionCanonicalId = nullableString("resolution_canonical_id"),
+        )
+    }
 
     private fun Cursor.index(name: String): Int = getColumnIndexOrThrow(name)
     private fun Cursor.string(name: String): String = getString(index(name))
@@ -2100,6 +2463,45 @@ class SqliteCanonicalRecordStore(
                 canonical_version INTEGER NOT NULL,
                 action TEXT NOT NULL
             )
+            """.trimIndent(),
+        )
+    }
+
+    fun createProjectionFactTables(database: SQLiteDatabase) {
+        database.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS canonical_projection_fact (
+                canonical_id TEXT PRIMARY KEY,
+                quality TEXT NOT NULL,
+                target_record TEXT
+            )
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS canonical_projection_warning (
+                canonical_id TEXT NOT NULL,
+                code TEXT NOT NULL,
+                PRIMARY KEY (canonical_id, code)
+            )
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS canonical_projection_fact_quality
+            ON canonical_projection_fact (quality)
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS canonical_projection_warning_code
+            ON canonical_projection_warning (code)
+            """.trimIndent(),
+        )
+        database.execSQL(
+            """
+            CREATE INDEX IF NOT EXISTS canonical_record_resolution
+            ON canonical_record (resolution_canonical_id)
             """.trimIndent(),
         )
     }

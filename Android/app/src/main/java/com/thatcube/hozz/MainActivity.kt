@@ -55,6 +55,7 @@ class MainActivity : ComponentActivity() {
                     onExport = {
                         archiveDirectoryPicker.launch(null)
                     },
+                    onLoadPreviousTimeline = viewModel::loadPreviousTimeline,
                     onLoadMoreTimeline = viewModel::loadMoreTimeline,
                 )
             }

@@ -18,6 +18,7 @@ data class TimelineItem(
 data class TimelineItemPage(
     val records: List<TimelineItem>,
     val nextCursor: TimelineCursor?,
+    val previousCursor: TimelineCursor? = null,
 )
 
 data class HozzCoreSnapshot(
@@ -25,7 +26,12 @@ data class HozzCoreSnapshot(
     val timelineNextCursor: TimelineCursor?,
     val projection: ProjectionSummary,
     val totalRecordCount: Int,
-)
+    val runRecordCount: Int = 0,
+    val timelinePreviousCursor: TimelineCursor? = null,
+) {
+    val hasArchive: Boolean
+        get() = totalRecordCount > 0 || runRecordCount > 0
+}
 
 data class ProjectionDraftPage(
     val operations: List<PlannedRecord>,
@@ -39,8 +45,11 @@ data class ProjectionDraftPage(
  * length-delimited JSON facade without moving SAF, Compose, or Health Connect
  * APIs into the portable core.
  */
-class HozzCoreService(context: Context) {
-    private val store = SqliteCanonicalRecordStore(context)
+class HozzCoreService internal constructor(
+    private val store: CanonicalRecordStore,
+) {
+    constructor(context: Context) : this(SqliteCanonicalRecordStore(context))
+
     private val importer = ArchiveImporter(store)
     private val exporter = CanonicalArchiveExporter(store)
 
@@ -48,33 +57,23 @@ class HozzCoreService(context: Context) {
         transport.open().use { input -> importer.import(input) }
 
     suspend fun snapshot(): HozzCoreSnapshot {
-        var after: String? = null
-        var projection = ProjectionSummary()
-        while (true) {
-            val page = store.recordsPage(after, PAGE_SIZE)
-            if (page.isEmpty()) {
-                break
-            }
-            val ledger = store.healthConnectProjections(
-                page.mapTo(linkedSetOf(), CanonicalRecord::canonicalId),
-            )
-            val pending = store.pendingHealthConnectOperations(
-                page.mapTo(linkedSetOf(), CanonicalRecord::canonicalId),
-            )
-            projection += ProjectionPlanner.plan(page, ledger, pending).summary()
-            after = page.last().canonicalId
-        }
+        val overview = store.archiveOverview()
         val timeline = store.timelinePage()
         return HozzCoreSnapshot(
             timeline = timeline.asDisplayPage().records,
+            timelinePreviousCursor = timeline.previousCursor,
             timelineNextCursor = timeline.nextCursor,
-            projection = projection,
-            totalRecordCount = store.recordCount(),
+            projection = overview.projection,
+            totalRecordCount = overview.canonicalRecordCount,
+            runRecordCount = overview.runRecordCount,
         )
     }
 
     suspend fun timelinePage(after: TimelineCursor?): TimelineItemPage =
         store.timelinePage(after).asDisplayPage()
+
+    suspend fun timelinePageBefore(before: TimelineCursor): TimelineItemPage =
+        store.timelinePageBefore(before).asDisplayPage()
 
     suspend fun projectionDraftPage(
         afterCanonicalId: String?,
@@ -136,10 +135,11 @@ class HozzCoreService(context: Context) {
                 TimelineItem(
                     canonicalId = record.canonicalId,
                     displayType = record.displayType,
-                    endTime = record.endTime,
+                    endTime = record.endTime ?: record.startTime,
                     projectionQuality = ProjectionPlanner.plan(record).quality,
                 )
             },
+            previousCursor = previousCursor,
             nextCursor = nextCursor,
         )
 

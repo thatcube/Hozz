@@ -47,6 +47,9 @@ cannot monopolize the receiver or overlap database commits.
 
 - Every record resolves to a stable Hozz canonical ID and monotonic version, so
   a retry updates the same row and an older replay cannot replace newer state.
+  Two records at the same version must be semantically identical; a conflicting
+  live record or deletion rejects the whole batch before compatibility
+  deferrals are resolved. A legacy ID can map to only one stable ID.
 - Every batch carries an `Idempotency-Key`, so a batch that arrives twice —
   which happens whenever a response is lost after the server already committed —
   is recognised and skipped.
@@ -63,8 +66,12 @@ payload. CSV entries inside a ZIP are skipped, since they are a lossy projection
 of records already present losslessly. Run, coverage, and error lines are kept
 verbatim rather than mistaken for measurements. ZIP imports enforce the Hozz v1
 manifest and bounded entry, expansion, record, and compression-ratio limits
-before any part of the archive commits. ZIP entries must use Stored or Deflate;
-encrypted, BZIP2, LZMA, and unknown methods are rejected before decompression.
+before any part of the archive commits. The preflight follows prepended-data
+offsets to the exact central directory selected by Python's ZIP reader, rejects
+an inconsistent final EOCD comment, and validates both ZIP64 record locations
+used across supported Python versions before Python allocates the directory.
+ZIP entries must use Stored or Deflate; encrypted, BZIP2, LZMA, and unknown
+methods are rejected before decompression.
 Network requests are capped and spooled, while NDJSON and JSON arrays are
 decoded one record at a time. Folder candidates must be regular files and fit
 the raw import limit before hashing begins.
@@ -86,13 +93,20 @@ filesystem metadata does not duplicate archive run or coverage records.
 Health Auto Export metric points must include their source record ID. Without
 it, a later date-less deletion cannot identify the record it supersedes, so the
 receiver rejects the whole batch instead of acknowledging an unrecoverable
-partial history.
+partial history. Stable records received directly preserve the same alias
+signature before deletion, so a delayed legacy replay cannot resurrect them.
 
 Databases written by an older receiver mark prior batch receipts during
 migration. A replay can repair a dated deletion against the old name-and-date
 identity. A date-less deletion cannot be linked to an older synthesized row, so
 that replay fails explicitly and requires a fresh full export rather than
-creating an unrelated tombstone.
+creating an unrelated tombstone. Migration also preserves a conservative
+type-scoped barrier for unresolved stable tombstones from versions that did not
+store compatibility metadata, preventing delayed legacy records from reviving
+them. Filename-only watcher receipts are repaired under their original run
+scope, avoiding duplicate run and coverage history. Data backfills are
+versioned and run once; normal batches reconcile only encoding errors related
+to IDs changed by that batch.
 
 ## Ask it things
 

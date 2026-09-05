@@ -32,7 +32,7 @@ final class SchemaMigrationTests: XCTestCase {
     }
 
     /// The current schema. Every historical fixture must reach this.
-    private static let currentVersion: Int64 = 12
+    private static let currentVersion: Int64 = 13
 
     // MARK: - The historical schemas, as they actually were
 
@@ -270,6 +270,14 @@ final class SchemaMigrationTests: XCTestCase {
         }
         if version >= 11 {
             try database.execute(Self.aliasSignatureTable)
+        }
+        if version >= 12 {
+            try database.execute(
+                """
+                ALTER TABLE batch
+                    ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 0;
+                """
+            )
         }
         try database.run(
             """
@@ -938,6 +946,321 @@ final class SchemaMigrationTests: XCTestCase {
                 row: { $0.integer(0) }
             ).first,
             1
+        )
+    }
+
+    func testVersionTwelveReconcilesLegacyHeartAndSleepShapesConservatively() async throws {
+        let directory = try makeReceiptDatabase(
+            version: 12,
+            name: "version-twelve-legacy-metrics"
+        )
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let database = try SQLiteDatabase(url: databaseURL)
+        try database.execute(
+            """
+            INSERT INTO sample
+                (id, type, kind, start_date, end_date, value, unit,
+                 source_name, raw, received_at)
+            VALUES
+                ('heart_rate:2026-01-01T10:00:00.000Z', 'heart_rate',
+                 'quantity', '2026-01-01T10:00:00.000Z',
+                 '2026-01-01T10:00:00.000Z', NULL, 'bpm', 'Watch', X'7B7D',
+                 '2026-01-01T12:00:00.000Z'),
+                ('heart-stable', 'heart_rate', 'quantity',
+                 '2026-01-01T10:00:00.000Z',
+                 '2026-01-01T10:00:00.000Z', 62, 'bpm', 'Watch', X'7B7D',
+                 '2026-01-01T12:01:00.000Z'),
+                ('heart_rate:2026-01-01T10:01:00.000Z', 'heart_rate',
+                 'quantity', '2026-01-01T10:01:00.000Z',
+                 '2026-01-01T10:01:00.000Z', NULL, 'bpm', 'Watch', X'7B7D',
+                 '2026-01-01T12:00:00.000Z'),
+                ('sleep_analysis:2026-01-01T11:00:00.000Z', 'sleep_analysis',
+                 'quantity', '2026-01-01T11:00:00.000Z',
+                 '2026-01-01T12:00:00.000Z', 1, 'hr', 'Watch', X'7B7D',
+                 '2026-01-01T12:00:00.000Z'),
+                ('sleep-stable', 'sleep_analysis', 'category',
+                 '2026-01-01T11:00:00.000Z',
+                 '2026-01-01T12:00:00.000Z', 5, 'hr', 'Watch', X'7B7D',
+                 '2026-01-01T12:01:00.000Z'),
+                ('sleep_analysis:2026-01-01T13:00:00.000Z', 'sleep_analysis',
+                 'quantity', '2026-01-01T13:00:00.000Z',
+                 '2026-01-01T14:00:00.000Z', 1, 'hr', 'Watch', X'7B7D',
+                 '2026-01-01T14:01:00.000Z');
+            INSERT INTO sample_alias_signature
+                (stable_id, type, kind, start_time, end_time,
+                 value, unit, source_name)
+            VALUES
+                ('heart-stable', 'heart_rate', 'quantity',
+                 '2026-01-01T10:00:00.000Z',
+                 '2026-01-01T10:00:00.000Z', 62, 'bpm', 'Watch'),
+                ('sleep-stable', 'sleep_analysis', 'category',
+                 '2026-01-01T11:00:00.000Z',
+                 '2026-01-01T12:00:00.000Z', 5, 'hr', 'Watch');
+            INSERT INTO sample_tombstone (id, received_at)
+            VALUES (
+                'sleep_analysis:2026-01-01T11:00:00.000Z',
+                '2026-01-02T00:00:00.000Z'
+            );
+            INSERT INTO sample_alias_retirement (type, start_time)
+            VALUES ('sleep_analysis', '2026-01-01T11:00:00.000Z');
+            """
+        )
+        database.close()
+
+        let upgraded = try IngestStore(directory: directory)
+
+        XCTAssertEqual(try version(of: databaseURL), Self.currentVersion)
+        let migratedHeart = try await upgraded.samples(type: "heart_rate")
+        let migratedSleep = try await upgraded.samples(type: "sleep_analysis")
+        XCTAssertEqual(
+            migratedHeart.map(\.id),
+            [
+                "heart_rate:2026-01-01T10:01:00.000Z",
+                "heart-stable"
+            ]
+        )
+        XCTAssertEqual(
+            migratedSleep.map(\.id),
+            ["sleep_analysis:2026-01-01T13:00:00.000Z"],
+            "A tombstone on either reconciled identity must remove both copies."
+        )
+
+        let migrated = try SQLiteDatabase(url: databaseURL)
+        let aliases = try migrated.query(
+            """
+            SELECT stable_id, legacy_id FROM sample_identity_alias
+            WHERE stable_id IN ('heart-stable', 'sleep-stable')
+            ORDER BY stable_id
+            """,
+            row: { "\($0.text(0))=\($0.text(1))" }
+        )
+        let sleepLegacyTombstone = try migrated.query(
+            """
+            SELECT COUNT(*) FROM sample_tombstone
+            WHERE id = 'sleep_analysis:2026-01-01T11:00:00.000Z'
+            """,
+            row: { $0.integer(0) }
+        ).first
+        migrated.close()
+        XCTAssertEqual(
+            aliases,
+            [
+                "heart-stable=heart_rate:2026-01-01T10:00:00.000Z",
+                "sleep-stable=sleep_analysis:2026-01-01T11:00:00.000Z"
+            ]
+        )
+        XCTAssertEqual(sleepLegacyTombstone, 1)
+
+        _ = try await upgraded.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[
+                      {"name":"heart_rate","units":"bpm","data":[
+                        {"id":"heart-runtime","date":"2026-01-01T10:01:00.000Z",
+                         "Min":63,"Avg":63,"Max":63,"source":"Watch"}]},
+                      {"name":"sleep_analysis","units":"hr","data":[
+                        {"id":"sleep-runtime",
+                         "startDate":"2026-01-01T13:00:00.000Z",
+                         "endDate":"2026-01-01T14:00:00.000Z",
+                         "qty":1,"value":"Deep","rawValue":4,"source":"Watch"}]}
+                    ]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "migrated-shape-runtime-reconciliation"
+        )
+        let reconciledHeart = try await upgraded.samples(type: "heart_rate")
+        let reconciledSleep = try await upgraded.samples(type: "sleep_analysis")
+        XCTAssertEqual(
+            Set(reconciledHeart.map(\.id)),
+            ["heart-stable", "heart-runtime"]
+        )
+        XCTAssertEqual(reconciledSleep.map(\.id), ["sleep-runtime"])
+        XCTAssertEqual(reconciledSleep.first?.value, 4)
+
+        _ = try await upgraded.ingest(
+            try BatchParser.parse(
+                Data(
+                    #"{"id":"heart-runtime","kind":"deletion","schemaVersion":1,"type":"HKQuantityTypeIdentifierHeartRate"}"#
+                        .utf8
+                )
+            ),
+            idempotencyKey: "migrated-heart-delete"
+        )
+        let afterDeletion = try await upgraded.samples(type: "heart_rate")
+        XCTAssertEqual(afterDeletion.map(\.id), ["heart-stable"])
+
+        _ = try await upgraded.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"heart_rate","units":"bpm","data":[
+                      {"id":"heart-runtime","date":"2026-01-01T10:01:00.000Z",
+                       "Min":63,"Avg":63,"Max":63,"source":"Watch"}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "migrated-heart-replay"
+        )
+        let afterReplay = try await upgraded.samples(type: "heart_rate")
+        XCTAssertEqual(afterReplay.map(\.id), ["heart-stable"])
+        await upgraded.close()
+    }
+
+    func testVersionThirteenLegacyTombstonesScaleWithTombstonesNotCartesianPairs()
+        throws
+    {
+        let directory = try makeReceiptDatabase(
+            version: 12,
+            name: "version-twelve-large-retirement-set"
+        )
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let database = try SQLiteDatabase(url: databaseURL)
+        defer { database.close() }
+        let insertRetirement = try database.prepared(
+            """
+            INSERT INTO sample_alias_retirement (type, start_time)
+            VALUES (?, ?)
+            """
+        )
+        let insertTombstone = try database.prepared(
+            """
+            INSERT INTO sample_tombstone (id, received_at)
+            VALUES (?, '2026-02-01T00:00:00.000Z')
+            """
+        )
+        defer {
+            insertRetirement.finalize()
+            insertTombstone.finalize()
+        }
+
+        let count = 1_024
+        let base = Date(timeIntervalSince1970: 1_767_225_600)
+        let timestamp = Date.ISO8601FormatStyle(
+            includingFractionalSeconds: true,
+            timeZone: .gmt
+        )
+        for offset in 0..<count {
+            let start = timestamp.format(
+                base.addingTimeInterval(TimeInterval(offset))
+            )
+            try insertRetirement.run([.text("step_count"), .text(start)])
+            try insertTombstone.run([.text("step_count:\(start)")])
+        }
+
+        let statistics = try IngestStore.migrateToThirteen(
+            database,
+            from: 12
+        )
+
+        XCTAssertEqual(statistics.tombstonesScanned, count)
+        XCTAssertEqual(
+            statistics.retirementLookups,
+            count,
+            "Each tombstone should cause one indexed lookup, not one comparison per retirement."
+        )
+        XCTAssertEqual(
+            try database.query(
+                "SELECT COUNT(*) FROM sample_legacy_tombstone",
+                row: { Int($0.integer(0)) }
+            ).first,
+            count
+        )
+        let plan = try database.query(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT 1 FROM sample_alias_retirement
+            WHERE type = ? AND start_time = ?
+            """,
+            [.text("step_count"), .text(timestamp.format(base))],
+            row: { $0.text(3) }
+        )
+        XCTAssertTrue(
+            plan.contains { $0.contains("USING COVERING INDEX") },
+            "The per-tombstone retirement lookup must use the (type, start_time) key: \(plan)"
+        )
+    }
+
+    func testUpdatedLegacyHeartShapeCannotBeRelaxedIntoADifferentStableSample()
+        async throws
+    {
+        let directory = try makeReceiptDatabase(
+            version: 12,
+            name: "version-twelve-updated-legacy-heart"
+        )
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let database = try SQLiteDatabase(url: databaseURL)
+        try database.execute(
+            """
+            INSERT INTO sample
+                (id, type, kind, start_date, end_date, value, unit,
+                 source_name, raw, received_at)
+            VALUES (
+                'heart_rate:2026-01-01T10:00:00.000Z',
+                'heart_rate', 'quantity',
+                '2026-01-01T10:00:00.000Z',
+                '2026-01-01T10:00:00.000Z',
+                NULL, 'bpm', 'Watch', X'7B7D',
+                '2026-01-01T12:00:00.000Z'
+            );
+            """
+        )
+        database.close()
+
+        let upgraded = try IngestStore(directory: directory)
+        _ = try await upgraded.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"heart_rate","units":"bpm","data":[
+                      {"date":"2026-01-01T10:00:00.000Z",
+                       "Min":63,"Avg":63,"Max":63,"source":"Watch"}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "current-no-id-heart"
+        )
+        _ = try await upgraded.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"heart_rate","units":"bpm","data":[
+                      {"id":"stable-heart-62",
+                       "date":"2026-01-01T10:00:00.000Z",
+                       "Min":62,"Avg":62,"Max":62,"source":"Watch"}
+                    ]}]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "different-stable-heart"
+        )
+
+        let samples = try await upgraded.samples(type: "heart_rate")
+        XCTAssertEqual(
+            Dictionary(uniqueKeysWithValues: samples.map { ($0.id, $0.value) }),
+            [
+                "heart_rate:2026-01-01T10:00:00.000Z": 63,
+                "stable-heart-62": 62
+            ],
+            "A stale migration marker must never delete the current no-ID reading."
+        )
+        await upgraded.close()
+
+        let inspected = try SQLiteDatabase(url: databaseURL)
+        defer { inspected.close() }
+        XCTAssertEqual(
+            try inspected.query(
+                """
+                SELECT COUNT(*) FROM sample_legacy_compatibility_shape
+                WHERE legacy_id = 'heart_rate:2026-01-01T10:00:00.000Z'
+                """,
+                row: { $0.integer(0) }
+            ).first,
+            0,
+            "Updating the row to the current shape must retire its one-time migration marker."
         )
     }
 
