@@ -1,5 +1,7 @@
 import CryptoKit
 import Foundation
+import HozzCore
+import HozzDeliver
 @testable import HozzReceive
 import HozzStore
 import XCTest
@@ -33,7 +35,7 @@ final class SchemaMigrationTests: XCTestCase {
     }
 
     /// The current schema. Every historical fixture must reach this.
-    private static let currentVersion: Int64 = 13
+    private static let currentVersion: Int64 = 14
 
     // MARK: - The historical schemas, as they actually were
 
@@ -204,6 +206,17 @@ final class SchemaMigrationTests: XCTestCase {
             );
         """
 
+    private static let legacyCompatibilityTables = """
+        CREATE TABLE sample_legacy_compatibility_shape (
+            legacy_id TEXT PRIMARY KEY, shape TEXT NOT NULL
+        );
+        CREATE TABLE sample_legacy_tombstone (
+            type TEXT NOT NULL, start_time TEXT NOT NULL,
+            legacy_id TEXT NOT NULL,
+            PRIMARY KEY (type, start_time, legacy_id)
+        );
+        """
+
     /// Builds a database exactly as version `version` left it, with data in it.
     private func makeHistoricalDatabase(version: Int64) throws -> URL {
         let url = root.appending(path: "store-v\(version)")
@@ -279,6 +292,9 @@ final class SchemaMigrationTests: XCTestCase {
                     ADD COLUMN receipt_version INTEGER NOT NULL DEFAULT 0;
                 """
             )
+        }
+        if version >= 13 {
+            try database.execute(Self.legacyCompatibilityTables)
         }
         try database.run(
             """
@@ -1304,7 +1320,285 @@ final class SchemaMigrationTests: XCTestCase {
         )
     }
 
-    func testVersionThirteenStreamsLargeLegacyShapeScanAndReconcilesSetWise()
+    func testVersionTenRetirementSentinelPreservesEquivalentAliasAmbiguity()
+        async throws
+    {
+        let legacyID = "heart_rate:2026-01-01T05:00:00.000-05:00"
+        let retiredID = "heart_rate:2026-01-01T10:00:00.000Z"
+        let directory = try makeAliasRepairDatabase(
+            version: 10,
+            legacyID: legacyID,
+            retiredID: retiredID
+        )
+        try await assertAliasRepairRemainsAmbiguous(
+            directory: directory,
+            legacyID: legacyID,
+            retiredID: retiredID,
+            legacyRowSurvives: true
+        )
+    }
+
+    func testVersionThirteenUnsafeMappingIsQuarantinedWithBothAliasIdentities()
+        async throws
+    {
+        let legacyID = "heart_rate:2026-01-01T10:00:00.000Z"
+        let retiredID = "heart_rate:2026-01-01T05:00:00.000-05:00"
+        let directory = try makeAliasRepairDatabase(
+            version: 13,
+            legacyID: legacyID,
+            retiredID: retiredID
+        )
+        try await assertAliasRepairRemainsAmbiguous(
+            directory: directory,
+            legacyID: legacyID,
+            retiredID: retiredID,
+            legacyRowSurvives: false
+        )
+    }
+
+    private func makeAliasRepairDatabase(
+        version: Int64,
+        legacyID: String,
+        retiredID: String
+    ) throws -> URL {
+        let directory = try makeReceiptDatabase(
+            version: version,
+            name: "alias-repair-v\(version)"
+        )
+        let database = try SQLiteDatabase(
+            url: directory.appending(path: "hozz-received.sqlite")
+        )
+        defer { database.close() }
+        try database.execute(
+            """
+            INSERT INTO sample
+                (id, type, kind, start_date, end_date, value, unit,
+                 source_name, raw, received_at)
+            VALUES (
+                'stable-heart', 'heart_rate', 'quantity',
+                '2026-01-01T10:00:00.000Z', '2026-01-01T10:00:00.000Z',
+                62, 'bpm', 'Watch', X'7B226B657074223A747275657D',
+                '2026-01-01T12:01:00.000Z'
+            );
+            """
+        )
+        try database.run(
+            """
+            INSERT INTO sample_tombstone (id, received_at)
+            VALUES (?, '2026-01-02T00:00:00.000Z')
+            """,
+            [.text(retiredID)]
+        )
+        if version == 10 {
+            try database.run(
+                """
+                INSERT INTO sample
+                    (id, type, kind, start_date, end_date, value, unit,
+                     source_name, raw, received_at)
+                VALUES (
+                    ?, 'heart_rate', 'quantity',
+                    '2026-01-01T10:00:00.000Z', '2026-01-01T10:00:00.000Z',
+                    NULL, 'bpm', 'Watch', X'7B7D', '2026-01-01T12:00:00.000Z'
+                )
+                """,
+                [.text(legacyID)]
+            )
+            try database.execute(
+                """
+                INSERT INTO sample_alias_retirement (type, start_time)
+                VALUES ('heart_rate', '2026-01-01T10:00:00.000Z');
+                """
+            )
+        } else {
+            // The old version-13 repair already deleted this alias's sample.
+            // Only its mapping, one-time shape, and retirement evidence survived.
+            try database.execute(
+                """
+                INSERT INTO sample_alias_signature
+                    (stable_id, type, kind, start_time, end_time,
+                     value, unit, source_name)
+                SELECT id, type, kind, start_date, end_date,
+                       value, unit, source_name
+                FROM sample WHERE id = 'stable-heart';
+                INSERT INTO sample_unresolved_legacy_deletion (stable_id, type)
+                VALUES (
+                    'v10-retirement:heart_rate:2026-01-01T10:00:00.000Z',
+                    'heart_rate'
+                );
+                INSERT INTO sample_alias_retirement (type, start_time)
+                VALUES ('heart_rate', '2026-01-01T10:00:00.000Z');
+                """
+            )
+            try database.run(
+                """
+                INSERT INTO sample_identity_alias (stable_id, legacy_id)
+                VALUES ('stable-heart', ?)
+                """,
+                [.text(legacyID)]
+            )
+            try database.run(
+                """
+                INSERT INTO sample_legacy_compatibility_shape (legacy_id, shape)
+                VALUES (?, 'heartRateRange')
+                """,
+                [.text(legacyID)]
+            )
+        }
+        return directory
+    }
+
+    private func assertAliasRepairRemainsAmbiguous(
+        directory: URL,
+        legacyID: String,
+        retiredID: String,
+        legacyRowSurvives: Bool
+    ) async throws {
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let expectedIDs: Set<String> = legacyRowSurvives
+            ? ["stable-heart", legacyID]
+            : ["stable-heart"]
+        let expectedRetiredIDs: Set<String> = legacyRowSurvives
+            ? [retiredID]
+            : [legacyID, retiredID]
+        for _ in 0..<3 {
+            let store = try IngestStore(directory: directory)
+            let samples = try await store.samples(type: "heart_rate")
+            XCTAssertEqual(Set(samples.map(\.id)), expectedIDs)
+            XCTAssertEqual(samples.first { $0.id == "stable-heart" }?.value, 62)
+            await store.close()
+
+            let inspected = try SQLiteDatabase(url: databaseURL)
+            XCTAssertEqual(
+                try inspected.query(
+                    "PRAGMA user_version",
+                    row: { $0.integer(0) }
+                ).first,
+                Self.currentVersion
+            )
+            XCTAssertEqual(
+                try inspected.query(
+                    "SELECT COUNT(*) FROM sample_identity_alias",
+                    row: { $0.integer(0) }
+                ).first,
+                0
+            )
+            let retiredIDs = try inspected.query(
+                """
+                SELECT legacy_id FROM sample_legacy_tombstone
+                WHERE type = 'heart_rate'
+                  AND start_time = '2026-01-01T10:00:00.000Z'
+                """,
+                row: { $0.text(0) }
+            )
+            XCTAssertEqual(Set(retiredIDs), expectedRetiredIDs)
+            XCTAssertEqual(
+                try inspected.query(
+                    """
+                    SELECT COUNT(*) FROM sample_unresolved_legacy_deletion
+                    WHERE stable_id =
+                        'v10-retirement:heart_rate:2026-01-01T10:00:00.000Z'
+                    """,
+                    row: { $0.integer(0) }
+                ).first,
+                1,
+                "The v10 sentinel must remain available as retirement evidence."
+            )
+            XCTAssertEqual(
+                try inspected.query(
+                    "SELECT hex(raw) FROM sample WHERE id = 'stable-heart'",
+                    row: { $0.text(0) }
+                ).first,
+                "7B226B657074223A747275657D"
+            )
+            XCTAssertEqual(
+                try inspected.query(
+                    "SELECT value FROM sample WHERE id = 'stale-value'",
+                    row: { $0.real(0) }
+                ).first,
+                2
+            )
+            XCTAssertEqual(
+                try inspected.query(
+                    """
+                    SELECT COUNT(*) FROM sample_tombstone
+                    WHERE id IN ('stable-heart', ?)
+                    """,
+                    [.text(legacyID)],
+                    row: { $0.integer(0) }
+                ).first,
+                0,
+                "Candidate history is not proof that either identity was deleted."
+            )
+            inspected.close()
+        }
+
+        let store = try IngestStore(directory: directory)
+        for aliasID in [legacyID, retiredID] {
+            let date = String(aliasID.dropFirst("heart_rate:".count))
+            let batch = try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"heart_rate","units":"bpm","data":[
+                      {"id":"stable-heart","date":"\(date)",
+                       "Min":62,"Avg":62,"Max":62,"source":"Watch"}
+                    ]}]}}
+                    """.utf8
+                )
+            )
+            do {
+                _ = try await store.ingest(
+                    batch,
+                    idempotencyKey: "ambiguous-replay-\(aliasID)"
+                )
+                XCTFail("Neither date spelling proves which legacy identity was retired.")
+            } catch is UnresolvedLegacyAliasError {
+                // Expected.
+            }
+        }
+        do {
+            _ = try await store.ingest(
+                try BatchParser.parse(
+                    Data(
+                        #"{"id":"stable-heart","kind":"deletion","schemaVersion":1,"type":"HKQuantityTypeIdentifierHeartRate"}"#
+                            .utf8
+                    )
+                ),
+                idempotencyKey: "ambiguous-stable-deletion"
+            )
+            XCTFail("Deleting the stable ID must not guess between the candidates.")
+        } catch is UnresolvedLegacyAliasError {
+            // Expected.
+        }
+        let afterRejectedWrites = try await store.samples(type: "heart_rate")
+        XCTAssertEqual(Set(afterRejectedWrites.map(\.id)), expectedIDs)
+        XCTAssertEqual(afterRejectedWrites.first { $0.id == "stable-heart" }?.value, 62)
+
+        let legacyDate = String(legacyID.dropFirst("heart_rate:".count))
+        _ = try await store.ingest(
+            try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[],"deletions":[
+                      {"name":"heart_rate","date":"\(legacyDate)"}
+                    ]}}
+                    """.utf8
+                )
+            ),
+            idempotencyKey: "exact-legacy-deletion"
+        )
+        let afterLegacyDeletion = try await store.samples(type: "heart_rate")
+        XCTAssertEqual(afterLegacyDeletion.map(\.id), ["stable-heart"])
+        XCTAssertEqual(afterLegacyDeletion.first?.value, 62)
+        await store.close()
+
+        let reopened = try IngestStore(directory: directory)
+        let final = try await reopened.samples(type: "heart_rate")
+        XCTAssertEqual(final.map(\.id), ["stable-heart"])
+        XCTAssertEqual(final.first?.value, 62)
+        await reopened.close()
+    }
+
+    func testVersionThirteenStreamsLegacyShapesAndFourteenRepairsSetWise()
         throws
     {
         let directory = try makeReceiptDatabase(
@@ -1409,6 +1703,58 @@ final class SchemaMigrationTests: XCTestCase {
                 row: { Int($0.integer(0)) }
             ).first,
             count
+        )
+
+        let insertTombstone = try database.prepared(
+            """
+            INSERT INTO sample_tombstone (id, received_at)
+            VALUES (?, '2026-02-01T00:00:00.000Z')
+            """
+        )
+        defer { insertTombstone.finalize() }
+        let alternateTimestamp = Date.ISO8601FormatStyle(
+            includingFractionalSeconds: true,
+            timeZone: try XCTUnwrap(TimeZone(secondsFromGMT: -18_000))
+        )
+        for index in 0..<count {
+            let date = base.addingTimeInterval(TimeInterval(index * 3_601))
+            let type = index.isMultiple(of: 2) ? "heart_rate" : "sleep_analysis"
+            try insertTombstone.run([
+                .text("\(type):\(alternateTimestamp.format(date))")
+            ])
+        }
+
+        let repair = try IngestStore.migrateToFourteen(database, from: 13)
+        XCTAssertEqual(repair.legacySamplesScanned, 0)
+        XCTAssertEqual(repair.tombstonesScanned, count)
+        XCTAssertEqual(repair.retirementLookups, count)
+        XCTAssertEqual(repair.reconciliationPasses, 1)
+        XCTAssertEqual(repair.reconciliationCandidateRows, count * 2)
+        XCTAssertEqual(repair.reconciledAliases, 0)
+        XCTAssertEqual(
+            try database.query(
+                "SELECT COUNT(*) FROM sample",
+                row: { Int($0.integer(0)) }
+            ).first,
+            count
+        )
+        XCTAssertEqual(
+            try database.query(
+                "SELECT COUNT(*) FROM sample_identity_alias",
+                row: { Int($0.integer(0)) }
+            ).first,
+            0
+        )
+        XCTAssertEqual(
+            try database.query(
+                "SELECT COUNT(*) FROM sample_legacy_tombstone",
+                row: { Int($0.integer(0)) }
+            ).first,
+            count * 2
+        )
+        XCTAssertEqual(
+            try IngestStore.migrateToFourteen(database, from: 14),
+            LegacyTombstoneMigrationStatistics()
         )
     }
 
@@ -1646,7 +1992,7 @@ final class SchemaMigrationTests: XCTestCase {
 
         let store = try HozzStore(directory: directory)
         let version = try await store.schemaVersion()
-        XCTAssertEqual(version, 7)
+        XCTAssertEqual(version, 8)
 
         let database = try SQLiteDatabase(url: databaseURL)
         defer { database.close() }
@@ -1694,13 +2040,190 @@ final class SchemaMigrationTests: XCTestCase {
         )
     }
 
+    func testVersionSevenMarksAdvancedLossyDestinationsForReplay() async throws {
+        let directory = root.appending(path: "phone-lossy-replay")
+        let store = try HozzStore(directory: directory)
+        let type = HealthTypeKey("HKQuantityTypeIdentifierStepCount")
+        let metrics = Destination(
+            name: "Metrics with cursor",
+            kind: .folder,
+            format: .metrics,
+            folderBookmark: Data("metrics".utf8)
+        )
+        let influx = Destination(
+            name: "Influx with prime",
+            kind: .restAPI,
+            format: .influx,
+            endpointURL: try XCTUnwrap(URL(string: "https://influx.example"))
+        )
+        let metricsWithoutState = Destination(
+            name: "Unused metrics",
+            kind: .folder,
+            format: .metrics,
+            folderBookmark: Data("unused".utf8)
+        )
+        let influxWithoutState = Destination(
+            name: "Unused influx",
+            kind: .restAPI,
+            format: .influx,
+            endpointURL: URL(string: "https://unused.example")
+        )
+        let lossless = Destination(
+            name: "Lossless with cursor",
+            kind: .folder,
+            format: .ndjson,
+            folderBookmark: Data("lossless".utf8)
+        )
+        let json = Destination(
+            name: "JSON with prime",
+            kind: .folder,
+            format: .json,
+            folderBookmark: Data("json".utf8)
+        )
+        let destinations = [
+            metrics, influx, metricsWithoutState, influxWithoutState, lossless, json
+        ]
+        for destination in destinations {
+            _ = try await store.saveDestination(
+                id: destination.id,
+                payload: try JSONEncoder().encode(destination),
+                createdAt: destination.createdAt
+            )
+        }
+        for destination in [metrics, lossless] {
+            try await store.commit(
+                [
+                    PendingAnchorCommit(
+                        type: type,
+                        baseAnchor: nil,
+                        anchor: AnchorToken(data: Data([0x01])),
+                        coverage: .draining,
+                        addedRecordCount: 1,
+                        addedObservedCount: 1
+                    )
+                ],
+                scope: .destination(destination.id)
+            )
+        }
+        for destination in [influx, json] {
+            _ = try await store.beginPrime(
+                scope: .destination(destination.id),
+                type: type,
+                windowStart: Date(timeIntervalSince1970: 1),
+                startedAt: Date(timeIntervalSince1970: 2),
+                chunkSeconds: 60
+            )
+        }
+        let unreadableID = UUID()
+        _ = try await store.saveDestination(
+            id: unreadableID,
+            payload: Data("not JSON".utf8),
+            createdAt: .now
+        )
+        await store.close()
+
+        // Version 8 changes only data; the version-7 tables are identical.
+        let database = try SQLiteDatabase(
+            url: StoreLocation.databaseURL(in: directory)
+        )
+        try database.execute(
+            """
+            DELETE FROM delivery_omission_seal;
+            PRAGMA user_version = 7;
+            """
+        )
+        database.close()
+
+        let upgraded = try HozzStore(directory: directory)
+        let version = try await upgraded.schemaVersion()
+        let metricsDebt = try await upgraded.deliveryOmissionFormats(for: metrics.id)
+        let influxDebt = try await upgraded.deliveryOmissionFormats(for: influx.id)
+        XCTAssertEqual(version, 8)
+        XCTAssertEqual(metricsDebt, ["metrics"])
+        XCTAssertEqual(influxDebt, ["influx"])
+        for destination in [metricsWithoutState, influxWithoutState, lossless, json] {
+            let formats = try await upgraded.deliveryOmissionFormats(
+                for: destination.id
+            )
+            XCTAssertTrue(formats.isEmpty, destination.name)
+        }
+        let unreadableDebt = try await upgraded.deliveryOmissionFormats(
+            for: unreadableID
+        )
+        XCTAssertTrue(unreadableDebt.isEmpty)
+        let preservedCursor = try await upgraded.committedAnchor(
+            scope: .destination(metrics.id),
+            type: type
+        )
+        let preservedPrime = try await upgraded.primeRecord(
+            scope: .destination(influx.id),
+            type: type
+        )
+        XCTAssertEqual(preservedCursor, AnchorToken(data: Data([0x01])))
+        XCTAssertNotNil(preservedPrime)
+
+        let delivery = DeliveryEngine(store: upgraded, channels: [:])
+        for (destination, format) in [(metrics, DeliveryFormat.ndjson), (influx, .json)] {
+            let loaded = try await delivery.destination(id: destination.id)
+            var broadened = try XCTUnwrap(loaded)
+            broadened.format = format
+            try await delivery.save(broadened)
+            let stream = try await upgraded.streamRecord(
+                scope: .destination(destination.id),
+                type: type
+            )
+            let prime = try await upgraded.primeRecord(
+                scope: .destination(destination.id),
+                type: type
+            )
+            let debt = try await upgraded.deliveryOmissionFormats(for: destination.id)
+            let saved = try await delivery.destination(id: destination.id)
+            XCTAssertNil(stream)
+            XCTAssertNil(prime)
+            XCTAssertTrue(debt.isEmpty)
+            XCTAssertEqual(saved?.format, format)
+            XCTAssertEqual(saved?.isReplayPending, false)
+        }
+        let untouchedCursor = try await upgraded.committedAnchor(
+            scope: .destination(lossless.id),
+            type: type
+        )
+        let untouchedPrime = try await upgraded.primeRecord(
+            scope: .destination(json.id),
+            type: type
+        )
+        XCTAssertEqual(untouchedCursor, preservedCursor)
+        XCTAssertNotNil(untouchedPrime)
+
+        _ = try await upgraded.beginPrime(
+            scope: .destination(metricsWithoutState.id),
+            type: type,
+            windowStart: Date(timeIntervalSince1970: 1),
+            startedAt: Date(timeIntervalSince1970: 2),
+            chunkSeconds: 60
+        )
+        await upgraded.close()
+        let reopened = try HozzStore(directory: directory)
+        for destination in destinations {
+            let debt = try await reopened.deliveryOmissionFormats(for: destination.id)
+            XCTAssertTrue(debt.isEmpty, "The historical repair must run only once.")
+        }
+        let newPrime = try await reopened.primeRecord(
+            scope: .destination(metricsWithoutState.id),
+            type: type
+        )
+        XCTAssertNotNil(newPrime)
+        await reopened.close()
+    }
+
     func testThePhoneStoreIsIdempotentAcrossReopens() async throws {
         let directory = root.appending(path: "phone-idempotent")
 
         for _ in 0..<3 {
             let store = try HozzStore(directory: directory)
             let version = try await store.schemaVersion()
-            XCTAssertEqual(version, 7)
+            XCTAssertEqual(version, 8)
+            await store.close()
         }
     }
 }

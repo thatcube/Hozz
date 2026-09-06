@@ -125,7 +125,7 @@ final class HozzStoreTests: XCTestCase {
 
         for store in stores {
             let version = try await store.schemaVersion()
-            XCTAssertEqual(version, 7)
+            XCTAssertEqual(version, 8)
             await store.close()
         }
     }
@@ -427,6 +427,85 @@ final class HozzStoreTests: XCTestCase {
         )
         XCTAssertNil(anchor)
         XCTAssertTrue(formats.isEmpty)
+    }
+
+    func testStaleDestinationRevisionRejectsStateAndReceiptWrites() async throws {
+        let store = try await makeStore()
+        let id = UUID()
+        let original = try await store.saveDestination(
+            id: id,
+            payload: Data(#"{"format":"metrics"}"#.utf8),
+            createdAt: .now
+        )
+        let current = try await store.saveDestination(
+            id: id,
+            payload: Data(#"{"format":"ndjson"}"#.utf8),
+            createdAt: .now
+        )
+        let state = DeliveryStateRecord(
+            destinationID: id,
+            state: "idle",
+            deliveredRecords: 7
+        )
+        let receipt = DeliveryReceiptRecord(
+            destinationID: id,
+            attemptedAt: Date(timeIntervalSince1970: 1),
+            recordCount: 7,
+            byteCount: 70,
+            state: "delivered",
+            detail: nil,
+            artifactName: nil
+        )
+        try await store.saveDeliveryState(
+            state,
+            expectedDestinationRevision: current.revision
+        )
+        try await store.appendReceipt(
+            receipt,
+            expectedDestinationRevision: current.revision
+        )
+        try await store.validateDestinationRevision(
+            id: id,
+            expectedRevision: current.revision
+        )
+
+        for deleted in [false, true] {
+            if deleted {
+                try await store.deleteDestination(id: id)
+            }
+            let expectedActual: Int64? = deleted ? nil : current.revision
+            do {
+                try await store.saveDeliveryState(
+                    DeliveryStateRecord(destinationID: id, state: "retrying"),
+                    expectedDestinationRevision: original.revision
+                )
+                XCTFail("A stale state write must fail, including after deletion.")
+            } catch HozzStoreError.staleDestinationConfiguration(
+                let failedID, let expected, let actual
+            ) {
+                XCTAssertEqual(failedID, id)
+                XCTAssertEqual(expected, original.revision)
+                XCTAssertEqual(actual, expectedActual)
+            }
+            do {
+                try await store.appendReceipt(
+                    receipt,
+                    keeping: 0,
+                    expectedDestinationRevision: original.revision
+                )
+                XCTFail("A stale receipt must neither insert nor prune history.")
+            } catch HozzStoreError.staleDestinationConfiguration(
+                let failedID, let expected, let actual
+            ) {
+                XCTAssertEqual(failedID, id)
+                XCTAssertEqual(expected, original.revision)
+                XCTAssertEqual(actual, expectedActual)
+            }
+            let savedState = try await store.deliveryState(for: id)
+            let receipts = try await store.receipts(for: id)
+            XCTAssertEqual(savedState, deleted ? nil : state)
+            XCTAssertEqual(receipts, deleted ? [] : [receipt])
+        }
     }
 
     func testScopesDoNotShareAnchors() async throws {

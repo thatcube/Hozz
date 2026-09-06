@@ -189,6 +189,30 @@ extension HozzStore {
         ).first
     }
 
+    public func validateDestinationRevision(
+        id: UUID,
+        expectedRevision: Int64
+    ) throws {
+        try requireDestinationRevision(
+            id: id,
+            expectedRevision: expectedRevision
+        )
+    }
+
+    private func requireDestinationRevision(
+        id: UUID,
+        expectedRevision: Int64
+    ) throws {
+        let actual = try destinationRevision(id: id)
+        guard actual == expectedRevision else {
+            throw HozzStoreError.staleDestinationConfiguration(
+                id: id,
+                expected: expectedRevision,
+                actual: actual
+            )
+        }
+    }
+
     /// Applies one automatic field repair to the latest persisted payload.
     ///
     /// The transform runs only while the destination still has the revision
@@ -284,39 +308,50 @@ extension HozzStore {
         )
     }
 
-    public func saveDeliveryState(_ record: DeliveryStateRecord) throws {
-        try database.run(
-            """
-            INSERT INTO delivery_state (
-                destination_id, state, last_attempt_at, last_success_at,
-                next_attempt_at, consecutive_failures, pending_batch_id,
-                next_sequence, delivered_records, detail
+    public func saveDeliveryState(
+        _ record: DeliveryStateRecord,
+        expectedDestinationRevision: Int64? = nil
+    ) throws {
+        try database.transaction {
+            if let expectedDestinationRevision {
+                try requireDestinationRevision(
+                    id: record.destinationID,
+                    expectedRevision: expectedDestinationRevision
+                )
+            }
+            try database.run(
+                """
+                INSERT INTO delivery_state (
+                    destination_id, state, last_attempt_at, last_success_at,
+                    next_attempt_at, consecutive_failures, pending_batch_id,
+                    next_sequence, delivered_records, detail
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(destination_id) DO UPDATE SET
+                    state = excluded.state,
+                    last_attempt_at = excluded.last_attempt_at,
+                    last_success_at = excluded.last_success_at,
+                    next_attempt_at = excluded.next_attempt_at,
+                    consecutive_failures = excluded.consecutive_failures,
+                    pending_batch_id = excluded.pending_batch_id,
+                    next_sequence = excluded.next_sequence,
+                    delivered_records = excluded.delivered_records,
+                    detail = excluded.detail;
+                """,
+                [
+                    .text(record.destinationID.uuidString.lowercased()),
+                    .text(record.state),
+                    record.lastAttemptAt.map { .real($0.timeIntervalSince1970) } ?? .null,
+                    record.lastSuccessAt.map { .real($0.timeIntervalSince1970) } ?? .null,
+                    record.nextAttemptAt.map { .real($0.timeIntervalSince1970) } ?? .null,
+                    .integer(Int64(record.consecutiveFailures)),
+                    record.pendingBatchID.map { .text($0.uuidString.lowercased()) } ?? .null,
+                    .integer(Int64(record.nextSequence)),
+                    .integer(Int64(record.deliveredRecords)),
+                    record.detail.map(SQLiteValue.text) ?? .null
+                ]
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(destination_id) DO UPDATE SET
-                state = excluded.state,
-                last_attempt_at = excluded.last_attempt_at,
-                last_success_at = excluded.last_success_at,
-                next_attempt_at = excluded.next_attempt_at,
-                consecutive_failures = excluded.consecutive_failures,
-                pending_batch_id = excluded.pending_batch_id,
-                next_sequence = excluded.next_sequence,
-                delivered_records = excluded.delivered_records,
-                detail = excluded.detail;
-            """,
-            [
-                .text(record.destinationID.uuidString.lowercased()),
-                .text(record.state),
-                record.lastAttemptAt.map { .real($0.timeIntervalSince1970) } ?? .null,
-                record.lastSuccessAt.map { .real($0.timeIntervalSince1970) } ?? .null,
-                record.nextAttemptAt.map { .real($0.timeIntervalSince1970) } ?? .null,
-                .integer(Int64(record.consecutiveFailures)),
-                record.pendingBatchID.map { .text($0.uuidString.lowercased()) } ?? .null,
-                .integer(Int64(record.nextSequence)),
-                .integer(Int64(record.deliveredRecords)),
-                record.detail.map(SQLiteValue.text) ?? .null
-            ]
-        )
+        }
     }
 
     // MARK: - Receipts
@@ -327,9 +362,16 @@ extension HozzStore {
     /// it is deliberately bounded rather than growing without limit.
     public func appendReceipt(
         _ receipt: DeliveryReceiptRecord,
-        keeping limit: Int = 100
+        keeping limit: Int = 100,
+        expectedDestinationRevision: Int64? = nil
     ) throws {
         try database.transaction {
+            if let expectedDestinationRevision {
+                try requireDestinationRevision(
+                    id: receipt.destinationID,
+                    expectedRevision: expectedDestinationRevision
+                )
+            }
             try database.run(
                 """
                 INSERT INTO delivery_receipt (

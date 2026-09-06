@@ -49,13 +49,15 @@ private actor ScriptedChannel: DeliveryChannel {
 
 private actor GatedRepairChannel: DeliveryChannel {
     private let refreshedBookmark: Data?
+    private let failure: DeliveryError?
     private var started = false
     private var released = false
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
     private var releaseWaiter: CheckedContinuation<Void, Never>?
 
-    init(refreshedBookmark: Data? = nil) {
+    init(refreshedBookmark: Data? = nil, failure: DeliveryError? = nil) {
         self.refreshedBookmark = refreshedBookmark
+        self.failure = failure
     }
 
     func waitUntilStarted() async {
@@ -94,6 +96,9 @@ private actor GatedRepairChannel: DeliveryChannel {
                 }
             }
         }
+        if let failure {
+            throw failure
+        }
         return DeliveryReceipt(
             destinationID: destination.id,
             attemptedAt: .now,
@@ -106,13 +111,13 @@ private actor GatedRepairChannel: DeliveryChannel {
 }
 
 private actor EndpointRepairGate {
-    private let endpoint: URL
+    private let endpoint: URL?
     private var started = false
     private var released = false
     private var startWaiters: [CheckedContinuation<Void, Never>] = []
     private var releaseWaiter: CheckedContinuation<Void, Never>?
 
-    init(endpoint: URL) {
+    init(endpoint: URL?) {
         self.endpoint = endpoint
     }
 
@@ -378,6 +383,205 @@ final class DeliveryTests: XCTestCase {
         let state = try await store.deliveryState(for: destination.id)
         XCTAssertTrue(remaining.isEmpty)
         XCTAssertNil(state)
+    }
+
+    func testRevisionIsRecheckedAfterDiscoveryWithoutAnEndpointRepair()
+        async throws
+    {
+        let store = try makeStore()
+        let channel = ScriptedChannel()
+        let gate = EndpointRepairGate(endpoint: nil)
+        let engine = DeliveryEngine(
+            store: store,
+            channels: [.restAPI: channel],
+            endpointRepairResolver: { destination in
+                await gate.resolve(destination)
+            }
+        )
+        var destination = Destination(
+            name: "Receiver",
+            kind: .restAPI,
+            endpointURL: try XCTUnwrap(URL(string: "https://old.example"))
+        )
+        try await engine.save(destination)
+        let snapshots = try await engine.dueDestinationSnapshots(
+            ignoringCadence: true
+        )
+        let snapshot = try XCTUnwrap(snapshots.first)
+        let batch = makeBatch()
+        let delivery = Task {
+            try await engine.deliver(
+                batch,
+                to: snapshot.destination,
+                expectedRevision: snapshot.revision
+            )
+        }
+        await gate.waitUntilStarted()
+
+        let editor = DeliveryEngine(store: store, channels: [:])
+        destination.endpointURL = try XCTUnwrap(
+            URL(string: "https://new.example")
+        )
+        try await editor.save(destination)
+        let editedState = try await store.deliveryState(for: destination.id)
+        await gate.release()
+
+        do {
+            _ = try await delivery.value
+            XCTFail("Discovery must not send a snapshot another engine edited.")
+        } catch HozzStoreError.staleDestinationConfiguration {
+            // Expected.
+        }
+        let sent = await channel.batchIDs()
+        let state = try await store.deliveryState(for: destination.id)
+        let receipts = try await store.receipts(for: destination.id)
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertEqual(state, editedState)
+        XCTAssertTrue(receipts.isEmpty)
+    }
+
+    func testStaleEmptyWindowDoesNotWriteSuccess() async throws {
+        var destination = folderDestination()
+        destination.deliveryWindow = .sinceStartOfToday
+        let batch = DeliveryBatch(
+            id: UUID(),
+            sequence: 0,
+            createdAt: Date(timeIntervalSince1970: 1_767_355_200),
+            recordCount: 1,
+            payload: Data(
+                #"{"id":"old","kind":"quantity","type":"steps","startDate":"2020-01-01T00:00:00.000Z","quantity":{"value":1,"unit":"count"}}"#
+                    .utf8
+            ),
+            format: .ndjson
+        )
+        try await assertStaleAttemptDoesNotWrite(destination, batch: batch)
+    }
+
+    func testStaleInvalidWindowDoesNotWriteFailure() async throws {
+        var destination = folderDestination()
+        destination.deliveryWindow = .sinceStartOfToday
+        let batch = DeliveryBatch(
+            id: UUID(),
+            sequence: 0,
+            createdAt: Date(timeIntervalSince1970: 1_767_355_200),
+            recordCount: 1,
+            payload: Data("not JSON".utf8),
+            format: .ndjson
+        )
+        try await assertStaleAttemptDoesNotWrite(destination, batch: batch)
+    }
+
+    func testStaleUnsupportedDestinationDoesNotWriteAttention() async throws {
+        let destination = try JSONDecoder().decode(
+            Destination.self,
+            from: Data(
+                """
+                {"id":"8B2E7F6A-1C2D-4E5F-9A0B-1C2D3E4F5A6B",
+                 "name":"Future format","kind":"folder","format":"future",
+                 "createdAt":760000000}
+                """.utf8
+            )
+        )
+        XCTAssertFalse(destination.isUsable)
+        try await assertStaleAttemptDoesNotWrite(
+            destination,
+            batch: makeBatch()
+        )
+    }
+
+    private func assertStaleAttemptDoesNotWrite(
+        _ destination: Destination,
+        batch: DeliveryBatch
+    ) async throws {
+        let store = try makeStore()
+        let channel = ScriptedChannel()
+        let engine = DeliveryEngine(store: store, channels: [.folder: channel])
+        try await engine.save(
+            destination,
+            now: Date(timeIntervalSince1970: 1_767_355_200)
+        )
+        let loaded = try await engine.destination(id: destination.id)
+        let snapshot = try XCTUnwrap(loaded)
+        let revision = try await store.destinationRevision(id: destination.id)
+        let expectedRevision = try XCTUnwrap(revision)
+        var edited = snapshot
+        edited.isEnabled = false
+        try await engine.save(edited)
+        let editedState = try await store.deliveryState(for: destination.id)
+
+        do {
+            _ = try await engine.deliver(
+                batch,
+                to: snapshot,
+                expectedRevision: expectedRevision
+            )
+            XCTFail("A stale attempt must not record any outcome.")
+        } catch HozzStoreError.staleDestinationConfiguration {
+            // Expected.
+        }
+        let sent = await channel.batchIDs()
+        let state = try await store.deliveryState(for: destination.id)
+        let receipts = try await store.receipts(for: destination.id)
+        XCTAssertTrue(sent.isEmpty)
+        XCTAssertEqual(state, editedState)
+        XCTAssertTrue(receipts.isEmpty)
+    }
+
+    func testStaleTransportFailureDoesNotOverwriteEditedState() async throws {
+        try await assertFinishingStaleDeliveryDoesNotWrite(
+            failure: .transport("offline"),
+            deleting: false
+        )
+    }
+
+    func testStaleSuccessDoesNotRecreateDeletedState() async throws {
+        try await assertFinishingStaleDeliveryDoesNotWrite(
+            failure: nil,
+            deleting: true
+        )
+    }
+
+    private func assertFinishingStaleDeliveryDoesNotWrite(
+        failure: DeliveryError?,
+        deleting: Bool
+    ) async throws {
+        let store = try makeStore()
+        let channel = GatedRepairChannel(failure: failure)
+        let engine = DeliveryEngine(store: store, channels: [.folder: channel])
+        var destination = folderDestination()
+        try await engine.save(destination)
+        let snapshots = try await engine.dueDestinationSnapshots(
+            ignoringCadence: true
+        )
+        let snapshot = try XCTUnwrap(snapshots.first)
+        let batch = makeBatch()
+        let delivery = Task {
+            try await engine.deliver(
+                batch,
+                to: snapshot.destination,
+                expectedRevision: snapshot.revision
+            )
+        }
+        await channel.waitUntilStarted()
+        if deleting {
+            try await engine.delete(id: destination.id)
+        } else {
+            destination.isEnabled = false
+            try await engine.save(destination)
+        }
+        let editedState = try await store.deliveryState(for: destination.id)
+        await channel.release()
+
+        do {
+            _ = try await delivery.value
+            XCTFail("A stale completion must not overwrite the user's state.")
+        } catch HozzStoreError.staleDestinationConfiguration {
+            // Expected.
+        }
+        let state = try await store.deliveryState(for: destination.id)
+        let receipts = try await store.receipts(for: destination.id)
+        XCTAssertEqual(state, editedState)
+        XCTAssertTrue(receipts.isEmpty)
     }
 
     // MARK: - Delivery outcomes

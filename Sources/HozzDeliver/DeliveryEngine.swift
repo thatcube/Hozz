@@ -457,6 +457,19 @@ public actor DeliveryEngine {
         return revision
     }
 
+    private func validateDestinationRevision(
+        id: UUID,
+        expectedRevision: Int64?
+    ) async throws {
+        guard let expectedRevision else {
+            return
+        }
+        try await store.validateDestinationRevision(
+            id: id,
+            expectedRevision: expectedRevision
+        )
+    }
+
     // MARK: - Delivering
 
     /// Sends one batch, recording the outcome either way.
@@ -470,11 +483,21 @@ public actor DeliveryEngine {
         expectedRevision: Int64? = nil,
         now: Date = .now
     ) async throws -> DeliveryReceipt {
+        let capturedRevision = expectedRevision ?? revisions[destination.id]
+        try await validateDestinationRevision(
+            id: destination.id,
+            expectedRevision: capturedRevision
+        )
         if let detail = destination.unsupportedDescription {
             // Recorded rather than thrown quietly, so the dashboard shows the
             // destination needing attention instead of it simply never
             // delivering anything again.
-            try await recordUnusable(destination, detail: detail, now: now)
+            try await recordUnusable(
+                destination,
+                detail: detail,
+                expectedRevision: capturedRevision,
+                now: now
+            )
             throw DeliveryError.unsupportedSettings(detail)
         }
         guard let channel = channels[destination.kind] else {
@@ -498,6 +521,7 @@ public actor DeliveryEngine {
                 error,
                 destination: destination,
                 batch: batch,
+                expectedRevision: capturedRevision,
                 now: now
             )
             throw error
@@ -512,6 +536,7 @@ public actor DeliveryEngine {
                 destination,
                 excluded: windowed.excludedRecords,
                 sequence: batch.sequence,
+                expectedRevision: capturedRevision,
                 now: now
             )
             return DeliveryReceipt(
@@ -543,11 +568,11 @@ public actor DeliveryEngine {
                 nextSequence: max(previous?.nextSequence ?? 0, batch.sequence + 1),
                 deliveredRecords: previous?.deliveredRecords ?? 0,
                 detail: nil
-            )
+            ),
+            expectedDestinationRevision: capturedRevision
         )
 
         var destination = destination
-        let capturedRevision = expectedRevision ?? revisions[destination.id]
         // A computer's address is not permanent: routers reassign them, laptops
         // move network, ports change when an app restarts. Without this, a
         // destination that worked yesterday retries a dead address forever and
@@ -568,6 +593,10 @@ public actor DeliveryEngine {
         }
 
         do {
+            try await validateDestinationRevision(
+                id: destination.id,
+                expectedRevision: capturedRevision
+            )
             let delivered = try await channel.deliver(batch, to: destination)
 
             // Persist a refreshed folder bookmark so an ordinary folder move
@@ -602,6 +631,10 @@ public actor DeliveryEngine {
                 )
                 : delivered
 
+            try await validateDestinationRevision(
+                id: destination.id,
+                expectedRevision: capturedRevision
+            )
             try await store.saveDeliveryState(
                 DeliveryStateRecord(
                     destinationID: destination.id,
@@ -614,19 +647,28 @@ public actor DeliveryEngine {
                     nextSequence: max(previous?.nextSequence ?? 0, batch.sequence + 1),
                     deliveredRecords: (previous?.deliveredRecords ?? 0) + batch.recordCount,
                     detail: nil
-                )
+                ),
+                expectedDestinationRevision: capturedRevision
             )
-            try await store.appendReceipt(Self.record(receipt))
+            try await store.appendReceipt(
+                Self.record(receipt),
+                expectedDestinationRevision: capturedRevision
+            )
             return receipt
         } catch let error as HozzStoreError {
             throw error
         } catch {
             let failure = error as? DeliveryError
                 ?? .transport(error.localizedDescription)
+            try await validateDestinationRevision(
+                id: destination.id,
+                expectedRevision: capturedRevision
+            )
             try await recordFailure(
                 failure,
                 destination: destination,
                 batch: batch,
+                expectedRevision: capturedRevision,
                 now: now
             )
             throw failure
@@ -672,6 +714,7 @@ public actor DeliveryEngine {
         _ failure: DeliveryError,
         destination: Destination,
         batch: DeliveryBatch,
+        expectedRevision: Int64?,
         now: Date
     ) async throws {
         let previous = try await store.deliveryState(for: destination.id)
@@ -696,7 +739,8 @@ public actor DeliveryEngine {
                 nextSequence: previous?.nextSequence ?? batch.sequence,
                 deliveredRecords: previous?.deliveredRecords ?? 0,
                 detail: failure.errorDescription
-            )
+            ),
+            expectedDestinationRevision: expectedRevision
         )
         try await store.appendReceipt(
             DeliveryReceiptRecord(
@@ -707,7 +751,8 @@ public actor DeliveryEngine {
                 state: state.rawValue,
                 detail: failure.errorDescription,
                 artifactName: nil
-            )
+            ),
+            expectedDestinationRevision: expectedRevision
         )
     }
 
@@ -721,6 +766,7 @@ public actor DeliveryEngine {
         _ destination: Destination,
         excluded: Int,
         sequence: Int,
+        expectedRevision: Int64?,
         now: Date
     ) async throws {
         let previous = try await store.deliveryState(for: destination.id)
@@ -737,7 +783,8 @@ public actor DeliveryEngine {
                 nextSequence: max(previous?.nextSequence ?? 0, sequence + 1),
                 deliveredRecords: previous?.deliveredRecords ?? 0,
                 detail: detail
-            )
+            ),
+            expectedDestinationRevision: expectedRevision
         )
         try await store.appendReceipt(
             DeliveryReceiptRecord(
@@ -748,7 +795,8 @@ public actor DeliveryEngine {
                 state: DeliveryState.delivered.rawValue,
                 detail: detail,
                 artifactName: nil
-            )
+            ),
+            expectedDestinationRevision: expectedRevision
         )
     }
 
@@ -829,6 +877,7 @@ public actor DeliveryEngine {
     private func recordUnusable(
         _ destination: Destination,
         detail: String,
+        expectedRevision: Int64?,
         now: Date
     ) async throws {
         let previous = try await store.deliveryState(for: destination.id)
@@ -844,7 +893,8 @@ public actor DeliveryEngine {
                 nextSequence: previous?.nextSequence ?? 0,
                 deliveredRecords: previous?.deliveredRecords ?? 0,
                 detail: detail
-            )
+            ),
+            expectedDestinationRevision: expectedRevision
         )
         try await store.appendReceipt(
             DeliveryReceiptRecord(
@@ -855,7 +905,8 @@ public actor DeliveryEngine {
                 state: DeliveryState.needsAttention.rawValue,
                 detail: detail,
                 artifactName: nil
-            )
+            ),
+            expectedDestinationRevision: expectedRevision
         )
     }
 

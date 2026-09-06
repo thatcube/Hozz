@@ -373,7 +373,7 @@ final class TypeCoverageReceiveTests: XCTestCase {
 
         let version = try SQLiteDatabase(url: databaseURL)
             .query("PRAGMA user_version", row: { $0.integer(0) }).first
-        XCTAssertEqual(version, 13)
+        XCTAssertEqual(version, 14)
     }
 
     /// A rolled-back attempt must leave the database at the version it was and

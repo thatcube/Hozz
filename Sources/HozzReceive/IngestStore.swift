@@ -416,6 +416,7 @@ public actor IngestStore {
         try migrateToEleven(database, from: version)
         try migrateToTwelve(database, from: version)
         _ = try migrateToThirteen(database, from: version)
+        try migrateToFourteen(database, from: version)
     }
 
     @discardableResult
@@ -477,51 +478,9 @@ public actor IngestStore {
                 )
             }
 
-            let retireLegacyTombstone = try database.prepared(
-                """
-                INSERT OR IGNORE INTO sample_legacy_tombstone
-                    (type, start_time, legacy_id)
-                SELECT ?, ?, ?
-                WHERE EXISTS (
-                    SELECT 1
-                    FROM sample_alias_retirement
-                    WHERE type = ? AND start_time = ?
-                )
-                """
-            )
-            defer { retireLegacyTombstone.finalize() }
-            statistics.tombstonesScanned = try database.forEachRow(
-                """
-                SELECT id
-                FROM sample_tombstone
-                WHERE instr(id, ':') > 1
-                """
-            ) { row in
-                let legacyID = row.text(0)
-                guard
-                    let delimiter = legacyID.firstIndex(of: ":"),
-                    delimiter != legacyID.startIndex
-                else {
-                    return
-                }
-                let type = String(legacyID[..<delimiter])
-                guard !type.isEmpty,
-                      let legacyDate = legacyDate(from: legacyID, type: type)
-                else {
-                    return
-                }
-                let normalizedStart = Timestamps.text(from: legacyDate)
-                statistics.retirementLookups += 1
-                try retireLegacyTombstone.run(
-                    [
-                        .text(type),
-                        .text(normalizedStart),
-                        .text(legacyID),
-                        .text(type),
-                        .text(normalizedStart)
-                    ]
-                )
-            }
+            let retired = try captureRetiredLegacyTombstones(in: database)
+            statistics.tombstonesScanned = retired.scanned
+            statistics.retirementLookups = retired.lookups
 
             let reconciliation = try reconcileMarkedLegacyCompatibilityAliases(
                 in: database
@@ -532,6 +491,90 @@ public actor IngestStore {
             try database.execute("PRAGMA user_version = 13")
             return statistics
         }
+    }
+
+    @discardableResult
+    static func migrateToFourteen(
+        _ database: SQLiteDatabase,
+        from version: Int64
+    ) throws -> LegacyTombstoneMigrationStatistics {
+        guard version < 14 else {
+            return LegacyTombstoneMigrationStatistics()
+        }
+        return try database.transaction {
+            var statistics = LegacyTombstoneMigrationStatistics()
+            // Version 11 replaced retirement rows with sentinels. Revisit
+            // their tombstones even when the old version-13 repair already
+            // ran, then reconsider mappings using all surviving identities.
+            let retired = try captureRetiredLegacyTombstones(in: database)
+            statistics.tombstonesScanned = retired.scanned
+            statistics.retirementLookups = retired.lookups
+            let reconciliation = try reconcileMarkedLegacyCompatibilityAliases(
+                in: database
+            )
+            statistics.reconciliationCandidateRows = reconciliation.candidates
+            statistics.reconciliationPasses = 1
+            statistics.reconciledAliases = reconciliation.reconciled
+            try database.execute("PRAGMA user_version = 14")
+            return statistics
+        }
+    }
+
+    private static func captureRetiredLegacyTombstones(
+        in database: SQLiteDatabase
+    ) throws -> (scanned: Int, lookups: Int) {
+        let retireLegacyTombstone = try database.prepared(
+            """
+            INSERT OR IGNORE INTO sample_legacy_tombstone
+                (type, start_time, legacy_id)
+            SELECT ?, ?, ?
+            WHERE EXISTS (
+                SELECT 1
+                FROM sample_alias_retirement
+                WHERE type = ? AND start_time = ?
+            ) OR EXISTS (
+                SELECT 1
+                FROM sample_unresolved_legacy_deletion
+                WHERE stable_id = ?
+            )
+            """
+        )
+        defer { retireLegacyTombstone.finalize() }
+        var lookups = 0
+        let scanned = try database.forEachRow(
+            """
+            SELECT id
+            FROM sample_tombstone
+            WHERE instr(id, ':') > 1
+            """
+        ) { row in
+            let legacyID = row.text(0)
+            guard
+                let delimiter = legacyID.firstIndex(of: ":"),
+                delimiter != legacyID.startIndex
+            else {
+                return
+            }
+            let type = String(legacyID[..<delimiter])
+            guard !type.isEmpty,
+                  let legacyDate = legacyDate(from: legacyID, type: type)
+            else {
+                return
+            }
+            let normalizedStart = Timestamps.text(from: legacyDate)
+            lookups += 1
+            try retireLegacyTombstone.run(
+                [
+                    .text(type),
+                    .text(normalizedStart),
+                    .text(legacyID),
+                    .text(type),
+                    .text(normalizedStart),
+                    .text("v10-retirement:\(type):\(normalizedStart)")
+                ]
+            )
+        }
+        return (scanned, lookups)
     }
 
     private static func migrateToTwelve(
@@ -1933,11 +1976,25 @@ public actor IngestStore {
             """
         )
 
-        // Current-format time-derived aliases match on the complete stored
-        // signature. This is one indexed join, not one query per migration
-        // marker.
+        // A prior mapping may be all that remains of an alias. Its identity
+        // counts at the retired instant, just like a tombstone; its lost
+        // values cannot narrow the candidates. Live current-format aliases
+        // still match on the complete signature, without per-marker queries.
         try database.execute(
             """
+            INSERT OR IGNORE INTO v13_legacy_alias_candidate
+                (stable_id, legacy_id, type, start_time)
+            SELECT stable.stable_id, alias.legacy_id,
+                   stable.type, stable.start_time
+            FROM sample_identity_alias AS alias
+            JOIN sample_alias_signature AS mapped
+              ON mapped.stable_id = alias.stable_id
+            JOIN sample_alias_signature AS stable
+              ON stable.type = mapped.type
+             AND stable.start_time = mapped.start_time
+            WHERE substr(alias.legacy_id, 1, length(mapped.type) + 1)
+                      = mapped.type || ':';
+
             INSERT OR IGNORE INTO v13_legacy_alias_candidate
                 (stable_id, legacy_id, type, start_time)
             SELECT stable.stable_id, legacy.id, stable.type, stable.start_time
@@ -2021,6 +2078,40 @@ public actor IngestStore {
             SELECT legacy_id, COUNT(*)
             FROM v13_legacy_alias_candidate
             GROUP BY legacy_id;
+            """
+        )
+
+        // An old repair may already have removed the mapped legacy row. Its
+        // identity still counts, even though its values cannot be recovered.
+        // Keep ambiguous retired identities in the candidate history before
+        // removing their mappings; this does not invent a sample_tombstone
+        // (an actual deletion), nor any missing sample values.
+        try database.execute(
+            """
+            INSERT OR IGNORE INTO sample_legacy_tombstone
+                (type, start_time, legacy_id)
+            SELECT signature.type, signature.start_time, alias.legacy_id
+            FROM sample_identity_alias AS alias
+            JOIN sample_alias_signature AS signature
+              ON signature.stable_id = alias.stable_id
+            JOIN v13_stable_candidate_count AS stable_count
+              ON stable_count.stable_id = alias.stable_id
+            JOIN v13_legacy_candidate_count AS legacy_count
+              ON legacy_count.legacy_id = alias.legacy_id
+            WHERE stable_count.candidate_count > 1
+               OR legacy_count.candidate_count > 1;
+
+            DELETE FROM sample_identity_alias
+            WHERE stable_id IN (
+                SELECT alias.stable_id
+                FROM sample_identity_alias AS alias
+                JOIN v13_stable_candidate_count AS stable_count
+                  ON stable_count.stable_id = alias.stable_id
+                JOIN v13_legacy_candidate_count AS legacy_count
+                  ON legacy_count.legacy_id = alias.legacy_id
+                WHERE stable_count.candidate_count > 1
+                   OR legacy_count.candidate_count > 1
+            );
 
             CREATE TEMP TABLE v13_reconciled_alias (
                 stable_id TEXT PRIMARY KEY,
@@ -2271,6 +2362,17 @@ public actor IngestStore {
                 }
 
                 if try isTombstoned(legacyAliasID) {
+                    var candidates = try matchingLegacyAliasIDs(
+                        for: StoredCompatibilitySignature(record),
+                        in: database
+                    )
+                    candidates.insert(legacyAliasID)
+                    candidates.formUnion(
+                        incomingLegacyIDs[CompatibilityRecordSignature(record)] ?? []
+                    )
+                    guard candidates.count == 1 else {
+                        throw UnresolvedLegacyAliasError(type: record.type)
+                    }
                     try database.run(
                         """
                         INSERT OR REPLACE INTO sample_tombstone (id, received_at)

@@ -410,6 +410,51 @@ public actor HozzStore {
                 try database.execute("PRAGMA user_version = 7;")
             }
         }
+
+        if version < 8 {
+            try database.transaction {
+                let lockedVersion = try database.query(
+                    "PRAGMA user_version;"
+                ) { row in
+                    Int(row.integer(0))
+                }.first ?? 0
+                guard lockedVersion < 8 else {
+                    return
+                }
+                // A lossy destination may already have advanced its cursor
+                // before omission seals existed. Mark that historical debt
+                // conservatively so a later edit to NDJSON/JSON replays from
+                // the beginning instead of trusting an incomplete cursor.
+                try database.execute(
+                    """
+                    INSERT OR IGNORE INTO delivery_omission_seal (
+                        destination_id, format, omitted_record_count, sealed_at
+                    )
+                    SELECT destination.id,
+                           json_extract(destination.payload, '$.format'),
+                           1,
+                           destination.updated_at
+                    FROM destination
+                    WHERE CASE WHEN json_valid(destination.payload)
+                              THEN json_extract(destination.payload, '$.format')
+                          END IN ('metrics', 'influx')
+                      AND (
+                        EXISTS (
+                            SELECT 1 FROM stream_state
+                            WHERE scope =
+                                'destination:' || lower(destination.id)
+                        )
+                        OR EXISTS (
+                            SELECT 1 FROM prime_state
+                            WHERE scope =
+                                'destination:' || lower(destination.id)
+                        )
+                      );
+                    PRAGMA user_version = 8;
+                    """
+                )
+            }
+        }
     }
 
     public func schemaVersion() throws -> Int {

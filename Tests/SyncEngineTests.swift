@@ -828,6 +828,161 @@ final class SyncEngineTests: XCTestCase {
         XCTAssertNotNil(retryAnchor)
     }
 
+    func testDisablingDestinationDuringHealthReadPreventsStaleTransmission()
+        async throws
+    {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        var destination = Destination(
+            name: "Disable during read",
+            kind: .folder,
+            format: .ndjson,
+            folderBookmark: Data("disable-race".utf8)
+        )
+        try await delivery.save(destination)
+        let source = GatedHealthDataSource(
+            type: steps,
+            change: sample("disable-race", type: steps)
+        )
+        let engine = HealthSyncEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps],
+            lease: ExportWriterLease()
+        )
+
+        let stalePass = Task {
+            try await engine.sync(ignoringCadence: true)
+        }
+        await source.waitUntilReadStarts()
+        destination.isEnabled = false
+        try await delivery.save(destination)
+        let editedState = try await store.deliveryState(for: destination.id)
+        await source.releaseRead()
+
+        let outcome = try await stalePass.value
+        let payloads = await channel.payloads(for: destination.id)
+        let anchor = try await store.committedAnchor(
+            scope: .destination(destination.id),
+            type: steps
+        )
+        let state = try await store.deliveryState(for: destination.id)
+        let receipts = try await store.receipts(for: destination.id)
+        let reopened = DeliveryEngine(store: store, channels: [:])
+        let saved = try await reopened.destination(id: destination.id)
+        XCTAssertTrue(outcome.wasInterrupted)
+        XCTAssertTrue(payloads.isEmpty)
+        XCTAssertNil(anchor)
+        XCTAssertEqual(state, editedState)
+        XCTAssertTrue(receipts.isEmpty)
+        XCTAssertEqual(saved?.isEnabled, false)
+    }
+
+    func testEndpointEditDuringHealthReadPreventsStaleTransmission()
+        async throws
+    {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.restAPI: channel])
+        var destination = Destination(
+            name: "Move during read",
+            kind: .restAPI,
+            format: .ndjson,
+            endpointURL: try XCTUnwrap(URL(string: "https://old.example"))
+        )
+        try await delivery.save(destination)
+        let source = GatedHealthDataSource(
+            type: steps,
+            change: sample("endpoint-race", type: steps)
+        )
+        let engine = HealthSyncEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps],
+            lease: ExportWriterLease()
+        )
+
+        let stalePass = Task {
+            try await engine.sync(ignoringCadence: true)
+        }
+        await source.waitUntilReadStarts()
+        destination.endpointURL = try XCTUnwrap(
+            URL(string: "https://new.example")
+        )
+        try await delivery.save(destination)
+        let editedState = try await store.deliveryState(for: destination.id)
+        await source.releaseRead()
+
+        let outcome = try await stalePass.value
+        let payloads = await channel.payloads(for: destination.id)
+        let anchor = try await store.committedAnchor(
+            scope: .destination(destination.id),
+            type: steps
+        )
+        let state = try await store.deliveryState(for: destination.id)
+        let receipts = try await store.receipts(for: destination.id)
+        let reopened = DeliveryEngine(store: store, channels: [:])
+        let saved = try await reopened.destination(id: destination.id)
+        XCTAssertTrue(outcome.wasInterrupted)
+        XCTAssertTrue(payloads.isEmpty)
+        XCTAssertNil(anchor)
+        XCTAssertEqual(state, editedState)
+        XCTAssertTrue(receipts.isEmpty)
+        XCTAssertEqual(saved?.endpointURL, URL(string: "https://new.example"))
+    }
+
+    func testDeletionDuringHealthReadPreventsStaleTransmissionAndBookkeeping()
+        async throws
+    {
+        let store = try makeStore()
+        let channel = RecordingChannel()
+        let delivery = DeliveryEngine(store: store, channels: [.folder: channel])
+        let destination = Destination(
+            name: "Delete during read",
+            kind: .folder,
+            format: .ndjson,
+            folderBookmark: Data("delete-race".utf8)
+        )
+        try await delivery.save(destination)
+        let source = GatedHealthDataSource(
+            type: steps,
+            change: sample("delete-race", type: steps)
+        )
+        let engine = HealthSyncEngine(
+            store: store,
+            source: source,
+            delivery: delivery,
+            types: [steps],
+            lease: ExportWriterLease()
+        )
+
+        let stalePass = Task {
+            try await engine.sync(ignoringCadence: true)
+        }
+        await source.waitUntilReadStarts()
+        try await delivery.delete(id: destination.id)
+        await source.releaseRead()
+
+        let outcome = try await stalePass.value
+        let payloads = await channel.payloads(for: destination.id)
+        let anchor = try await store.committedAnchor(
+            scope: .destination(destination.id),
+            type: steps
+        )
+        let state = try await store.deliveryState(for: destination.id)
+        let receipts = try await store.receipts(for: destination.id)
+        let revision = try await store.destinationRevision(id: destination.id)
+        XCTAssertTrue(outcome.wasInterrupted)
+        XCTAssertTrue(payloads.isEmpty)
+        XCTAssertNil(anchor)
+        XCTAssertNil(state)
+        XCTAssertTrue(receipts.isEmpty)
+        XCTAssertNil(revision)
+    }
+
     func testMixedMetricsPageReplaysBothRecordsAfterLosslessEdit() async throws {
         let store = try makeStore()
         let channel = RecordingChannel()
