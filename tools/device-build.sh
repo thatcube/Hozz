@@ -13,6 +13,10 @@ DERIVED="${HOZZ_DERIVED:-/tmp/hozz-dd}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+source tools/lib/apple-build-lease.sh
+acquire_apple_build_shared_lease "hozz/device-build"
+install_apple_build_lease_traps
+
 # Recreate the local signing settings if this is a fresh clone or worktree.
 if [ ! -f Local.xcconfig ]; then
   cat > Local.xcconfig <<CFG
@@ -23,7 +27,7 @@ CFG
   echo "Created Local.xcconfig for team $TEAM."
 fi
 
-xcodegen generate >/dev/null
+tools/generate-project.sh >/dev/null
 
 DEVELOPER_DIR=/Applications/Xcode.app xcodebuild \
   -project Hozz.xcodeproj -scheme Hozz -configuration Debug \

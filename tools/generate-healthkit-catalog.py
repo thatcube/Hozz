@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 
+import os
 import pathlib
 import re
 import subprocess
+import sys
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -138,6 +140,75 @@ def render(entries: list[dict[str, object]]) -> str:
     return "\n".join(lines)
 
 
+def exec_under_build_lease() -> None:
+    """Restart through the shared wrapper before reading the Apple SDK."""
+    if os.environ.get("HOZZ_CATALOG_BUILD_LEASE_WRAPPED") == "1":
+        required = (
+            "APPLE_BUILD_LEASE_MODE",
+            "APPLE_BUILD_LEASE_OWNER",
+            "APPLE_BUILD_LEASE_ID",
+            "APPLE_BUILD_LEASE_TOKEN",
+            "APPLE_BUILD_LEASE_LOCK_FD",
+            "APPLE_BUILD_LEASE_PROOF_FD",
+        )
+        if (
+            os.environ.get("APPLE_BUILD_LEASE_PROTOCOL") != "1"
+            or os.environ.get("APPLE_BUILD_LEASE_MODE") != "shared"
+            or any(not os.environ.get(name) for name in required)
+        ):
+            sys.exit("Invalid inherited Apple build lease environment.")
+        try:
+            lock_fd = int(os.environ["APPLE_BUILD_LEASE_LOCK_FD"])
+            proof_fd = int(os.environ["APPLE_BUILD_LEASE_PROOF_FD"])
+        except ValueError:
+            sys.exit("Invalid inherited Apple build lease descriptors.")
+        if lock_fd < 3 or proof_fd < 3 or lock_fd == proof_fd:
+            sys.exit("Invalid inherited Apple build lease descriptors.")
+
+        validator = ROOT / "tools/lib/apple_build_lease.py"
+        result = subprocess.run(
+            [
+                "/usr/bin/python3",
+                str(validator),
+                "validate",
+                "--mode",
+                "shared",
+                "--owner",
+                os.environ["APPLE_BUILD_LEASE_OWNER"],
+                "--lease-id",
+                os.environ["APPLE_BUILD_LEASE_ID"],
+                "--token",
+                os.environ["APPLE_BUILD_LEASE_TOKEN"],
+                "--lock-fd",
+                str(lock_fd),
+                "--proof-fd",
+                str(proof_fd),
+                "--role-exit-code",
+            ],
+            pass_fds=(proof_fd, lock_fd),
+            check=False,
+        )
+        if result.returncode not in {0, 10}:
+            sys.exit("Inherited Apple build lease validation failed.")
+        return
+
+    wrapper = ROOT / "tools/with-apple-build-lease.sh"
+    env = dict(os.environ)
+    env["HOZZ_CATALOG_BUILD_LEASE_WRAPPED"] = "1"
+    os.execve(
+        wrapper,
+        [
+            str(wrapper),
+            "hozz/generate-healthkit-catalog",
+            "--",
+            sys.executable,
+            str(pathlib.Path(__file__).resolve()),
+            *sys.argv[1:],
+        ],
+        env,
+    )
+
+
 def main() -> None:
     OUTPUT.parent.mkdir(parents=True, exist_ok=True)
     OUTPUT.write_text(render(parse_entries()))
@@ -145,4 +216,5 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    exec_under_build_lease()
     main()

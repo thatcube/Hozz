@@ -12,6 +12,10 @@ DERIVED="${HOZZ_MAC_DERIVED:-}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
 
+source tools/lib/apple-build-lease.sh
+acquire_apple_build_shared_lease "hozz/mac-build"
+install_apple_build_lease_traps
+
 # Recreate the local signing settings if this is a fresh clone or worktree.
 # Gitignored on purpose: no team identifier belongs in a public repository.
 if [ ! -f Local.xcconfig ]; then
@@ -22,7 +26,7 @@ CFG
   echo "Created Local.xcconfig for team $TEAM."
 fi
 
-xcodegen generate >/dev/null
+tools/generate-project.sh >/dev/null
 
 ARGS=(
   -project Hozz.xcodeproj

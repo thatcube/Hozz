@@ -62,17 +62,16 @@ generated Xcode project.
 ## Build and test
 
 ```bash
-xcodegen generate
-xcodebuild -project Hozz.xcodeproj -scheme Hozz \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
-xcodebuild -project Hozz.xcodeproj -scheme Hozz \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
+tools/generate-project.sh
+tools/simulator-build.sh
+tools/run-tests.sh
 ```
 
 `tools/device-build.sh` builds and installs on a connected iPhone, and
 `tools/mac-build.sh` builds the Mac app. The README covers signing, the App
 Group the widget needs, and two macOS networking traps that are invisible from
-the code and cost days each.
+the code and cost days each. These entrypoints hold the machine-wide Apple
+build lease; do not replace them with raw `xcodegen` or `xcodebuild` commands.
 
 Do not believe a red build until you have regenerated the project and used a
 derived data path of your own. Two of the three "broken build" scares in one
@@ -82,8 +81,8 @@ genuine regression:
 - The `.xcodeproj` is generated and gitignored, so changing branch brings in
   source files it does not know about. That surfaces as `cannot find type in
   scope` across a module you never touched — 26 errors in `HozzDeliver` on one
-  occasion — and reads as a broken `main`. Run `xcodegen generate` after any
-  branch change, and after adding a file of your own.
+  occasion — and reads as a broken `main`. Run `tools/generate-project.sh`
+  after any branch change, and after adding a file of your own.
 - DerivedData shared between two checkouts of the same project mixes a stale
   app binary with a freshly built framework, which fails at launch as
   `dyld: Symbol not found` for a symbol that does exist. Pass

@@ -75,12 +75,14 @@ override the signing team.
 Simulator build and tests:
 
 ```bash
-xcodegen generate
-xcodebuild -project Hozz.xcodeproj -scheme Hozz \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
-xcodebuild -project Hozz.xcodeproj -scheme Hozz \
-  -destination 'platform=iOS Simulator,name=iPhone 17 Pro' test
+tools/simulator-build.sh
+tools/run-tests.sh
 ```
+
+All project generation, builds, tests, installs, and launches must use the
+scripts under `tools/`. They hold the machine-wide Apple build lease before
+XcodeGen or Xcode writes shared developer resources. For an unusual direct
+command, use `tools/with-apple-build-lease.sh hozz/manual -- <command>`.
 
 The XCTest suite runs over a thousand tests covering anchors, transaction
 boundaries, cancellation, retries, tombstones, deterministic encoding, the
@@ -233,10 +235,11 @@ deliberate decision.
 
 Turning clinical records on takes two deliberate steps:
 
-1. Build with `HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS`, on the `xcodebuild`
-   command line or in the gitignored `Local.xcconfig`. This changes no
-   entitlement — the code compiles and reports honestly that the entitlement is
-   missing.
+1. Pass `HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS` as an argument to one of the
+   leased build scripts (for example,
+   `tools/simulator-build.sh HOZZ_CLINICAL_FLAG=HOZZ_CLINICAL_RECORDS`), or set
+   it in the gitignored `Local.xcconfig`. This changes no entitlement — the code
+   compiles and reports honestly that the entitlement is missing.
 2. Change `com.apple.developer.healthkit.access` in `project.yml` from `[]` to
    `[health-records]`. This is the step App Review sees, which is why it is a
    visible edit to a tracked file rather than a switch.
