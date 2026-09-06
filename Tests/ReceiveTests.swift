@@ -888,6 +888,69 @@ final class ReceiveTests: XCTestCase {
         XCTAssertTrue(remaining.isEmpty)
     }
 
+    func testExactLegacyTombstoneRejectsTwoIncomingStableCandidatesInEitherOrder()
+        async throws
+    {
+        for otherValue in [20, 30] {
+            let directory = root.appending(path: "stable-candidates-\(otherValue)")
+            let store = try IngestStore(directory: directory)
+            let date = "2026-01-01 10:00:00 +0000"
+            _ = try await store.ingest(
+                try BatchParser.parse(
+                    Data(
+                        """
+                        {"data":{"metrics":[],"deletions":[
+                          {"name":"step_count","date":"\(date)"}
+                        ]}}
+                        """.utf8
+                    )
+                ),
+                idempotencyKey: "exact-legacy-delete"
+            )
+            await store.close()
+
+            let records = [
+                #"{"id":"stable-a","date":"\#(date)","qty":20}"#,
+                #"{"id":"stable-b","date":"\#(date)","qty":\#(otherValue)}"#
+            ]
+            for ordered in [records, Array(records.reversed())] {
+                let reopened = try IngestStore(directory: directory)
+                do {
+                    _ = try await reopened.ingest(
+                        try BatchParser.parse(
+                            Data(
+                                """
+                                {"data":{"metrics":[{"name":"step_count","units":"count",
+                                  "data":[\(ordered.joined(separator: ","))]}]}}
+                                """.utf8
+                            )
+                        ),
+                        idempotencyKey: "ambiguous-stable-batch"
+                    )
+                    XCTFail("Even the first record must not consume an ambiguous tombstone.")
+                } catch is UnresolvedLegacyAliasError {
+                    // The same key remains retryable in either order.
+                }
+                let remaining = try await reopened.samples(type: "step_count")
+                XCTAssertTrue(remaining.isEmpty)
+                await reopened.close()
+            }
+
+            let inspected = try SQLiteDatabase(
+                url: directory.appending(path: "hozz-received.sqlite")
+            )
+            for sql in [
+                "SELECT COUNT(*) FROM sample_identity_alias",
+                "SELECT COUNT(*) FROM sample_alias_signature",
+                "SELECT COUNT(*) FROM sample_tombstone WHERE id IN ('stable-a', 'stable-b')",
+                "SELECT COUNT(*) FROM batch WHERE key = 'ambiguous-stable-batch'"
+            ] {
+                XCTAssertEqual(try inspected.query(sql, row: { $0.integer(0) }).first, 0)
+            }
+            inspected.close()
+        }
+    }
+
     func testSameTimestampDistinctSourceAndValueAreNotAliases() async throws {
         let store = try makeStore()
         let date = "2026-01-01 10:00:00 +0000"

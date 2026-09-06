@@ -31,6 +31,16 @@ private struct CompatibilityRecordSignature: Hashable {
     }
 }
 
+private struct CompatibilityAliasInstant: Hashable {
+    let type: String
+    let startTime: String
+
+    init(_ record: HealthRecord) {
+        type = record.type
+        startTime = Timestamps.text(from: record.startDate)
+    }
+}
+
 private enum LegacyCompatibilityShape: String {
     case heartRateRange
     case sleepDuration
@@ -2237,12 +2247,16 @@ public actor IngestStore {
         var deletedIdentities = Set<String>()
         var incomingStableIDs: [CompatibilityRecordSignature: Set<String>] = [:]
         var incomingLegacyIDs: [CompatibilityRecordSignature: Set<String>] = [:]
+        var incomingStableIDsByInstant: [CompatibilityAliasInstant: Set<String>] = [:]
         for record in batch.records {
             let signature = CompatibilityRecordSignature(record)
             if record.isLegacyCompatibilityIdentity {
                 incomingLegacyIDs[signature, default: []].insert(record.id)
             } else if record.legacyAliasID != nil {
                 incomingStableIDs[signature, default: []].insert(record.id)
+                incomingStableIDsByInstant[
+                    CompatibilityAliasInstant(record), default: []
+                ].insert(record.id)
             }
         }
         func isTombstoned(_ id: String) throws -> Bool {
@@ -2370,7 +2384,24 @@ public actor IngestStore {
                     candidates.formUnion(
                         incomingLegacyIDs[CompatibilityRecordSignature(record)] ?? []
                     )
-                    guard candidates.count == 1 else {
+                    // A retired alias has no values left to narrow its stable
+                    // candidates. Match migration's type/instant scope, including
+                    // signatures of deleted IDs whose unsafe mappings it removed.
+                    let instant = CompatibilityAliasInstant(record)
+                    let otherPersistedStableID = try database.query(
+                        """
+                        SELECT 1 FROM sample_alias_signature
+                        WHERE type = ? AND start_time = ? AND stable_id != ?
+                        LIMIT 1
+                        """,
+                        [.text(instant.type), .text(instant.startTime), .text(record.id)],
+                        row: { _ in true }
+                    ).first ?? false
+                    let incomingStableCandidates = incomingStableIDsByInstant[instant] ?? []
+                    guard candidates.count == 1,
+                          !otherPersistedStableID,
+                          incomingStableCandidates == Set([record.id])
+                    else {
                         throw UnresolvedLegacyAliasError(type: record.type)
                     }
                     try database.run(

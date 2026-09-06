@@ -1356,6 +1356,220 @@ final class SchemaMigrationTests: XCTestCase {
         )
     }
 
+    func testVersionFourteenRetiredMappingCannotDeleteSurvivingStableIdentity()
+        async throws
+    {
+        try await assertRetiredMappingRejectsStableReplay(
+            replayIDs: ["stable-b", "stable-heart"]
+        )
+    }
+
+    func testVersionFourteenRetiredMappingStaysAmbiguousWhenDeletedIdentityReplaysFirst()
+        async throws
+    {
+        try await assertRetiredMappingRejectsStableReplay(
+            replayIDs: ["stable-heart", "stable-b"]
+        )
+    }
+
+    func testVersionFourteenRetiredMappingCannotUseLostValuesToNarrowStableCandidates()
+        async throws
+    {
+        try await assertRetiredMappingRejectsStableReplay(
+            replayIDs: ["stable-b", "stable-heart"],
+            survivorValue: 72
+        )
+    }
+
+    func testVersionFourteenUniqueRetiredMappingStillPropagatesDeletion()
+        async throws
+    {
+        let legacyID = "heart_rate:2026-01-01T10:00:00.000Z"
+        let directory = try makeAliasRepairDatabase(
+            version: 13,
+            legacyID: legacyID,
+            retiredID: legacyID
+        )
+        let migrated = try IngestStore(directory: directory)
+        let afterMigration = try await migrated.samples(type: "heart_rate")
+        XCTAssertTrue(afterMigration.isEmpty)
+        await migrated.close()
+
+        for attempt in 0..<2 {
+            let reopened = try IngestStore(directory: directory)
+            let result = try await reopened.ingest(
+                try BatchParser.parse(
+                    Data(
+                        """
+                        {"data":{"metrics":[{"name":"heart_rate","units":"bpm","data":[
+                          {"id":"stable-heart","date":"2026-01-01T10:00:00.000Z",
+                           "Min":62,"Avg":62,"Max":62,"source":"Watch"}
+                        ]}]}}
+                        """.utf8
+                    )
+                ),
+                idempotencyKey: "unique-retired-replay-\(attempt)"
+            )
+            XCTAssertEqual(result.stored, 0)
+            let remaining = try await reopened.samples(type: "heart_rate")
+            XCTAssertTrue(remaining.isEmpty)
+            await reopened.close()
+        }
+        let inspected = try SQLiteDatabase(
+            url: directory.appending(path: "hozz-received.sqlite")
+        )
+        defer { inspected.close() }
+        XCTAssertEqual(
+            try inspected.query(
+                "SELECT legacy_id FROM sample_identity_alias WHERE stable_id = 'stable-heart'",
+                row: { $0.text(0) }
+            ),
+            [legacyID]
+        )
+        XCTAssertEqual(
+            try inspected.query(
+                "SELECT COUNT(*) FROM sample_tombstone WHERE id IN ('stable-heart', ?)",
+                [.text(legacyID)],
+                row: { $0.integer(0) }
+            ).first,
+            2
+        )
+    }
+
+    private func assertRetiredMappingRejectsStableReplay(
+        replayIDs: [String],
+        survivorValue: Double = 62
+    ) async throws {
+        let legacyID = "heart_rate:2026-01-01T10:00:00.000Z"
+        let directory = try makeAliasRepairDatabase(
+            version: 13,
+            legacyID: legacyID,
+            retiredID: legacyID
+        )
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let database = try SQLiteDatabase(url: databaseURL)
+        try database.execute(
+            """
+            INSERT INTO sample
+                (id, type, kind, start_date, end_date, value, unit,
+                 source_name, raw, received_at)
+            SELECT 'stable-b', type, kind, start_date, end_date, value, unit,
+                   source_name, raw, received_at
+            FROM sample WHERE id = 'stable-heart';
+            INSERT INTO sample_alias_signature
+                (stable_id, type, kind, start_time, end_time, value, unit, source_name)
+            SELECT 'stable-b', type, kind, start_time, end_time, value, unit, source_name
+            FROM sample_alias_signature WHERE stable_id = 'stable-heart';
+            INSERT INTO sample_tombstone (id, received_at)
+            VALUES ('stable-heart', '2026-01-02T00:00:00.000Z');
+            DELETE FROM sample WHERE id = 'stable-heart';
+            """
+        )
+        for table in ["sample", "sample_alias_signature"] {
+            let idColumn = table == "sample" ? "id" : "stable_id"
+            try database.run(
+                "UPDATE \(table) SET value = ? WHERE \(idColumn) = 'stable-b'",
+                [.real(survivorValue)]
+            )
+        }
+        database.close()
+
+        let migrated = try IngestStore(directory: directory)
+        let survivors = try await migrated.samples(type: "heart_rate")
+        XCTAssertEqual(survivors.map(\.id), ["stable-b"])
+        await migrated.close()
+
+        let inspected = try SQLiteDatabase(url: databaseURL)
+        XCTAssertEqual(
+            try inspected.query("PRAGMA user_version", row: { $0.integer(0) }).first,
+            Self.currentVersion
+        )
+        XCTAssertEqual(
+            try inspected.query(
+                "SELECT COUNT(*) FROM sample_identity_alias",
+                row: { $0.integer(0) }
+            ).first,
+            0,
+            "Migration removes the unsafe mapping, not its ambiguity."
+        )
+        XCTAssertEqual(
+            try inspected.query(
+                "SELECT legacy_id FROM sample_legacy_tombstone",
+                row: { $0.text(0) }
+            ),
+            [legacyID],
+            "One legacy candidate is insufficient when two stable identities survived."
+        )
+        let plan = try inspected.query(
+            """
+            EXPLAIN QUERY PLAN
+            SELECT 1 FROM sample_alias_signature
+            WHERE type = ? AND start_time = ? AND stable_id != ?
+            LIMIT 1
+            """,
+            [.text("heart_rate"), .text("2026-01-01T10:00:00.000Z"), .text("stable-b")],
+            row: { $0.text(3) }
+        )
+        XCTAssertTrue(
+            plan.contains { $0.contains("USING INDEX sample_alias_signature_lookup") },
+            "Stable-side ambiguity must use the type/instant index: \(plan)"
+        )
+        inspected.close()
+
+        for replayID in replayIDs {
+            let reopened = try IngestStore(directory: directory)
+            let value = replayID == "stable-b" ? survivorValue : 62
+            let batch = try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"heart_rate","units":"bpm","data":[
+                      {"id":"\(replayID)","date":"2026-01-01T10:00:00.000Z",
+                       "Min":\(value),"Avg":\(value),"Max":\(value),"source":"Watch"}
+                    ]}]}}
+                    """.utf8
+                )
+            )
+            do {
+                _ = try await reopened.ingest(
+                    batch,
+                    idempotencyKey: "retired-mapping-replay-\(replayID)"
+                )
+                XCTFail("A removed mapping must not transfer its tombstone to another stable ID.")
+            } catch is UnresolvedLegacyAliasError {
+                // Expected, including after another reopen and either replay order.
+            }
+            let remaining = try await reopened.samples(type: "heart_rate")
+            XCTAssertEqual(remaining.map(\.id), ["stable-b"])
+            XCTAssertEqual(remaining.first?.value, survivorValue)
+            await reopened.close()
+
+            let verified = try SQLiteDatabase(url: databaseURL)
+            XCTAssertEqual(
+                try verified.query(
+                    "SELECT hex(raw) FROM sample WHERE id = 'stable-b'",
+                    row: { $0.text(0) }
+                ).first,
+                "7B226B657074223A747275657D"
+            )
+            for sql in [
+                "SELECT COUNT(*) FROM sample_tombstone WHERE id = 'stable-b'",
+                "SELECT COUNT(*) FROM sample_identity_alias",
+                "SELECT COUNT(*) FROM batch WHERE key LIKE 'retired-mapping-replay-%'"
+            ] {
+                XCTAssertEqual(try verified.query(sql, row: { $0.integer(0) }).first, 0)
+            }
+            XCTAssertEqual(
+                try verified.query(
+                    "SELECT COUNT(*) FROM sample_alias_signature",
+                    row: { $0.integer(0) }
+                ).first,
+                2,
+                "Deleted stable identities must still participate in cardinality."
+            )
+            verified.close()
+        }
+    }
+
     private func makeAliasRepairDatabase(
         version: Int64,
         legacyID: String,
