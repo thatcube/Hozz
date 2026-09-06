@@ -704,6 +704,118 @@ final class ReceiveTests: XCTestCase {
         XCTAssertEqual(records.map(\.id), ["stable"])
     }
 
+    func testEquivalentLiveAndRetiredOffsetAliasesAreNeverGuessedInEitherOrder()
+        async throws
+    {
+        for tombstoneFirst in [false, true] {
+            let directory = root.appending(
+                path: tombstoneFirst ? "tombstone-first" : "live-first"
+            )
+            let store = try IngestStore(directory: directory)
+            let liveAlias = try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"date":"2026-01-01 05:00:00 -0500","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            )
+            let retiredAlias = try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[],"deletions":[
+                      {"name":"step_count","date":"2026-01-01 10:00:00 +0000"}
+                    ]}}
+                    """.utf8
+                )
+            )
+            if tombstoneFirst {
+                _ = try await store.ingest(
+                    retiredAlias,
+                    idempotencyKey: "retired-first"
+                )
+                _ = try await store.ingest(
+                    liveAlias,
+                    idempotencyKey: "live-second"
+                )
+            } else {
+                _ = try await store.ingest(
+                    liveAlias,
+                    idempotencyKey: "live-first"
+                )
+                _ = try await store.ingest(
+                    retiredAlias,
+                    idempotencyKey: "retired-second"
+                )
+            }
+            await store.close()
+
+            let database = try SQLiteDatabase(
+                url: directory.appending(path: "hozz-received.sqlite")
+            )
+            try database.run(
+                """
+                INSERT INTO sample_alias_signature
+                    (stable_id, type, kind, start_time, end_time,
+                     value, unit, source_name)
+                VALUES (
+                    'stable-offset', 'step_count', 'quantity',
+                    '2026-01-01T10:00:00.000Z',
+                    '2026-01-01T10:00:00.000Z',
+                    20, 'count', NULL
+                )
+                """
+            )
+            database.close()
+
+            let reopened = try IngestStore(directory: directory)
+            let stable = try BatchParser.parse(
+                Data(
+                    """
+                    {"data":{"metrics":[{"name":"step_count","units":"count","data":[
+                      {"id":"stable-offset",
+                       "date":"2026-01-01 11:00:00 +0100","qty":20}
+                    ]}]}}
+                    """.utf8
+                )
+            )
+
+            do {
+                _ = try await reopened.ingest(
+                    stable,
+                    idempotencyKey: "stable-third"
+                )
+                XCTFail(
+                    "Equivalent live and retired aliases must remain ambiguous "
+                        + "when tombstoneFirst=\(tombstoneFirst)."
+                )
+            } catch is UnresolvedLegacyAliasError {
+            }
+
+            let records = try await reopened.samples(type: "step_count")
+            XCTAssertEqual(records.count, 1)
+            XCTAssertEqual(
+                records.first?.id,
+                "step_count:2026-01-01 05:00:00 -0500"
+            )
+            await reopened.close()
+
+            let inspected = try SQLiteDatabase(
+                url: directory.appending(path: "hozz-received.sqlite")
+            )
+            let mappingCount = try inspected.query(
+                """
+                SELECT COUNT(*) FROM sample_identity_alias
+                WHERE stable_id = 'stable-offset'
+                """,
+                row: { $0.integer(0) }
+            ).first
+            inspected.close()
+            XCTAssertEqual(mappingCount, 0)
+        }
+    }
+
     func testExactLegacyTombstoneSuppressesLaterStableCompatibilityUpsert() async throws {
         let store = try makeStore()
         let date = "2026-01-01 10:00:00 +0000"

@@ -47,6 +47,112 @@ private actor ScriptedChannel: DeliveryChannel {
     }
 }
 
+private actor GatedRepairChannel: DeliveryChannel {
+    private let refreshedBookmark: Data?
+    private var started = false
+    private var released = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    init(refreshedBookmark: Data? = nil) {
+        self.refreshedBookmark = refreshedBookmark
+    }
+
+    func waitUntilStarted() async {
+        guard !started else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+
+    func deliver(
+        _ batch: DeliveryBatch,
+        to destination: Destination
+    ) async throws -> DeliveryReceipt {
+        if !started {
+            started = true
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+        if !released {
+            await withCheckedContinuation { continuation in
+                if released {
+                    continuation.resume()
+                } else {
+                    releaseWaiter = continuation
+                }
+            }
+        }
+        return DeliveryReceipt(
+            destinationID: destination.id,
+            attemptedAt: .now,
+            recordCount: batch.recordCount,
+            byteCount: UInt64(batch.payload.count),
+            state: .delivered,
+            refreshedBookmark: refreshedBookmark
+        )
+    }
+}
+
+private actor EndpointRepairGate {
+    private let endpoint: URL
+    private var started = false
+    private var released = false
+    private var startWaiters: [CheckedContinuation<Void, Never>] = []
+    private var releaseWaiter: CheckedContinuation<Void, Never>?
+
+    init(endpoint: URL) {
+        self.endpoint = endpoint
+    }
+
+    func waitUntilStarted() async {
+        guard !started else {
+            return
+        }
+        await withCheckedContinuation { continuation in
+            startWaiters.append(continuation)
+        }
+    }
+
+    func release() {
+        released = true
+        releaseWaiter?.resume()
+        releaseWaiter = nil
+    }
+
+    func resolve(_ destination: Destination) async -> URL? {
+        if !started {
+            started = true
+            let waiters = startWaiters
+            startWaiters.removeAll()
+            for waiter in waiters {
+                waiter.resume()
+            }
+        }
+        if !released {
+            await withCheckedContinuation { continuation in
+                if released {
+                    continuation.resume()
+                } else {
+                    releaseWaiter = continuation
+                }
+            }
+        }
+        return endpoint
+    }
+}
+
 final class DeliveryTests: XCTestCase {
     private var directory: TemporaryDirectory!
 
@@ -65,7 +171,8 @@ final class DeliveryTests: XCTestCase {
     private func makeBatch(
         id: UUID = UUID(),
         sequence: Int = 0,
-        records: Int = 3
+        records: Int = 3,
+        format: DeliveryFormat = .ndjson
     ) -> DeliveryBatch {
         DeliveryBatch(
             id: id,
@@ -73,7 +180,7 @@ final class DeliveryTests: XCTestCase {
             createdAt: Date(timeIntervalSince1970: 1_700_000_000),
             recordCount: records,
             payload: Data(#"{"kind":"quantity"}"#.utf8),
-            format: .ndjson
+            format: format
         )
     }
 
@@ -100,6 +207,163 @@ final class DeliveryTests: XCTestCase {
         XCTAssertEqual(loaded.count, 1)
         XCTAssertEqual(loaded.first?.name, "My Mac")
         XCTAssertEqual(loaded.first?.id, destination.id)
+    }
+
+    func testRefreshedBookmarkCannotOverwriteANewerDestinationEdit()
+        async throws
+    {
+        let store = try makeStore()
+        let channel = GatedRepairChannel(
+            refreshedBookmark: Data("automatic-refresh".utf8)
+        )
+        let engine = DeliveryEngine(
+            store: store,
+            channels: [.folder: channel]
+        )
+        var destination = folderDestination()
+        destination.format = .metrics
+        destination.folderBookmark = Data("old".utf8)
+        try await engine.save(destination)
+        let snapshots = try await engine.dueDestinationSnapshots(
+            ignoringCadence: true
+        )
+        let snapshot = try XCTUnwrap(snapshots.first)
+        let batch = makeBatch(format: .metrics)
+
+        let delivery = Task {
+            try await engine.deliver(
+                batch,
+                to: snapshot.destination,
+                expectedRevision: snapshot.revision
+            )
+        }
+        await channel.waitUntilStarted()
+
+        destination.format = .ndjson
+        destination.folderBookmark = Data("user-choice".utf8)
+        try await engine.save(destination)
+        await channel.release()
+
+        do {
+            _ = try await delivery.value
+            XCTFail("The stale bookmark repair must be rejected.")
+        } catch HozzStoreError.staleDestinationConfiguration {
+            // Expected.
+        }
+        let saved = try await engine.destination(id: destination.id)
+        XCTAssertEqual(saved?.format, .ndjson)
+        XCTAssertEqual(saved?.folderBookmark, Data("user-choice".utf8))
+    }
+
+    func testEndpointRepairCannotOverwriteANewerDestinationEdit() async throws {
+        let store = try makeStore()
+        let channel = ScriptedChannel()
+        let gate = EndpointRepairGate(
+            endpoint: try XCTUnwrap(URL(string: "https://automatic.example"))
+        )
+        let engine = DeliveryEngine(
+            store: store,
+            channels: [.restAPI: channel],
+            endpointRepairResolver: { destination in
+                await gate.resolve(destination)
+            }
+        )
+        var destination = Destination(
+            name: "Receiver",
+            kind: .restAPI,
+            format: .metrics,
+            endpointURL: try XCTUnwrap(URL(string: "https://old.example"))
+        )
+        try await engine.save(destination)
+        let snapshots = try await engine.dueDestinationSnapshots(
+            ignoringCadence: true
+        )
+        let snapshot = try XCTUnwrap(snapshots.first)
+        let batch = makeBatch(format: .metrics)
+
+        let delivery = Task {
+            try await engine.deliver(
+                batch,
+                to: snapshot.destination,
+                expectedRevision: snapshot.revision
+            )
+        }
+        await gate.waitUntilStarted()
+
+        destination.format = .ndjson
+        destination.endpointURL = try XCTUnwrap(
+            URL(string: "https://user.example")
+        )
+        try await engine.save(destination)
+        await gate.release()
+
+        do {
+            _ = try await delivery.value
+            XCTFail("The stale endpoint repair must be rejected.")
+        } catch HozzStoreError.staleDestinationConfiguration {
+            // Expected.
+        }
+        let saved = try await engine.destination(id: destination.id)
+        XCTAssertEqual(saved?.format, .ndjson)
+        XCTAssertEqual(
+            saved?.endpointURL,
+            URL(string: "https://user.example")
+        )
+        let deliveredBatches = await channel.batchIDs()
+        XCTAssertTrue(deliveredBatches.isEmpty)
+    }
+
+    func testAutomaticEndpointRepairCannotRecreateADeletedDestination()
+        async throws
+    {
+        let store = try makeStore()
+        let channel = ScriptedChannel()
+        let gate = EndpointRepairGate(
+            endpoint: try XCTUnwrap(URL(string: "https://automatic.example"))
+        )
+        let engine = DeliveryEngine(
+            store: store,
+            channels: [.restAPI: channel],
+            endpointRepairResolver: { destination in
+                await gate.resolve(destination)
+            }
+        )
+        let destination = Destination(
+            name: "Receiver",
+            kind: .restAPI,
+            format: .metrics,
+            endpointURL: try XCTUnwrap(URL(string: "https://old.example"))
+        )
+        try await engine.save(destination)
+        let snapshots = try await engine.dueDestinationSnapshots(
+            ignoringCadence: true
+        )
+        let snapshot = try XCTUnwrap(snapshots.first)
+        let batch = makeBatch(format: .metrics)
+
+        let delivery = Task {
+            try await engine.deliver(
+                batch,
+                to: snapshot.destination,
+                expectedRevision: snapshot.revision
+            )
+        }
+        await gate.waitUntilStarted()
+        try await engine.delete(id: destination.id)
+        await gate.release()
+
+        do {
+            _ = try await delivery.value
+            XCTFail("A deleted destination must reject its stale repair.")
+        } catch HozzStoreError.staleDestinationConfiguration {
+            // Expected.
+        }
+        let saved = try await engine.destination(id: destination.id)
+        let revision = try await store.destinationRevision(id: destination.id)
+        let deliveredBatches = await channel.batchIDs()
+        XCTAssertNil(saved)
+        XCTAssertNil(revision)
+        XCTAssertTrue(deliveredBatches.isEmpty)
     }
 
     func testDeletingADestinationRemovesItsState() async throws {

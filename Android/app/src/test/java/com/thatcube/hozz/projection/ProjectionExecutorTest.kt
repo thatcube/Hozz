@@ -2,6 +2,7 @@ package com.thatcube.hozz.projection
 
 import android.os.RemoteException
 import androidx.health.connect.client.HealthConnectClient
+import com.thatcube.hozz.healthConnectCompletionStatus
 import com.thatcube.hozz.core.CanonicalRecord
 import com.thatcube.hozz.core.CanonicalValue
 import com.thatcube.hozz.core.HealthConnectProjection
@@ -128,6 +129,167 @@ class ProjectionExecutorTest {
                 pending = pending,
             ).summary().pendingCount,
         )
+    }
+
+    @Test
+    fun exactlyHundredRecordLocalUpsertRetriesAllSucceedWithoutCeiling() =
+        runBlocking {
+            val store = InMemoryCanonicalRecordStore()
+            val operations = (1..100).map { index ->
+                ProjectionPlanner.plan(live("upsert-retry-$index"))
+            }
+            val writer = FakeWriter(failUpsertBatches = true)
+
+            val result = executor(store, writer).apply(operations)
+
+            assertEquals(100, result.inserted)
+            assertEquals(0, result.failureCount)
+            assertFalse(result.retryCeilingReached)
+            assertEquals(
+                "Health Connect applied 100 inserts, 0 updates, and 0 deletions.",
+                healthConnectCompletionStatus(result, permissionDeferred = 0),
+            )
+        }
+
+    @Test
+    fun exactlyHundredRecordLocalDeleteRetriesAllSucceedWithoutCeiling() =
+        runBlocking {
+            val store = InMemoryCanonicalRecordStore()
+            val operations = (1..100).map { index ->
+                val record = tombstone("delete-retry-$index")
+                val prior = projection(
+                    record.canonicalId,
+                    version = 1,
+                    recordId = "health-delete-retry-$index",
+                )
+                store.saveHealthConnectProjections(listOf(prior))
+                ProjectionPlanner.plan(record, prior)
+            }
+            val writer = FakeWriter(failDeleteBatches = true)
+
+            val result = executor(store, writer).apply(operations)
+
+            assertEquals(100, result.deleted)
+            assertEquals(0, result.failureCount)
+            assertFalse(result.retryCeilingReached)
+            assertEquals(
+                "Health Connect applied 0 inserts, 0 updates, and 100 deletions.",
+                healthConnectCompletionStatus(result, permissionDeferred = 0),
+            )
+        }
+
+    @Test
+    fun unresolvedFailureCarriesAcrossEightyAndTwentyRetryPages() =
+        runBlocking {
+            val store = InMemoryCanonicalRecordStore()
+            val firstPage = (1..80).map { index ->
+                ProjectionPlanner.plan(live("eighty-$index"))
+            }
+            val secondPage = (1..20).map { index ->
+                ProjectionPlanner.plan(live("twenty-$index"))
+            }
+            val failedId = firstPage.last().source.canonicalId
+            val writer = FakeWriter(
+                failUpserts = setOf(failedId),
+                failUpsertBatches = true,
+            )
+            val executor = executor(store, writer)
+
+            val firstResult = executor.apply(firstPage)
+            val secondResult = executor.apply(secondPage)
+            val combined = firstResult + secondResult
+
+            assertEquals(79, firstResult.inserted)
+            assertEquals(1, firstResult.failureCount)
+            assertFalse(firstResult.retryCeilingReached)
+            assertEquals(20, secondResult.inserted)
+            assertEquals(0, secondResult.failureCount)
+            assertTrue(secondResult.retryCeilingReached)
+            assertEquals(99, combined.inserted)
+            assertEquals(1, combined.failureCount)
+            assertTrue(combined.retryCeilingReached)
+        }
+
+    @Test
+    fun retryCeilingIsReportedWhenHundredAndFirstRecordRemainsUnattempted() =
+        runBlocking {
+            val store = InMemoryCanonicalRecordStore()
+            val operations = (1..101).map { index ->
+                ProjectionPlanner.plan(live("continuation-$index"))
+            }
+            val writer = FakeWriter(failUpsertBatches = true)
+
+            val result = executor(store, writer).apply(operations)
+
+            assertEquals(100, result.inserted)
+            assertEquals(0, result.failureCount)
+            assertTrue(result.retryCeilingReached)
+            assertEquals(101, writer.batchSizes.size)
+            assertEquals(
+                100,
+                store.healthConnectProjections(
+                    operations.mapTo(linkedSetOf()) { it.source.canonicalId },
+                ).size,
+            )
+        }
+
+    @Test
+    fun exhaustedRetryBudgetStopsLaterPageAndViewModelReportsPending() =
+        runBlocking {
+            val store = InMemoryCanonicalRecordStore()
+            val firstPage = (1..100).map { index ->
+                ProjectionPlanner.plan(live("page-one-$index"))
+            }
+            val laterPage = listOf(
+                ProjectionPlanner.plan(live("page-two-1")),
+            )
+            val writer = FakeWriter(failUpsertBatches = true)
+            val executor = executor(store, writer)
+            var result = ProjectionExecutionResult()
+            var pagesAttempted = 0
+
+            for (page in listOf(firstPage, laterPage)) {
+                pagesAttempted += 1
+                val pageResult = executor.apply(page)
+                result += pageResult
+                if (pageResult.retryCeilingReached) break
+            }
+
+            assertEquals(2, pagesAttempted)
+            assertEquals(100, result.inserted)
+            assertTrue(result.retryCeilingReached)
+            assertTrue(
+                healthConnectCompletionStatus(result, permissionDeferred = 0)
+                    .endsWith(
+                        "The per-run retry limit was reached; " +
+                            "remaining records stay pending.",
+                    ),
+            )
+            assertTrue(
+                store.healthConnectProjections(
+                    setOf(laterPage.single().source.canonicalId),
+                ).isEmpty(),
+            )
+        }
+
+    @Test
+    fun finalSingletonFailureAtRetryBoundaryReportsCeiling() = runBlocking {
+        val store = InMemoryCanonicalRecordStore()
+        val operations = (1..100).map { index ->
+            ProjectionPlanner.plan(live("final-failure-$index"))
+        }
+        val failedId = operations.last().source.canonicalId
+        val writer = FakeWriter(
+            failUpserts = setOf(failedId),
+            failUpsertBatches = true,
+        )
+
+        val result = executor(store, writer).apply(operations)
+
+        assertEquals(99, result.inserted)
+        assertEquals(1, result.failureCount)
+        assertEquals(failedId, result.failures.single().canonicalId)
+        assertTrue(result.retryCeilingReached)
     }
 
     @Test
@@ -580,6 +742,8 @@ class ProjectionExecutorTest {
         private val cancelUpserts: Set<String> = emptySet(),
         private val providerUpsertFailure: IOException? = null,
         private val providerReceiptCountMismatch: Boolean = false,
+        private val failUpsertBatches: Boolean = false,
+        private val failDeleteBatches: Boolean = false,
     ) : HealthConnectProjectionWriter {
         val calls = mutableListOf<String>()
         val batchSizes = mutableListOf<Int>()
@@ -596,6 +760,9 @@ class ProjectionExecutorTest {
                     expected = drafts.size,
                     actual = drafts.size - 1,
                 )
+            }
+            if (failUpsertBatches && drafts.size > 1) {
+                throw IllegalArgumentException("upsert batch failed")
             }
             if (drafts.any { it.canonicalId in cancelUpserts }) {
                 throw CancellationException("cancelled")
@@ -620,6 +787,9 @@ class ProjectionExecutorTest {
         ): List<HealthConnectProjection> {
             deleteBatchSizes += drafts.size
             calls += "delete:${drafts.joinToString(",") { it.canonicalId }}"
+            if (failDeleteBatches && drafts.size > 1) {
+                throw IllegalArgumentException("delete batch failed")
+            }
             if (drafts.any { it.canonicalId in failDeletes }) {
                 throw IllegalArgumentException("delete failed")
             }

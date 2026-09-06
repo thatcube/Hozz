@@ -40,7 +40,6 @@ private final class LocalFolderIngestFileSystem:
     }
 
     func allNames(in folder: URL) -> [String] {
-        resetPaging()
         return (try? FileManager.default.contentsOfDirectory(atPath: folder.path))
             ?? []
     }
@@ -322,11 +321,12 @@ public actor FolderIngestWatcher {
         let rawNames: [String]
         let completedPeriodicCycle: Bool
         if scanAllEntries {
+            // Event scans are an independent fast path. Resetting the periodic
+            // pager here lets a steady stream of events keep its audit on page
+            // one forever, so a same-metadata rewrite on a later page is never
+            // hashed.
             rawNames = fileSystem.allNames(in: folder)
             completedPeriodicCycle = false
-            namesSeenInPeriodicCycle.removeAll()
-            auditPagesSeenInPeriodicCycle.removeAll()
-            fileSystem.resetPaging()
         } else {
             let page = fileSystem.nextNamePage(
                 in: folder,

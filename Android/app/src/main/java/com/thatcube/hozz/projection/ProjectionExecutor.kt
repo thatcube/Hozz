@@ -57,6 +57,7 @@ class ProjectionExecutor(
 ) {
     private var remainingSingletonAttempts =
         MAX_RECORD_LOCAL_RETRIES_PER_RUN
+    private val unresolvedSingletonFailures = mutableSetOf<String>()
 
     suspend fun apply(
         operations: List<PlannedRecord>,
@@ -95,6 +96,9 @@ class ProjectionExecutor(
                 }
                 if (attempted.value != null) {
                     result += acceptDeletions(chunk, attempted.value)
+                    chunk.forEach {
+                        unresolvedSingletonFailures.remove(it.canonicalId)
+                    }
                     null
                 } else {
                     attempted
@@ -103,12 +107,11 @@ class ProjectionExecutor(
             if (batch != null) {
                 if (chunk.size == 1) {
                     remainingSingletonAttempts -= 1
-                    result += ProjectionExecutionResult(
+                    val singleResult = ProjectionExecutionResult(
                         failures = listOfNotNull(batch.failure),
                     )
-                    if (remainingSingletonAttempts == 0) {
-                        return result.copy(retryCeilingReached = true)
-                    }
+                    recordSingletonResult(chunk.single().canonicalId, singleResult)
+                    result += singleResult
                 } else {
                     for (draft in chunk) {
                         if (remainingSingletonAttempts == 0) {
@@ -116,7 +119,7 @@ class ProjectionExecutor(
                         }
                         remainingSingletonAttempts -= 1
                         currentCoroutineContext().ensureActive()
-                        result += withContext(NonCancellable) {
+                        val singleResult = withContext(NonCancellable) {
                             val single = attempt(
                                 draft.canonicalId,
                                 ProjectionAction.DELETE,
@@ -132,9 +135,8 @@ class ProjectionExecutor(
                                 acceptDeletions(listOf(draft), removed)
                             }
                         }
-                        if (remainingSingletonAttempts == 0) {
-                            return result.copy(retryCeilingReached = true)
-                        }
+                        recordSingletonResult(draft.canonicalId, singleResult)
+                        result += singleResult
                     }
                 }
             }
@@ -164,6 +166,11 @@ class ProjectionExecutor(
                 }
                 if (attempted.value != null) {
                     result += acceptUpserts(chunk, attempted.value)
+                    chunk.forEach {
+                        unresolvedSingletonFailures.remove(
+                            it.source.canonicalId,
+                        )
+                    }
                     null
                 } else {
                     attempted
@@ -172,12 +179,14 @@ class ProjectionExecutor(
             if (batch != null) {
                 if (chunk.size == 1) {
                     remainingSingletonAttempts -= 1
-                    result += ProjectionExecutionResult(
+                    val singleResult = ProjectionExecutionResult(
                         failures = listOfNotNull(batch.failure),
                     )
-                    if (remainingSingletonAttempts == 0) {
-                        return result.copy(retryCeilingReached = true)
-                    }
+                    recordSingletonResult(
+                        chunk.single().source.canonicalId,
+                        singleResult,
+                    )
+                    result += singleResult
                 } else {
                     for (operation in chunk) {
                         if (remainingSingletonAttempts == 0) {
@@ -186,7 +195,7 @@ class ProjectionExecutor(
                         val draft = operation.draft ?: continue
                         remainingSingletonAttempts -= 1
                         currentCoroutineContext().ensureActive()
-                        result += withContext(NonCancellable) {
+                        val singleResult = withContext(NonCancellable) {
                             val single = attempt(
                                 draft.canonicalId,
                                 operation.action,
@@ -202,14 +211,31 @@ class ProjectionExecutor(
                                 acceptUpserts(listOf(operation), written)
                             }
                         }
-                        if (remainingSingletonAttempts == 0) {
-                            return result.copy(retryCeilingReached = true)
-                        }
+                        recordSingletonResult(
+                            operation.source.canonicalId,
+                            singleResult,
+                        )
+                        result += singleResult
                     }
                 }
             }
         }
-        return result
+        return result.copy(
+            retryCeilingReached =
+                remainingSingletonAttempts == 0 &&
+                    unresolvedSingletonFailures.isNotEmpty(),
+        )
+    }
+
+    private fun recordSingletonResult(
+        canonicalId: String,
+        result: ProjectionExecutionResult,
+    ) {
+        if (result.failureCount > 0) {
+            unresolvedSingletonFailures += canonicalId
+        } else {
+            unresolvedSingletonFailures -= canonicalId
+        }
     }
 
     private suspend fun acceptDeletions(

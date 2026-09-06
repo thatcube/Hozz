@@ -343,6 +343,18 @@ Grouped by metric rather than by sample, `application/json`. What Home
 Assistant, MQTT subscribers, and most dashboards want. **Lossy**: metadata,
 device, and workout detail are dropped.
 
+An explicit `sampleEncodingError` has no numeric point to publish, so Metrics
+JSON omits it rather than inventing a value. Hozz records that omission
+durably with the destination cursor. If the same destination is later changed
+to NDJSON or JSON, its sweep and recent-history prime replay so the lossless
+format receives the error record and every other record that was passed under
+the narrower format. Destination settings carry a persisted revision; a sync
+that started under an older format cannot commit its cursor after that edit.
+The element pages and end markers that expand high-frequency series are treated
+the same way: Metrics JSON and line protocol omit those detail records, seal
+that omission with the cursor, and replay them if the destination later becomes
+lossless.
+
 ```json
 {
   "data": {

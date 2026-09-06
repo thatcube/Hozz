@@ -143,6 +143,13 @@ public enum InfluxLineProtocol {
         return payload
     }
 
+    public static func canRepresent(
+        _ record: CompatiblePayloadBuilder.Record,
+        options: Options = Options()
+    ) -> Bool {
+        line(for: record, options: options) != nil
+    }
+
     /// One line, or nil when the record cannot be represented at all.
     ///
     /// The only records that return nil are ones with no timestamp *and* no

@@ -10,6 +10,7 @@ public enum ScriptedHealthDataSourceError: Error, Equatable, Sendable {
 
 public enum ScriptedQueryFault: Hashable, Sendable {
     case fail
+    case cancelTask
     case holdAnchor
     case replaceFirstChangeType(HealthTypeKey)
 }
@@ -63,6 +64,8 @@ public actor ScriptedHealthDataSource: HealthDataSource {
             switch fault {
             case .fail:
                 throw ScriptedHealthDataSourceError.injectedFailure
+            case .cancelTask:
+                withUnsafeCurrentTask { $0?.cancel() }
             case .holdAnchor:
                 proposedAnchor = anchor ?? Self.anchor(for: 0)
             case .replaceFirstChangeType(let replacement):

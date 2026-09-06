@@ -391,3 +391,26 @@ public struct PendingAnchorCommit: Equatable, Sendable {
         self.failureReason = failureReason
     }
 }
+
+/// A durable acknowledgement that a lossy destination intentionally omitted
+/// records while advancing its acquisition cursors.
+///
+/// The exact format is part of the seal because changing that format can make
+/// the omitted records representable. A later lossless edit uses this marker to
+/// replay the destination instead of trusting cursors advanced under narrower
+/// semantics.
+public struct DeliveryOmissionSeal: Equatable, Sendable {
+    public let destinationID: UUID
+    public let format: String
+    public let omittedRecordCount: Int
+
+    public init(
+        destinationID: UUID,
+        format: String,
+        omittedRecordCount: Int
+    ) {
+        self.destinationID = destinationID
+        self.format = format
+        self.omittedRecordCount = omittedRecordCount
+    }
+}

@@ -576,7 +576,7 @@ final class DeliveryWindowTests: XCTestCase {
         // wider window saved, the marker set, the cursors untouched.
         destination.deliveryWindow = .sinceLastDelivery
         destination.options[Destination.pendingReplayKey] = "1"
-        try await store.saveDestination(
+        _ = try await store.saveDestination(
             id: destination.id,
             payload: try JSONEncoder().encode(destination),
             createdAt: destination.createdAt

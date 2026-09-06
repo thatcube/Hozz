@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 @testable import HozzReceive
 import HozzStore
@@ -849,8 +850,117 @@ final class SchemaMigrationTests: XCTestCase {
                 row: { $0.integer(0) }
             )
             promoted.close()
-            XCTAssertEqual(promotedVersions, [1, 1], "version \(version)")
+            XCTAssertEqual(promotedVersions, [2, 2], "version \(version)")
         }
+    }
+
+    func testVersionOneFolderReceiptReplaysDeletionWithoutDowngradingUpserts()
+        async throws
+    {
+        let directory = try makeReceiptDatabase(
+            version: 12,
+            name: "store-v12-version-one-folder-receipt"
+        )
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let payload = Data(
+            """
+            {"data":{
+              "metrics":[{"name":"step_count","units":"count","data":[
+                {"id":"preserved-stable","date":"2026-01-01 11:00:00 +0000","qty":1}
+              ]}],
+              "deletions":[
+                {"id":"deleted-stable","name":"step_count",
+                 "type":"HKQuantityTypeIdentifierStepCount","date":""}
+              ]
+            }}
+            """.utf8
+        )
+        let digest = SHA256.hash(data: payload)
+            .map { String(format: "%02x", $0) }
+            .joined()
+        let receiptKey = "folder-v2:\(digest)"
+        let legacyID = "step_count:2026-01-01 10:00:00 +0000"
+        let database = try SQLiteDatabase(url: databaseURL)
+        try database.execute(
+            """
+            DELETE FROM sample;
+            DELETE FROM batch;
+            """
+        )
+        try database.run(
+            """
+            INSERT INTO sample
+                (id, type, kind, start_date, end_date, value, unit,
+                 source_name, raw, received_at)
+            VALUES
+                (?, 'step_count', 'quantity',
+                 '2026-01-01T10:00:00.000Z',
+                 '2026-01-01T10:00:00.000Z',
+                 12, 'count', 'Watch', X'7B7D',
+                 '2026-01-01T12:00:00.000Z'),
+                ('preserved-stable', 'step_count', 'quantity',
+                 '2026-01-01T11:00:00.000Z',
+                 '2026-01-01T11:00:00.000Z',
+                 99, 'count', 'Watch', X'7B7D',
+                 '2026-01-01T12:00:00.000Z')
+            """,
+            [.text(legacyID)]
+        )
+        try database.run(
+            """
+            INSERT INTO sample_identity_alias (stable_id, legacy_id)
+            VALUES ('deleted-stable', ?)
+            """,
+            [.text(legacyID)]
+        )
+        try database.run(
+            """
+            INSERT INTO batch
+                (key, received_at, record_count, receipt_version)
+            VALUES (?, '2026-01-01T12:00:00.000Z', 2, 1)
+            """,
+            [.text(receiptKey)]
+        )
+        database.close()
+
+        let store = try IngestStore(directory: directory)
+        let parsed = try BatchParser.parse(payload)
+        let first = try await store.ingest(
+            parsed,
+            idempotencyKey: receiptKey
+        )
+
+        XCTAssertFalse(first.duplicate)
+        XCTAssertEqual(first.stored, 0)
+        XCTAssertEqual(first.deleted, 1)
+        let samples = try await store.samples(type: "step_count")
+        XCTAssertEqual(samples.map(\.id), ["preserved-stable"])
+        XCTAssertEqual(samples.first?.value, 99)
+        let second = try await store.ingest(
+            parsed,
+            idempotencyKey: receiptKey
+        )
+        XCTAssertTrue(second.duplicate)
+        await store.close()
+
+        let inspected = try SQLiteDatabase(url: databaseURL)
+        defer { inspected.close() }
+        XCTAssertEqual(
+            try inspected.query(
+                "SELECT receipt_version FROM batch WHERE key = ?",
+                [.text(receiptKey)],
+                row: { $0.integer(0) }
+            ).first,
+            2
+        )
+        XCTAssertEqual(
+            try inspected.query(
+                "SELECT COUNT(*) FROM sample_tombstone WHERE id IN (?, ?)",
+                [.text("deleted-stable"), .text(legacyID)],
+                row: { $0.integer(0) }
+            ).first,
+            2
+        )
     }
 
     func testVersionElevenCarriedPreTenReceiptReplaysOnlyDeletion() async throws {
@@ -1109,6 +1219,199 @@ final class SchemaMigrationTests: XCTestCase {
         await upgraded.close()
     }
 
+    func testVersionThirteenCountsEquivalentRetiredOffsetAliasBeforePairing()
+        async throws
+    {
+        let directory = try makeReceiptDatabase(
+            version: 12,
+            name: "version-twelve-offset-alias-cardinality"
+        )
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let database = try SQLiteDatabase(url: databaseURL)
+        try database.execute(
+            """
+            DELETE FROM sample;
+            DELETE FROM batch;
+            INSERT INTO sample
+                (id, type, kind, start_date, end_date, value, unit,
+                 source_name, raw, received_at)
+            VALUES
+                ('heart_rate:2026-01-01T05:00:00.000-05:00',
+                 'heart_rate', 'quantity',
+                 '2026-01-01T10:00:00.000Z',
+                 '2026-01-01T10:00:00.000Z',
+                 NULL, 'bpm', 'Watch', X'7B7D',
+                 '2026-01-01T12:00:00.000Z'),
+                ('stable-heart', 'heart_rate', 'quantity',
+                 '2026-01-01T10:00:00.000Z',
+                 '2026-01-01T10:00:00.000Z',
+                 62, 'bpm', 'Watch', X'7B7D',
+                 '2026-01-01T12:01:00.000Z');
+            INSERT INTO sample_alias_signature
+                (stable_id, type, kind, start_time, end_time,
+                 value, unit, source_name)
+            VALUES
+                ('stable-heart', 'heart_rate', 'quantity',
+                 '2026-01-01T10:00:00.000Z',
+                 '2026-01-01T10:00:00.000Z',
+                 62, 'bpm', 'Watch');
+            INSERT INTO sample_tombstone (id, received_at)
+            VALUES (
+                'heart_rate:2026-01-01T10:00:00.000Z',
+                '2026-01-02T00:00:00.000Z'
+            );
+            INSERT INTO sample_alias_retirement (type, start_time)
+            VALUES ('heart_rate', '2026-01-01T10:00:00.000Z');
+            """
+        )
+        database.close()
+
+        let upgraded = try IngestStore(directory: directory)
+        let samples = try await upgraded.samples(type: "heart_rate")
+        XCTAssertEqual(
+            Set(samples.map(\.id)),
+            [
+                "heart_rate:2026-01-01T05:00:00.000-05:00",
+                "stable-heart"
+            ],
+            "Two equivalent legacy spellings are ambiguous, even when one is retired."
+        )
+        await upgraded.close()
+
+        let inspected = try SQLiteDatabase(url: databaseURL)
+        defer { inspected.close() }
+        XCTAssertEqual(
+            try inspected.query(
+                """
+                SELECT COUNT(*) FROM sample_identity_alias
+                WHERE stable_id = 'stable-heart'
+                """,
+                row: { $0.integer(0) }
+            ).first,
+            0,
+            "Migration must not guess which offset spelling named the stable sample."
+        )
+        XCTAssertEqual(
+            try inspected.query(
+                """
+                SELECT COUNT(*) FROM sample_legacy_tombstone
+                WHERE type = 'heart_rate'
+                  AND start_time = '2026-01-01T10:00:00.000Z'
+                """,
+                row: { $0.integer(0) }
+            ).first,
+            1
+        )
+    }
+
+    func testVersionThirteenStreamsLargeLegacyShapeScanAndReconcilesSetWise()
+        throws
+    {
+        let directory = try makeReceiptDatabase(
+            version: 12,
+            name: "version-twelve-large-legacy-shape-set"
+        )
+        let databaseURL = directory.appending(path: "hozz-received.sqlite")
+        let database = try SQLiteDatabase(url: databaseURL)
+        defer { database.close() }
+        try database.execute(
+            """
+            DELETE FROM sample;
+            DELETE FROM batch;
+            """
+        )
+        let insertSample = try database.prepared(
+            """
+            INSERT INTO sample
+                (id, type, kind, start_date, end_date, value, unit,
+                 source_name, raw, received_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Watch', X'7B7D',
+                    '2026-02-01T00:00:00.000Z')
+            """
+        )
+        let insertSignature = try database.prepared(
+            """
+            INSERT INTO sample_alias_signature
+                (stable_id, type, kind, start_time, end_time,
+                 value, unit, source_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'Watch')
+            """
+        )
+        defer {
+            insertSample.finalize()
+            insertSignature.finalize()
+        }
+
+        let count = 2_048
+        let base = Date(timeIntervalSince1970: 1_767_225_600)
+        let timestamp = Date.ISO8601FormatStyle(
+            includingFractionalSeconds: true,
+            timeZone: .gmt
+        )
+        for index in 0..<count {
+            let startDate = base.addingTimeInterval(TimeInterval(index * 3_601))
+            let start = timestamp.format(startDate)
+            let isHeart = index.isMultiple(of: 2)
+            let type = isHeart ? "heart_rate" : "sleep_analysis"
+            let end = isHeart
+                ? start
+                : timestamp.format(startDate.addingTimeInterval(3_600))
+            let legacyID = "\(type):\(start)"
+            let stableID = "stable-\(index)"
+            try insertSample.run([
+                .text(legacyID),
+                .text(type),
+                .text("quantity"),
+                .text(start),
+                .text(end),
+                isHeart ? .null : .real(1),
+                .text(isHeart ? "bpm" : "hr")
+            ])
+            try insertSample.run([
+                .text(stableID),
+                .text(type),
+                .text(isHeart ? "quantity" : "category"),
+                .text(start),
+                .text(end),
+                .real(isHeart ? Double(60 + index % 40) : 5),
+                .text(isHeart ? "bpm" : "hr")
+            ])
+            try insertSignature.run([
+                .text(stableID),
+                .text(type),
+                .text(isHeart ? "quantity" : "category"),
+                .text(start),
+                .text(end),
+                .real(isHeart ? Double(60 + index % 40) : 5),
+                .text(isHeart ? "bpm" : "hr")
+            ])
+        }
+
+        let statistics = try IngestStore.migrateToThirteen(
+            database,
+            from: 12
+        )
+
+        XCTAssertEqual(statistics.legacySamplesScanned, count)
+        XCTAssertEqual(statistics.reconciliationPasses, 1)
+        XCTAssertEqual(statistics.reconciliationCandidateRows, count)
+        XCTAssertEqual(statistics.reconciledAliases, count)
+        XCTAssertEqual(
+            try database.query(
+                "SELECT COUNT(*) FROM sample",
+                row: { Int($0.integer(0)) }
+            ).first,
+            count
+        )
+        XCTAssertEqual(
+            try database.query(
+                "SELECT COUNT(*) FROM sample_identity_alias",
+                row: { Int($0.integer(0)) }
+            ).first,
+            count
+        )
+    }
+
     func testVersionThirteenLegacyTombstonesScaleWithTombstonesNotCartesianPairs()
         throws
     {
@@ -1343,7 +1646,7 @@ final class SchemaMigrationTests: XCTestCase {
 
         let store = try HozzStore(directory: directory)
         let version = try await store.schemaVersion()
-        XCTAssertEqual(version, 5)
+        XCTAssertEqual(version, 7)
 
         let database = try SQLiteDatabase(url: databaseURL)
         defer { database.close() }
@@ -1373,7 +1676,14 @@ final class SchemaMigrationTests: XCTestCase {
         )
         XCTAssertTrue(tables.contains("destination"))
         XCTAssertTrue(tables.contains("delivery_state"))
+        XCTAssertTrue(tables.contains("delivery_omission_seal"))
         XCTAssertTrue(tables.contains("canonical_record_version"))
+        let destinationColumns = Set(
+            try database.query("PRAGMA table_info(destination)") {
+                $0.text(1)
+            }
+        )
+        XCTAssertTrue(destinationColumns.contains("revision"))
         XCTAssertTrue(
             tables.contains("prime_state"),
             """
@@ -1390,7 +1700,7 @@ final class SchemaMigrationTests: XCTestCase {
         for _ in 0..<3 {
             let store = try HozzStore(directory: directory)
             let version = try await store.schemaVersion()
-            XCTAssertEqual(version, 5)
+            XCTAssertEqual(version, 7)
         }
     }
 }

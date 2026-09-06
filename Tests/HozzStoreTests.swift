@@ -125,7 +125,7 @@ final class HozzStoreTests: XCTestCase {
 
         for store in stores {
             let version = try await store.schemaVersion()
-            XCTAssertEqual(version, 5)
+            XCTAssertEqual(version, 7)
             await store.close()
         }
     }
@@ -304,6 +304,129 @@ final class HozzStoreTests: XCTestCase {
             "A rolled back transaction must not leave the healthy commit behind."
         )
         XCTAssertNil(heartRecord)
+    }
+
+    func testOmissionSealRollsBackWithAFailedCursorTransaction() async throws {
+        let store = try await makeStore()
+        let destinationID = UUID()
+        let scope = AnchorScope.destination(destinationID)
+        _ = try await store.saveDestination(
+            id: destinationID,
+            payload: Data("{}".utf8),
+            createdAt: .now
+        )
+        try await store.commit(
+            [
+                PendingAnchorCommit(
+                    type: steps,
+                    baseAnchor: nil,
+                    anchor: anchor("a1"),
+                    coverage: .draining,
+                    addedRecordCount: 1,
+                    addedObservedCount: 1
+                )
+            ],
+            scope: scope
+        )
+
+        do {
+            try await store.commit(
+                [
+                    PendingAnchorCommit(
+                        type: steps,
+                        baseAnchor: anchor("a1"),
+                        anchor: anchor("a2"),
+                        coverage: .draining,
+                        addedRecordCount: 1,
+                        addedObservedCount: 1
+                    ),
+                    PendingAnchorCommit(
+                        type: heartRate,
+                        baseAnchor: anchor("wrong"),
+                        anchor: anchor("bad"),
+                        coverage: .draining,
+                        addedRecordCount: 1,
+                        addedObservedCount: 1
+                    )
+                ],
+                prime: [],
+                omissionSeal: DeliveryOmissionSeal(
+                    destinationID: destinationID,
+                    format: "metrics",
+                    omittedRecordCount: 1
+                ),
+                scope: scope
+            )
+            XCTFail("The stale cursor must roll back the omission seal too.")
+        } catch HozzStoreError.staleBaseAnchor {
+            // Expected.
+        }
+
+        let stored = try await store.streamRecord(scope: scope, type: steps)
+        let omissionFormats = try await store.deliveryOmissionFormats(
+            for: destinationID
+        )
+        XCTAssertEqual(stored?.committedAnchor, anchor("a1"))
+        XCTAssertTrue(omissionFormats.isEmpty)
+    }
+
+    func testStaleDestinationRevisionRejectsCursorAndOmissionTogether()
+        async throws
+    {
+        let store = try await makeStore()
+        let destinationID = UUID()
+        let scope = AnchorScope.destination(destinationID)
+        let first = try await store.saveDestination(
+            id: destinationID,
+            payload: Data(#"{"format":"metrics"}"#.utf8),
+            createdAt: .now
+        )
+        let second = try await store.saveDestination(
+            id: destinationID,
+            payload: Data(#"{"format":"ndjson"}"#.utf8),
+            createdAt: .now
+        )
+        XCTAssertEqual(first.revision, 1)
+        XCTAssertEqual(second.revision, 2)
+
+        do {
+            try await store.commit(
+                [
+                    PendingAnchorCommit(
+                        type: steps,
+                        baseAnchor: nil,
+                        anchor: anchor("stale"),
+                        coverage: .draining,
+                        addedRecordCount: 1,
+                        addedObservedCount: 1
+                    )
+                ],
+                prime: [],
+                omissionSeal: DeliveryOmissionSeal(
+                    destinationID: destinationID,
+                    format: "metrics",
+                    omittedRecordCount: 1
+                ),
+                expectedDestinationRevision: first.revision,
+                scope: scope
+            )
+            XCTFail("A stale destination snapshot must not advance its cursor.")
+        } catch HozzStoreError.staleDestinationConfiguration(
+            let id,
+            let expected,
+            let actual
+        ) {
+            XCTAssertEqual(id, destinationID)
+            XCTAssertEqual(expected, first.revision)
+            XCTAssertEqual(actual, second.revision)
+        }
+
+        let anchor = try await store.committedAnchor(scope: scope, type: steps)
+        let formats = try await store.deliveryOmissionFormats(
+            for: destinationID
+        )
+        XCTAssertNil(anchor)
+        XCTAssertTrue(formats.isEmpty)
     }
 
     func testScopesDoNotShareAnchors() async throws {

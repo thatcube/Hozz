@@ -77,6 +77,10 @@ private struct StoredCompatibilitySignature {
 struct LegacyTombstoneMigrationStatistics: Equatable, Sendable {
     var tombstonesScanned = 0
     var retirementLookups = 0
+    var legacySamplesScanned = 0
+    var reconciliationCandidateRows = 0
+    var reconciliationPasses = 0
+    var reconciledAliases = 0
 }
 
 /// One reading from inside a quantity series, back out of the store.
@@ -372,7 +376,7 @@ public struct IngestResult: Hashable, Sendable {
 ///
 /// Nothing here ever leaves the machine.
 public actor IngestStore {
-    private static let currentBatchReceiptVersion: Int64 = 1
+    private static let currentBatchReceiptVersion: Int64 = 2
     private static let canonicalWorkoutType = "HKWorkoutTypeIdentifier"
     private static let compatibilityWorkoutType = "workout"
     private static let historicalWorkoutType = "Workout"
@@ -439,7 +443,15 @@ public actor IngestStore {
                 """
             )
 
-            let legacy = try database.query(
+            let markLegacyShape = try database.prepared(
+                """
+                INSERT OR IGNORE INTO sample_legacy_compatibility_shape
+                    (legacy_id, shape)
+                VALUES (?, ?)
+                """
+            )
+            defer { markLegacyShape.finalize() }
+            statistics.legacySamplesScanned = try database.forEachRow(
                 """
                 SELECT id, type, kind, start_date, end_date,
                        value, unit, source_name
@@ -447,34 +459,21 @@ public actor IngestStore {
                 WHERE substr(id, 1, length(type) + 1) = type || ':'
                   AND type IN ('heart_rate', 'sleep_analysis')
                 """,
-                row: {
-                    (
-                        $0.text(0), $0.text(1), $0.optionalText(2),
-                        $0.text(3), $0.text(4), $0.optionalReal(5),
-                        $0.optionalText(6), $0.optionalText(7)
-                    )
-                }
-            )
-            for row in legacy {
+            ) { row in
                 let signature = StoredCompatibilitySignature(
-                    type: row.1,
-                    kind: row.2,
-                    startTime: row.3,
-                    endTime: row.4,
-                    value: row.5,
-                    unit: row.6,
-                    sourceName: row.7
+                    type: row.text(1),
+                    kind: row.optionalText(2),
+                    startTime: row.text(3),
+                    endTime: row.text(4),
+                    value: row.optionalReal(5),
+                    unit: row.optionalText(6),
+                    sourceName: row.optionalText(7)
                 )
                 guard let shape = legacyCompatibilityShape(for: signature) else {
-                    continue
+                    return
                 }
-                try database.run(
-                    """
-                    INSERT OR IGNORE INTO sample_legacy_compatibility_shape
-                        (legacy_id, shape)
-                    VALUES (?, ?)
-                    """,
-                    [.text(row.0), .text(shape.rawValue)]
+                try markLegacyShape.run(
+                    [.text(row.text(0)), .text(shape.rawValue)]
                 )
             }
 
@@ -524,7 +523,12 @@ public actor IngestStore {
                 )
             }
 
-            try reconcileMarkedLegacyCompatibilityAliases(in: database)
+            let reconciliation = try reconcileMarkedLegacyCompatibilityAliases(
+                in: database
+            )
+            statistics.reconciliationCandidateRows = reconciliation.candidates
+            statistics.reconciliationPasses = 1
+            statistics.reconciledAliases = reconciliation.reconciled
             try database.execute("PRAGMA user_version = 13")
             return statistics
         }
@@ -553,8 +557,9 @@ public actor IngestStore {
             // A row in a version-ten or version-eleven database may have been
             // written there, or may have arrived from version nine. The schema
             // carries no provenance that can tell those cases apart, so every
-            // inherited receipt remains zero. Only a receipt written after
-            // this migration is allowed to claim version one semantics.
+            // inherited receipt remains zero. Receipts written after this
+            // migration carry an explicit semantic version, which later fixes
+            // can advance without trusting older deletion behavior.
             try database.run("UPDATE batch SET receipt_version = 0")
             try database.execute("PRAGMA user_version = 12")
         }
@@ -976,8 +981,10 @@ public actor IngestStore {
                     key TEXT PRIMARY KEY,
                     received_at TEXT NOT NULL,
                     record_count INTEGER NOT NULL,
-                    -- Version zero predates durable deletion tombstones. Those
-                    -- receipts must be replayed once rather than trusted.
+                    -- Version zero predates durable deletion tombstones, and
+                    -- version one predates complete legacy-alias deletion
+                    -- reconciliation. Both must replay deletions once rather
+                    -- than being trusted as final.
                     receipt_version INTEGER NOT NULL DEFAULT 0
                 );
 
@@ -1886,159 +1893,237 @@ public actor IngestStore {
             }
             identifiers.insert(identifier)
         }
+        identifiers.formUnion(
+            try database.query(
+                """
+                SELECT legacy_id
+                FROM sample_legacy_tombstone
+                WHERE type = ? AND start_time = ?
+                """,
+                [
+                    .text(signature.type),
+                    .text(signature.startTime)
+                ],
+                row: { $0.text(0) }
+            )
+        )
         return identifiers
     }
 
     private static func reconcileMarkedLegacyCompatibilityAliases(
         in database: SQLiteDatabase
-    ) throws {
-        let legacy = try database.query(
+    ) throws -> (candidates: Int, reconciled: Int) {
+        try database.execute(
             """
-            SELECT sample.id, sample.type, sample.kind,
-                   sample.start_date, sample.end_date, sample.value,
-                   sample.unit, sample.source_name, legacy.shape
-            FROM sample
-            JOIN sample_legacy_compatibility_shape AS legacy
-              ON legacy.legacy_id = sample.id
-            ORDER BY sample.id
-            """,
-            row: {
-                (
-                    $0.text(0), $0.text(1), $0.optionalText(2),
-                    $0.text(3), $0.text(4), $0.optionalReal(5),
-                    $0.optionalText(6), $0.optionalText(7), $0.text(8)
-                )
-            }
+            DROP TABLE IF EXISTS temp.v13_legacy_alias_candidate;
+            DROP TABLE IF EXISTS temp.v13_stable_candidate_count;
+            DROP TABLE IF EXISTS temp.v13_legacy_candidate_count;
+            DROP TABLE IF EXISTS temp.v13_reconciled_alias;
+            DROP TABLE IF EXISTS temp.v13_reconciled_tombstone;
+
+            CREATE TEMP TABLE v13_legacy_alias_candidate (
+                stable_id TEXT NOT NULL,
+                legacy_id TEXT NOT NULL,
+                type TEXT NOT NULL,
+                start_time TEXT NOT NULL,
+                PRIMARY KEY (stable_id, legacy_id)
+            ) WITHOUT ROWID;
+            CREATE INDEX v13_legacy_alias_candidate_legacy
+                ON v13_legacy_alias_candidate (legacy_id, stable_id);
+            """
         )
 
-        for row in legacy {
-            guard let shape = LegacyCompatibilityShape(rawValue: row.8) else {
-                continue
-            }
-            let markedSignature = StoredCompatibilitySignature(
-                type: row.1,
-                kind: row.2,
-                startTime: row.3,
-                endTime: row.4,
-                value: row.5,
-                unit: row.6,
-                sourceName: row.7
-            )
-            guard legacyCompatibilityShape(for: markedSignature) == shape else {
-                try database.run(
-                    """
-                    DELETE FROM sample_legacy_compatibility_shape
-                    WHERE legacy_id = ?
-                    """,
-                    [.text(row.0)]
-                )
-                continue
-            }
-            let stable = try database.query(
-                """
-                SELECT stable_id, type, kind, start_time, end_time,
-                       value, unit, source_name
-                FROM sample_alias_signature
-                WHERE type = ? AND start_time = ? AND end_time = ?
-                  AND source_name IS ?
-                """,
-                [
-                    .text(row.1), .text(row.3), .text(row.4),
-                    row.7.map(SQLiteValue.text) ?? .null
-                ],
-                row: {
-                    (
-                        $0.text(0),
-                        StoredCompatibilitySignature(
-                            type: $0.text(1),
-                            kind: $0.optionalText(2),
-                            startTime: $0.text(3),
-                            endTime: $0.text(4),
-                            value: $0.optionalReal(5),
-                            unit: $0.optionalText(6),
-                            sourceName: $0.optionalText(7)
-                        )
-                    )
-                }
-            ).filter { currentSignature($0.1, matches: shape) }
-            guard stable.count == 1, let stableID = stable.first?.0 else {
-                continue
-            }
-            let candidates = try matchingLegacyAliasIDs(
-                for: stable[0].1,
-                in: database
-            )
-            guard candidates == Set([row.0]) else {
-                continue
-            }
-            let otherMappings = try database.query(
-                """
-                SELECT stable_id FROM sample_identity_alias
-                WHERE legacy_id = ? AND stable_id != ?
-                """,
-                [.text(row.0), .text(stableID)],
-                row: { $0.text(0) }
-            )
-            guard otherMappings.isEmpty else {
-                continue
-            }
+        // Current-format time-derived aliases match on the complete stored
+        // signature. This is one indexed join, not one query per migration
+        // marker.
+        try database.execute(
+            """
+            INSERT OR IGNORE INTO v13_legacy_alias_candidate
+                (stable_id, legacy_id, type, start_time)
+            SELECT stable.stable_id, legacy.id, stable.type, stable.start_time
+            FROM sample_alias_signature AS stable
+            JOIN sample AS legacy
+              ON legacy.type = stable.type
+             AND legacy.start_date = stable.start_time
+             AND legacy.end_date = stable.end_time
+             AND legacy.kind IS stable.kind
+             AND legacy.value IS stable.value
+             AND legacy.unit IS stable.unit
+             AND legacy.source_name IS stable.source_name
+            WHERE substr(legacy.id, 1, length(legacy.type) + 1)
+                      = legacy.type || ':';
+            """
+        )
 
-            try database.run(
-                """
-                INSERT OR REPLACE INTO sample_identity_alias
-                    (stable_id, legacy_id)
-                VALUES (?, ?)
-                """,
-                [.text(stableID), .text(row.0)]
-            )
-            try database.run(
-                """
-                INSERT OR REPLACE INTO sample_alias_retirement
-                    (type, start_time)
-                VALUES (?, ?)
-                """,
-                [.text(row.1), .text(row.3)]
-            )
+        // Versions before 13 stored heart-rate ranges without a point value
+        // and sleep duration where the current format stores a stage. Their
+        // one-time shape marker makes that exact relaxation explicit.
+        try database.run(
+            """
+            INSERT OR IGNORE INTO v13_legacy_alias_candidate
+                (stable_id, legacy_id, type, start_time)
+            SELECT stable.stable_id, legacy.id, stable.type, stable.start_time
+            FROM sample_alias_signature AS stable
+            JOIN sample AS legacy
+              ON legacy.type = stable.type
+             AND legacy.start_date = stable.start_time
+             AND legacy.end_date = stable.end_time
+             AND legacy.source_name IS stable.source_name
+            JOIN sample_legacy_compatibility_shape AS marker
+              ON marker.legacy_id = legacy.id
+            WHERE (
+                    marker.shape = ?
+                AND stable.type = 'heart_rate'
+                AND stable.kind = 'quantity'
+                AND stable.value IS NOT NULL
+                AND stable.unit IN ('bpm', 'count/min')
+            ) OR (
+                    marker.shape = ?
+                AND stable.type = 'sleep_analysis'
+                AND stable.kind = 'category'
+                AND stable.value IS NOT NULL
+            );
+            """,
+            [
+                .text(LegacyCompatibilityShape.heartRateRange.rawValue),
+                .text(LegacyCompatibilityShape.sleepDuration.rawValue)
+            ]
+        )
 
-            let tombstone = try database.query(
-                """
-                SELECT received_at FROM sample_tombstone
-                WHERE id IN (?, ?)
-                ORDER BY received_at DESC
-                LIMIT 1
-                """,
-                [.text(stableID), .text(row.0)],
-                row: { $0.text(0) }
-            ).first
-            if let tombstone {
-                for identifier in [stableID, row.0] {
-                    try database.run(
-                        """
-                        INSERT OR REPLACE INTO sample_tombstone
-                            (id, received_at)
-                        VALUES (?, ?)
-                        """,
-                        [.text(identifier), .text(tombstone)]
-                    )
-                    try database.run(
-                        "DELETE FROM sample WHERE id = ?",
-                        [.text(identifier)]
-                    )
-                }
-                try database.run(
-                    """
-                    DELETE FROM sample_unresolved_legacy_deletion
-                    WHERE stable_id = ?
-                    """,
-                    [.text(stableID)]
+        // A deleted spelling is still a candidate identity. Excluding it from
+        // cardinality lets a surviving equivalent offset spelling appear
+        // unique and be guessed as the stable record.
+        try database.execute(
+            """
+            INSERT OR IGNORE INTO v13_legacy_alias_candidate
+                (stable_id, legacy_id, type, start_time)
+            SELECT stable.stable_id, tombstone.legacy_id,
+                   stable.type, stable.start_time
+            FROM sample_alias_signature AS stable
+            JOIN sample_legacy_tombstone AS tombstone
+              ON tombstone.type = stable.type
+             AND tombstone.start_time = stable.start_time;
+
+            CREATE TEMP TABLE v13_stable_candidate_count (
+                stable_id TEXT PRIMARY KEY,
+                candidate_count INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO v13_stable_candidate_count
+            SELECT stable_id, COUNT(*)
+            FROM v13_legacy_alias_candidate
+            GROUP BY stable_id;
+
+            CREATE TEMP TABLE v13_legacy_candidate_count (
+                legacy_id TEXT PRIMARY KEY,
+                candidate_count INTEGER NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO v13_legacy_candidate_count
+            SELECT legacy_id, COUNT(*)
+            FROM v13_legacy_alias_candidate
+            GROUP BY legacy_id;
+
+            CREATE TEMP TABLE v13_reconciled_alias (
+                stable_id TEXT PRIMARY KEY,
+                legacy_id TEXT NOT NULL UNIQUE,
+                type TEXT NOT NULL,
+                start_time TEXT NOT NULL
+            );
+            INSERT INTO v13_reconciled_alias
+                (stable_id, legacy_id, type, start_time)
+            SELECT candidate.stable_id, candidate.legacy_id,
+                   candidate.type, candidate.start_time
+            FROM v13_legacy_alias_candidate AS candidate
+            JOIN sample_legacy_compatibility_shape AS marker
+              ON marker.legacy_id = candidate.legacy_id
+            JOIN v13_stable_candidate_count AS stable_count
+              ON stable_count.stable_id = candidate.stable_id
+             AND stable_count.candidate_count = 1
+            JOIN v13_legacy_candidate_count AS legacy_count
+              ON legacy_count.legacy_id = candidate.legacy_id
+             AND legacy_count.candidate_count = 1
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM sample_identity_alias AS existing
+                WHERE (
+                    existing.stable_id = candidate.stable_id
+                    AND existing.legacy_id != candidate.legacy_id
+                ) OR (
+                    existing.legacy_id = candidate.legacy_id
+                    AND existing.stable_id != candidate.stable_id
                 )
-            } else {
-                try database.run(
-                    "DELETE FROM sample WHERE id = ?",
-                    [.text(row.0)]
-                )
-            }
-        }
+            );
+
+            INSERT OR REPLACE INTO sample_identity_alias
+                (stable_id, legacy_id)
+            SELECT stable_id, legacy_id
+            FROM v13_reconciled_alias;
+
+            INSERT OR REPLACE INTO sample_alias_retirement
+                (type, start_time)
+            SELECT type, start_time
+            FROM v13_reconciled_alias;
+
+            CREATE TEMP TABLE v13_reconciled_tombstone (
+                stable_id TEXT PRIMARY KEY,
+                legacy_id TEXT NOT NULL,
+                received_at TEXT NOT NULL
+            ) WITHOUT ROWID;
+            INSERT INTO v13_reconciled_tombstone
+                (stable_id, legacy_id, received_at)
+            SELECT stable_id, legacy_id, MAX(received_at)
+            FROM (
+                SELECT match.stable_id, match.legacy_id,
+                       tombstone.received_at
+                FROM v13_reconciled_alias AS match
+                JOIN sample_tombstone AS tombstone
+                  ON tombstone.id = match.stable_id
+                UNION ALL
+                SELECT match.stable_id, match.legacy_id,
+                       tombstone.received_at
+                FROM v13_reconciled_alias AS match
+                JOIN sample_tombstone AS tombstone
+                  ON tombstone.id = match.legacy_id
+            )
+            GROUP BY stable_id, legacy_id;
+
+            INSERT OR REPLACE INTO sample_tombstone (id, received_at)
+            SELECT stable_id, received_at
+            FROM v13_reconciled_tombstone;
+            INSERT OR REPLACE INTO sample_tombstone (id, received_at)
+            SELECT legacy_id, received_at
+            FROM v13_reconciled_tombstone;
+
+            DELETE FROM sample_unresolved_legacy_deletion
+            WHERE stable_id IN (
+                SELECT stable_id FROM v13_reconciled_tombstone
+            );
+            DELETE FROM sample
+            WHERE id IN (
+                SELECT legacy_id FROM v13_reconciled_alias
+            ) OR id IN (
+                SELECT stable_id FROM v13_reconciled_tombstone
+            );
+            """
+        )
+
+        let candidates = try database.query(
+            "SELECT COUNT(*) FROM v13_legacy_alias_candidate",
+            row: { Int($0.integer(0)) }
+        ).first ?? 0
+        let reconciled = try database.query(
+            "SELECT COUNT(*) FROM v13_reconciled_alias",
+            row: { Int($0.integer(0)) }
+        ).first ?? 0
+        try database.execute(
+            """
+            DROP TABLE v13_reconciled_tombstone;
+            DROP TABLE v13_reconciled_alias;
+            DROP TABLE v13_legacy_candidate_count;
+            DROP TABLE v13_stable_candidate_count;
+            DROP TABLE v13_legacy_alias_candidate;
+            """
+        )
+        return (candidates, reconciled)
     }
 
     /// Writes a batch's contents. The caller owns the transaction, because both

@@ -187,6 +187,18 @@ CREATE TABLE IF NOT EXISTS receiver_migrations (
 DATA_MIGRATION_ENCODING_RECONCILIATION = 1
 DATA_MIGRATION_COMPATIBLE_ALIAS_BACKFILL = 2
 DATA_MIGRATION_COMPATIBLE_IDENTITY_SAFETY = 3
+DURABLE_RECEIVER_TABLES = (
+    "samples",
+    "batches",
+    "ingested_files",
+    "archive_run_records",
+    "compatible_alias_retirement",
+    "compatible_unresolved_deletion",
+    "compatible_resolved_deletion",
+    "compatible_alias_identity",
+    "receiver_migrations",
+)
+DURABLE_MUTATION_TRACKER = "receiver_durable_mutation_tracker"
 
 
 def connect(path):
@@ -3918,6 +3930,12 @@ def ingest_hashed_file(
             digest,
         )
         legacy_receipt = legacy_file_receipt(db, path.name)
+        repair_legacy_receipt = (
+            legacy_scope is not None
+            and legacy_receipt is not None
+            and legacy_scope == legacy_receipt[0]
+            and legacy_receipt[3] < 0
+        )
         if (
             legacy_scope is None
             and legacy_receipt is not None
@@ -3931,13 +3949,10 @@ def ingest_hashed_file(
                 legacy_receipt[0],
             )
         ):
-            db.execute(
-                """
-                INSERT OR IGNORE INTO batches
-                    (key, received_at, records, deletions)
-                VALUES (?, ?, ?, ?)
-                """,
-                (file_batch_key, *legacy_receipt[1:]),
+            copy_batch_receipt(
+                db,
+                legacy_receipt[0],
+                file_batch_key,
             )
             verify_file_content(path, source, initial, digest)
             record_file_receipt(
@@ -3949,29 +3964,53 @@ def ingest_hashed_file(
             db.commit()
             return 0, 0
         if path.suffix == ".zip":
-            return ingest_zip_stream(
+            if not repair_legacy_receipt:
+                return ingest_zip_stream(
+                    db,
+                    path,
+                    captured,
+                    initial,
+                    file_batch_key,
+                    watch_receipt_name,
+                    legacy_scope,
+                    verification_source=source,
+                    file_digest=digest,
+                )
+            stored, deleted = ingest_zip_stream(
                 db,
                 path,
                 captured,
                 initial,
-                file_batch_key,
-                watch_receipt_name,
+                legacy_scope,
+                None,
                 legacy_scope,
                 verification_source=source,
                 file_digest=digest,
+                commit=False,
             )
+            copy_batch_receipt(db, legacy_scope, file_batch_key)
+            record_file_receipt(
+                db,
+                watch_receipt_name,
+                initial,
+                digest,
+            )
+            db.commit()
+            return stored, deleted
 
         file_size = initial[2]
         stored, deleted, _ = ingest_seekable_stream(
             db,
             captured,
             file_size,
-            file_batch_key,
+            legacy_scope if repair_legacy_receipt else file_batch_key,
             commit=False,
             run_scope_key=legacy_scope,
             replay_run_occurrences=legacy_scope is not None,
         )
         verify_file_content(path, source, initial, digest)
+        if repair_legacy_receipt:
+            copy_batch_receipt(db, legacy_scope, file_batch_key)
         record_file_receipt(
             db,
             watch_receipt_name,
@@ -4268,6 +4307,93 @@ def legacy_file_receipt(db, name):
     return None
 
 
+def copy_batch_receipt(db, source_key, destination_key):
+    receipt = db.execute(
+        """
+        SELECT received_at, records, deletions FROM batches
+        WHERE key = ?
+        """,
+        (source_key,),
+    ).fetchone()
+    if receipt is None or receipt[2] < 0:
+        raise RuntimeError("legacy batch receipt was not repaired")
+    db.execute(
+        """
+        INSERT OR IGNORE INTO batches
+            (key, received_at, records, deletions)
+        VALUES (?, ?, ?, ?)
+        """,
+        (destination_key, *receipt),
+    )
+
+
+def quote_sqlite_identifier(identifier):
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+@contextmanager
+def track_durable_mutations(db):
+    tracker = quote_sqlite_identifier(DURABLE_MUTATION_TRACKER)
+    db.execute(f"DROP TABLE IF EXISTS temp.{tracker}")
+    db.execute(
+        f"""
+        CREATE TEMP TABLE {tracker} (
+            table_name TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            mutations INTEGER NOT NULL,
+            PRIMARY KEY (table_name, operation)
+        ) WITHOUT ROWID
+        """
+    )
+    trigger_names = []
+    try:
+        # TEMP triggers on main tables observe durable row changes without
+        # counting the receiver's TEMP validation and reconciliation tables.
+        for table_index, table_name in enumerate(DURABLE_RECEIVER_TABLES):
+            quoted_table = quote_sqlite_identifier(table_name)
+            table_literal = table_name.replace("'", "''")
+            for operation in ("INSERT", "UPDATE", "DELETE"):
+                trigger_name = (
+                    f"receiver_track_durable_{table_index}_{operation.lower()}"
+                )
+                trigger_names.append(trigger_name)
+                quoted_trigger = quote_sqlite_identifier(trigger_name)
+                db.execute(
+                    f"""
+                    CREATE TEMP TRIGGER {quoted_trigger}
+                    AFTER {operation} ON main.{quoted_table}
+                    BEGIN
+                        INSERT INTO {tracker}
+                            (table_name, operation, mutations)
+                        VALUES ('{table_literal}', '{operation.lower()}', 1)
+                        ON CONFLICT(table_name, operation) DO UPDATE SET
+                            mutations = mutations + 1;
+                    END
+                    """
+                )
+        yield
+    finally:
+        for trigger_name in trigger_names:
+            db.execute(
+                "DROP TRIGGER IF EXISTS temp."
+                + quote_sqlite_identifier(trigger_name)
+            )
+        db.execute(f"DROP TABLE IF EXISTS temp.{tracker}")
+
+
+def durable_mutations(db):
+    return tuple(
+        db.execute(
+            f"""
+            SELECT table_name, operation, mutations
+            FROM temp.{quote_sqlite_identifier(DURABLE_MUTATION_TRACKER)}
+            WHERE mutations > 0
+            ORDER BY table_name, operation
+            """
+        )
+    )
+
+
 def file_matches_legacy_receipt(
     db,
     path,
@@ -4277,40 +4403,42 @@ def file_matches_legacy_receipt(
     legacy_key,
 ):
     savepoint = "legacy_file_probe"
-    db.execute(f"SAVEPOINT {savepoint}")
-    before = db.total_changes
     try:
-        if path.suffix == ".zip":
-            ingest_zip_stream(
-                db,
-                path,
-                captured,
-                initial,
-                None,
-                None,
-                legacy_key,
-                verification_source=verification_source,
-                commit=False,
-            )
-        else:
-            ingest_seekable_stream(
-                db,
-                captured,
-                initial[2],
-                batch_key=None,
-                commit=False,
-                run_scope_key=legacy_key,
-                replay_run_occurrences=True,
-            )
-        unchanged = db.total_changes == before
-        db.execute(f"ROLLBACK TO {savepoint}")
-        db.execute(f"RELEASE {savepoint}")
-        captured.seek(0)
-        return unchanged
+        with track_durable_mutations(db):
+            db.execute(f"SAVEPOINT {savepoint}")
+            try:
+                if path.suffix == ".zip":
+                    ingest_zip_stream(
+                        db,
+                        path,
+                        captured,
+                        initial,
+                        None,
+                        None,
+                        legacy_key,
+                        verification_source=verification_source,
+                        commit=False,
+                    )
+                else:
+                    ingest_seekable_stream(
+                        db,
+                        captured,
+                        initial[2],
+                        batch_key=None,
+                        commit=False,
+                        run_scope_key=legacy_key,
+                        replay_run_occurrences=True,
+                    )
+                unchanged = not durable_mutations(db)
+            finally:
+                db.execute(f"ROLLBACK TO {savepoint}")
+                db.execute(f"RELEASE {savepoint}")
+            return unchanged
     except Exception:  # noqa: BLE001 - a failed probe falls back to normal ingest
         db.rollback()
+    finally:
         captured.seek(0)
-        return False
+    return False
 
 
 def verify_file_snapshot(path, stream, initial):

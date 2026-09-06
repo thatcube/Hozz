@@ -1766,6 +1766,13 @@ class MigrationTests(unittest.TestCase):
                     """
                 ).fetchone()[0],
             )
+            self.assertEqual(
+                0,
+                migrated.execute(
+                    "SELECT deletions FROM batches WHERE key = ?",
+                    (legacy_key,),
+                ).fetchone()[0],
+            )
             migrated.close()
 
 
@@ -6310,17 +6317,24 @@ class TransactionAndArchiveTests(unittest.TestCase):
             ).fetchone()[0],
         )
 
-    def test_null_snapshot_legacy_receipt_is_probed_without_run_duplication(self):
+    def test_null_digest_legacy_receipt_with_canonical_and_coverage_is_unchanged(
+        self,
+    ):
         path = Path(self.directory.name) / "hozz-upgraded-run.ndjson"
-        run = json.dumps({
-            "kind": "typeSummary",
+        record = json.dumps(self.strict_record("upgraded"))
+        coverage = json.dumps({
+            "kind": "typeCoverage",
             "schemaVersion": 1,
             "type": "heart.rate",
             "state": "complete",
         })
-        path.write_text(run + "\n")
+        path.write_text(record + "\n" + coverage + "\n")
         legacy_key = f"file:{path.name}"
-        ingest_lines(self.db, [run], batch_key=legacy_key)
+        ingest_lines(
+            self.db,
+            [record, coverage],
+            batch_key=legacy_key,
+        )
         self.db.execute(
             """
             INSERT INTO ingested_files (name, ingested_at)
@@ -6329,6 +6343,16 @@ class TransactionAndArchiveTests(unittest.TestCase):
             (path.name,),
         )
         self.db.commit()
+        self.assertEqual(
+            1,
+            self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
 
         self.assertEqual(
             (0, 0),
@@ -6340,6 +6364,10 @@ class TransactionAndArchiveTests(unittest.TestCase):
             self.db.execute(
                 "SELECT COUNT(*) FROM archive_run_records"
             ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.db.execute("SELECT COUNT(*) FROM samples").fetchone()[0],
         )
         self.assertEqual(
             1,
@@ -6359,6 +6387,135 @@ class TransactionAndArchiveTests(unittest.TestCase):
         self.assertEqual(
             (0, 0),
             ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
+
+    def test_null_digest_legacy_receipt_detects_changed_canonical_file(self):
+        path = Path(self.directory.name) / "hozz-upgraded-changed.ndjson"
+        original = self.strict_record("changed")
+        coverage = {
+            "kind": "typeCoverage",
+            "schemaVersion": 1,
+            "type": "heart.rate",
+            "state": "complete",
+        }
+        legacy_key = f"file:{path.name}"
+        ingest_lines(
+            self.db,
+            [json.dumps(original), json.dumps(coverage)],
+            batch_key=legacy_key,
+        )
+        self.db.execute(
+            """
+            INSERT INTO ingested_files (name, ingested_at)
+            VALUES (?, 0)
+            """,
+            (path.name,),
+        )
+        self.db.commit()
+
+        changed = {
+            **original,
+            "quantity": {"unit": "count", "value": 2},
+            "recordVersion": 2,
+        }
+        path.write_text(
+            json.dumps(changed) + "\n" + json.dumps(coverage) + "\n"
+        )
+
+        self.assertEqual(
+            (1, 0),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+        self.assertEqual(
+            (2, 2.0),
+            self.db.execute(
+                """
+                SELECT record_version, value FROM samples
+                WHERE canonical_id = ?
+                """,
+                (changed["canonicalId"],),
+            ).fetchone(),
+        )
+        self.assertEqual(
+            2,
+            self.db.execute(
+                "SELECT COUNT(*) FROM archive_run_records"
+            ).fetchone()[0],
+        )
+
+    def test_unknown_deletion_receipt_repairs_under_legacy_run_scope(self):
+        path = Path(self.directory.name) / "hozz-upgraded-deletion.ndjson"
+        record = self.strict_record("deleted-after-upgrade")
+        deletion = {
+            **record,
+            "deleted": True,
+            "kind": "deletion",
+            "recordVersion": 2,
+        }
+        coverage = {
+            "kind": "typeCoverage",
+            "schemaVersion": 1,
+            "type": "heart.rate",
+            "state": "complete",
+        }
+        legacy_key = f"file:{path.name}"
+        ingest_lines(self.db, [json.dumps(record)])
+        ingest_lines(
+            self.db,
+            [json.dumps(coverage)],
+            batch_key=legacy_key,
+        )
+        self.db.execute(
+            "UPDATE batches SET deletions = -1 WHERE key = ?",
+            (legacy_key,),
+        )
+        self.db.execute(
+            """
+            INSERT INTO ingested_files (name, ingested_at)
+            VALUES (?, 0)
+            """,
+            (path.name,),
+        )
+        self.db.commit()
+        path.write_text(
+            json.dumps(deletion) + "\n" + json.dumps(coverage) + "\n"
+        )
+
+        self.assertEqual(
+            (0, 1),
+            ingest_file(self.db, path, watch_receipt_name=path.name),
+        )
+        self.assertEqual(
+            1,
+            self.db.execute(
+                """
+                SELECT tombstone FROM samples
+                WHERE canonical_id = ?
+                """,
+                (record["canonicalId"],),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.db.execute(
+                "SELECT deletions FROM batches WHERE key = ?",
+                (legacy_key,),
+            ).fetchone()[0],
+        )
+        self.assertEqual(
+            1,
+            self.db.execute(
+                """
+                SELECT COUNT(*) FROM batches
+                WHERE key LIKE 'file:v3:%' AND deletions = 1
+                """
+            ).fetchone()[0],
         )
         self.assertEqual(
             1,

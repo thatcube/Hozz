@@ -469,13 +469,12 @@ public struct Destination: Codable, Hashable, Identifiable, Sendable {
     public static let timeoutKey = "requestTimeout"
     /// Set while this destination is owed a replay of its whole history.
     ///
-    /// Widening a delivery window has to do two things — write the new window,
-    /// and clear the cursors so the readings the narrower one skipped are read
-    /// again — and they are two separate writes to two separate tables. If the
-    /// second never happens, because the process was killed or the write failed,
-    /// nothing afterwards can tell: the destination already holds the wider
-    /// window, so comparing old against new says no replay is due, and the
-    /// readings are lost for good.
+    /// Widening a delivery window or changing a format after it durably omitted
+    /// records has to do two things — write the broader configuration, and
+    /// clear the cursors so skipped records are read again. They are separate
+    /// writes to separate tables. If the second never happens, nothing
+    /// afterwards can infer the prior configuration, and the records are lost
+    /// for good.
     ///
     /// The marker is written *with* the new window, in the same record, before
     /// the cursors are touched. Whatever happens next, the fact that a replay is

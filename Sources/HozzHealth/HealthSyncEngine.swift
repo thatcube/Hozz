@@ -166,7 +166,7 @@ public actor HealthSyncEngine {
         ignoringCadence: Bool = false,
         now: Date = .now
     ) async throws -> SyncOutcome {
-        let destinations = try await delivery.dueDestinations(
+        let destinations = try await delivery.dueDestinationSnapshots(
             now: now,
             ignoringCadence: ignoringCadence
         )
@@ -177,8 +177,8 @@ public actor HealthSyncEngine {
         // An automatic pass does not wait: it runs again soon anyway, and
         // queueing behind a manual export would hold up the person watching.
         guard await lease.acquire(for: .automaticSync) else {
-            for destination in destinations {
-                try? await delivery.markWaitingForSystem(destination.id)
+            for snapshot in destinations {
+                try? await delivery.markWaitingForSystem(snapshot.destination.id)
             }
             return .idle
         }
@@ -190,7 +190,8 @@ public actor HealthSyncEngine {
         var interrupted = false
         var waitingForUnlock = false
 
-        for destination in destinations {
+        for snapshot in destinations {
+            let destination = snapshot.destination
             // Anything unexpected while handling one destination — an encoding
             // failure, a SQLite error — must not skip the destinations after
             // it. They are ordered deterministically, so the same ones would be
@@ -199,6 +200,7 @@ public actor HealthSyncEngine {
             do {
                 result = try await sync(
                     destination: destination,
+                    expectedRevision: snapshot.revision,
                     dirtyTypes: dirtyTypes,
                     now: now
                 )
@@ -261,6 +263,7 @@ public actor HealthSyncEngine {
     /// waits that long before deciding an app is broken.
     private func sync(
         destination: Destination,
+        expectedRevision: Int64,
         dirtyTypes: Set<HealthTypeKey>,
         now: Date
     ) async throws -> SyncOutcome {
@@ -417,12 +420,20 @@ public actor HealthSyncEngine {
         )
         let coverageIsNews = destination.format.carriesCoverage
             && digest != destination.reportedCoverageDigest
-        let deliverableRecords = DeliveryPayloadBuilder.recordsCompatibleWith(
-            destination,
-            from: records
+        let builtPayload = try DeliveryPayloadBuilder.buildWithAccounting(
+            records: records,
+            coverage: destination.format.carriesCoverage ? coverage : [],
+            destination: destination
         )
+        let omissionSeal = builtPayload.omittedRecordCount == 0
+            ? nil
+            : DeliveryOmissionSeal(
+                destinationID: destination.id,
+                format: destination.format.rawValue,
+                omittedRecordCount: builtPayload.omittedRecordCount
+            )
 
-        guard !deliverableRecords.isEmpty || coverageIsNews else {
+        guard builtPayload.representedRecordCount > 0 || coverageIsNews else {
             // Nothing new for this destination. Still commit any cursor that
             // moved without data, so an empty stream is not re-read forever.
             //
@@ -437,7 +448,9 @@ public actor HealthSyncEngine {
             try await commit(
                 committable,
                 prime: prime.commits,
-                scope: scope
+                scope: scope,
+                omissionSeal: omissionSeal,
+                expectedDestinationRevision: expectedRevision
             )
             return SyncOutcome(
                 deliveredRecords: 0,
@@ -450,26 +463,26 @@ public actor HealthSyncEngine {
             )
         }
 
-        let payload = try DeliveryPayloadBuilder.build(
-            records: deliverableRecords,
-            coverage: destination.format.carriesCoverage ? coverage : [],
-            destination: destination
-        )
         let batch = DeliveryBatch(
             // The key is derived from the bytes being sent, so a retry of the
             // same data reuses it and a receiver can discard the repeat, while
             // a retry that picked up newer data gets a new key and is stored.
             // Reusing a key for changed contents would silently lose records.
-            id: DeliveryBatch.identifier(for: payload),
+            id: DeliveryBatch.identifier(for: builtPayload.payload),
             sequence: try await delivery.nextSequence(for: destination.id),
             createdAt: now,
-            recordCount: deliverableRecords.count,
-            payload: payload,
+            recordCount: builtPayload.representedRecordCount,
+            payload: builtPayload.payload,
             format: destination.format
         )
 
         do {
-            _ = try await delivery.deliver(batch, to: destination, now: now)
+            _ = try await delivery.deliver(
+                batch,
+                to: destination,
+                expectedRevision: expectedRevision,
+                now: now
+            )
         } catch {
             Self.log.error(
                 "A destination did not accept its batch; it will be retried."
@@ -489,23 +502,31 @@ public actor HealthSyncEngine {
             )
         }
 
-        try await commit(committable, prime: prime.commits, scope: scope)
+        try await commit(
+            committable,
+            prime: prime.commits,
+            scope: scope,
+            omissionSeal: omissionSeal,
+            expectedDestinationRevision: expectedRevision
+        )
         if coverageIsNews {
             // After the batch was accepted, so a refusal leaves the coverage
             // still owed rather than recorded as told.
             try? await delivery.recordCoverageDigest(digest, for: destination.id)
         }
 
+        let primedDelivered = try DeliveryPayloadBuilder
+            .representedRecordCount(
+                in: prime.changes,
+                destination: destination
+            )
         return SyncOutcome(
-            deliveredRecords: deliverableRecords.count,
+            deliveredRecords: builtPayload.representedRecordCount,
             destinationCount: 1,
             typesDrained: touched.count,
             wasInterrupted: interrupted,
             waitingForUnlock: waitingForUnlock,
-            primedRecords: DeliveryPayloadBuilder.recordsCompatibleWith(
-                destination,
-                from: prime.changes
-            ).count,
+            primedRecords: primedDelivered,
             primingRemains: prime.remains
         )
     }
@@ -714,9 +735,15 @@ public actor HealthSyncEngine {
     private func commit(
         _ states: [HealthTypeKey: TypeState],
         prime primeCommits: [PendingPrimeCommit],
-        scope: AnchorScope
+        scope: AnchorScope,
+        omissionSeal: DeliveryOmissionSeal? = nil,
+        expectedDestinationRevision: Int64
     ) async throws {
-        guard !states.isEmpty || !primeCommits.isEmpty else {
+        guard
+            !states.isEmpty
+                || !primeCommits.isEmpty
+                || omissionSeal != nil
+        else {
             return
         }
         let closedAt = Date.now
@@ -739,6 +766,8 @@ public actor HealthSyncEngine {
         try await store.commit(
             commits,
             prime: primeCommits.sorted { $0.type < $1.type },
+            omissionSeal: omissionSeal,
+            expectedDestinationRevision: expectedDestinationRevision,
             scope: scope
         )
     }
@@ -746,44 +775,17 @@ public actor HealthSyncEngine {
 
 /// Turns drained records into the bytes a destination expects.
 enum DeliveryPayloadBuilder {
+    struct BuildResult {
+        let payload: Data
+        let representedRecordCount: Int
+        let omittedRecordCount: Int
+    }
+
     static func supportsMetrics(type: HealthTypeKey) -> Bool {
         let identifier = type.rawValue
         return identifier.hasPrefix("HKQuantityTypeIdentifier")
             || identifier.hasPrefix("HKCategoryTypeIdentifier")
             || identifier == "HKWorkoutTypeIdentifier"
-    }
-
-    /// Applies format compatibility at record granularity.
-    ///
-    /// An encoding failure deliberately keeps the Health type that could not
-    /// be encoded. That makes it part of a supported quantity/category stream,
-    /// but it still has no numeric value for a grouped metrics point. Omitting
-    /// only that explicit stand-in lets valid readings from the same page move
-    /// forward. When there are valid records, the cursor advances only after
-    /// they are accepted; a page containing only stand-ins is complete for this
-    /// deliberately lossy destination without making an empty request.
-    /// Lossless destinations have independent cursors and continue to receive
-    /// the failure record itself.
-    static func recordsCompatibleWith(
-        _ destination: Destination,
-        from records: [HealthChange]
-    ) -> [HealthChange] {
-        guard destination.format == .metrics else {
-            return records
-        }
-        return records.filter { record in
-            guard case .upsert(let object) = record else {
-                return true
-            }
-            guard
-                let decoded = try? JSONSerialization.jsonObject(
-                    with: object.canonicalPayload
-                ) as? [String: Any]
-            else {
-                return true
-            }
-            return decoded["kind"] as? String != "sampleEncodingError"
-        }
     }
 
     /// Turns a pass's records into the destination's own format.
@@ -812,17 +814,44 @@ enum DeliveryPayloadBuilder {
         coverage: [TypeCoverageReport] = [],
         destination: Destination
     ) throws -> Data {
+        try buildWithAccounting(
+            records: records,
+            coverage: coverage,
+            destination: destination
+        ).payload
+    }
+
+    static func representedRecordCount(
+        in records: [HealthChange],
+        destination: Destination
+    ) throws -> Int {
+        guard destination.format == .metrics
+                || destination.format == .influx
+        else {
+            return records.count
+        }
+        return try representation(
+            of: records,
+            destination: destination
+        ).decoded.count
+    }
+
+    static func buildWithAccounting(
+        records: [HealthChange],
+        coverage: [TypeCoverageReport] = [],
+        destination: Destination
+    ) throws -> BuildResult {
         let format = destination.format
         let encoder = HealthSampleEncoder()
-        var lines: [Data] = []
-        lines.reserveCapacity(records.count)
+        var recordLines: [Data] = []
+        recordLines.reserveCapacity(records.count)
 
         for record in records {
             switch record {
             case .upsert(let object):
-                lines.append(object.canonicalPayload)
+                recordLines.append(object.canonicalPayload)
             case .delete(let deletion):
-                lines.append(
+                recordLines.append(
                     try encoder.encodeDeletion(
                         id: deletion.id,
                         typeIdentifier: deletion.type.rawValue
@@ -838,50 +867,135 @@ enum DeliveryPayloadBuilder {
         let coverageLines = format.carriesCoverage
             ? CoverageReporter.lines(for: coverage)
             : []
-        lines.append(contentsOf: coverageLines)
 
         switch format {
         case .ndjson:
             var payload = Data()
-            for line in lines {
+            for line in recordLines + coverageLines {
                 payload.append(line)
                 payload.append(0x0A)
             }
-            return payload
+            return BuildResult(
+                payload: payload,
+                representedRecordCount: records.count,
+                omittedRecordCount: 0
+            )
 
         case .json:
             var payload = Data("[\n".utf8)
-            for (index, line) in lines.enumerated() {
+            for (index, line) in (recordLines + coverageLines).enumerated() {
                 if index > 0 {
                     payload.append(Data(",\n".utf8))
                 }
                 payload.append(line)
             }
             payload.append(Data("\n]\n".utf8))
-            return payload
+            return BuildResult(
+                payload: payload,
+                representedRecordCount: records.count,
+                omittedRecordCount: 0
+            )
 
         case .csv:
-            return try csv(from: lines)
+            return BuildResult(
+                payload: try csv(from: recordLines),
+                representedRecordCount: records.count,
+                omittedRecordCount: 0
+            )
 
         case .metrics:
-            let decoded = lines
-                .compactMap(CompatiblePayloadBuilder.record(from:))
-                .filter { !SeriesEncoding.isDetailKind($0.kind) }
+            let represented = try representation(
+                of: records,
+                destination: destination,
+                preencodedLines: recordLines
+            )
+            let payload: Data
             switch destination.payloadSchema {
             case .hozz:
-                return try CompatiblePayloadBuilder.build(records: decoded)
+                payload = try CompatiblePayloadBuilder.build(
+                    records: represented.decoded
+                )
             case .healthAutoExport:
-                return try HealthAutoExportPayloadBuilder.build(records: decoded)
+                payload = try HealthAutoExportPayloadBuilder.build(
+                    records: represented.decoded
+                )
             }
+            return BuildResult(
+                payload: payload,
+                representedRecordCount: represented.decoded.count,
+                omittedRecordCount: records.count - represented.decoded.count
+            )
 
         case .influx:
-            return InfluxLineProtocol.build(
-                records: lines
-                    .compactMap(CompatiblePayloadBuilder.record(from:))
-                    .filter { !SeriesEncoding.isDetailKind($0.kind) },
-                options: destination.influxOptions
+            let represented = try representation(
+                of: records,
+                destination: destination,
+                preencodedLines: recordLines
+            )
+            return BuildResult(
+                payload: InfluxLineProtocol.build(
+                    records: represented.decoded,
+                    options: destination.influxOptions
+                ),
+                representedRecordCount: represented.decoded.count,
+                omittedRecordCount: records.count - represented.decoded.count
             )
         }
+    }
+
+    private static func representation(
+        of records: [HealthChange],
+        destination: Destination,
+        preencodedLines: [Data]? = nil
+    ) throws -> (decoded: [CompatiblePayloadBuilder.Record], lines: [Data]) {
+        let lines: [Data]
+        if let preencodedLines {
+            lines = preencodedLines
+        } else {
+            let encoder = HealthSampleEncoder()
+            lines = try records.map { record in
+                switch record {
+                case .upsert(let object):
+                    object.canonicalPayload
+                case .delete(let deletion):
+                    try encoder.encodeDeletion(
+                        id: deletion.id,
+                        typeIdentifier: deletion.type.rawValue
+                    )
+                }
+            }
+        }
+        guard destination.format == .metrics
+                || destination.format == .influx
+        else {
+            return (
+                lines.compactMap(CompatiblePayloadBuilder.record(from:)),
+                lines
+            )
+        }
+        var decoded: [CompatiblePayloadBuilder.Record] = []
+        decoded.reserveCapacity(lines.count)
+        for line in lines {
+            guard let record = CompatiblePayloadBuilder.record(from: line) else {
+                continue
+            }
+            if SeriesEncoding.isDetailKind(record.kind) {
+                continue
+            }
+            if destination.format == .metrics,
+               record.kind == "sampleEncodingError" {
+                continue
+            }
+            if destination.format == .influx,
+               !InfluxLineProtocol.canRepresent(
+                    record,
+                    options: destination.influxOptions
+               ) {
+                continue
+            }
+            decoded.append(record)
+        }
+        return (decoded, lines)
     }
 
     /// A single flat CSV, since an incremental batch spans several types and

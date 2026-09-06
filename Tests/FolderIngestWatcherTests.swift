@@ -94,7 +94,6 @@ final class FolderIngestWatcherTests: XCTestCase {
             lock.lock()
             defer { lock.unlock() }
             fullListings += 1
-            pageOffset = 0
             return names
         }
 
@@ -1065,6 +1064,63 @@ final class FolderIngestWatcherTests: XCTestCase {
         await store.close()
     }
 
+    func testDirectoryEventsCannotStarveThePeriodicAuditCursor() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appending(path: "hozz-folder-event-audit-cursor-\(UUID().uuidString)")
+        let folder = root.appending(path: "incoming")
+        try FileManager.default.createDirectory(
+            at: folder,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: root) }
+        let store = try IngestStore(directory: root.appending(path: "store"))
+        let fileSystem = FakeFileSystem()
+        let names = (0..<65).map { String(format: "%02d.ndjson", $0) }
+        fileSystem.replaceNames(names)
+        fileSystem.setContentGenerationAvailable(false)
+        for name in names {
+            try fileSystem.data(for: name).write(
+                to: folder.appending(path: name)
+            )
+        }
+        let watcher = FolderIngestWatcher(
+            store: store,
+            reconciliationInterval: .seconds(60),
+            observesDirectoryChanges: false,
+            metadataPageLimit: 64,
+            generationlessAuditFileLimit: 64,
+            fileSystem: fileSystem
+        )
+
+        await watcher.start(folder: folder)
+        let initialCount = try await store.totalRecordCount()
+        XCTAssertEqual(initialCount, 65)
+
+        let lastName = try XCTUnwrap(names.last)
+        let original = fileSystem.data(for: lastName)
+        let replacement = Data(
+            String(decoding: original, as: UTF8.self)
+                .replacingOccurrences(of: lastName, with: "hidden-64")
+                .utf8
+        )
+        XCTAssertEqual(replacement.count, original.count)
+        fileSystem.replacePayload(replacement, for: lastName)
+        try replacement.write(to: folder.appending(path: lastName))
+
+        for _ in 0..<4 {
+            await watcher.runPeriodicReconciliationForTesting()
+            await watcher.directoryDidChange()
+        }
+
+        let ids = Set(try await store.samples(type: "steps").map(\.id))
+        XCTAssertTrue(
+            ids.contains("hidden-64"),
+            "Event scans must not reset the independent periodic page cursor."
+        )
+        await watcher.stop()
+        await store.close()
+    }
+
     func testLegacyFilenameEqualClockFactsPreserveExistingAndInsertNew() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appending(path: "hozz-folder-facts-\(UUID().uuidString)")
@@ -1238,7 +1294,7 @@ final class FolderIngestWatcherTests: XCTestCase {
         let receipts = try database.query(
             """
             SELECT COUNT(*) FROM batch
-            WHERE key LIKE 'folder-v2:%' AND receipt_version = 1
+            WHERE key LIKE 'folder-v2:%' AND receipt_version = 2
             """,
             row: { $0.integer(0) }
         ).first

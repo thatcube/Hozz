@@ -1448,6 +1448,129 @@ class SqliteCanonicalRecordStoreTest {
     }
 
     @Test
+    fun archiveOverviewMatchesPlannerAcrossLedgerAndPendingDeleteTransitions() =
+        runBlocking {
+            fun tombstone(id: String): CanonicalRecord =
+                record(version = 2, tombstone = true).copy(
+                    canonicalId = "apple.healthkit:$id",
+                    canonicalType = "body.weight",
+                    type = "HKQuantityTypeIdentifierBodyMass",
+                    sourceRecordId = id,
+                    lineage = listOf(
+                        SourceLineage("apple.healthkit", recordId = id),
+                    ),
+                )
+
+            fun healthConnectLoop(id: String): CanonicalRecord =
+                tombstone(id).copy(
+                    lineage = listOf(
+                        SourceLineage("apple.healthkit", recordId = id),
+                        SourceLineage(
+                            "healthConnect",
+                            packageName = "com.thatcube.hozz",
+                            recordId = "health-$id",
+                        ),
+                    ),
+                )
+
+            fun clinical(id: String): CanonicalRecord =
+                tombstone(id).copy(
+                    kind = "clinicalRecord",
+                    canonicalType = "clinical.allergy",
+                    type = "HKClinicalTypeIdentifierAllergyRecord",
+                )
+
+            suspend fun expectedSummary() = store.allRecords().let { records ->
+                val ids = records.mapTo(linkedSetOf(), CanonicalRecord::canonicalId)
+                ProjectionPlanner.plan(
+                    records,
+                    store.healthConnectProjections(ids),
+                    store.pendingHealthConnectOperations(ids),
+                ).summary()
+            }
+
+            suspend fun assertParity() {
+                assertEquals(
+                    expectedSummary(),
+                    store.archiveOverview().projection,
+                )
+            }
+
+            val ledgerRecords = listOf(
+                tombstone("overview-ledger-delete"),
+                healthConnectLoop("overview-ledger-loop"),
+                clinical("overview-ledger-clinical"),
+            )
+            val pendingRecords = listOf(
+                tombstone("overview-pending-delete"),
+                healthConnectLoop("overview-pending-loop"),
+                clinical("overview-pending-clinical"),
+            )
+            val records = ledgerRecords + pendingRecords
+            store.upsert(records)
+            store.saveHealthConnectProjections(
+                ledgerRecords.map { record ->
+                    HealthConnectProjection(
+                        canonicalId = record.canonicalId,
+                        targetRecord = "WeightRecord",
+                        canonicalVersion = 1,
+                        healthConnectRecordId = "health:${record.canonicalId}",
+                    )
+                },
+            )
+            store.stageHealthConnectOperations(
+                pendingRecords.map { record ->
+                    PendingHealthConnectOperation(
+                        canonicalId = record.canonicalId,
+                        targetRecord = "WeightRecord",
+                        canonicalVersion = 1,
+                        action = HealthConnectPendingAction.UPSERT,
+                    )
+                },
+            )
+
+            assertParity()
+            store.archiveOverview().projection.also { summary ->
+                assertEquals(4, summary.archiveOnlyCount)
+                assertEquals(6, summary.deleteCount)
+                assertEquals(2, summary.warningCounts["source-store-loop"])
+                assertEquals(
+                    2,
+                    summary.warningCounts["clinical-snapshot-incomplete"],
+                )
+                assertTrue("tombstone" !in summary.warningCounts)
+            }
+
+            val deletes = records.map { record ->
+                PendingHealthConnectOperation(
+                    canonicalId = record.canonicalId,
+                    targetRecord = "WeightRecord",
+                    canonicalVersion = record.recordVersion,
+                    action = HealthConnectPendingAction.DELETE,
+                )
+            }
+            store.stageHealthConnectOperations(deletes)
+
+            assertParity()
+            assertEquals(6, store.archiveOverview().projection.deleteCount)
+
+            store.completeHealthConnectDeletes(deletes)
+
+            assertParity()
+            store.archiveOverview().projection.also { summary ->
+                assertEquals(6, summary.archiveOnlyCount)
+                assertEquals(0, summary.deleteCount)
+                assertEquals(2, summary.warningCounts["tombstone"])
+                assertEquals(2, summary.warningCounts["source-store-loop"])
+                assertEquals(
+                    2,
+                    summary.warningCounts["clinical-snapshot-incomplete"],
+                )
+            }
+            Unit
+        }
+
+    @Test
     fun largeSnapshotMaterializesOnlyOneBoundedTimelinePage() = runBlocking {
         val archiveSize = 2_000
         val start = Instant.parse("2026-01-31T00:00:00Z")

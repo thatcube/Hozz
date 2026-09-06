@@ -651,7 +651,13 @@ class SqliteCanonicalRecordStore(
                               OR pending.canonical_id IS NOT NULL
                             THEN 1
                             ELSE 0
-                        END AS has_projection_state
+                        END AS has_projection_state,
+                        EXISTS (
+                            SELECT 1
+                            FROM canonical_projection_warning AS warning
+                            WHERE warning.canonical_id = canonical.canonical_id
+                              AND warning.code = 'tombstone'
+                        ) AS has_tombstone_warning
                     FROM canonical_record AS canonical
                     JOIN canonical_projection_fact AS fact
                       ON fact.canonical_id = canonical.canonical_id
@@ -663,7 +669,9 @@ class SqliteCanonicalRecordStore(
                 effective AS (
                     SELECT
                         CASE
-                            WHEN tombstone = 1 AND has_projection_state = 1
+                            WHEN tombstone = 1
+                              AND has_projection_state = 1
+                              AND has_tombstone_warning = 1
                                 THEN 'DELETE'
                             ELSE base_quality
                         END AS quality,
@@ -739,6 +747,7 @@ class SqliteCanonicalRecordStore(
                        ledger.canonical_id IS NULL
                        AND pending.canonical_id IS NULL
                    )
+                   OR warning.code <> 'tombstone'
                 GROUP BY warning.code
                 ORDER BY warning.code
                 """.trimIndent(),

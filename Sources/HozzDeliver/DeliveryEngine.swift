@@ -3,6 +3,16 @@ import os
 import HozzCore
 import HozzStore
 
+public struct DestinationSnapshot: Sendable {
+    public let destination: Destination
+    public let revision: Int64
+
+    public init(destination: Destination, revision: Int64) {
+        self.destination = destination
+        self.revision = revision
+    }
+}
+
 /// Owns the user's destinations and the state of delivering to each.
 ///
 /// The engine never reads Health itself. It is handed already-encoded records
@@ -24,7 +34,10 @@ public actor DeliveryEngine {
     private let store: HozzStore
     private let credentials: DestinationCredentials
     private let channels: [DestinationKind: any DeliveryChannel]
+    private let endpointRepairResolver:
+        (@Sendable (Destination) async -> URL?)?
     private var cache: [UUID: Destination] = [:]
+    private var revisions: [UUID: Int64] = [:]
     private var isLoaded = false
 
     public init(
@@ -34,11 +47,14 @@ public actor DeliveryEngine {
             .folder: FolderDeliveryChannel(),
             .restAPI: RESTDeliveryChannel(),
             .mqtt: MQTTDeliveryChannel()
-        ]
+        ],
+        endpointRepairResolver:
+            (@Sendable (Destination) async -> URL?)? = nil
     ) {
         self.store = store
         self.credentials = credentials
         self.channels = channels
+        self.endpointRepairResolver = endpointRepairResolver
     }
 
     // MARK: - Destinations
@@ -57,20 +73,18 @@ public actor DeliveryEngine {
         try await loadIfNeeded()
         let previous = cache[destination.id]
 
-        // Moving a destination's starting point earlier replays its history.
+        // Broadening what a destination accepts replays its history.
         //
-        // This is the guarantee that stops a bounded window from losing records
-        // permanently. An later starting point has already let batches go by
-        // with readings the new setting wants, and the cursors moved past them,
-        // so they are not coming round again on their own. Clearing this
-        // destination's cursors makes it read Health from the start; every
-        // record carries the identifier HealthKit gave it, so a receiver
-        // recognises the repeats and keeps one of each.
+        // This stops a bounded window, or a lossy format that recorded an
+        // explicit omission, from losing records permanently. The cursors have
+        // already moved past bytes the broader setting wants, so they are not
+        // coming round again on their own. Clearing this destination's cursors
+        // makes it read Health from the start; stable record identifiers let a
+        // receiver absorb repeats.
         //
         // Re-reading is the cheap side of this trade and losing a reading is the
-        // expensive one. Note this is only needed for the *window*: a data type
-        // that was excluded was never drained at all, so its cursor never moved,
-        // and switching it back on needs nothing.
+        // expensive one. A type that was excluded was never drained at all, so
+        // switching it back on needs nothing.
         //
         // The marker is written first and cleared last, because the two writes
         // this needs cannot be made atomic from here. A crash between them would
@@ -79,16 +93,22 @@ public actor DeliveryEngine {
         // guarded against.
         var destination = destination
         Self.resolveFloor(&destination, previous: previous, now: now)
-        let owesReplay = previous.map {
+        let widenedWindow = previous.map {
             !$0.deliveryFloor.covers(destination.deliveryFloor)
         } ?? false
-        if owesReplay {
+        let broadenedToLossless = previous.map {
+            !$0.format.isLossless && destination.format.isLossless
+        } ?? false
+        if widenedWindow {
             destination.options[Destination.pendingReplayKey] = "1"
         }
 
-        try await write(destination)
-        if destination.isReplayPending {
-            try await settleReplay(for: destination)
+        let stored = try await write(
+            destination,
+            replayingIfOmitted: broadenedToLossless
+        )
+        if stored.isReplayPending {
+            try await settleReplay(for: stored)
         }
 
         // Re-saving a destination is how the user says "I fixed it", so a
@@ -141,14 +161,64 @@ public actor DeliveryEngine {
     }
 
     /// Persists a destination and keeps the in-memory copy in step.
-    private func write(_ destination: Destination) async throws {
+    @discardableResult
+    private func write(
+        _ destination: Destination,
+        replayingIfOmitted: Bool = false
+    ) async throws -> Destination {
         let payload = try JSONEncoder().encode(destination)
-        try await store.saveDestination(
+        var replay = destination
+        replay.options[Destination.pendingReplayKey] = "1"
+        let expectedRevision = revisions[destination.id]
+        let result = try await store.saveDestination(
             id: destination.id,
             payload: payload,
+            replayPayloadIfOmitted: replayingIfOmitted
+                ? try JSONEncoder().encode(replay)
+                : nil,
+            expectedRevision: expectedRevision,
             createdAt: destination.createdAt
         )
-        cache[destination.id] = destination
+        let stored = result.usedReplayPayload ? replay : destination
+        if let currentRevision = revisions[destination.id],
+           currentRevision > result.revision {
+            return cache[destination.id] ?? stored
+        }
+        cache[destination.id] = stored
+        revisions[destination.id] = result.revision
+        return stored
+    }
+
+    /// Applies one automatic repair to the latest stored destination, but only
+    /// while it is still the configuration the caller captured.
+    ///
+    /// Starting from the persisted payload rather than the stale snapshot is
+    /// what makes this a field patch: a refreshed bookmark cannot roll back a
+    /// format edit, endpoint change, or any unrelated bookkeeping.
+    private func patchDestination(
+        id: UUID,
+        expectedRevision: Int64,
+        update: @escaping @Sendable (inout Destination) -> Void
+    ) async throws -> Destination {
+        let result = try await store.patchDestination(
+            id: id,
+            expectedRevision: expectedRevision
+        ) { payload in
+            var destination = try JSONDecoder().decode(
+                Destination.self,
+                from: payload
+            )
+            update(&destination)
+            return try JSONEncoder().encode(destination)
+        }
+        let patched = try JSONDecoder().decode(
+            Destination.self,
+            from: result.payload
+        )
+        if revisions[id] == expectedRevision {
+            cache[id] = patched
+        }
+        return patched
     }
 
     /// Carries out a replay this destination is owed, and only then forgets it.
@@ -157,12 +227,15 @@ public actor DeliveryEngine {
     /// does nothing, and the marker is removed last so an interruption leaves
     /// the work still owed rather than silently done.
     private func settleReplay(for destination: Destination) async throws {
-        Self.log.info("A destination's date range widened; its history will replay.")
+        Self.log.info("A destination broadened what it accepts; its history will replay.")
+        let expectedRevision = try revision(for: destination.id)
         try await store.deleteStreamState(scope: .destination(destination.id))
-
-        var settled = destination
-        settled.options[Destination.pendingReplayKey] = nil
-        try await write(settled)
+        _ = try await patchDestination(
+            id: destination.id,
+            expectedRevision: expectedRevision
+        ) {
+            $0.options[Destination.pendingReplayKey] = nil
+        }
     }
 
     /// Removes a destination and the secret that belonged to it.
@@ -173,6 +246,7 @@ public actor DeliveryEngine {
         }
         try await store.deleteDestination(id: id)
         cache[id] = nil
+        revisions[id] = nil
     }
 
     public func setSecret(_ secret: String?, for destination: Destination) throws {
@@ -212,14 +286,19 @@ public actor DeliveryEngine {
         for destinationID: UUID
     ) async throws {
         try await loadIfNeeded()
-        guard var destination = cache[destinationID] else {
+        guard let destination = cache[destinationID] else {
             return
         }
         guard destination.options[Destination.coverageDigestKey] != digest else {
             return
         }
-        destination.options[Destination.coverageDigestKey] = digest
-        try await write(destination)
+        let expectedRevision = try revision(for: destinationID)
+        _ = try await patchDestination(
+            id: destinationID,
+            expectedRevision: expectedRevision
+        ) {
+            $0.options[Destination.coverageDigestKey] = digest
+        }
     }
 
     /// When this destination's current coverage was observed.
@@ -254,11 +333,16 @@ public actor DeliveryEngine {
             return observation.moment
         }
 
-        var updated = destination
-        updated.options[Destination.coverageObservedDigestKey] = digest
-        updated.options[Destination.coverageObservedAtKey] =
-            Destination.observedCoverageText(observation.moment)
-        try? await write(updated)
+        if let expectedRevision = revisions[destinationID] {
+            let moment = Destination.observedCoverageText(observation.moment)
+            _ = try? await patchDestination(
+                id: destinationID,
+                expectedRevision: expectedRevision
+            ) {
+                $0.options[Destination.coverageObservedDigestKey] = digest
+                $0.options[Destination.coverageObservedAtKey] = moment
+            }
+        }
 
         // Why this value has to survive being written down, kept from the
         // change that first diagnosed it:
@@ -295,10 +379,30 @@ public actor DeliveryEngine {
         now: Date = .now,
         ignoringCadence: Bool = false
     ) async throws -> [Destination] {
-        try await loadIfNeeded()
-        var due: [Destination] = []
+        let snapshots = try await dueDestinationSnapshots(
+            now: now,
+            ignoringCadence: ignoringCadence
+        )
+        return snapshots.map(\.destination)
+    }
 
-        for destination in cache.values.sorted(by: { $0.createdAt < $1.createdAt }) {
+    public func dueDestinationSnapshots(
+        now: Date = .now,
+        ignoringCadence: Bool = false
+    ) async throws -> [DestinationSnapshot] {
+        try await loadIfNeeded()
+        var due: [DestinationSnapshot] = []
+        let snapshots = try cache.values
+            .sorted(by: { $0.createdAt < $1.createdAt })
+            .map {
+                DestinationSnapshot(
+                    destination: $0,
+                    revision: try revision(for: $0.id)
+                )
+            }
+
+        for snapshot in snapshots {
+            let destination = snapshot.destination
             guard destination.isEnabled, destination.isConfigured else {
                 continue
             }
@@ -312,7 +416,7 @@ public actor DeliveryEngine {
             if ignoringCadence {
                 // An explicit "sync now" bypasses both the cadence and any
                 // backoff: the user is standing there asking for an answer.
-                due.append(destination)
+                due.append(snapshot)
                 continue
             }
             guard destination.cadence != .manual else {
@@ -338,9 +442,19 @@ public actor DeliveryEngine {
                now.timeIntervalSince(lastSuccess) < destination.cadence.minimumInterval {
                 continue
             }
-            due.append(destination)
+            due.append(snapshot)
         }
         return due
+    }
+
+    private func revision(for destinationID: UUID) throws -> Int64 {
+        guard let revision = revisions[destinationID] else {
+            throw HozzStoreError.corruptStoredValue(
+                "missing configuration revision for destination "
+                    + destinationID.uuidString
+            )
+        }
+        return revision
     }
 
     // MARK: - Delivering
@@ -353,6 +467,7 @@ public actor DeliveryEngine {
     public func deliver(
         _ batch: DeliveryBatch,
         to destination: Destination,
+        expectedRevision: Int64? = nil,
         now: Date = .now
     ) async throws -> DeliveryReceipt {
         if let detail = destination.unsupportedDescription {
@@ -432,13 +547,24 @@ public actor DeliveryEngine {
         )
 
         var destination = destination
+        let capturedRevision = expectedRevision ?? revisions[destination.id]
         // A computer's address is not permanent: routers reassign them, laptops
         // move network, ports change when an app restarts. Without this, a
         // destination that worked yesterday retries a dead address forever and
         // the user is told only that it timed out.
-        if let repaired = await repairedEndpointIfNeeded(for: destination) {
-            destination = repaired
-            try? await save(repaired)
+        if let repairedEndpoint = await repairedEndpointIfNeeded(
+            for: destination
+        ) {
+            if let capturedRevision {
+                destination = try await patchDestination(
+                    id: destination.id,
+                    expectedRevision: capturedRevision
+                ) {
+                    $0.endpointURL = repairedEndpoint
+                }
+            } else {
+                destination.endpointURL = repairedEndpoint
+            }
         }
 
         do {
@@ -446,10 +572,14 @@ public actor DeliveryEngine {
 
             // Persist a refreshed folder bookmark so an ordinary folder move
             // does not decay into a permanent failure later.
-            if let refreshed = delivered.refreshedBookmark {
-                var updated = destination
-                updated.folderBookmark = refreshed
-                try? await save(updated)
+            if let refreshed = delivered.refreshedBookmark,
+               let capturedRevision {
+                _ = try await patchDestination(
+                    id: destination.id,
+                    expectedRevision: capturedRevision
+                ) {
+                    $0.folderBookmark = refreshed
+                }
             }
 
             // What the window left out is carried on the successful receipt as
@@ -488,6 +618,8 @@ public actor DeliveryEngine {
             )
             try await store.appendReceipt(Self.record(receipt))
             return receipt
+        } catch let error as HozzStoreError {
+            throw error
         } catch {
             let failure = error as? DeliveryError
                 ?? .transport(error.localizedDescription)
@@ -644,9 +776,14 @@ public actor DeliveryEngine {
     /// hand is never quietly repointed somewhere else.
     private func repairedEndpointIfNeeded(
         for destination: Destination
-    ) async -> Destination? {
-        guard destination.kind == .restAPI,
-              let current = destination.endpointURL?.absoluteString,
+    ) async -> URL? {
+        guard destination.kind == .restAPI else {
+            return nil
+        }
+        if let endpointRepairResolver {
+            return await endpointRepairResolver(destination)
+        }
+        guard let current = destination.endpointURL?.absoluteString,
               let savedToken = (try? credentials.secret(
                   for: destination.credentialKey
               )) ?? nil,
@@ -671,12 +808,7 @@ public actor DeliveryEngine {
         }
 
         Self.log.info("A destination moved address and was re-resolved.")
-        // Rebuilt by mutation rather than field by field: a re-resolve that
-        // forgot to copy a field would silently reset it, and the user would
-        // have no way to tell that moving networks had changed their settings.
-        var repaired = destination
-        repaired.endpointURL = URL(string: working)
-        return repaired
+        return URL(string: working)
     }
 
     /// The record belonging to this destination, not whichever Mac published
@@ -739,22 +871,28 @@ public actor DeliveryEngine {
             throw DeliveryError.notConfigured
         }
         let savedBeforeTest = cache[destination.id]
+        let savedRevision = revisions[destination.id]
         let mayPersistRepair =
             savedBeforeTest?.kind == destination.kind
                 && savedBeforeTest?.endpointURL == destination.endpointURL
-        let target = await repairedEndpointIfNeeded(for: destination)
-            ?? destination
+        var target = destination
+        if let endpoint = await repairedEndpointIfNeeded(for: destination) {
+            target.endpointURL = endpoint
+        }
         let receipt = try await channel.deliver(batch, to: target)
         if mayPersistRepair,
            target != destination,
            let savedBeforeTest,
-           cache[destination.id] == savedBeforeTest {
-            // Persist only the endpoint into the exact saved configuration.
-            // The editor normalises defaults into its draft, so writing the
-            // whole draft here would save changes the user only asked to test.
-            var repairedSaved = savedBeforeTest
-            repairedSaved.endpointURL = target.endpointURL
-            try? await save(repairedSaved)
+           let savedRevision,
+           cache[destination.id] == savedBeforeTest,
+           revisions[destination.id] == savedRevision {
+            let repairedEndpoint = target.endpointURL
+            _ = try? await patchDestination(
+                id: destination.id,
+                expectedRevision: savedRevision
+            ) {
+                $0.endpointURL = repairedEndpoint
+            }
         }
         return receipt
     }
@@ -829,6 +967,7 @@ public actor DeliveryEngine {
         for row in try await store.destinationPayloads() {
             if let destination = try? decoder.decode(Destination.self, from: row.payload) {
                 cache[row.id] = destination
+                revisions[row.id] = row.revision
             }
         }
         isLoaded = true

@@ -11,6 +11,12 @@ public enum HozzStoreError: Error, LocalizedError, Equatable, Sendable {
     case stalePrimeFrontier(type: String)
     /// A prime advance arrived for a type that has no window to advance.
     case unknownPrime(type: String)
+    /// A destination changed after a sync captured its configuration.
+    case staleDestinationConfiguration(
+        id: UUID,
+        expected: Int64,
+        actual: Int64?
+    )
     case unknownRun(UUID)
     case unknownPart(runID: UUID, sequence: Int)
     case partNotOpen(runID: UUID, sequence: Int)
@@ -25,6 +31,10 @@ public enum HozzStoreError: Error, LocalizedError, Equatable, Sendable {
             "Hozz refused to move the recent-history frontier for \(type) because it changed underneath the walk."
         case .unknownPrime(let type):
             "Hozz has no recent-history window recorded for \(type)."
+        case .staleDestinationConfiguration(let id, let expected, let actual):
+            "Destination \(id.uuidString) changed while a sync using revision "
+                + "\(expected) was running (current revision: "
+                + "\(actual.map(String.init) ?? "missing"))."
         case .unknownRun(let id):
             "Export run \(id.uuidString) is not in the store."
         case .unknownPart(let runID, let sequence):
@@ -173,7 +183,8 @@ public actor HozzStore {
                         id TEXT PRIMARY KEY NOT NULL,
                         payload TEXT NOT NULL,
                         created_at REAL NOT NULL,
-                        updated_at REAL NOT NULL
+                        updated_at REAL NOT NULL,
+                        revision INTEGER NOT NULL DEFAULT 1
                     );
 
                     CREATE TABLE delivery_state (
@@ -346,6 +357,59 @@ public actor HozzStore {
                 try database.execute("PRAGMA user_version = 5;")
             }
         }
+
+        if version < 6 {
+            try database.transaction {
+                let lockedVersion = try database.query(
+                    "PRAGMA user_version;"
+                ) { row in
+                    Int(row.integer(0))
+                }.first ?? 0
+                guard lockedVersion < 6 else {
+                    return
+                }
+                try database.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS delivery_omission_seal (
+                        destination_id TEXT NOT NULL
+                            REFERENCES destination(id) ON DELETE CASCADE,
+                        format TEXT NOT NULL,
+                        omitted_record_count INTEGER NOT NULL,
+                        sealed_at REAL NOT NULL,
+                        PRIMARY KEY (destination_id, format)
+                    );
+                    PRAGMA user_version = 6;
+                    """
+                )
+            }
+        }
+
+        if version < 7 {
+            try database.transaction {
+                let lockedVersion = try database.query(
+                    "PRAGMA user_version;"
+                ) { row in
+                    Int(row.integer(0))
+                }.first ?? 0
+                guard lockedVersion < 7 else {
+                    return
+                }
+                let columns = Set(
+                    try database.query("PRAGMA table_info(destination);") {
+                        $0.text(1)
+                    }
+                )
+                if !columns.contains("revision") {
+                    try database.execute(
+                        """
+                        ALTER TABLE destination
+                            ADD COLUMN revision INTEGER NOT NULL DEFAULT 1;
+                        """
+                    )
+                }
+                try database.execute("PRAGMA user_version = 7;")
+            }
+        }
     }
 
     public func schemaVersion() throws -> Int {
@@ -452,14 +516,66 @@ public actor HozzStore {
     public func commit(
         _ commits: [PendingAnchorCommit],
         prime primeCommits: [PendingPrimeCommit],
+        omissionSeal: DeliveryOmissionSeal? = nil,
+        expectedDestinationRevision: Int64? = nil,
         scope: AnchorScope,
         at date: Date = .now
     ) throws {
-        guard !commits.isEmpty || !primeCommits.isEmpty else {
+        guard
+            !commits.isEmpty
+                || !primeCommits.isEmpty
+                || omissionSeal != nil
+        else {
             return
         }
 
         try database.transaction {
+            if let expectedDestinationRevision {
+                guard case .destination(let destinationID) = scope else {
+                    throw HozzStoreError.corruptStoredValue(
+                        "a destination revision was supplied for a non-destination scope"
+                    )
+                }
+                let actual = try destinationRevision(id: destinationID)
+                guard actual == expectedDestinationRevision else {
+                    throw HozzStoreError.staleDestinationConfiguration(
+                        id: destinationID,
+                        expected: expectedDestinationRevision,
+                        actual: actual
+                    )
+                }
+            }
+            if let omissionSeal {
+                guard scope == .destination(omissionSeal.destinationID) else {
+                    throw HozzStoreError.corruptStoredValue(
+                        "an omission seal did not match its destination scope"
+                    )
+                }
+                guard omissionSeal.omittedRecordCount > 0 else {
+                    throw HozzStoreError.corruptStoredValue(
+                        "an omission seal had no omitted records"
+                    )
+                }
+                try database.run(
+                    """
+                    INSERT INTO delivery_omission_seal (
+                        destination_id, format, omitted_record_count, sealed_at
+                    )
+                    VALUES (?, ?, ?, ?)
+                    ON CONFLICT(destination_id, format) DO UPDATE SET
+                        omitted_record_count =
+                            delivery_omission_seal.omitted_record_count
+                            + excluded.omitted_record_count,
+                        sealed_at = excluded.sealed_at;
+                    """,
+                    [
+                        .text(omissionSeal.destinationID.uuidString.lowercased()),
+                        .text(omissionSeal.format),
+                        .integer(Int64(omissionSeal.omittedRecordCount)),
+                        .real(date.timeIntervalSince1970)
+                    ]
+                )
+            }
             for commit in commits {
                 try apply(commit, scope: scope, at: date)
             }
@@ -561,7 +677,29 @@ public actor HozzStore {
                 "DELETE FROM prime_state WHERE scope = ?;",
                 [.text(scope.rawValue)]
             )
+            if case .destination(let destinationID) = scope {
+                try database.run(
+                    "DELETE FROM delivery_omission_seal WHERE destination_id = ?;",
+                    [.text(destinationID.uuidString.lowercased())]
+                )
+            }
         }
+    }
+
+    public func deliveryOmissionFormats(
+        for destinationID: UUID
+    ) throws -> Set<String> {
+        Set(
+            try database.query(
+                """
+                SELECT format
+                FROM delivery_omission_seal
+                WHERE destination_id = ?
+                """,
+                [.text(destinationID.uuidString.lowercased())],
+                row: { $0.text(0) }
+            )
+        )
     }
 
     private static func streamRecord(_ row: SQLiteRow) throws -> StreamRecord {

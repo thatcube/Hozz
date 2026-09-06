@@ -103,10 +103,13 @@ that replay fails explicitly and requires a fresh full export rather than
 creating an unrelated tombstone. Migration also preserves a conservative
 type-scoped barrier for unresolved stable tombstones from versions that did not
 store compatibility metadata, preventing delayed legacy records from reviving
-them. Filename-only watcher receipts are repaired under their original run
-scope, avoiding duplicate run and coverage history. Data backfills are
-versioned and run once; normal batches reconcile only encoding errors related
-to IDs changed by that batch.
+them. Filename-only watcher receipts are compared using mutations to durable
+receiver tables only, so temporary validation bookkeeping cannot make unchanged
+content look new. Receipts with an unknown deletion count replay against their
+original receipt and run scope before the content-digest receipt is recorded,
+avoiding duplicate run and coverage history. Data backfills are versioned and
+run once; normal batches reconcile only encoding errors related to IDs changed
+by that batch.
 
 ## Ask it things
 
